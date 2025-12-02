@@ -1,0 +1,12 @@
+broker/build/
+broker/data-local/
+broker/data/
+broker/logs/
+build/
+common/build/
+logs/
+network/build/
+pipe/build/
+storage/build/
+.idea/
+.gradle/
