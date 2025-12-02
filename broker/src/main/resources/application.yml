@@ -1,0 +1,70 @@
+micronaut:
+  application:
+    name: messaging-broker
+  server:
+    port: ${HTTP_PORT:8081}  # HTTP admin port
+
+  metrics:
+    enabled: true
+    export:
+      prometheus:
+        enabled: true
+        step: PT1M  # 1 minute scrape interval
+        descriptions: true
+    binders:
+      jvm:
+        enabled: true
+      processor:
+        enabled: true
+      uptime:
+        enabled: true
+      files:
+        enabled: true
+      logback:
+        enabled: true
+
+endpoints:
+  all:
+    enabled: true
+    sensitive: false
+  prometheus:
+    enabled: true
+    sensitive: false
+  health:
+    enabled: true
+    sensitive: false
+  metrics:
+    enabled: true
+    sensitive: false
+
+broker:
+  nodeId: ${NODE_ID:local-001}
+
+  registry:
+    url: ${REGISTRY_URL:http://localhost:8080}
+
+  storage:
+    type: mmap
+    dataDir: ${DATA_DIR:./data}
+    segment-size: 1073741824  # 1GB
+
+  network:
+    type: tcp
+    port: ${BROKER_PORT:9092}
+    threads:
+      boss: 2
+      worker: 16
+
+  consumer:
+    default-retry-policy: EXPONENTIAL_THEN_FIXED
+    default-max-exponential-retries: 10
+    default-initial-retry-delay: 1000
+    default-max-retry-delay: 30000
+    default-fixed-retry-interval: 30000
+    ack-timeout: 5000
+
+logger:
+  levels:
+    com.messaging: INFO
+    com.messaging.network.codec: DEBUG
+    io.netty: WARN

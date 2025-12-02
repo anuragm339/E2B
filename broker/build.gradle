@@ -1,0 +1,46 @@
+plugins {
+    id 'io.micronaut.application' version '4.2.1'
+}
+
+dependencies {
+    // Depend on all modules
+    implementation project(':common')
+    implementation project(':storage')
+    implementation project(':network')
+    implementation project(':pipe')
+
+    // Micronaut
+    implementation 'io.micronaut:micronaut-inject'
+    implementation 'io.micronaut:micronaut-runtime'
+    implementation 'io.micronaut:micronaut-http-server-netty'
+    implementation 'io.micronaut:micronaut-http-client'
+
+    // Jackson for JSON
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'
+    implementation 'io.micronaut:micronaut-jackson-databind'
+
+    // YAML support
+    runtimeOnly 'org.yaml:snakeyaml'
+
+    // Scheduling
+    annotationProcessor 'io.micronaut:micronaut-inject-java'
+    implementation 'io.micronaut:micronaut-context'
+
+    // Metrics - Prometheus & Micrometer
+    implementation 'io.micronaut.micrometer:micronaut-micrometer-core'
+    implementation 'io.micronaut.micrometer:micronaut-micrometer-registry-prometheus'
+    implementation 'io.micrometer:micrometer-core'
+    implementation 'io.micrometer:micrometer-registry-prometheus'
+
+    // Management endpoints
+    implementation 'io.micronaut:micronaut-management'
+}
+
+application {
+    mainClass = 'com.messaging.broker.Application'
+}
+
+micronaut {
+    version = '4.2.1'
+    runtime(io.micronaut.gradle.MicronautRuntime.NETTY)
+}

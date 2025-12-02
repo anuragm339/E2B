@@ -1,0 +1,50 @@
+# Build artifacts
+**/build/
+**/target/
+**/.gradle/
+**/bin/
+**/out/
+
+# Data directories
+data/
+data-local/
+**/data/
+**/data-*/
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Test files
+**/test/
+**/*Test.java
+
+# Docker files
+Dockerfile*
+docker-compose*.yml
+.dockerignore

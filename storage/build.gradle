@@ -1,0 +1,10 @@
+dependencies {
+    // Depend on common module
+    implementation project(':common')
+
+    // For CRC32 and file operations
+    implementation 'com.google.guava:guava:32.1.3-jre'
+
+    // SQLite for metadata persistence
+    implementation 'org.xerial:sqlite-jdbc:3.44.1.0'
+}

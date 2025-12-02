@@ -1,0 +1,10 @@
+dependencies {
+    // Depend on common module
+    implementation project(':common')
+
+    // Netty for NIO
+    implementation 'io.netty:netty-all:4.1.100.Final'
+
+    // For serialization
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'
+}

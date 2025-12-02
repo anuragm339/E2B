@@ -1,0 +1,44 @@
+plugins {
+    id 'java'
+    id 'io.micronaut.application' version '4.2.1' apply false
+    id 'io.micronaut.library' version '4.2.1' apply false
+}
+
+group = 'com.messaging'
+version = '1.0.0-SNAPSHOT'
+
+subprojects {
+    apply plugin: 'java'
+    apply plugin: 'io.micronaut.library'
+
+    java {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    micronaut {
+        version = '4.2.1'
+    }
+
+    repositories {
+        mavenCentral()
+    }
+
+    dependencies {
+        // Micronaut core
+        implementation("io.micronaut:micronaut-inject")
+        implementation("io.micronaut:micronaut-runtime")
+
+        // Logging
+        implementation("ch.qos.logback:logback-classic")
+
+        // Testing
+        testImplementation("io.micronaut.test:micronaut-test-junit5")
+        testImplementation("org.junit.jupiter:junit-jupiter")
+        testImplementation("org.mockito:mockito-core")
+    }
+
+    test {
+        useJUnitPlatform()
+    }
+}
