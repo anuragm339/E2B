@@ -100,7 +100,12 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             log.info("Received message from parent: key={}, type={}",
                     record.getMsgKey(), record.getEventType());
 
-            metrics.recordMessageReceived();
+            // Calculate message size (estimate: key + data + metadata)
+            long messageBytes = (record.getMsgKey() != null ? record.getMsgKey().length() : 0) +
+                                (record.getData() != null ? record.getData().length() : 0) +
+                                50; // metadata overhead estimate
+
+            metrics.recordMessageReceived(messageBytes);
 
             // Store message in local storage
             // Use topic from record, fallback to default if not set

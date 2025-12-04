@@ -63,6 +63,10 @@ public class RemoteConsumerRegistry {
         long persistedOffset = offsetTracker.getOffset(consumerId);
         consumer.setCurrentOffset(persistedOffset);
 
+        // Initialize consumer metrics
+        metrics.updateConsumerOffset(clientId, topic, group, persistedOffset);
+        metrics.updateConsumerLag(clientId, topic, group, 0);
+
         consumers.put(clientId, consumer);
 
         // Start delivery task
@@ -81,6 +85,8 @@ public class RemoteConsumerRegistry {
             if (consumer.deliveryTask != null) {
                 consumer.deliveryTask.cancel(false);
             }
+            // Clean up metrics
+            metrics.removeConsumerMetrics(clientId, consumer.topic);
             log.info("Unregistered remote consumer: {}", clientId);
         }
     }
@@ -154,20 +160,50 @@ public class RemoteConsumerRegistry {
             // Send each message to consumer
             for (MessageRecord record : records) {
                 try {
-                    Timer.Sample deliverySample = metrics.startMessageDeliveryTimer();
+                    // Start timing for per-consumer delivery
+                    Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
+
                     sendMessageToConsumer(consumer, record, currentOffset);
-                    metrics.stopMessageDeliveryTimer(deliverySample);
-                    metrics.recordMessageSent();
+
+                    // Calculate message size
+                    long messageBytes = (record.getMsgKey() != null ? record.getMsgKey().length() : 0) +
+                                        (record.getData() != null ? record.getData().length() : 0) +
+                                        50; // metadata overhead
+
+                    // Record per-consumer metrics
+                    metrics.recordConsumerMessageSent(consumer.clientId, consumer.topic, consumer.group, messageBytes);
+                    metrics.stopConsumerDeliveryTimer(deliverySample, consumer.clientId, consumer.topic, consumer.group);
+
+                    // Record global metrics
+                    metrics.recordMessageSent(messageBytes);
+
                     currentOffset++;
                 } catch (Exception e) {
                     log.error("Failed to send message to consumer {}: offset={}",
                              consumer.clientId, currentOffset, e);
+                    // Record failure
+                    metrics.recordConsumerFailure(consumer.clientId, consumer.topic, consumer.group);
                     break; // Stop on error
                 }
             }
 
             // Update offset
             consumer.setCurrentOffset(currentOffset);
+
+            // Update consumer offset metric
+            metrics.updateConsumerOffset(consumer.clientId, consumer.topic, consumer.group, currentOffset);
+
+            // Calculate and update lag (difference between latest message and consumer offset)
+            // Get head offset from storage (getCurrentOffset returns the highest offset written)
+            try {
+                long headOffset = storage.getCurrentOffset(consumer.topic, 0);
+                // headOffset is the last written offset, so next offset to write would be headOffset + 1
+                // lag is (headOffset + 1) - currentOffset
+                long lag = (headOffset + 1) - currentOffset;
+                metrics.updateConsumerLag(consumer.clientId, consumer.topic, consumer.group, Math.max(0, lag));
+            } catch (Exception e) {
+                log.debug("Could not calculate lag for consumer {}: {}", consumer.clientId, e.getMessage());
+            }
 
             // Persist offset periodically (every 100 messages or every 5 seconds)
             if (currentOffset % 100 == 0 ||

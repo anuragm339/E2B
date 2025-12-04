@@ -5,11 +5,13 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Custom Prometheus metrics for messaging broker
  * Tracks latency, throughput, memory, and disk I/O
+ * Supports per-consumer metrics with labels
  */
 @Singleton
 public class BrokerMetrics {
@@ -17,10 +19,22 @@ public class BrokerMetrics {
 
     private final MeterRegistry registry;
 
+    // Per-consumer metric caches
+    private final ConcurrentHashMap<String, Counter> consumerMessagesSent = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerBytesSent = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerAcks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerFailures = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerRetries = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> consumerOffsets = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> consumerLag = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Timer> consumerDeliveryLatency = new ConcurrentHashMap<>();
+
     // Counters
     private final Counter messagesReceived;
     private final Counter messagesSent;
     private final Counter messagesStored;
+    private final Counter bytesReceived;
+    private final Counter bytesSent;
     private final Counter storageReads;
     private final Counter storageWrites;
     private final Counter consumerConnections;
@@ -57,6 +71,16 @@ public class BrokerMetrics {
 
         this.messagesStored = Counter.builder("broker.messages.stored")
             .description("Total number of messages stored to disk")
+            .register(registry);
+
+        this.bytesReceived = Counter.builder("broker.bytes.received")
+            .description("Total bytes received from upstream")
+            .baseUnit("bytes")
+            .register(registry);
+
+        this.bytesSent = Counter.builder("broker.bytes.sent")
+            .description("Total bytes sent to consumers")
+            .baseUnit("bytes")
             .register(registry);
 
         this.storageReads = Counter.builder("broker.storage.reads")
@@ -127,8 +151,18 @@ public class BrokerMetrics {
         messagesReceived.increment();
     }
 
+    public void recordMessageReceived(long bytes) {
+        messagesReceived.increment();
+        bytesReceived.increment(bytes);
+    }
+
     public void recordMessageSent() {
         messagesSent.increment();
+    }
+
+    public void recordMessageSent(long bytes) {
+        messagesSent.increment();
+        bytesSent.increment(bytes);
     }
 
     public void recordMessageStored() {
@@ -215,5 +249,164 @@ public class BrokerMetrics {
 
     public long getActiveConsumers() {
         return activeConsumers.get();
+    }
+
+    // ==================== PER-CONSUMER METRICS ====================
+
+    /**
+     * Record a message sent to a specific consumer
+     */
+    public void recordConsumerMessageSent(String consumerId, String topic, String group, long bytes) {
+        String key = consumerId + ":" + topic;
+
+        // Get or create counter for this consumer+topic
+        Counter counter = consumerMessagesSent.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.messages.sent")
+                .description("Messages sent to specific consumer")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry)
+        );
+        counter.increment();
+
+        // Track bytes
+        Counter bytesCounter = consumerBytesSent.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.bytes.sent")
+                .description("Bytes sent to specific consumer")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .baseUnit("bytes")
+                .register(registry)
+        );
+        bytesCounter.increment(bytes);
+    }
+
+    /**
+     * Record an ACK from a specific consumer
+     */
+    public void recordConsumerAck(String consumerId, String topic, String group) {
+        String key = consumerId + ":" + topic;
+        Counter counter = consumerAcks.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.acks")
+                .description("ACKs received from consumer")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry)
+        );
+        counter.increment();
+    }
+
+    /**
+     * Record a delivery failure for a specific consumer
+     */
+    public void recordConsumerFailure(String consumerId, String topic, String group) {
+        String key = consumerId + ":" + topic;
+        Counter counter = consumerFailures.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.failures")
+                .description("Failed message deliveries to consumer")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry)
+        );
+        counter.increment();
+    }
+
+    /**
+     * Record a retry for a specific consumer
+     */
+    public void recordConsumerRetry(String consumerId, String topic, String group) {
+        String key = consumerId + ":" + topic;
+        Counter counter = consumerRetries.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.retries")
+                .description("Message retry attempts for consumer")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry)
+        );
+        counter.increment();
+    }
+
+    /**
+     * Update the current offset for a consumer
+     */
+    public void updateConsumerOffset(String consumerId, String topic, String group, long offset) {
+        String key = consumerId + ":" + topic;
+        AtomicLong gauge = consumerOffsets.computeIfAbsent(key, k -> {
+            AtomicLong atomicOffset = new AtomicLong(0);
+            Gauge.builder("broker.consumer.offset", atomicOffset, AtomicLong::get)
+                .description("Current offset for consumer")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry);
+            return atomicOffset;
+        });
+        gauge.set(offset);
+    }
+
+    /**
+     * Update the lag for a consumer (difference between head and consumer offset)
+     */
+    public void updateConsumerLag(String consumerId, String topic, String group, long lag) {
+        String key = consumerId + ":" + topic;
+        AtomicLong gauge = consumerLag.computeIfAbsent(key, k -> {
+            AtomicLong atomicLag = new AtomicLong(0);
+            Gauge.builder("broker.consumer.lag", atomicLag, AtomicLong::get)
+                .description("Message lag for consumer (head - consumer offset)")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry);
+            return atomicLag;
+        });
+        gauge.set(lag);
+    }
+
+    /**
+     * Start timing delivery to a specific consumer
+     */
+    public Timer.Sample startConsumerDeliveryTimer() {
+        return Timer.start(registry);
+    }
+
+    /**
+     * Stop timing delivery to a specific consumer
+     */
+    public void stopConsumerDeliveryTimer(Timer.Sample sample, String consumerId, String topic, String group) {
+        String key = consumerId + ":" + topic;
+        Timer timer = consumerDeliveryLatency.computeIfAbsent(key, k ->
+            Timer.builder("broker.consumer.delivery.latency")
+                .description("Delivery latency to specific consumer")
+                .tag("consumer_id", consumerId)
+                .tag("topic", topic)
+                .tag("group", group)
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(registry)
+        );
+        sample.stop(timer);
+    }
+
+    /**
+     * Remove all metrics for a consumer when they disconnect
+     */
+    public void removeConsumerMetrics(String consumerId, String topic) {
+        String key = consumerId + ":" + topic;
+
+        // Remove from caches - actual metrics will remain in registry until scrape
+        consumerMessagesSent.remove(key);
+        consumerBytesSent.remove(key);
+        consumerAcks.remove(key);
+        consumerFailures.remove(key);
+        consumerRetries.remove(key);
+        consumerOffsets.remove(key);
+        consumerLag.remove(key);
+        consumerDeliveryLatency.remove(key);
+
+        log.debug("Removed metrics cache for consumer: {} topic: {}", consumerId, topic);
     }
 }
