@@ -1,0 +1,129 @@
+version: '3.8'
+
+services:
+  # Cloud Test Server (Mock Registry)
+  cloud-server:
+    image: python:3.11-slim
+    container_name: cloud-server
+    working_dir: /app
+    volumes:
+      - ./cloud-test-server.py:/app/cloud-test-server.py
+    command: sh -c "pip install flask && python cloud-test-server.py"
+    ports:
+      - "8080:8080"
+    networks:
+      - messaging-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Messaging Broker
+  broker:
+    build:
+      context: ./provider
+      dockerfile: Dockerfile
+    container_name: messaging-broker
+    environment:
+      NODE_ID: broker-001
+      BROKER_PORT: 9092
+      HTTP_PORT: 8081
+      DATA_DIR: /app/data
+      REGISTRY_URL: http://cloud-server:8080
+      JAVA_OPTS: "-Xms512m -Xmx2g -XX:+UseG1GC"
+    ports:
+      - "9092:9092"  # TCP broker port
+      - "8081:8081"  # HTTP admin/metrics port
+    volumes:
+      - broker-data:/app/data
+    networks:
+      - messaging-network
+    depends_on:
+      - cloud-server
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Consumer App (Price Consumer)
+  consumer-price:
+    build:
+      context: ./consumer-app
+      dockerfile: Dockerfile
+    container_name: consumer-price
+    environment:
+      CONSUMER_TYPE: price
+      CONSUMER_TOPIC: price-topic
+      CONSUMER_GROUP: price-group
+      CONSUMER_PORT: 8082
+      BROKER_HOST: broker
+      BROKER_PORT: 9092
+      STORAGE_DATA_DIR: /app/consumer-data
+    ports:
+      - "8082:8082"
+    volumes:
+      - consumer-price-data:/app/consumer-data
+    networks:
+      - messaging-network
+    depends_on:
+      - broker
+    restart: unless-stopped
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - messaging-network
+    depends_on:
+      - broker
+    restart: unless-stopped
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana-data:/var/lib/grafana
+    networks:
+      - messaging-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  broker-data:
+    driver: local
+  consumer-price-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+networks:
+  messaging-network:
+    driver: bridge
