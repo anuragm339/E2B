@@ -17,53 +17,73 @@ app = Flask(__name__)
 # Simulated message storage - will grow dynamically
 messages = []
 
-# Stock symbols to generate data for
-SYMBOLS = ["AAPL", "GOOGL", "MSFT", "TSLA", "AMZN", "META", "NVDA", "NFLX", "AMD", "INTC"]
+# All topics served by cloud server (24 topics total)
+ALL_TOPICS = [
+    "prices-v1", "reference-data-v5", "non-promotable-products", "prices-v4",
+    "minimum-price", "deposit", "product-base-document", "search-product",
+    "location", "location-clusters", "selling-restrictions", "colleague-facts-jobs",
+    "colleague-facts-legacy", "loss-prevention-configuration",
+    "loss-prevention-store-configuration", "loss-prevention-product",
+    "loss-prevention-rule-config", "stored-value-services-banned-promotion",
+    "stored-value-services-active-promotion", "colleague-card-pin",
+    "colleague-card-pin-v2", "dcxp-content", "restriction-rules", "dcxp-ugc"
+]
 
-# Base prices for stocks
-BASE_PRICES = {
-    "AAPL": 150.25,
-    "GOOGL": 2800.50,
-    "MSFT": 380.75,
-    "TSLA": 245.30,
-    "AMZN": 178.90,
-    "META": 485.20,
-    "NVDA": 875.45,
-    "NFLX": 625.30,
-    "AMD": 165.80,
-    "INTC": 42.15
+# Data generators for different topic types
+DATA_TEMPLATES = {
+    "price": lambda: {"price": round(random.uniform(10, 1000), 2), "currency": "GBP", "timestamp": datetime.utcnow().isoformat() + "Z"},
+    "product": lambda: {"productId": random.randint(10000, 99999), "name": f"Product-{random.randint(1, 999)}", "category": random.choice(["Food", "Electronics", "Clothing"])},
+    "location": lambda: {"storeId": random.randint(1000, 9999), "latitude": round(random.uniform(50, 55), 6), "longitude": round(random.uniform(-5, 2), 6)},
+    "restriction": lambda: {"restrictionId": random.randint(1, 100), "type": random.choice(["AGE", "QUANTITY", "TIME"]), "value": random.randint(1, 21)},
+    "colleague": lambda: {"colleagueId": random.randint(10000, 99999), "role": random.choice(["CASHIER", "MANAGER", "STOCK"]), "storeId": random.randint(1000, 9999)},
+    "prevention": lambda: {"ruleId": random.randint(1, 500), "severity": random.choice(["LOW", "MEDIUM", "HIGH"]), "action": random.choice(["ALERT", "BLOCK"])},
+    "content": lambda: {"contentId": random.randint(1, 10000), "type": random.choice(["BANNER", "PROMOTION", "NEWS"]), "status": "ACTIVE"}
 }
-
-# Current prices (will fluctuate)
-current_prices = BASE_PRICES.copy()
 
 # Lock for thread-safe message append
 messages_lock = threading.Lock()
 
-def generate_price_update():
-    """Generate a new price update message"""
-    symbol = random.choice(SYMBOLS)
+def get_template_for_topic(topic):
+    """Map topic to data template"""
+    if any(x in topic for x in ["price", "minimum", "deposit", "reference"]):
+        return "price"
+    elif any(x in topic for x in ["product", "search", "promotable"]):
+        return "product"
+    elif any(x in topic for x in ["location"]):
+        return "location"
+    elif any(x in topic for x in ["restriction", "selling"]):
+        return "restriction"
+    elif any(x in topic for x in ["colleague", "identity"]):
+        return "colleague"
+    elif any(x in topic for x in ["prevention", "loss"]):
+        return "prevention"
+    else:
+        return "content"
 
-    # Price fluctuation: +/- 2%
-    fluctuation = random.uniform(-0.02, 0.02)
-    current_prices[symbol] *= (1 + fluctuation)
+def generate_message():
+    """Generate a message for a random topic"""
+    topic = random.choice(ALL_TOPICS)
+    template_type = get_template_for_topic(topic)
+    data = DATA_TEMPLATES[template_type]()
 
-    # Keep price within reasonable bounds
-    if current_prices[symbol] < BASE_PRICES[symbol] * 0.7:
-        current_prices[symbol] = BASE_PRICES[symbol] * 0.7
-    elif current_prices[symbol] > BASE_PRICES[symbol] * 1.3:
-        current_prices[symbol] = BASE_PRICES[symbol] * 1.3
+    # Add topic-specific fields
+    data["topic"] = topic
+    data["generatedAt"] = datetime.utcnow().isoformat() + "Z"
+
+    # Generate message with size up to ~1KB (expandable to 1MB if needed)
+    # Add padding to simulate realistic message sizes
+    data["metadata"] = {
+        "version": "1.0",
+        "source": "cloud-server",
+        "messageId": len(messages),
+        "padding": "x" * random.randint(100, 500)  # Random padding
+    }
 
     message = {
-        "msgKey": f"{symbol}_{len(messages)}",
+        "msgKey": f"{topic}_{len(messages)}",
         "eventType": "MESSAGE",
-        "topic": "price-topic",  # Topic for routing
-        "data": json.dumps({
-            "symbol": symbol,
-            "price": round(current_prices[symbol], 2),
-            "volume": random.randint(1000, 100000),
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }),
+        "topic": topic,
+        "data": json.dumps(data),
         "createdAt": datetime.utcnow().isoformat() + "Z"
     }
 
@@ -71,16 +91,16 @@ def generate_price_update():
 
 def message_generator():
     """Background thread to continuously generate messages"""
-    print("[GENERATOR] Starting message generator thread...")
+    print("[GENERATOR] Starting message generator thread for all 24 topics...")
 
     while True:
         try:
-            # Generate 5-15 messages per batch
-            batch_size = random.randint(5, 15)
+            # Generate 10-30 messages per batch (to cover all topics)
+            batch_size = random.randint(10, 30)
 
             with messages_lock:
                 for _ in range(batch_size):
-                    msg = generate_price_update()
+                    msg = generate_message()
                     messages.append(msg)
 
             # Generate messages every 2-5 seconds

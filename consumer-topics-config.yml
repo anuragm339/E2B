@@ -1,0 +1,119 @@
+# Consumer to Topics Mapping Configuration
+# Each consumer service subscribes to specific topics
+# Maximum message size: 1MB per record
+
+consumers:
+  - name: price-quote
+    group: price-quote-group
+    port: 8090
+    topics:
+      - prices-v1
+      - reference-data-v5
+      - non-promotable-products
+      - prices-v4
+      - minimum-price
+      - deposit
+
+  - name: product-svc-lite
+    group: product-svc-lite-group
+    port: 8091
+    topics:
+      - product-base-document
+
+  - name: search-enterprise
+    group: search-enterprise-group
+    port: 8092
+    topics:
+      - search-product
+
+  - name: tesco-location-service
+    group: tesco-location-service-group
+    port: 8093
+    topics:
+      - location
+      - location-clusters
+
+  - name: customer-order-on-till
+    group: customer-order-on-till-group
+    port: 8094
+    topics:
+      - selling-restrictions
+
+  - name: colleague-facts
+    group: colleague-facts-group
+    port: 8095
+    topics:
+      - colleague-facts-jobs
+      - colleague-facts-legacy
+
+  - name: loss-prevention-api
+    group: loss-prevention-api-group
+    port: 8096
+    topics:
+      - loss-prevention-configuration
+      - loss-prevention-store-configuration
+      - loss-prevention-product
+      - loss-prevention-rule-config
+
+  - name: stored-value-services
+    group: stored-value-services-group
+    port: 8097
+    topics:
+      - stored-value-services-banned-promotion
+      - stored-value-services-active-promotion
+
+  - name: colleague-identity
+    group: colleague-identity-group
+    port: 8098
+    topics:
+      - colleague-card-pin
+
+  - name: distributed-identity
+    group: distributed-identity-group
+    port: 8099
+    topics:
+      - colleague-card-pin-v2
+
+  - name: dcxp-content
+    group: dcxp-content-group
+    port: 8100
+    topics:
+      - dcxp-content
+
+  - name: restriction-service-on-tills
+    group: restriction-service-on-tills-group
+    port: 8101
+    topics:
+      - restriction-rules
+
+  - name: dcxp-ugc
+    group: dcxp-ugc-group
+    port: 8102
+    topics:
+      - dcxp-ugc
+
+# Topic List (21 total topics):
+# 1. prices-v1
+# 2. reference-data-v5
+# 3. non-promotable-products
+# 4. prices-v4
+# 5. minimum-price
+# 6. deposit
+# 7. product-base-document
+# 8. search-product
+# 9. location
+# 10. location-clusters
+# 11. selling-restrictions
+# 12. colleague-facts-jobs
+# 13. colleague-facts-legacy
+# 14. loss-prevention-configuration
+# 15. loss-prevention-store-configuration
+# 16. loss-prevention-product
+# 17. loss-prevention-rule-config
+# 18. stored-value-services-banned-promotion
+# 19. stored-value-services-active-promotion
+# 20. colleague-card-pin
+# 21. colleague-card-pin-v2
+# 22. dcxp-content
+# 23. restriction-rules
+# 24. dcxp-ugc
