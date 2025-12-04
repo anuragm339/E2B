@@ -41,7 +41,7 @@ public class TopologyManager {
     public TopologyManager(
             CloudRegistryClient registryClient,
             PipeConnector pipeConnector,
-            @Value("${broker.registry.url:}") String registryUrl,
+            @Value("${broker.registry.url}") String registryUrl,
             @Value("${broker.nodeId:local-001}") String nodeId,
             @Value("${broker.storage.data-dir:./data}") String dataDir) {
 

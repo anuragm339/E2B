@@ -2,7 +2,7 @@ micronaut:
   application:
     name: messaging-broker
   server:
-    port: ${HTTP_PORT:8081}  # HTTP admin port
+    port: ${HTTP_PORT:8082}  # HTTP admin port
 
   metrics:
     enabled: true
@@ -48,9 +48,11 @@ broker:
     dataDir: ${DATA_DIR:./data}
     segment-size: 1073741824  # 1GB
 
+  default-topic: ${DEFAULT_TOPIC:price-topic}
+
   network:
     type: tcp
-    port: ${BROKER_PORT:9092}
+    port: ${BROKER_PORT:19092}
     threads:
       boss: 2
       worker: 16
@@ -66,5 +68,4 @@ broker:
 logger:
   levels:
     com.messaging: INFO
-    com.messaging.network.codec: DEBUG
     io.netty: WARN

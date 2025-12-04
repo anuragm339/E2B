@@ -53,7 +53,7 @@ public class NettyTcpClient implements NetworkClient {
                         protected void initChannel(SocketChannel ch) throws Exception {
                             ChannelPipeline pipeline = ch.pipeline();
 
-                            // Codecs
+                            // Codecs (Binary format for efficiency)
                             pipeline.addLast("decoder", new BinaryMessageDecoder());
                             pipeline.addLast("encoder", new BinaryMessageEncoder());
 

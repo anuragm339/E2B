@@ -26,22 +26,16 @@ FROM eclipse-temurin:17-jre-jammy
 # Create non-root user
 RUN groupadd -r broker && useradd -r -g broker broker
 
-# Install SQLite
+# Install SQLite and curl for healthcheck
 RUN apt-get update && \
-    apt-get install -y sqlite3 libsqlite3-dev && \
+    apt-get install -y sqlite3 libsqlite3-dev curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy built JARs from builder
-COPY --from=builder /build/broker/build/libs/*.jar ./
-COPY --from=builder /build/common/build/libs/*.jar ./lib/
-COPY --from=builder /build/storage/build/libs/*.jar ./lib/
-COPY --from=builder /build/network/build/libs/*.jar ./lib/
-COPY --from=builder /build/pipe/build/libs/*.jar ./lib/
-
-# Copy dependencies
-COPY --from=builder /root/.gradle/caches/modules-2/files-2.1/ /app/dependencies/
+# Extract the broker distribution (contains all libs and scripts)
+COPY --from=builder /build/broker/build/distributions/broker.tar /tmp/broker.tar
+RUN tar -xf /tmp/broker.tar -C /app --strip-components=1 && rm /tmp/broker.tar
 
 # Create data directory with proper permissions
 RUN mkdir -p /app/data && chown -R broker:broker /app
@@ -64,7 +58,5 @@ EXPOSE 9092 8081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${HTTP_PORT}/health || exit 1
 
-# Run the application
-CMD java ${JAVA_OPTS} \
-    -cp "/app/*:/app/lib/*" \
-    com.messaging.broker.Application
+# Run the application using the distribution script
+CMD ["/app/bin/broker"]

@@ -1,11 +1,13 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.metrics.BrokerMetrics;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.common.model.ConsumerRecord;
 import com.messaging.common.model.MessageRecord;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Timer;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -29,6 +31,7 @@ public class RemoteConsumerRegistry {
     private final StorageEngine storage;
     private final NetworkServer server;
     private final ConsumerOffsetTracker offsetTracker;
+    private final BrokerMetrics metrics;
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
 
@@ -37,10 +40,11 @@ public class RemoteConsumerRegistry {
 
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
-                                  ConsumerOffsetTracker offsetTracker) {
+                                  ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics) {
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
+        this.metrics = metrics;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
         this.scheduler = Executors.newScheduledThreadPool(10);
@@ -112,6 +116,8 @@ public class RemoteConsumerRegistry {
 
                 // Use a CompletableFuture with timeout to prevent indefinite blocking
                 final long offsetToRead = currentOffset; // Must be final for lambda
+                Timer.Sample readSample = metrics.startStorageReadTimer();
+
                 records = CompletableFuture.supplyAsync(() -> {
                     try {
                         return storage.read(consumer.topic, 0, offsetToRead, BATCH_SIZE);
@@ -120,6 +126,9 @@ public class RemoteConsumerRegistry {
                         throw new RuntimeException(e);
                     }
                 }).get(5, TimeUnit.SECONDS);
+
+                metrics.stopStorageReadTimer(readSample);
+                metrics.recordStorageRead();
 
                 log.info("storage.read() returned successfully with {} records",
                          records != null ? records.size() : "null");
@@ -140,10 +149,15 @@ public class RemoteConsumerRegistry {
                 return; // No new messages
             }
 
+            metrics.recordBatchSize(records.size());
+
             // Send each message to consumer
             for (MessageRecord record : records) {
                 try {
+                    Timer.Sample deliverySample = metrics.startMessageDeliveryTimer();
                     sendMessageToConsumer(consumer, record, currentOffset);
+                    metrics.stopMessageDeliveryTimer(deliverySample);
+                    metrics.recordMessageSent();
                     currentOffset++;
                 } catch (Exception e) {
                     log.error("Failed to send message to consumer {}: offset={}",

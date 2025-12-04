@@ -2,6 +2,7 @@ package com.messaging.broker.core;
 
 import com.messaging.broker.consumer.ConsumerDeliveryManager;
 import com.messaging.broker.consumer.RemoteConsumerRegistry;
+import com.messaging.broker.metrics.BrokerMetrics;
 import com.messaging.broker.registry.TopologyManager;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
@@ -10,6 +11,7 @@ import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
@@ -34,6 +36,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final ConsumerDeliveryManager consumerDelivery;
     private final RemoteConsumerRegistry remoteConsumers;
     private final TopologyManager topologyManager;
+    private final BrokerMetrics metrics;
     private final int serverPort;
     private final ObjectMapper objectMapper;
 
@@ -44,6 +47,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             ConsumerDeliveryManager consumerDelivery,
             RemoteConsumerRegistry remoteConsumers,
             TopologyManager topologyManager,
+            BrokerMetrics metrics,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
@@ -51,6 +55,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.consumerDelivery = consumerDelivery;
         this.remoteConsumers = remoteConsumers;
         this.topologyManager = topologyManager;
+        this.metrics = metrics;
         this.serverPort = serverPort;
         this.objectMapper = new ObjectMapper();
 
@@ -89,14 +94,27 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      * Handle messages received from parent via Pipe
      */
     private void handlePipeMessage(MessageRecord record) {
+        Timer.Sample e2eSample = metrics.startE2ETimer();
+
         try {
             log.info("Received message from parent: key={}, type={}",
                     record.getMsgKey(), record.getEventType());
 
+            metrics.recordMessageReceived();
+
             // Store message in local storage
-            // TODO: Extract topic from record metadata (for now use default)
-            String topic = "price-topic";
+            // Use topic from record, fallback to default if not set
+            String topic = record.getTopic();
+            if (topic == null || topic.isEmpty()) {
+                topic = "price-topic"; // Default fallback
+                log.warn("Message received without topic, using default: price-topic");
+            }
+
+            Timer.Sample storageSample = metrics.startStorageWriteTimer();
             long offset = storage.append(topic, 0, record);
+            metrics.stopStorageWriteTimer(storageSample);
+
+            metrics.recordMessageStored();
 
             log.info("Stored message from parent: topic={}, offset={}, key={}",
                     topic, offset, record.getMsgKey());
@@ -104,6 +122,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // PUSH MODEL: Immediately notify remote consumers about new message
             // This triggers instant delivery instead of waiting for scheduler poll
             remoteConsumers.notifyNewMessage(topic, offset);
+
+            metrics.stopE2ETimer(e2eSample);
 
         } catch (Exception e) {
             log.error("Error handling pipe message", e);
@@ -147,7 +167,12 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      * Handle DATA message - store and ACK
      */
     private void handleDataMessage(String clientId, BrokerMessage message) {
+        Timer.Sample e2eSample = metrics.startE2ETimer();
+
         try {
+            metrics.recordMessageReceived();
+            metrics.recordMessageSize(message.getPayload().length);
+
             // Decode payload
             String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
             JsonNode json = objectMapper.readTree(payload);
@@ -171,12 +196,19 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             );
 
             // Store
+            Timer.Sample storageSample = metrics.startStorageWriteTimer();
             long offset = storage.append(topic, 0, record);
+            metrics.stopStorageWriteTimer(storageSample);
+
+            metrics.recordMessageStored();
+
             log.info("Stored message: topic={}, offset={}, key={}, type={}",
                      topic, offset, msgKey, eventType);
 
             // PUSH MODEL: Immediately notify consumers
             remoteConsumers.notifyNewMessage(topic, offset);
+
+            metrics.stopE2ETimer(e2eSample);
 
             // Send ACK
             BrokerMessage ack = new BrokerMessage(
@@ -213,6 +245,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             // Register consumer for message delivery
             remoteConsumers.registerConsumer(clientId, topic, group);
+            metrics.recordConsumerConnection();
+
             log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
 
             // Send ACK
@@ -321,6 +355,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private void handleDisconnect(String clientId) {
         log.info("Handling disconnect for client: {}", clientId);
         remoteConsumers.unregisterConsumer(clientId);
+        metrics.recordConsumerDisconnection();
     }
 
     @PreDestroy

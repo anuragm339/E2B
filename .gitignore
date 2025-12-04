@@ -10,3 +10,4 @@ pipe/build/
 storage/build/
 .idea/
 .gradle/
+data/
