@@ -64,6 +64,8 @@ broker:
     default-max-retry-delay: 30000
     default-fixed-retry-interval: 30000
     ack-timeout: 5000
+    max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:1048576}  # 1MB max data per consumer per delivery cycle
+    max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}  # Max messages to read from storage per cycle
 
 logger:
   levels:

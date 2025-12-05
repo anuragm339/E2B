@@ -1,6 +1,7 @@
 package com.messaging.broker.consumer;
 
 import io.micronaut.context.annotation.Value;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -11,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.*;
 
 /**
@@ -19,7 +21,7 @@ import java.util.concurrent.*;
 @Singleton
 public class ConsumerOffsetTracker {
     private static final Logger log = LoggerFactory.getLogger(ConsumerOffsetTracker.class);
-    private static final String OFFSET_FILE = "consumer-offsets.dat";
+    private static final String OFFSET_FILE = "consumer-offsets.properties";
     private static final long FLUSH_INTERVAL_MS = 5000;
 
     private final String dataDir;
@@ -39,6 +41,7 @@ public class ConsumerOffsetTracker {
     /**
      * Initialize - load offsets from disk and start periodic flush
      */
+    @PostConstruct
     public void init() {
         // Create data directory if it doesn't exist
         try {
@@ -82,7 +85,7 @@ public class ConsumerOffsetTracker {
     }
 
     /**
-     * Load offsets from disk
+     * Load offsets from disk (properties file format)
      */
     private void loadOffsets() {
         if (!Files.exists(offsetFilePath)) {
@@ -90,10 +93,20 @@ public class ConsumerOffsetTracker {
             return;
         }
 
-        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(offsetFilePath.toFile()))) {
-            @SuppressWarnings("unchecked")
-            Map<String, Long> loaded = (Map<String, Long>) ois.readObject();
-            offsets.putAll(loaded);
+        try (FileInputStream fis = new FileInputStream(offsetFilePath.toFile())) {
+            Properties props = new Properties();
+            props.load(fis);
+
+            // Convert properties to offset map
+            for (String key : props.stringPropertyNames()) {
+                try {
+                    long offset = Long.parseLong(props.getProperty(key));
+                    offsets.put(key, offset);
+                } catch (NumberFormatException e) {
+                    log.warn("Invalid offset value for consumer {}: {}", key, props.getProperty(key));
+                }
+            }
+
             log.info("Loaded {} consumer offsets from disk", offsets.size());
         } catch (Exception e) {
             log.error("Failed to load offsets from disk", e);
@@ -101,15 +114,22 @@ public class ConsumerOffsetTracker {
     }
 
     /**
-     * Flush offsets to disk
+     * Flush offsets to disk (properties file format)
      */
     private synchronized void flushOffsets() {
         try {
             // Write to temp file first
             Path tempFile = Paths.get(dataDir, OFFSET_FILE + ".tmp");
 
-            try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(tempFile.toFile()))) {
-                oos.writeObject(new ConcurrentHashMap<>(offsets));
+            // Convert offsets to properties
+            Properties props = new Properties();
+            for (Map.Entry<String, Long> entry : offsets.entrySet()) {
+                props.setProperty(entry.getKey(), String.valueOf(entry.getValue()));
+            }
+
+            // Write properties to file with comments
+            try (FileOutputStream fos = new FileOutputStream(tempFile.toFile())) {
+                props.store(fos, "Consumer Offsets - Updated: " + new java.util.Date());
             }
 
             // Atomic rename

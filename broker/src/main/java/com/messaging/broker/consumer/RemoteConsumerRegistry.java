@@ -8,6 +8,7 @@ import com.messaging.common.model.ConsumerRecord;
 import com.messaging.common.model.MessageRecord;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Timer;
+import io.micronaut.context.annotation.Value;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -26,7 +27,6 @@ import java.util.concurrent.TimeoutException;
 public class RemoteConsumerRegistry {
     private static final Logger log = LoggerFactory.getLogger(RemoteConsumerRegistry.class);
     private static final long POLL_INTERVAL_MS = 100;
-    private static final int BATCH_SIZE = 10;
 
     private final StorageEngine storage;
     private final NetworkServer server;
@@ -34,22 +34,29 @@ public class RemoteConsumerRegistry {
     private final BrokerMetrics metrics;
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
+    private final long maxMessageSizePerConsumer;
+    private final int readBatchSize;
 
     // Map: clientId -> RemoteConsumer
     private final Map<String, RemoteConsumer> consumers;
 
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
-                                  ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics) {
+                                  ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
+                                  @Value("${broker.consumer.max-message-size-per-consumer:1048576}") long maxMessageSizePerConsumer,
+                                  @Value("${broker.consumer.max-batch-size-per-consumer:100}") int readBatchSize) {
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
         this.metrics = metrics;
+        this.maxMessageSizePerConsumer = maxMessageSizePerConsumer;
+        this.readBatchSize = readBatchSize;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
         this.scheduler = Executors.newScheduledThreadPool(10);
         this.consumers = new ConcurrentHashMap<>();
-        log.info("RemoteConsumerRegistry initialized");
+        log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer, readBatchSize={}",
+                 maxMessageSizePerConsumer, readBatchSize);
     }
 
     /**
@@ -126,7 +133,7 @@ public class RemoteConsumerRegistry {
 
                 records = CompletableFuture.supplyAsync(() -> {
                     try {
-                        return storage.read(consumer.topic, 0, offsetToRead, BATCH_SIZE);
+                        return storage.read(consumer.topic, 0, offsetToRead, readBatchSize);
                     } catch (Exception e) {
                         log.error("Exception in storage.read(): ", e);
                         throw new RuntimeException(e);
@@ -157,18 +164,28 @@ public class RemoteConsumerRegistry {
 
             metrics.recordBatchSize(records.size());
 
-            // Send each message to consumer
+            // Send messages to consumer with size limit enforcement
+            long totalBytesSent = 0;
+            int messagesSent = 0;
+
             for (MessageRecord record : records) {
                 try {
+                    // Calculate message size before sending
+                    long messageBytes = (record.getMsgKey() != null ? record.getMsgKey().length() : 0) +
+                                        (record.getData() != null ? record.getData().length() : 0) +
+                                        50; // metadata overhead
+
+                    // Check if adding this message would exceed size limit
+                    if (totalBytesSent + messageBytes > maxMessageSizePerConsumer) {
+                        log.debug("Consumer {} would exceed max size limit ({}bytes) with next message ({}bytes total), stopping delivery. Sent {} messages ({} bytes) this cycle",
+                                 consumer.clientId, maxMessageSizePerConsumer, totalBytesSent + messageBytes, messagesSent, totalBytesSent);
+                        break;
+                    }
+
                     // Start timing for per-consumer delivery
                     Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
 
                     sendMessageToConsumer(consumer, record, currentOffset);
-
-                    // Calculate message size
-                    long messageBytes = (record.getMsgKey() != null ? record.getMsgKey().length() : 0) +
-                                        (record.getData() != null ? record.getData().length() : 0) +
-                                        50; // metadata overhead
 
                     // Record per-consumer metrics
                     metrics.recordConsumerMessageSent(consumer.clientId, consumer.topic, consumer.group, messageBytes);
@@ -177,6 +194,8 @@ public class RemoteConsumerRegistry {
                     // Record global metrics
                     metrics.recordMessageSent(messageBytes);
 
+                    totalBytesSent += messageBytes;
+                    messagesSent++;
                     currentOffset++;
                 } catch (Exception e) {
                     log.error("Failed to send message to consumer {}: offset={}",
@@ -185,6 +204,11 @@ public class RemoteConsumerRegistry {
                     metrics.recordConsumerFailure(consumer.clientId, consumer.topic, consumer.group);
                     break; // Stop on error
                 }
+            }
+
+            if (messagesSent > 0) {
+                log.debug("Sent {} messages ({} bytes) to consumer {}",
+                         messagesSent, totalBytesSent, consumer.clientId);
             }
 
             // Update offset
