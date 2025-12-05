@@ -3,12 +3,15 @@ version: '3.8'
 services:
   # Cloud Test Server (Mock Registry)
   cloud-server:
-    image: python:3.11-slim
+    build:
+      context: /Users/anuragmishra/Desktop/workspace/messaging
+      dockerfile: Dockerfile.cloud-server
     container_name: cloud-server
-    working_dir: /app
     volumes:
-      - /Users/anuragmishra/Desktop/workspace/messaging/cloud-test-server.py:/app/cloud-test-server.py
-    command: sh -c "pip install flask && python cloud-test-server.py"
+      - /Users/anuragmishra/Desktop/workspace/messaging/data:/data  # Mount data directory for SQLite database
+    environment:
+      - SQLITE_DB_PATH=/data/events.db  # Path to SQLite database inside container
+      - DATA_MODE=TEST  # Set to PRODUCTION to use actual data from SQLite
     ports:
       - "8080:8080"
     networks:
