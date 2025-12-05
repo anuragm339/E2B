@@ -103,14 +103,13 @@ public class Segment {
         }
 
         long offset = nextOffset++;
-        record.setOffset(offset);
 
-        // Calculate CRC32
-        int crc32 = calculateCRC32(record);
-        record.setCrc32(crc32);
+        // Calculate CRC32 for the record with the new offset
+        int crc32 = calculateCRC32(record, offset);
 
-        // Write record to log buffer
-        int recordSize = writeRecord(record);
+        // Write record to log buffer with assigned offset and CRC32
+        // NOTE: This does NOT modify the input record object
+        int recordSize = writeRecord(record, offset, crc32);
 
         // Update index every 4KB
         if (logPosition % 4096 < recordSize) {
@@ -123,8 +122,9 @@ public class Segment {
     /**
      * Write record to log buffer in binary format
      * Returns the number of bytes written
+     * NOTE: Does NOT modify the input record object
      */
-    private int writeRecord(MessageRecord record) throws IOException {
+    private int writeRecord(MessageRecord record, long offset, int crc32) throws IOException {
         int startPosition = logPosition;
 
         // Calculate record size first
@@ -141,8 +141,8 @@ public class Segment {
 
         // Format: [offset:8][key_len:4][key:var][event_type:1][data_len:4][data:var][created_at:8][crc32:4]
 
-        // Write offset
-        logBuffer.putLong(logPosition, record.getOffset());
+        // Write offset (use the provided offset, not record.getOffset())
+        logBuffer.putLong(logPosition, offset);
         logPosition += 8;
 
         // Write msg_key
@@ -169,8 +169,8 @@ public class Segment {
         logBuffer.putLong(logPosition, record.getCreatedAt().toEpochMilli());
         logPosition += 8;
 
-        // Write CRC32
-        logBuffer.putInt(logPosition, record.getCrc32());
+        // Write CRC32 (use the provided crc32, not record.getCrc32())
+        logBuffer.putInt(logPosition, crc32);
         logPosition += 4;
 
         return logPosition - startPosition;
@@ -434,11 +434,12 @@ public class Segment {
     /**
      * Calculate CRC32 checksum for a record
      */
-    private int calculateCRC32(MessageRecord record) {
+    private int calculateCRC32(MessageRecord record, long offset) {
         CRC32 crc = new CRC32();
 
         // Include all fields except CRC32 itself
-        crc.update(ByteBuffer.allocate(8).putLong(record.getOffset()).array());
+        // Use the provided offset (not record.getOffset() which may be the parent's offset)
+        crc.update(ByteBuffer.allocate(8).putLong(offset).array());
         crc.update(record.getMsgKey().getBytes(StandardCharsets.UTF_8));
         crc.update((byte) record.getEventType().getCode());
         if (record.getData() != null) {

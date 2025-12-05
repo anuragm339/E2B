@@ -121,6 +121,7 @@ public class SegmentManager {
 
     /**
      * Append a message record
+     * NOTE: Does NOT modify the input record object
      */
     public long append(MessageRecord record) throws IOException {
         Segment current = activeSegment.get();
@@ -136,9 +137,8 @@ public class SegmentManager {
             }
         }
 
-        // Set topic and partition
-        record.setTopic(topic);
-        record.setPartition(partition);
+        // Don't modify the record - topic and partition are not written to segment file
+        // The segment only stores: offset, msgKey, eventType, data, createdAt, crc32
 
         return current.append(record);
     }
