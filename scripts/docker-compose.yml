@@ -4,24 +4,27 @@ services:
   # Cloud Test Server (Mock Registry)
   cloud-server:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging
-      dockerfile: Dockerfile.cloud-server
+      context: /Users/anuragmishra/Desktop/workspace/messaging/cloud-server
+      dockerfile: Dockerfile
     container_name: cloud-server
     volumes:
       - /Users/anuragmishra/Desktop/workspace/messaging/data:/data  # Mount data directory for SQLite database
     environment:
       - SQLITE_DB_PATH=/data/events.db  # Path to SQLite database inside container
       - DATA_MODE=TEST  # Set to PRODUCTION to use actual data from SQLite
+      - JAVA_OPTS=-Xms64m -Xmx256m -XX:+UseG1GC
     ports:
       - "8080:8080"
     networks:
       - messaging-network
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    mem_limit: 300m
+    memswap_limit: 300m
 
   # Messaging Broker
   broker:
