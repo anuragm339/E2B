@@ -423,7 +423,7 @@ public class Segment {
         int storedCrc32 = logBuffer.getInt(position);
         record.setCrc32(storedCrc32);
 
-        int calculatedCrc32 = calculateCRC32(record);
+        int calculatedCrc32 = calculateCRC32(record, offset);
         if (storedCrc32 != calculatedCrc32) {
             throw new IOException("CRC32 mismatch for offset " + offset);
         }
