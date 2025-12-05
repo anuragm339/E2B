@@ -21,14 +21,20 @@ import java.util.zip.CRC32;
 public class Segment {
     private static final Logger log = LoggerFactory.getLogger(Segment.class);
     private static final int INDEX_ENTRY_SIZE = 8; // 4 bytes relative offset + 4 bytes position
+    private static final long INITIAL_MMAP_SIZE = 64 * 1024 * 1024; // Start with 64MB
+    private static final long MMAP_GROWTH_SIZE = 64 * 1024 * 1024; // Grow by 64MB chunks
+    private static final long INDEX_INITIAL_SIZE = 1 * 1024 * 1024; // 1MB for index
 
     private final long baseOffset;
     private final Path logPath;
     private final Path indexPath;
     private final FileChannel logChannel;
     private final FileChannel indexChannel;
-    private final MappedByteBuffer logBuffer;
-    private final MappedByteBuffer indexBuffer;
+    private final long maxSize;
+    private MappedByteBuffer logBuffer;
+    private MappedByteBuffer indexBuffer;
+    private long currentLogMappedSize;
+    private long currentIndexMappedSize;
 
     private long nextOffset;
     private int logPosition;
@@ -43,6 +49,7 @@ public class Segment {
         this.logPosition = 0;
         this.indexPosition = 0;
         this.active = true;
+        this.maxSize = maxSize;
 
         // Open log file channel
         this.logChannel = FileChannel.open(logPath,
@@ -56,13 +63,34 @@ public class Segment {
                 StandardOpenOption.WRITE,
                 StandardOpenOption.CREATE);
 
-        // Memory-map the log file
-        this.logBuffer = logChannel.map(FileChannel.MapMode.READ_WRITE, 0, maxSize);
+        // Determine initial mapping size based on existing file size
+        long existingLogSize = logChannel.size();
+        long existingIndexSize = indexChannel.size();
 
-        // Memory-map the index file (10MB default)
-        this.indexBuffer = indexChannel.map(FileChannel.MapMode.READ_WRITE, 0, 10 * 1024 * 1024);
+        // For existing files, map the actual size + growth buffer
+        // For new files, map initial small size
+        if (existingLogSize > 0) {
+            this.currentLogMappedSize = Math.min(existingLogSize + MMAP_GROWTH_SIZE, maxSize);
+            this.logPosition = (int) existingLogSize;
+        } else {
+            this.currentLogMappedSize = Math.min(INITIAL_MMAP_SIZE, maxSize);
+        }
 
-        log.info("Created segment with baseOffset={} at {}", baseOffset, logPath);
+        if (existingIndexSize > 0) {
+            this.currentIndexMappedSize = existingIndexSize + (INDEX_INITIAL_SIZE / 2);
+            this.indexPosition = (int) existingIndexSize;
+        } else {
+            this.currentIndexMappedSize = INDEX_INITIAL_SIZE;
+        }
+
+        // Memory-map the log file with initial size
+        this.logBuffer = logChannel.map(FileChannel.MapMode.READ_WRITE, 0, currentLogMappedSize);
+
+        // Memory-map the index file with initial size
+        this.indexBuffer = indexChannel.map(FileChannel.MapMode.READ_WRITE, 0, currentIndexMappedSize);
+
+        log.info("Created segment with baseOffset={} at {}, logMapped={}MB, indexMapped={}KB",
+                baseOffset, logPath, currentLogMappedSize / (1024 * 1024), currentIndexMappedSize / 1024);
     }
 
     /**
@@ -96,8 +124,20 @@ public class Segment {
      * Write record to log buffer in binary format
      * Returns the number of bytes written
      */
-    private int writeRecord(MessageRecord record) {
+    private int writeRecord(MessageRecord record) throws IOException {
         int startPosition = logPosition;
+
+        // Calculate record size first
+        byte[] keyBytes = record.getMsgKey().getBytes(StandardCharsets.UTF_8);
+        byte[] dataBytes = record.getData() != null ?
+                record.getData().getBytes(StandardCharsets.UTF_8) : new byte[0];
+
+        int recordSize = 8 + 4 + keyBytes.length + 1 + 4 + dataBytes.length + 8 + 4;
+
+        // Check if we need to expand the mapped region
+        if (logPosition + recordSize > currentLogMappedSize) {
+            expandLogMapping(logPosition + recordSize);
+        }
 
         // Format: [offset:8][key_len:4][key:var][event_type:1][data_len:4][data:var][created_at:8][crc32:4]
 
@@ -106,7 +146,6 @@ public class Segment {
         logPosition += 8;
 
         // Write msg_key
-        byte[] keyBytes = record.getMsgKey().getBytes(StandardCharsets.UTF_8);
         logBuffer.putInt(logPosition, keyBytes.length);
         logPosition += 4;
         logBuffer.position(logPosition);
@@ -118,8 +157,6 @@ public class Segment {
         logPosition += 1;
 
         // Write data (null for DELETE events)
-        byte[] dataBytes = record.getData() != null ?
-                record.getData().getBytes(StandardCharsets.UTF_8) : new byte[0];
         logBuffer.putInt(logPosition, dataBytes.length);
         logPosition += 4;
         if (dataBytes.length > 0) {
@@ -140,14 +177,83 @@ public class Segment {
     }
 
     /**
+     * Expand the log file mapping when needed
+     */
+    private synchronized void expandLogMapping(long requiredSize) throws IOException {
+        long newSize = Math.min(
+            Math.max(currentLogMappedSize + MMAP_GROWTH_SIZE, requiredSize + MMAP_GROWTH_SIZE),
+            maxSize
+        );
+
+        if (newSize <= currentLogMappedSize) {
+            return; // Already large enough
+        }
+
+        log.info("Expanding log mapping from {}MB to {}MB for segment at offset {}",
+                currentLogMappedSize / (1024 * 1024), newSize / (1024 * 1024), baseOffset);
+
+        // Unmap old buffer (this is important for releasing memory)
+        try {
+            java.lang.reflect.Method cleanerMethod = logBuffer.getClass().getMethod("cleaner");
+            cleanerMethod.setAccessible(true);
+            Object cleaner = cleanerMethod.invoke(logBuffer);
+            if (cleaner != null) {
+                java.lang.reflect.Method cleanMethod = cleaner.getClass().getMethod("clean");
+                cleanMethod.setAccessible(true);
+                cleanMethod.invoke(cleaner);
+            }
+        } catch (Exception e) {
+            // Cleaner not available, let GC handle it
+            log.debug("Buffer cleaner not available, relying on GC");
+        }
+
+        // Remap with new size
+        logBuffer = logChannel.map(FileChannel.MapMode.READ_WRITE, 0, newSize);
+        currentLogMappedSize = newSize;
+    }
+
+    /**
      * Add an index entry
      */
-    private void addIndexEntry(long offset, int position) {
+    private void addIndexEntry(long offset, int position) throws IOException {
+        // Check if we need to expand index mapping
+        if (indexPosition + INDEX_ENTRY_SIZE > currentIndexMappedSize) {
+            expandIndexMapping();
+        }
+
         int relativeOffset = (int) (offset - baseOffset);
         indexBuffer.putInt(indexPosition, relativeOffset);
         indexPosition += 4;
         indexBuffer.putInt(indexPosition, position);
         indexPosition += 4;
+    }
+
+    /**
+     * Expand the index file mapping when needed
+     */
+    private synchronized void expandIndexMapping() throws IOException {
+        long newSize = currentIndexMappedSize + INDEX_INITIAL_SIZE;
+
+        log.info("Expanding index mapping from {}KB to {}KB for segment at offset {}",
+                currentIndexMappedSize / 1024, newSize / 1024, baseOffset);
+
+        // Unmap old buffer
+        try {
+            java.lang.reflect.Method cleanerMethod = indexBuffer.getClass().getMethod("cleaner");
+            cleanerMethod.setAccessible(true);
+            Object cleaner = cleanerMethod.invoke(indexBuffer);
+            if (cleaner != null) {
+                java.lang.reflect.Method cleanMethod = cleaner.getClass().getMethod("clean");
+                cleanMethod.setAccessible(true);
+                cleanMethod.invoke(cleaner);
+            }
+        } catch (Exception e) {
+            log.debug("Buffer cleaner not available, relying on GC");
+        }
+
+        // Remap with new size
+        indexBuffer = indexChannel.map(FileChannel.MapMode.READ_WRITE, 0, newSize);
+        currentIndexMappedSize = newSize;
     }
 
     /**
