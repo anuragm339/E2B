@@ -8,14 +8,17 @@ import java.util.Objects;
  * Internal offset is NOT exposed to consumers.
  */
 public class ConsumerRecord {
-    private final String msgKey;
-    private final EventType eventType;
-    private final String data;           // null for DELETE events
-    private final Instant createdAt;
+    private String msgKey;
+    private EventType eventType;
+    private String data;           // null for DELETE events
+    private Instant createdAt;
 
     // Internal - used by broker for tracking, not exposed to consumer code
     private long internalOffset;
 
+    public ConsumerRecord() {
+
+    }
     public ConsumerRecord(String msgKey, EventType eventType, String data, Instant createdAt) {
         this.msgKey = msgKey;
         this.eventType = eventType;

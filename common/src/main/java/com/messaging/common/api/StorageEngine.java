@@ -37,6 +37,16 @@ public interface StorageEngine {
     long getCurrentOffset(String topic, int partition);
 
     /**
+     * Get earliest (lowest) available offset for a topic-partition
+     * This is the base offset of the first segment, not necessarily 0.
+     * For example, after compaction or deletion, earliest offset might be 1000000.
+     * @param topic Topic name
+     * @param partition Partition number
+     * @return Earliest offset, or 0 if no segments exist
+     */
+    long getEarliestOffset(String topic, int partition);
+
+    /**
      * Compact segments for a topic-partition
      * Removes obsolete records, keeps only latest value per key
      * @param topic Topic name

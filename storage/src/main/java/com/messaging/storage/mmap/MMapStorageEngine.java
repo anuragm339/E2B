@@ -80,6 +80,16 @@ public class MMapStorageEngine implements StorageEngine {
     }
 
     @Override
+    public long getEarliestOffset(String topic, int partition) {
+        SegmentManager manager = managers.get(new TopicPartition(topic, partition));
+        if (manager == null) {
+            return 0;  // No segments exist, start from 0
+        }
+
+        return manager.getEarliestOffset();
+    }
+
+    @Override
     public void compact(String topic, int partition) {
         // Compaction will be implemented in CompactionEngine
         log.info("Compaction requested for topic={}, partition={}", topic, partition);

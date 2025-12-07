@@ -267,6 +267,20 @@ public class SegmentManager {
     }
 
     /**
+     * Get earliest (lowest) available offset
+     * Returns the base offset of the first segment.
+     * This may NOT be 0 if old segments have been deleted or after compaction.
+     */
+    public long getEarliestOffset() {
+        if (!segments.isEmpty()) {
+            // ConcurrentSkipListMap keeps entries sorted by key (baseOffset)
+            // firstEntry() returns the segment with the lowest baseOffset
+            return segments.firstEntry().getKey();
+        }
+        return 0; // No segments, start from 0
+    }
+
+    /**
      * Get all segments (for compaction)
      */
     public List<Segment> getAllSegments() {

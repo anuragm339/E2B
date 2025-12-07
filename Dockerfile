@@ -62,7 +62,7 @@ ENV NODE_ID=broker-001 \
     JAVA_OPTS="-Xms512m -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
 
 # Expose ports
-EXPOSE 9092 8081
+EXPOSE 9092 8081 5005
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

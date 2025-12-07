@@ -25,7 +25,7 @@ public class ServerMessageHandler extends SimpleChannelInboundHandler<BrokerMess
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, BrokerMessage msg) throws Exception {
-        log.debug("Received message from {}: type={}, id={}",
+        log.info("Received message from {}: type={}, id={}",
                   clientId, msg.getType(), msg.getMessageId());
 
         // Delegate to all registered handlers

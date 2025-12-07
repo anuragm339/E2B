@@ -33,7 +33,11 @@ public class ConsumerOffsetTracker {
         this.dataDir = dataDir;
         this.offsetFilePath = Paths.get(dataDir, OFFSET_FILE);
         this.offsets = new ConcurrentHashMap<>();
-        this.flusher = Executors.newSingleThreadScheduledExecutor();
+        this.flusher = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("ConsumerOffsetFlusher");
+            return t;
+        });
 
         log.info("ConsumerOffsetTracker initialized with data dir: {}", dataDir);
     }

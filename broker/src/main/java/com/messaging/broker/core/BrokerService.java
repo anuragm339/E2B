@@ -97,7 +97,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         Timer.Sample e2eSample = metrics.startE2ETimer();
 
         try {
-            log.info("Received message from parent: key={}, type={}",
+            log.debug("Received message from parent: key={}, type={}",
                     record.getMsgKey(), record.getEventType());
 
             // Calculate message size (estimate: key + data + metadata)
@@ -121,7 +121,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             metrics.recordMessageStored();
 
-            log.info("Stored message from parent: topic={}, offset={}, key={}",
+            log.debug("Stored message from parent: topic={}, offset={}, key={}",
                     topic, offset, record.getMsgKey());
 
             // PUSH MODEL: Immediately notify remote consumers about new message
@@ -268,7 +268,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 if (ex != null) {
                     log.error("Failed to send ACK to {}", clientId, ex);
                 } else {
-                    log.debug("Sent ACK to {} for SUBSCRIBE", clientId);
+                    log.info("Sent ACK to {} for SUBSCRIBE", clientId);
                 }
             });
 

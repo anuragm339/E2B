@@ -54,7 +54,11 @@ public class HttpPipeConnector implements PipeConnector {
                 .build();
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
-        this.scheduler = Executors.newScheduledThreadPool(2); // 1 for polling, 1 for persistence
+        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(),runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("HttpPipeConnector" + t.getId());
+            return t;
+        });
         this.dataDir = dataDir;
         this.offsetFilePath = Paths.get(dataDir, OFFSET_FILE);
 
@@ -97,7 +101,7 @@ public class HttpPipeConnector implements PipeConnector {
 
             log.info("Connected to parent: {}", parentUrl);
             return connection;
-        });
+        }, scheduler);
     }
 
     @Override
@@ -166,12 +170,11 @@ public class HttpPipeConnector implements PipeConnector {
             if (!parentUrl.startsWith("http://") && !parentUrl.startsWith("https://")) {
                 parentUrl = "http://" + parentUrl;
             }
-            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + BATCH_SIZE;
+            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + 10;
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(pollUrl))
                     .GET()
-                    .timeout(Duration.ofSeconds(5))
                     .build();
 
             httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
@@ -215,7 +218,7 @@ public class HttpPipeConnector implements PipeConnector {
             }
 
             if (records.length > 0) {
-                log.info("Received {} messages from parent, current offset: {} (last record offset: {})",
+                log.debug("Received {} messages from parent, current offset: {} (last record offset: {})",
                         records.length, currentOffset, connection.lastReceivedOffset);
             }
 

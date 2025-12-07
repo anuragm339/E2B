@@ -4,6 +4,8 @@ import com.messaging.common.api.NetworkClient;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.network.codec.BinaryMessageDecoder;
 import com.messaging.network.codec.BinaryMessageEncoder;
+import com.messaging.network.codec.JsonMessageDecoder;
+import com.messaging.network.codec.JsonMessageEncoder;
 import com.messaging.network.handler.ClientMessageHandler;
 import io.micronaut.context.annotation.Requires;
 import io.netty.bootstrap.Bootstrap;
@@ -54,8 +56,8 @@ public class NettyTcpClient implements NetworkClient {
                             ChannelPipeline pipeline = ch.pipeline();
 
                             // Codecs (Binary format for efficiency)
-                            pipeline.addLast("decoder", new BinaryMessageDecoder());
-                            pipeline.addLast("encoder", new BinaryMessageEncoder());
+                            pipeline.addLast("decoder", new JsonMessageDecoder());
+                            pipeline.addLast("encoder", new JsonMessageEncoder());
 
                             // Business logic handler
                             pipeline.addLast("handler", new ClientMessageHandler(connection));
