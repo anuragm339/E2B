@@ -17,12 +17,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * HTTP-based implementation of PipeConnector
@@ -45,7 +49,7 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile PipeConnectionImpl connection;
     private volatile Consumer<MessageRecord> dataHandler;
     private volatile boolean running;
-    private volatile long currentOffset = 0;
+    private volatile long currentOffset = 1012001;
     private volatile long lastPersistedOffset = -1;
 
     public HttpPipeConnector(@Value("${broker.storage.data-dir:./data}") String dataDir) {
@@ -170,6 +174,7 @@ public class HttpPipeConnector implements PipeConnector {
             if (!parentUrl.startsWith("http://") && !parentUrl.startsWith("https://")) {
                 parentUrl = "http://" + parentUrl;
             }
+
             String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + 10;
 
             HttpRequest request = HttpRequest.newBuilder()
@@ -206,7 +211,11 @@ public class HttpPipeConnector implements PipeConnector {
 
             // Parse response as array of MessageRecords
             MessageRecord[] records = objectMapper.readValue(responseBody, MessageRecord[].class);
-
+            List<MessageRecord> list = Arrays.asList(records);
+            Map<String, List<MessageRecord>> collect = list.stream().collect(Collectors.groupingBy(MessageRecord::getTopic));
+            collect.forEach((s, messageRecords) -> {
+                log.info("Topic: {}, Records: {}", s, messageRecords.size());
+            });
             for (MessageRecord record : records) {
                 if (dataHandler != null) {
                     dataHandler.accept(record);

@@ -59,15 +59,23 @@ public class ConsumerDeliveryManager {
         }
 
         long persistedOffset = offsetTracker.getOffset(consumerId);
-        context.setCurrentOffset(persistedOffset);
+        long earliestOffset = storage.getEarliestOffset(context.getTopic(), 0);
+        long startOffset = Math.max(persistedOffset, earliestOffset);
 
-        log.info("Starting delivery for consumer: {} from offset: {}", context, persistedOffset);
+        if (startOffset > persistedOffset) {
+            log.info("Consumer {} start offset adjusted from {} to {} to align with earliest available offset",
+                    consumerId, persistedOffset, startOffset);
+        }
+
+        context.setCurrentOffset(startOffset);
+
+        log.info("Starting delivery for consumer: {} from offset: {}", context, startOffset);
 
         ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
-            () -> deliverMessages(context),
-            0L,
-            POLL_INTERVAL_MS,
-            TimeUnit.MILLISECONDS
+                () -> deliverMessages(context),
+                0L,
+                POLL_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
         );
         deliveryTasks.put(consumerId, task);
     }
@@ -95,18 +103,6 @@ public class ConsumerDeliveryManager {
             }
 
             long currentOffset = context.getCurrentOffset();
-
-            // If consumer is at offset 0, check if we should start from earliest available offset instead
-            // This handles cases where segments don't start at 0 (e.g., after compaction or deletion)
-            if (currentOffset == 0) {
-                long earliestOffset = storage.getEarliestOffset(context.getTopic(), 0);
-                if (earliestOffset > 0) {
-                    log.info("Consumer {} starting from earliest available offset {} instead of 0",
-                            context.getConsumerId(), earliestOffset);
-                    currentOffset = earliestOffset;
-                    context.setCurrentOffset(earliestOffset);
-                }
-            }
 
             // Use dynamic batch size from context
             int batchSize = context.getCurrentBatchSize();
@@ -222,13 +218,13 @@ public class ConsumerDeliveryManager {
         switch (policy) {
             case EXPONENTIAL_THEN_FIXED:
                 long retryDelay = context.calculateRetryDelay();
-                log.warn("Consumer {} failed (attempt {}), will retry in {}ms with reduced batch size {}: batch offsets {}-{}",
+                log.info("Consumer {} failed (attempt {}), will retry in {}ms with reduced batch size {}: batch offsets {}-{}",
                         context.getConsumerId(), failures, retryDelay, context.getCurrentBatchSize(),
                         firstRecord.getOffset(), records.get(records.size() - 1).getOffset());
                 break;
 
             case SKIP_ON_ERROR:
-                log.warn("Consumer {} failed, SKIPPING batch: offsets {}-{}",
+                log.info("Consumer {} failed, SKIPPING batch: offsets {}-{}",
                         context.getConsumerId(),
                         firstRecord.getOffset(), records.get(records.size() - 1).getOffset());
                 long lastOffset = records.get(records.size() - 1).getOffset();

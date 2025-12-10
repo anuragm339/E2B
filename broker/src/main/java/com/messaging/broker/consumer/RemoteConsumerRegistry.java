@@ -136,8 +136,8 @@ public class RemoteConsumerRegistry {
         try {
             long currentOffset = consumer.getCurrentOffset();
 
-            log.debug("Attempting to deliver messages to consumer {}: offset={}",
-                     consumer.clientId, currentOffset);
+            log.info("Attempting to deliver messages to consumer {}: and topic {}: offset={}",
+                     consumer.clientId,consumer.topic, currentOffset);
 
             // Read next batch of messages from storage
             List<MessageRecord> records;
@@ -173,8 +173,8 @@ public class RemoteConsumerRegistry {
                 return;
             }
 
-            log.info("Read {} messages from storage for consumer {}",
-                     records.size(), consumer.clientId);
+//            log.info("Read {} messages from storage for consumer {}",
+//                     records.size(), consumer.clientId);
 
             if (records.isEmpty()) {
                 return; // No new messages
@@ -210,7 +210,8 @@ public class RemoteConsumerRegistry {
                 try {
                     // Start timing for per-consumer delivery
                     Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
-
+                    log.info("Sending batch of {} messages ({} bytes) to consumer {} for topics {} starting at offset {}",
+                             batchToSend.size(), totalBytesSent, consumer.clientId,consumer.topic, currentOffset);
                     sendBatchToConsumer(consumer, batchToSend, currentOffset);
 
                     // Record per-consumer metrics
@@ -221,7 +222,7 @@ public class RemoteConsumerRegistry {
                     metrics.recordMessageSent(totalBytesSent);
 
                     // Update offset to after the last message sent
-                    currentOffset += messagesSent;
+                    currentOffset = batchToSend.get(batchToSend.size() - 1).getOffset()+1;
                 } catch (Exception e) {
                     log.error("Failed to send batch to consumer {}: batchSize={}, firstOffset={}",
                              consumer.clientId, batchToSend.size(), currentOffset, e);
@@ -312,6 +313,8 @@ public class RemoteConsumerRegistry {
         // Find all consumers subscribed to this topic and trigger immediate delivery
         for (RemoteConsumer consumer : consumers.values()) {
             if (consumer.topic.equals(topic)) {
+                // DO NOT update consumer offset here - let consumer maintain its own offset
+                // based on what it has successfully delivered
                 // Submit immediate delivery task (non-blocking)
                 scheduler.submit(() -> deliverMessages(consumer));
             }

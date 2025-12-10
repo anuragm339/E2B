@@ -66,7 +66,7 @@ services:
     container_name: consumer-price-quote
     environment:
       CONSUMER_TYPE: price-quote
-      CONSUMER_TOPICS: "prices-v1,reference-data-v5,non-promotable-products,prices-v4,minimum-price,deposit"
+      CONSUMER_TOPICS: "reference-data-v5,non-promotable-products,prices-v4,minimum-price,deposit"
       CONSUMER_GROUP: price-quote-group
       CONSUMER_PORT: 8090
       BROKER_HOST: broker

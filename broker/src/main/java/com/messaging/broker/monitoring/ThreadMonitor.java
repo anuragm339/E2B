@@ -156,15 +156,15 @@ public class ThreadMonitor {
                 (com.sun.management.ThreadMXBean) threadMXBean;
             if (sunThreadMXBean.isThreadAllocatedMemorySupported()) {
                 sunThreadMXBean.setThreadAllocatedMemoryEnabled(true);
-                log.info("ThreadMonitor initialized - CPU time tracking: {}, Memory allocation tracking: {}",
+                log.debug("ThreadMonitor initialized - CPU time tracking: {}, Memory allocation tracking: {}",
                         threadMXBean.isThreadCpuTimeSupported(), true);
             } else {
-                log.info("ThreadMonitor initialized - CPU time tracking: {}, Memory allocation tracking: not supported",
+                log.debug("ThreadMonitor initialized - CPU time tracking: {}, Memory allocation tracking: not supported",
                         threadMXBean.isThreadCpuTimeSupported());
             }
         } catch (Exception e) {
             log.warn("Could not enable thread memory allocation tracking", e);
-            log.info("ThreadMonitor initialized, CPU time tracking enabled: {}",
+            log.error("ThreadMonitor initialized, CPU time tracking enabled: {}",
                     threadMXBean.isThreadCpuTimeSupported());
         }
     }
@@ -317,7 +317,7 @@ public class ThreadMonitor {
                     ThreadGroupStats stats = entry.getValue();
                     double allocatedMB = stats.allocatedBytes / (1024.0 * 1024.0);
                     double cpuMs = stats.cpuTimeNanos / 1_000_000.0;
-                    log.info("  {} - Memory: {:.2f} MB, CPU: {:.1f}ms",
+                    log.debug("  {} - Memory: {:.2f} MB, CPU: {:.1f}ms",
                             entry.getKey(), allocatedMB, cpuMs);
                 });
 
@@ -330,7 +330,7 @@ public class ThreadMonitor {
             double cpuPercent = (usage.cpuTimeNanos / 30_000_000_000.0) * 100;
             double allocatedKB = usage.allocatedBytes / 1024.0;
 
-            log.info("  {}. [{}] {} - CPU: {:.1f}ms ({:.1f}%), Memory: {:.1f} KB, State: {}",
+            log.debug("  {}. [{}] {} - CPU: {:.1f}ms ({:.1f}%), Memory: {:.1f} KB, State: {}",
                     i + 1,
                     usage.threadId,
                     usage.threadName,
@@ -340,8 +340,8 @@ public class ThreadMonitor {
                     usage.state);
         }
 
-        log.info("───────────────────────────────────────────────────────────────");
-        log.info("Top {} Memory-allocating threads (last 30s):", TOP_THREADS_TO_LOG);
+        log.debug("───────────────────────────────────────────────────────────────");
+        log.debug("Top {} Memory-allocating threads (last 30s):", TOP_THREADS_TO_LOG);
 
         for (int i = 0; i < topMemoryThreads.size(); i++) {
             ThreadCpuUsage usage = topMemoryThreads.get(i);
@@ -349,7 +349,7 @@ public class ThreadMonitor {
             double cpuMs = usage.cpuTimeNanos / 1_000_000.0;
 
             if (allocatedMB > 0.01) { // Only log if > 10KB
-                log.info("  {}. [{}] {} - Memory: {:.2f} MB, CPU: {:.1f}ms, State: {}",
+                log.debug("  {}. [{}] {} - Memory: {:.2f} MB, CPU: {:.1f}ms, State: {}",
                         i + 1,
                         usage.threadId,
                         usage.threadName,
@@ -358,7 +358,7 @@ public class ThreadMonitor {
                         usage.state);
             }
         }
-        log.info("═══════════════════════════════════════════════════════════════");
+        log.debug("═══════════════════════════════════════════════════════════════");
     }
 
     /**

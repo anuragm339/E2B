@@ -106,7 +106,7 @@ public class TopologyManager {
 
             registryClient.getTopology(registryUrl, nodeId).whenComplete((topology, ex) -> {
                 if (ex != null) {
-                    log.error("Failed to query Cloud Registry", ex);
+//                    log.error("Failed to query Cloud Registry", ex);
                     return;
                 }
 

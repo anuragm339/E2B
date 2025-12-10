@@ -60,7 +60,7 @@ public class SegmentMetadataStore {
 
         try (Statement stmt = connection.createStatement()) {
             stmt.execute(createTableSQL);
-            
+
             // Create indices
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_topic_partition ON segment_metadata(topic, partition)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_base_offset ON segment_metadata(base_offset)");
