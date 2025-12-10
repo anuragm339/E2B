@@ -261,11 +261,11 @@ public class ThreadMonitor {
     private String categorizeThread(String threadName) {
         if (threadName.contains("nioEventLoopGroup") || threadName.contains("netty")) {
             return "Network I/O";
-        } else if (threadName.contains("consumer-delivery") || threadName.contains("delivery")) {
+        } else if (threadName.contains("RemoteConsumerRegistry") || threadName.contains("consumer-delivery") || threadName.contains("delivery")) {
             return "Consumer Delivery";
-        } else if (threadName.contains("storage") || threadName.contains("segment")) {
+        } else if (threadName.contains("StorageReader") || threadName.contains("storage") || threadName.contains("segment")) {
             return "Storage";
-        } else if (threadName.contains("pipe")) {
+        } else if (threadName.contains("HttpPipeConnector") || threadName.contains("pipe")) {
             return "Pipe/Replication";
         } else if (threadName.contains("scheduled") || threadName.contains("executor")) {
             return "Scheduled Tasks";
@@ -304,13 +304,13 @@ public class ThreadMonitor {
                                List<ThreadCpuUsage> topMemoryThreads,
                                Map<String, ThreadGroupStats> groupStats,
                                long totalBlocked, long totalWaiting) {
-        log.info("═══════════════════════════════════════════════════════════════");
-        log.info("Thread Activity Report - Total: {}, Blocked: {}, Waiting: {}",
-                threadMXBean.getThreadCount(), totalBlocked, totalWaiting);
-        log.info("───────────────────────────────────────────────────────────────");
+        //log.info("═══════════════════════════════════════════════════════════════");
+        //log.info("Thread Activity Report - Total: {}, Blocked: {}, Waiting: {}",
+         //       threadMXBean.getThreadCount(), totalBlocked, totalWaiting);
+       // log.info("───────────────────────────────────────────────────────────────");
 
         // Log by category
-        log.info("Memory Allocation by Category (last 30s):");
+       // log.info("Memory Allocation by Category (last 30s):");
         groupStats.entrySet().stream()
                 .sorted((a, b) -> Long.compare(b.getValue().allocatedBytes, a.getValue().allocatedBytes))
                 .forEach(entry -> {
@@ -321,8 +321,8 @@ public class ThreadMonitor {
                             entry.getKey(), allocatedMB, cpuMs);
                 });
 
-        log.info("───────────────────────────────────────────────────────────────");
-        log.info("Top {} CPU-consuming threads (last 30s):", TOP_THREADS_TO_LOG);
+       // log.info("───────────────────────────────────────────────────────────────");
+        //log.info("Top {} CPU-consuming threads (last 30s):", TOP_THREADS_TO_LOG);
 
         for (int i = 0; i < topCpuThreads.size(); i++) {
             ThreadCpuUsage usage = topCpuThreads.get(i);

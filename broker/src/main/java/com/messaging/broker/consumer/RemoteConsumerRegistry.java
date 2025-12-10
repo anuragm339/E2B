@@ -35,6 +35,7 @@ public class RemoteConsumerRegistry {
     private final BrokerMetrics metrics;
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
+    private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
     private final long maxMessageSizePerConsumer;
     private final int readBatchSize;
 
@@ -59,6 +60,13 @@ public class RemoteConsumerRegistry {
             t.setName("RemoteConsumerRegistry" + t.getId());
             return t;
         } );
+        // Separate thread pool for storage operations to prevent deadlock
+        // Use 2x CPU cores to handle concurrent storage reads without blocking delivery tasks
+        this.storageExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * 2, runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("StorageReader-" + t.getId());
+            return t;
+        });
         this.consumers = new ConcurrentHashMap<>();
         log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer, readBatchSize={}",
                  maxMessageSizePerConsumer, readBatchSize);
@@ -156,7 +164,7 @@ public class RemoteConsumerRegistry {
                         log.error("Exception in storage.read(): ", e);
                         throw new RuntimeException(e);
                     }
-                }, scheduler).get(10, TimeUnit.MINUTES);
+                }, storageExecutor).get(10, TimeUnit.MINUTES);
 
                 metrics.stopStorageReadTimer(readSample);
                 metrics.recordStorageRead();
@@ -334,8 +342,10 @@ public class RemoteConsumerRegistry {
         }
 
         scheduler.shutdown();
+        storageExecutor.shutdown();
         try {
             scheduler.awaitTermination(5, TimeUnit.SECONDS);
+            storageExecutor.awaitTermination(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

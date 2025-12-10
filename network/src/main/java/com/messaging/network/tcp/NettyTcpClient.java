@@ -55,9 +55,9 @@ public class NettyTcpClient implements NetworkClient {
                         protected void initChannel(SocketChannel ch) throws Exception {
                             ChannelPipeline pipeline = ch.pipeline();
 
-                            // Codecs (Binary format for efficiency)
-                            pipeline.addLast("decoder", new JsonMessageDecoder());
-                            pipeline.addLast("encoder", new JsonMessageEncoder());
+                            // Codecs (Binary format for efficiency - zero-copy optimization)
+                            pipeline.addLast("decoder", new BinaryMessageDecoder());
+                            pipeline.addLast("encoder", new BinaryMessageEncoder());
 
                             // Business logic handler
                             pipeline.addLast("handler", new ClientMessageHandler(connection));

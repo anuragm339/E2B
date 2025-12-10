@@ -35,7 +35,8 @@ import java.util.stream.Collectors;
 @Singleton
 public class HttpPipeConnector implements PipeConnector {
     private static final Logger log = LoggerFactory.getLogger(HttpPipeConnector.class);
-    private static final long POLL_INTERVAL_MS = 1000; // Poll every 1 second
+    private static final long MIN_POLL_INTERVAL_MS = 100; // Min delay between polls
+    private static final long MAX_POLL_INTERVAL_MS = 5000; // Max backoff when no data
     private static final int BATCH_SIZE = 100;
     private static final String OFFSET_FILE = "pipe-offset.properties";
     private static final long PERSIST_INTERVAL_MS = 5000; // Persist every 5 seconds
@@ -51,6 +52,8 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile boolean running;
     private volatile long currentOffset = 1012001;
     private volatile long lastPersistedOffset = -1;
+    private volatile long lastPollDuration = 0;
+    private volatile long adaptiveDelay = MIN_POLL_INTERVAL_MS;
 
     public HttpPipeConnector(@Value("${broker.storage.data-dir:./data}") String dataDir) {
         this.httpClient = HttpClient.newBuilder()
@@ -87,13 +90,8 @@ public class HttpPipeConnector implements PipeConnector {
             this.connection = new PipeConnectionImpl(parentUrl);
             this.running = true;
 
-            // Start polling for messages
-            scheduler.scheduleWithFixedDelay(
-                this::pollParent,
-                0,
-                POLL_INTERVAL_MS,
-                TimeUnit.MILLISECONDS
-            );
+            // Start adaptive polling for messages (schedules next poll after completion)
+            scheduleNextPoll(0);
 
             // Start periodic offset persistence
             scheduler.scheduleWithFixedDelay(
@@ -103,9 +101,48 @@ public class HttpPipeConnector implements PipeConnector {
                 TimeUnit.MILLISECONDS
             );
 
-            log.info("Connected to parent: {}", parentUrl);
+            log.info("Connected to parent: {} with adaptive polling", parentUrl);
             return connection;
         }, scheduler);
+    }
+
+    /**
+     * Schedule next poll with adaptive delay based on previous response time and data availability
+     */
+    private void scheduleNextPoll(long delayMs) {
+        if (running) {
+            scheduler.schedule(this::pollParentAdaptive, delayMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Poll parent and schedule next poll based on response
+     */
+    private void pollParentAdaptive() {
+        long startTime = System.currentTimeMillis();
+        try {
+            int messagesReceived = pollParent();
+            lastPollDuration = System.currentTimeMillis() - startTime;
+
+            // Adaptive delay calculation
+            if (messagesReceived > 0) {
+                // Got data - poll again quickly (but wait at least MIN_POLL_INTERVAL_MS)
+                adaptiveDelay = Math.max(MIN_POLL_INTERVAL_MS, lastPollDuration / 2);
+                log.debug("Received {} messages, next poll in {}ms", messagesReceived, adaptiveDelay);
+            } else {
+                // No data - exponential backoff up to MAX_POLL_INTERVAL_MS
+                adaptiveDelay = Math.min(adaptiveDelay * 2, MAX_POLL_INTERVAL_MS);
+                log.debug("No messages, backing off to {}ms", adaptiveDelay);
+            }
+
+        } catch (Exception e) {
+            log.error("Error in adaptive polling", e);
+            // On error, back off more
+            adaptiveDelay = Math.min(adaptiveDelay * 3, MAX_POLL_INTERVAL_MS);
+        } finally {
+            // Schedule next poll
+            scheduleNextPoll(adaptiveDelay);
+        }
     }
 
     @Override
@@ -161,11 +198,12 @@ public class HttpPipeConnector implements PipeConnector {
     }
 
     /**
-     * Poll parent broker for new messages
+     * Poll parent broker for new messages (synchronous with timeout)
+     * @return number of messages received
      */
-    private void pollParent() {
+    private int pollParent() {
         if (!running || connection == null) {
-            return;
+            return 0;
         }
 
         try {
@@ -179,34 +217,35 @@ public class HttpPipeConnector implements PipeConnector {
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(pollUrl))
+                    .timeout(Duration.ofSeconds(10))  // Request timeout
                     .GET()
                     .build();
 
-            httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                    .thenAccept(response -> {
-                        if (response.statusCode() == 200) {
-                            handlePollResponse(response.body());
-                        } else if (response.statusCode() != 204) { // 204 = No content
-                            log.warn("Poll failed with status: {}", response.statusCode());
-                        }
-                    })
-                    .exceptionally(ex -> {
-                        log.error("Error polling parent", ex);
-                        return null;
-                    });
+            // Synchronous call with timeout to prevent indefinite waiting
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                return handlePollResponse(response.body());
+            } else if (response.statusCode() != 204) { // 204 = No content
+                log.warn("Poll failed with status: {}", response.statusCode());
+            }
+
+            return 0;
 
         } catch (Exception e) {
             log.error("Error in pollParent", e);
+            return 0;
         }
     }
 
     /**
      * Handle response from parent poll
+     * @return number of messages received
      */
-    private void handlePollResponse(String responseBody) {
+    private int handlePollResponse(String responseBody) {
         try {
             if (responseBody == null || responseBody.isEmpty()) {
-                return;
+                return 0;
             }
 
             // Parse response as array of MessageRecords
@@ -231,8 +270,11 @@ public class HttpPipeConnector implements PipeConnector {
                         records.length, currentOffset, connection.lastReceivedOffset);
             }
 
+            return records.length;
+
         } catch (Exception e) {
             log.error("Error handling poll response", e);
+            return 0;
         }
     }
 
