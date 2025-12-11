@@ -1,30 +1,33 @@
 version: '3.8'
 
 services:
-  # Cloud Test Server (Mock Registry)
+  # Cloud Test Server (Micronaut-based)
   cloud-server:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/cloud-server
+      context: ./cloud-server
       dockerfile: Dockerfile
     container_name: cloud-server
     volumes:
-      - /Users/anuragmishra/Desktop/workspace/messaging/data:/data  # Mount data directory for SQLite database
+      - ./data:/data  # Mount data directory for SQLite database
     environment:
       - SQLITE_DB_PATH=/data/events.db  # Path to SQLite database inside container
       - DATA_MODE=TEST  # Set to PRODUCTION to use actual data from SQLite
+      - SERVER_PUBLIC_URL=http://cloud-server:8080  # URL brokers use to reach this server (Docker: cloud-server, Localhost: localhost)
       - JAVA_OPTS=-Xms64m -Xmx256m -XX:+UseG1GC
+      - JAVA_TOOL_OPTIONS="-agentlib:jdwp=transport=dt_socket,address=*:5005,server=y,suspend=n"
     ports:
       - "8080:8080"
     networks:
       - messaging-network
+    mem_limit: 300m
+    memswap_limit: 300m
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
-    mem_limit: 300m
-    memswap_limit: 300m
+
 
   # Messaging Broker
   broker:
@@ -32,25 +35,27 @@ services:
       context: ./provider
       dockerfile: Dockerfile
     container_name: messaging-broker
+    volumes:
+      - ./data:/data 
     environment:
       NODE_ID: broker-001
       BROKER_PORT: 9092
       HTTP_PORT: 8081
-      DATA_DIR: /app/data
+      DATA_DIR: /data
       REGISTRY_URL: http://cloud-server:8080
-      JAVA_OPTS: "-Xms128m -Xmx300m -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UseStringDeduplication"
+      JAVA_TOOL_OPTIONS: "-agentlib:jdwp=transport=dt_socket,address=*:5005,server=y,suspend=n"
+      JAVA_OPTS: "-Xms256m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UseStringDeduplication -XX:MaxDirectMemorySize=256m -XX:+DisableExplicitGC -XX:+AlwaysPreTouch -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/app/data/heap-dump.hprof -XX:+ExitOnOutOfMemoryError -Xlog:gc*=info:file=/app/data/gc.log:time,uptime,level,tags"
     ports:
-      - "9092:9092"  # TCP broker port
+      - "9093:9092"  # TCP broker port
       - "8081:8081"  # HTTP admin/metrics port
-    volumes:
-      - broker-data:/app/data
+      - "5005:5005"
     networks:
       - messaging-network
     depends_on:
       - cloud-server
-    # Memory limit: 300MB for broker
-    mem_limit: 300m
-    memswap_limit: 300m
+    # Memory limit: 512MB heap + 256MB direct = 768MB total + overhead = 1GB
+    mem_limit: 800m
+    memswap_limit: 800m
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
       interval: 30s
@@ -66,12 +71,11 @@ services:
     container_name: consumer-price-quote
     environment:
       CONSUMER_TYPE: price-quote
-      CONSUMER_TOPICS: "reference-data-v5,non-promotable-products,prices-v4,minimum-price,deposit"
+      CONSUMER_TOPICS: "prices-v1,reference-data-v5,non-promotable-products,prices-v4,minimum-price,deposit"
       CONSUMER_GROUP: price-quote-group
       CONSUMER_PORT: 8090
       BROKER_HOST: broker
       BROKER_PORT: 9092
-      STORAGE_DATA_DIR: /app/consumer-data
     ports:
       - "8090:8090"
     volumes:
@@ -81,8 +85,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 2: Product Service Lite
   consumer-product-svc-lite:
@@ -107,8 +110,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 3: Search Enterprise
   consumer-search-enterprise:
@@ -133,8 +135,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 4: Tesco Location Service
   consumer-tesco-location-service:
@@ -159,8 +160,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 5: Customer Order On Till
   consumer-customer-order-on-till:
@@ -185,8 +185,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 6: Colleague Facts
   consumer-colleague-facts:
@@ -211,8 +210,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 7: Loss Prevention API
   consumer-loss-prevention-api:
@@ -237,8 +235,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 8: Stored Value Services
   consumer-stored-value-services:
@@ -263,8 +260,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 9: Colleague Identity
   consumer-colleague-identity:
@@ -289,8 +285,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 10: Distributed Identity
   consumer-distributed-identity:
@@ -315,8 +310,6 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
 
   # Consumer 11: DCXP Content
   consumer-dcxp-content:
@@ -341,8 +334,6 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
 
   # Consumer 12: Restriction Service On Tills
   consumer-restriction-service-on-tills:
@@ -367,8 +358,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Consumer 13: DCXP UGC
   consumer-dcxp-ugc:
@@ -393,8 +383,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Prometheus
   prometheus:
@@ -416,8 +405,7 @@ services:
     depends_on:
       - broker
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
   # Grafana
   grafana:
@@ -439,8 +427,7 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
-    mem_limit: 200m
-    memswap_limit: 200m
+
 
 volumes:
   broker-data:
