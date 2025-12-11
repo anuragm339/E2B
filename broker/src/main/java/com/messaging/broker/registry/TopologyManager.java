@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
@@ -25,6 +26,7 @@ import java.util.function.Consumer;
 public class TopologyManager {
     private static final Logger log = LoggerFactory.getLogger(TopologyManager.class);
     private static final long REGISTRY_POLL_INTERVAL_MS = 30000; // Query every 30 seconds
+    private static final AtomicInteger threadCounter = new AtomicInteger(0);
 
     private final CloudRegistryClient registryClient;
     private final PipeConnector pipeConnector;
@@ -49,7 +51,11 @@ public class TopologyManager {
         this.pipeConnector = pipeConnector;
         this.registryUrl = registryUrl;
         this.nodeId = nodeId;
-        this.scheduler = Executors.newScheduledThreadPool(1);
+        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), r -> {
+            Thread t = new Thread(r);
+            t.setName("TopologyManager-" + threadCounter.incrementAndGet());
+            return t;
+        });
         this.running = false;
 
         // Initialize properties store
@@ -100,7 +106,7 @@ public class TopologyManager {
 
             registryClient.getTopology(registryUrl, nodeId).whenComplete((topology, ex) -> {
                 if (ex != null) {
-                    log.error("Failed to query Cloud Registry", ex);
+//                    log.error("Failed to query Cloud Registry", ex);
                     return;
                 }
 

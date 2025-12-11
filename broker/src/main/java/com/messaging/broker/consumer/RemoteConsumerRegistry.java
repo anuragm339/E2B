@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -34,6 +35,7 @@ public class RemoteConsumerRegistry {
     private final BrokerMetrics metrics;
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
+    private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
     private final long maxMessageSizePerConsumer;
     private final int readBatchSize;
 
@@ -53,7 +55,18 @@ public class RemoteConsumerRegistry {
         this.readBatchSize = readBatchSize;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
-        this.scheduler = Executors.newScheduledThreadPool(10);
+        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(),runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("RemoteConsumerRegistry" + t.getId());
+            return t;
+        } );
+        // Separate thread pool for storage operations to prevent deadlock
+        // Use 2x CPU cores to handle concurrent storage reads without blocking delivery tasks
+        this.storageExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() * 2, runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("StorageReader-" + t.getId());
+            return t;
+        });
         this.consumers = new ConcurrentHashMap<>();
         log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer, readBatchSize={}",
                  maxMessageSizePerConsumer, readBatchSize);
@@ -68,10 +81,23 @@ public class RemoteConsumerRegistry {
         // Load persisted offset
         String consumerId = group + ":" + topic;
         long persistedOffset = offsetTracker.getOffset(consumerId);
-        consumer.setCurrentOffset(persistedOffset);
+
+        // Get earliest available offset from storage
+        // If persisted offset is 0 (new consumer), use the earliest available offset in the topic
+        // This handles cases where the topic has been compacted or messages have been deleted
+        long earliestOffset = storage.getEarliestOffset(topic, 0);
+        long startOffset = persistedOffset;
+
+        if (persistedOffset < earliestOffset) {
+            startOffset = earliestOffset;
+            log.info("Adjusting consumer offset from {} to earliest available offset {} for topic={}",
+                     persistedOffset, earliestOffset, topic);
+        }
+
+        consumer.setCurrentOffset(startOffset);
 
         // Initialize consumer metrics
-        metrics.updateConsumerOffset(clientId, topic, group, persistedOffset);
+        metrics.updateConsumerOffset(clientId, topic, group, startOffset);
         metrics.updateConsumerLag(clientId, topic, group, 0);
 
         consumers.put(clientId, consumer);
@@ -79,8 +105,8 @@ public class RemoteConsumerRegistry {
         // Start delivery task
         startDelivery(consumer);
 
-        log.info("Registered remote consumer: clientId={}, topic={}, group={}, startOffset={}",
-                 clientId, topic, group, persistedOffset);
+        log.debug("Registered remote consumer: clientId={}, topic={}, group={}, startOffset={}",
+                 clientId, topic, group, startOffset);
     }
 
     /**
@@ -118,13 +144,13 @@ public class RemoteConsumerRegistry {
         try {
             long currentOffset = consumer.getCurrentOffset();
 
-            log.info("Attempting to deliver messages to consumer {}: offset={}",
-                     consumer.clientId, currentOffset);
+            log.info("Attempting to deliver messages to consumer {}: and topic {}: offset={}",
+                     consumer.clientId,consumer.topic, currentOffset);
 
             // Read next batch of messages from storage
             List<MessageRecord> records;
             try {
-                log.info("About to call storage.read() for consumer {}: topic={}, partition=0, offset={}",
+                log.debug("About to call storage.read() for consumer {}: topic={}, partition=0, offset={}",
                          consumer.clientId, consumer.topic, currentOffset);
 
                 // Use a CompletableFuture with timeout to prevent indefinite blocking
@@ -138,12 +164,12 @@ public class RemoteConsumerRegistry {
                         log.error("Exception in storage.read(): ", e);
                         throw new RuntimeException(e);
                     }
-                }).get(5, TimeUnit.SECONDS);
+                }, storageExecutor).get(10, TimeUnit.MINUTES);
 
                 metrics.stopStorageReadTimer(readSample);
                 metrics.recordStorageRead();
 
-                log.info("storage.read() returned successfully with {} records",
+                log.debug("storage.read() returned successfully with {} records",
                          records != null ? records.size() : "null");
             } catch (TimeoutException e) {
                 log.error("TIMEOUT: storage.read() did not complete within 5 seconds for consumer {}: topic={}, offset={}",
@@ -155,8 +181,8 @@ public class RemoteConsumerRegistry {
                 return;
             }
 
-            log.info("Read {} messages from storage for consumer {}",
-                     records.size(), consumer.clientId);
+//            log.info("Read {} messages from storage for consumer {}",
+//                     records.size(), consumer.clientId);
 
             if (records.isEmpty()) {
                 return; // No new messages
@@ -164,45 +190,53 @@ public class RemoteConsumerRegistry {
 
             metrics.recordBatchSize(records.size());
 
-            // Send messages to consumer with size limit enforcement
+            // Send messages to consumer as batch with size limit enforcement
             long totalBytesSent = 0;
             int messagesSent = 0;
+            List<MessageRecord> batchToSend = new ArrayList<>();
 
             for (MessageRecord record : records) {
+                // Calculate message size before adding to batch
+                long messageBytes = (record.getMsgKey() != null ? record.getMsgKey().length() : 0) +
+                                    (record.getData() != null ? record.getData().length() : 0) +
+                                    50; // metadata overhead
+
+                // Check if adding this message would exceed size limit
+                if (totalBytesSent + messageBytes > maxMessageSizePerConsumer && !batchToSend.isEmpty()) {
+                    log.debug("Consumer {} would exceed max size limit ({}bytes) with next message ({}bytes total), sending current batch of {} messages",
+                             consumer.clientId, maxMessageSizePerConsumer, totalBytesSent + messageBytes, batchToSend.size());
+                    break;
+                }
+
+                batchToSend.add(record);
+                totalBytesSent += messageBytes;
+                messagesSent++;
+            }
+
+            // Send the batch to consumer if not empty
+            if (!batchToSend.isEmpty()) {
                 try {
-                    // Calculate message size before sending
-                    long messageBytes = (record.getMsgKey() != null ? record.getMsgKey().length() : 0) +
-                                        (record.getData() != null ? record.getData().length() : 0) +
-                                        50; // metadata overhead
-
-                    // Check if adding this message would exceed size limit
-                    if (totalBytesSent + messageBytes > maxMessageSizePerConsumer) {
-                        log.debug("Consumer {} would exceed max size limit ({}bytes) with next message ({}bytes total), stopping delivery. Sent {} messages ({} bytes) this cycle",
-                                 consumer.clientId, maxMessageSizePerConsumer, totalBytesSent + messageBytes, messagesSent, totalBytesSent);
-                        break;
-                    }
-
                     // Start timing for per-consumer delivery
                     Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
-
-                    sendMessageToConsumer(consumer, record, currentOffset);
+                    log.info("Sending batch of {} messages ({} bytes) to consumer {} for topics {} starting at offset {}",
+                             batchToSend.size(), totalBytesSent, consumer.clientId,consumer.topic, currentOffset);
+                    sendBatchToConsumer(consumer, batchToSend, currentOffset);
 
                     // Record per-consumer metrics
-                    metrics.recordConsumerMessageSent(consumer.clientId, consumer.topic, consumer.group, messageBytes);
+                    metrics.recordConsumerMessageSent(consumer.clientId, consumer.topic, consumer.group, totalBytesSent);
                     metrics.stopConsumerDeliveryTimer(deliverySample, consumer.clientId, consumer.topic, consumer.group);
 
                     // Record global metrics
-                    metrics.recordMessageSent(messageBytes);
+                    metrics.recordMessageSent(totalBytesSent);
 
-                    totalBytesSent += messageBytes;
-                    messagesSent++;
-                    currentOffset++;
+                    // Update offset to after the last message sent
+                    currentOffset = batchToSend.get(batchToSend.size() - 1).getOffset()+1;
                 } catch (Exception e) {
-                    log.error("Failed to send message to consumer {}: offset={}",
-                             consumer.clientId, currentOffset, e);
+                    log.error("Failed to send batch to consumer {}: batchSize={}, firstOffset={}",
+                             consumer.clientId, batchToSend.size(), currentOffset, e);
                     // Record failure
                     metrics.recordConsumerFailure(consumer.clientId, consumer.topic, consumer.group);
-                    break; // Stop on error
+                    return; // Stop on error
                 }
             }
 
@@ -244,21 +278,24 @@ public class RemoteConsumerRegistry {
     }
 
     /**
-     * Send a single message to consumer
+     * Send a batch of messages to consumer
      */
-    private void sendMessageToConsumer(RemoteConsumer consumer, MessageRecord record, long offset)
+    private void sendBatchToConsumer(RemoteConsumer consumer, List<MessageRecord> records, long startOffset)
             throws Exception {
 
-        // Create ConsumerRecord (offset is tracked separately by broker)
-        ConsumerRecord consumerRecord = new ConsumerRecord(
-            record.getMsgKey(),
-            record.getEventType(),
-            record.getData(),
-            record.getCreatedAt()
-        );
+        // Create list of ConsumerRecords (offset is tracked separately by broker)
+        List<ConsumerRecord> consumerRecords = new ArrayList<>(records.size());
+        for (MessageRecord record : records) {
+            consumerRecords.add(new ConsumerRecord(
+                record.getMsgKey(),
+                record.getEventType(),
+                record.getData(),
+                record.getCreatedAt()
+            ));
+        }
 
-        // Serialize to JSON
-        String json = objectMapper.writeValueAsString(consumerRecord);
+        // Serialize batch to JSON
+        String json = objectMapper.writeValueAsString(consumerRecords);
 
         // Create DATA message
         BrokerMessage message = new BrokerMessage(
@@ -267,11 +304,11 @@ public class RemoteConsumerRegistry {
             json.getBytes(StandardCharsets.UTF_8)
         );
 
-        // Send to consumer
+        // Send batch to consumer
         server.send(consumer.clientId, message).get(5, TimeUnit.SECONDS);
 
-        log.debug("Sent message to consumer {}: offset={}, key={}",
-                 consumer.clientId, offset, record.getMsgKey());
+        log.debug("Sent batch of {} messages to consumer {}: startOffset={}, endOffset={}",
+                 records.size(), consumer.clientId, startOffset, startOffset + records.size() - 1);
     }
 
     /**
@@ -284,6 +321,8 @@ public class RemoteConsumerRegistry {
         // Find all consumers subscribed to this topic and trigger immediate delivery
         for (RemoteConsumer consumer : consumers.values()) {
             if (consumer.topic.equals(topic)) {
+                // DO NOT update consumer offset here - let consumer maintain its own offset
+                // based on what it has successfully delivered
                 // Submit immediate delivery task (non-blocking)
                 scheduler.submit(() -> deliverMessages(consumer));
             }
@@ -303,8 +342,10 @@ public class RemoteConsumerRegistry {
         }
 
         scheduler.shutdown();
+        storageExecutor.shutdown();
         try {
             scheduler.awaitTermination(5, TimeUnit.SECONDS);
+            storageExecutor.awaitTermination(5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

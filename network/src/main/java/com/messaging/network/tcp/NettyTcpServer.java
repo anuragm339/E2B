@@ -4,6 +4,8 @@ import com.messaging.common.api.NetworkServer;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.network.codec.BinaryMessageDecoder;
 import com.messaging.network.codec.BinaryMessageEncoder;
+import com.messaging.network.codec.JsonMessageDecoder;
+import com.messaging.network.codec.JsonMessageEncoder;
 import com.messaging.network.handler.ServerMessageHandler;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.annotation.Value;
@@ -71,7 +73,7 @@ public class NettyTcpServer implements NetworkServer {
 
                             ChannelPipeline pipeline = ch.pipeline();
 
-                            // Codecs (Binary format for efficiency)
+                            // Codecs (Binary format for efficiency - zero-copy optimization)
                             pipeline.addLast("decoder", new BinaryMessageDecoder());
                             pipeline.addLast("encoder", new BinaryMessageEncoder());
 

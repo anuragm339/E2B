@@ -41,4 +41,15 @@ subprojects {
     test {
         useJUnitPlatform()
     }
+    tasks.withType(Jar).configureEach {
+        manifest {
+            attributes(
+                    'Implementation-Title': project.name,
+                    'Implementation-Version': project.version,
+                    'Built-By': System.getProperty('user.name'),
+                    'Build-Timestamp': new Date().format("yyyy-MM-dd HH:mm:ss"),
+                    'Main-Class': project.findProperty("mainClassName") ?: ""
+            )
+        }
+    }
 }

@@ -45,7 +45,7 @@ broker:
 
   storage:
     type: mmap
-    dataDir: ${DATA_DIR:./data}
+    dataDir: ${DATA_DIR:/Users/anuragmishra/Desktop/workspace/messaging/data/}
     segment-size: 1073741824  # 1GB
 
   default-topic: ${DEFAULT_TOPIC:price-topic}

@@ -186,24 +186,32 @@ public class SegmentManager {
      * Read messages from a starting offset
      */
     public List<MessageRecord> read(long fromOffset, int maxRecords) throws IOException {
-        log.info("SegmentManager.read() called: topic={}, partition={}, fromOffset={}, maxRecords={}",
-                topic, partition, fromOffset, maxRecords);
+        // Default max size: 1MB
+        return readWithSizeLimit(fromOffset, maxRecords, 1048576);
+    }
+
+    /**
+     * Read messages with size limit (1MB batching)
+     */
+    public List<MessageRecord> readWithSizeLimit(long fromOffset, int maxRecords, int maxBytes) throws IOException {
+     //   log.info("SegmentManager.read() called: topic={}, partition={}, fromOffset={}, maxRecords={}, maxBytes={}", topic, partition, fromOffset, maxRecords, maxBytes);
 
         List<MessageRecord> records = new ArrayList<>();
+        int cumulativeSize = 0;
 
         // Find the segment containing the starting offset
         var entry = segments.floorEntry(fromOffset);
-        log.info("segments.floorEntry({}) returned: {}", fromOffset, entry != null ? entry.getKey() : "null");
+       // log.info("segments.floorEntry({}) returned: {}", fromOffset, entry != null ? entry.getKey() : "null");
 
         if (entry == null) {
             // Check active segment
             Segment active = activeSegment.get();
-            log.info("Checking active segment: baseOffset={}, nextOffset={}",
-                    active != null ? active.getBaseOffset() : "null",
-                    active != null ? active.getNextOffset() : "null");
+//            log.info("Checking active segment: baseOffset={}, nextOffset={}",
+//                    active != null ? active.getBaseOffset() : "null",
+//                    active != null ? active.getNextOffset() : "null");
 
             if (active != null && fromOffset >= active.getBaseOffset() && fromOffset < active.getNextOffset()) {
-                log.info("Using active segment for read");
+//                log.info("Using active segment for read");
                 entry = new java.util.AbstractMap.SimpleEntry<>(active.getBaseOffset(), active);
             } else {
                 log.info("No segment found for offset {}, returning empty list", fromOffset);
@@ -214,14 +222,26 @@ public class SegmentManager {
         long currentOffset = fromOffset;
         Segment currentSegment = entry.getValue();
 
-        while (records.size() < maxRecords) {
+        while (records.size() < maxRecords && cumulativeSize < maxBytes) {
             try {
                 // Try to read from current segment
                 if (currentOffset >= currentSegment.getBaseOffset() &&
                         currentOffset < currentSegment.getNextOffset()) {
 
                     MessageRecord record = currentSegment.read(currentOffset);
+
+                    // Calculate record size (approximate)
+                    int recordSize = calculateRecordSize(record);
+
+                    // Check if adding this record would exceed size limit
+                    if (cumulativeSize + recordSize > maxBytes && !records.isEmpty()) {
+                        log.info("Size limit reached: cumulativeSize={}, recordSize={}, maxBytes={}",
+                                cumulativeSize, recordSize, maxBytes);
+                        break;
+                    }
+
                     records.add(record);
+                    cumulativeSize += recordSize;
                     currentOffset++;
 
                 } else {
@@ -246,7 +266,20 @@ public class SegmentManager {
             }
         }
 
+//        log.info("Read {} records, total size: {} bytes", records.size(), cumulativeSize);
         return records;
+    }
+
+    /**
+     * Calculate approximate size of a message record
+     */
+    private int calculateRecordSize(MessageRecord record) {
+        // Binary format: offset(8) + keyLen(4) + key + eventType(1) + dataLen(4) + data + timestamp(8) + crc(4)
+        int size = 8 + 4 + record.getMsgKey().getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1 + 4 + 8 + 4;
+        if (record.getData() != null) {
+            size += record.getData().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        }
+        return size;
     }
 
     /**
@@ -264,6 +297,20 @@ public class SegmentManager {
         }
 
         return -1; // No messages
+    }
+
+    /**
+     * Get earliest (lowest) available offset
+     * Returns the base offset of the first segment.
+     * This may NOT be 0 if old segments have been deleted or after compaction.
+     */
+    public long getEarliestOffset() {
+        if (!segments.isEmpty()) {
+            // ConcurrentSkipListMap keeps entries sorted by key (baseOffset)
+            // firstEntry() returns the segment with the lowest baseOffset
+            return segments.firstEntry().getKey();
+        }
+        return 0; // No segments, start from 0
     }
 
     /**

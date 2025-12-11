@@ -27,6 +27,16 @@ public class MessageRecord {
         this.createdAt = createdAt;
     }
 
+    public MessageRecord(long offset, String topic, int partition, String msgKey, EventType eventType, String data, Instant createdAt) {
+        this.offset = offset;
+        this.topic = topic;
+        this.partition = partition;
+        this.msgKey = msgKey;
+        this.eventType = eventType;
+        this.data = data;
+        this.createdAt = createdAt;
+    }
+
     // Getters and setters
     public long getOffset() {
         return offset;

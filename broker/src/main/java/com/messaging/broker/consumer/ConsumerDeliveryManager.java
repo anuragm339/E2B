@@ -9,6 +9,7 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -19,7 +20,6 @@ import java.util.concurrent.*;
 @Singleton
 public class ConsumerDeliveryManager {
     private static final Logger log = LoggerFactory.getLogger(ConsumerDeliveryManager.class);
-    private static final int BATCH_SIZE = 100;
     private static final long POLL_INTERVAL_MS = 100L;
 
     private final StorageEngine storage;
@@ -34,7 +34,11 @@ public class ConsumerDeliveryManager {
         this.storage = storage;
         this.processor = processor;
         this.offsetTracker = offsetTracker;
-        this.scheduler = Executors.newScheduledThreadPool(10);
+        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), r -> {
+            Thread t = new Thread(r);
+            t.setName("ConsumerDeliveryScheduler-" + t.getId());
+            return t;
+        });
         this.deliveryTasks = new ConcurrentHashMap<>();
         log.info("ConsumerDeliveryManager initialized");
     }
@@ -55,15 +59,23 @@ public class ConsumerDeliveryManager {
         }
 
         long persistedOffset = offsetTracker.getOffset(consumerId);
-        context.setCurrentOffset(persistedOffset);
+        long earliestOffset = storage.getEarliestOffset(context.getTopic(), 0);
+        long startOffset = Math.max(persistedOffset, earliestOffset);
 
-        log.info("Starting delivery for consumer: {} from offset: {}", context, persistedOffset);
+        if (startOffset > persistedOffset) {
+            log.info("Consumer {} start offset adjusted from {} to {} to align with earliest available offset",
+                    consumerId, persistedOffset, startOffset);
+        }
+
+        context.setCurrentOffset(startOffset);
+
+        log.info("Starting delivery for consumer: {} from offset: {}", context, startOffset);
 
         ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
-            () -> deliverMessages(context),
-            0L,
-            POLL_INTERVAL_MS,
-            TimeUnit.MILLISECONDS
+                () -> deliverMessages(context),
+                0L,
+                POLL_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
         );
         deliveryTasks.put(consumerId, task);
     }
@@ -91,54 +103,82 @@ public class ConsumerDeliveryManager {
             }
 
             long currentOffset = context.getCurrentOffset();
-            List<MessageRecord> records = storage.read(context.getTopic(), 0, currentOffset, BATCH_SIZE);
+
+            // Use dynamic batch size from context
+            int batchSize = context.getCurrentBatchSize();
+            List<MessageRecord> records = storage.read(context.getTopic(), 0, currentOffset, batchSize);
 
             if (records.isEmpty()) {
                 return;
             }
 
-            for (MessageRecord record : records) {
-                boolean success = deliverSingleMessage(context, record);
-                if (!success) {
-                    handleDeliveryFailure(context, record);
-                    break;
-                }
-
-                long newOffset = record.getOffset() + 1L;
+            // Deliver entire batch at once
+            boolean success = deliverBatch(context, records);
+            if (success) {
+                // Update offset to last message in batch + 1
+                long lastOffset = records.get(records.size() - 1).getOffset();
+                long newOffset = lastOffset + 1L;
                 context.setCurrentOffset(newOffset);
                 context.resetFailures();
                 offsetTracker.updateOffset(context.getConsumerId(), newOffset);
+
+                // Update average message size for adaptive batch sizing
+                int totalBytes = calculateBatchSize(records);
+                context.updateAverageMessageSize(totalBytes, records.size());
+
+                log.debug("Delivered batch of {} messages to consumer {}, new offset={}, next batch size={}",
+                         records.size(), context.getConsumerId(), newOffset, context.getCurrentBatchSize());
+            } else {
+                // Handle batch failure
+                handleBatchFailure(context, records);
             }
         } catch (Exception e) {
             log.error("Error in delivery loop for consumer: {}", context.getConsumerId(), e);
         }
     }
 
-    private boolean deliverSingleMessage(ConsumerContext context, MessageRecord record) {
+    /**
+     * Deliver a batch of messages to the consumer
+     */
+    private boolean deliverBatch(ConsumerContext context, List<MessageRecord> records) {
         try {
-            ConsumerRecord consumerRecord = new ConsumerRecord(
-                record.getMsgKey(),
-                record.getEventType(),
-                record.getData(),
-                record.getCreatedAt()
-            );
-            context.getHandler().handle(consumerRecord);
-
-            log.debug("Delivered message to consumer {}: offset={}, key={}",
-                     context.getConsumerId(), record.getOffset(), record.getMsgKey());
-            return true;
-        } catch (Exception e) {
-            log.error("Failed to deliver message to consumer {}: offset={}, key={}",
-                     context.getConsumerId(), record.getOffset(), record.getMsgKey(), e);
-
-            try {
-                ConsumerRecord errorRecord = new ConsumerRecord(
+            // Convert MessageRecords to ConsumerRecords
+            List<ConsumerRecord> consumerRecords = new ArrayList<>(records.size());
+            for (MessageRecord record : records) {
+                consumerRecords.add(new ConsumerRecord(
                     record.getMsgKey(),
                     record.getEventType(),
                     record.getData(),
                     record.getCreatedAt()
-                );
-                context.getErrorHandler().onError(errorRecord, e);
+                ));
+            }
+
+            // Deliver entire batch
+            context.getHandler().handleBatch(consumerRecords);
+
+            log.debug("Delivered batch of {} messages to consumer {}: offsets {}-{}",
+                     records.size(), context.getConsumerId(),
+                     records.get(0).getOffset(),
+                     records.get(records.size() - 1).getOffset());
+            return true;
+
+        } catch (Exception e) {
+            log.error("Failed to deliver batch to consumer {}: batch size={}, first offset={}",
+                     context.getConsumerId(), records.size(),
+                     records.isEmpty() ? "N/A" : records.get(0).getOffset(), e);
+
+            // Call error handler with first record in failed batch
+            try {
+                if (!records.isEmpty()) {
+                    MessageRecord firstRecord = records.get(0);
+                    ConsumerRecord errorRecord = new ConsumerRecord(
+                        firstRecord.getMsgKey(),
+                        firstRecord.getEventType(),
+                        firstRecord.getData(),
+                        firstRecord.getCreatedAt()
+                    );
+                    context.getErrorHandler().onError(errorRecord, e);
+                }
             } catch (Exception errorHandlerEx) {
                 log.error("Error handler threw exception", errorHandlerEx);
             }
@@ -146,30 +186,58 @@ public class ConsumerDeliveryManager {
         }
     }
 
-    private void handleDeliveryFailure(ConsumerContext context, MessageRecord record) {
+    /**
+     * Calculate total size of batch in bytes (approximate)
+     */
+    private int calculateBatchSize(List<MessageRecord> records) {
+        int totalBytes = 0;
+        for (MessageRecord record : records) {
+            // Approximate: key + data + overhead
+            totalBytes += record.getMsgKey().length();
+            if (record.getData() != null) {
+                totalBytes += record.getData().length();
+            }
+            totalBytes += 100; // Overhead for metadata, offset, etc.
+        }
+        return totalBytes;
+    }
+
+    /**
+     * Handle batch delivery failure
+     */
+    private void handleBatchFailure(ConsumerContext context, List<MessageRecord> records) {
         context.incrementFailures();
         RetryPolicy policy = context.getRetryPolicy();
         int failures = context.getConsecutiveFailures();
 
+        // Reduce batch size for retry
+        context.reduceBatchSizeForRetry();
+
+        MessageRecord firstRecord = records.get(0);
+
         switch (policy) {
             case EXPONENTIAL_THEN_FIXED:
                 long retryDelay = context.calculateRetryDelay();
-                log.warn("Consumer {} failed (attempt {}), will retry in {}ms: offset={}, key={}",
-                        context.getConsumerId(), failures, retryDelay, record.getOffset(), record.getMsgKey());
+                log.info("Consumer {} failed (attempt {}), will retry in {}ms with reduced batch size {}: batch offsets {}-{}",
+                        context.getConsumerId(), failures, retryDelay, context.getCurrentBatchSize(),
+                        firstRecord.getOffset(), records.get(records.size() - 1).getOffset());
                 break;
 
             case SKIP_ON_ERROR:
-                log.warn("Consumer {} failed, SKIPPING message: offset={}, key={}",
-                        context.getConsumerId(), record.getOffset(), record.getMsgKey());
-                long newOffset = record.getOffset() + 1L;
+                log.info("Consumer {} failed, SKIPPING batch: offsets {}-{}",
+                        context.getConsumerId(),
+                        firstRecord.getOffset(), records.get(records.size() - 1).getOffset());
+                long lastOffset = records.get(records.size() - 1).getOffset();
+                long newOffset = lastOffset + 1L;
                 context.setCurrentOffset(newOffset);
                 context.resetFailures();
                 offsetTracker.updateOffset(context.getConsumerId(), newOffset);
                 break;
 
             case PAUSE_ON_ERROR:
-                log.error("Consumer {} failed, PAUSING consumer: offset={}, key={}",
-                        context.getConsumerId(), record.getOffset(), record.getMsgKey());
+                log.error("Consumer {} failed, PAUSING consumer: batch offsets {}-{}",
+                        context.getConsumerId(),
+                        firstRecord.getOffset(), records.get(records.size() - 1).getOffset());
                 context.pause();
                 break;
 

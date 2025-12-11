@@ -91,6 +91,195 @@ public class Segment {
 
         log.info("Created segment with baseOffset={} at {}, logMapped={}MB, indexMapped={}KB",
                 baseOffset, logPath, currentLogMappedSize / (1024 * 1024), currentIndexMappedSize / 1024);
+
+        // If segment has existing data, recover nextOffset by scanning the log
+        if (existingLogSize > 0) {
+            recoverNextOffset();
+        }
+    }
+
+    /**
+     * Recover nextOffset using index file (Kafka-style) - MUCH faster than scanning log
+     */
+    private void recoverNextOffset() {
+        log.info("Recovering nextOffset for segment at baseOffset={}, logPosition={}, indexPosition={}",
+                baseOffset, logPosition, indexPosition);
+
+        try {
+            // If index is empty, scan the log as fallback
+            if (indexPosition == 0) {
+                recoverFromLogScan();
+                return;
+            }
+
+            // Read the last index entry (each entry is 8 bytes: 4 for offset + 4 for position)
+            int lastIndexEntryPos = indexPosition - INDEX_ENTRY_SIZE;
+
+            if (lastIndexEntryPos < 0) {
+                log.warn("Invalid index position, falling back to log scan");
+                recoverFromLogScan();
+                return;
+            }
+
+            // Read last index entry
+            int relativeOffset = indexBuffer.getInt(lastIndexEntryPos);
+            int logPos = indexBuffer.getInt(lastIndexEntryPos + 4);
+
+            long lastIndexedOffset = baseOffset + relativeOffset;
+
+            log.info("Last index entry: relativeOffset={}, logPosition={}, absoluteOffset={}",
+                    relativeOffset, logPos, lastIndexedOffset);
+
+            // Now scan from the last indexed position to find the actual highest offset
+            // (there may be records after the last index entry)
+            long highestOffset = lastIndexedOffset;
+            int position = logPos;
+            long recordCount = 0;
+
+            while (position < logPosition) {
+                // Check if we have enough bytes to read offset (8 bytes)
+                if (position + 8 > logPosition) {
+                    break;
+                }
+
+                // Read offset at this position
+                long recordOffset = logBuffer.getLong(position);
+                position += 8;
+                recordCount++;
+
+                // Track the highest offset
+                if (recordOffset > highestOffset) {
+                    highestOffset = recordOffset;
+                }
+
+                // Skip the rest of the record
+                if (position + 4 > logPosition) break;
+                int keyLen = logBuffer.getInt(position);
+                position += 4;
+
+                if (position + keyLen > logPosition) break;
+                position += keyLen;
+
+                if (position + 1 > logPosition) break;
+                position += 1; // event type
+
+                if (position + 4 > logPosition) break;
+                int dataLen = logBuffer.getInt(position);
+                position += 4;
+
+                if (position + dataLen > logPosition) break;
+                position += dataLen;
+
+                if (position + 12 > logPosition) break;
+                position += 12; // timestamp (8) + crc32 (4)
+            }
+
+            // nextOffset is the highest offset + 1
+            this.nextOffset = highestOffset + 1;
+
+            log.info("Recovered segment using index: baseOffset={}, lastIndexedOffset={}, scannedRecords={}, highestOffset={}, nextOffset={}",
+                    baseOffset, lastIndexedOffset, recordCount, highestOffset, nextOffset);
+
+        } catch (Exception e) {
+            log.error("Error recovering from index, falling back to log scan", e);
+            recoverFromLogScan();
+        }
+    }
+
+    /**
+     * Fallback: Recover by scanning the entire log file (slow, used only when index is unavailable)
+     */
+    private void recoverFromLogScan() {
+        log.warn("Using slow log scan for recovery at baseOffset={}", baseOffset);
+
+        int position = 0;
+        int recordStartPosition = 0;
+        long recordCount = 0;
+        long highestOffset = baseOffset - 1;
+        int consecutiveZeroRecords = 0;
+        final int MAX_CONSECUTIVE_ZEROS = 10; // Stop if we hit 10 consecutive zero-offset records
+
+        try {
+            // Reset index position to rebuild it
+            indexPosition = 0;
+
+            while (position < logPosition) {
+                recordStartPosition = position; // Track where this record starts
+
+                if (position + 8 > logPosition) break;
+                long recordOffset = logBuffer.getLong(position);
+                position += 8;
+
+                // Detect pre-allocated zero region: if we hit multiple consecutive records with offset=0
+                // AFTER we've seen higher offsets, we've reached the pre-allocated zero region
+                // Note: The first record can legitimately be offset 0 (equals baseOffset)
+                if (recordOffset == 0 && highestOffset > 10) { // Only detect zeros after we've seen real data
+                    consecutiveZeroRecords++;
+                    if (consecutiveZeroRecords >= MAX_CONSECUTIVE_ZEROS) {
+                        log.info("Detected pre-allocated zero region at position {}, stopping scan", position - 8);
+                        break;
+                    }
+                } else {
+                    consecutiveZeroRecords = 0;
+                }
+
+                if (recordOffset > highestOffset) {
+                    highestOffset = recordOffset;
+                }
+
+                if (position + 4 > logPosition) break;
+                int keyLen = logBuffer.getInt(position);
+                position += 4;
+
+                // Validate keyLen: should be reasonable (UUIDs are 36 bytes, typically 10-100 bytes)
+                if (keyLen < 0 || keyLen > 1000) {
+                    log.warn("Invalid keyLen={} at position {}, stopping scan", keyLen, position - 4);
+                    break;
+                }
+
+                if (position + keyLen > logPosition) break;
+                position += keyLen;
+
+                if (position + 1 > logPosition) break;
+                position += 1;
+
+                if (position + 4 > logPosition) break;
+                int dataLen = logBuffer.getInt(position);
+                position += 4;
+
+                // Validate dataLen: should be reasonable (typically < 100KB for messages)
+                if (dataLen < 0 || dataLen > 10 * 1024 * 1024) {
+                    log.warn("Invalid dataLen={} at position {}, stopping scan", dataLen, position - 4);
+                    break;
+                }
+
+                if (position + dataLen > logPosition) break;
+                position += dataLen;
+
+                if (position + 12 > logPosition) break;
+                position += 12;
+
+                recordCount++;
+
+                // Rebuild index: add entry every 4KB (similar to append logic)
+                if (recordStartPosition % 4096 < (position - recordStartPosition)) {
+                    addIndexEntry(recordOffset, recordStartPosition);
+                }
+            }
+
+            // Update logPosition to reflect actual data end
+            this.logPosition = position;
+            this.nextOffset = highestOffset + 1;
+            log.info("Recovered segment (log scan): baseOffset={}, recordCount={}, highestOffset={}, nextOffset={}, actualLogPosition={}, rebuiltIndexEntries={}",
+                    baseOffset, recordCount, highestOffset, nextOffset, logPosition, indexPosition / INDEX_ENTRY_SIZE);
+
+            // Force index buffer to disk
+            indexBuffer.force();
+
+        } catch (Exception e) {
+            log.error("Error in log scan recovery, using baseOffset as fallback", e);
+            this.nextOffset = baseOffset;
+        }
     }
 
     /**
@@ -116,7 +305,7 @@ public class Segment {
             addIndexEntry(offset, logPosition - recordSize);
         }
 
-        return offset;
+        return record.getOffset();
     }
 
     /**
@@ -260,21 +449,20 @@ public class Segment {
      * Read a record at the given offset
      */
     public MessageRecord read(long offset) throws IOException {
-        log.info("Segment.read() called: offset={}, baseOffset={}, nextOffset={}",
-                 offset, baseOffset, nextOffset);
+
 
         if (offset < baseOffset || offset >= nextOffset) {
             throw new IllegalArgumentException("Offset " + offset + " out of range [" + baseOffset + ", " + nextOffset + ")");
         }
 
         // Find position using index
-        log.info("Calling findPosition() for offset={}", offset);
+        //log.info("Calling findPosition() for offset={}", offset);
         int position = findPosition(offset);
-        log.info("findPosition() returned position={}", position);
+        //log.info("findPosition() returned position={}", position);
 
-        log.info("Calling readRecordAt() at position={}", position);
+        //log.info("Calling readRecordAt() at position={}", position);
         MessageRecord record = readRecordAt(position, offset);
-        log.info("Successfully read record: key={}", record.getMsgKey());
+        //log.info("Successfully read record: key={}", record.getMsgKey());
 
         return record;
     }
@@ -285,13 +473,13 @@ public class Segment {
     private int findPosition(long offset) {
         int relativeOffset = (int) (offset - baseOffset);
 
-        log.info("findPosition(): relativeOffset={}, indexPosition={}, logPosition={}, active={}",
-                 relativeOffset, indexPosition, logPosition, active);
+        //log.info("findPosition(): relativeOffset={}, indexPosition={}, logPosition={}, active={}",
+            //     relativeOffset, indexPosition, logPosition, active);
 
         // For active segments with no index or small index, use sequential scan from start
         // This is similar to how Kafka handles active segment reads
         if (active && indexPosition < INDEX_ENTRY_SIZE) {
-            log.info("Active segment with no index entries, scanning from position 0");
+           // log.info("Active segment with no index entries, scanning from position 0");
             return scanToOffset(0, offset);
         }
 
@@ -300,7 +488,7 @@ public class Segment {
         int high = (indexPosition / INDEX_ENTRY_SIZE) - 1;
         int resultPosition = 0;
 
-        log.info("Binary search range: low={}, high={}", low, high);
+       // log.info("Binary search range: low={}, high={}", low, high);
 
         while (low <= high) {
             int mid = (low + high) / 2;
@@ -316,8 +504,8 @@ public class Segment {
             }
         }
 
-        log.info("Binary search complete. Calling scanToOffset(resultPosition={}, offset={})",
-                 resultPosition, offset);
+       // log.info("Binary search complete. Calling scanToOffset(resultPosition={}, offset={})",
+             //    resultPosition, offset);
 
         // Scan forward from the nearest index entry
         return scanToOffset(resultPosition, offset);
@@ -329,13 +517,13 @@ public class Segment {
     private int scanToOffset(int startPosition, long targetOffset) {
         int position = startPosition;
 
-        log.info("scanToOffset(): startPosition={}, targetOffset={}, logPosition={}",
-                 startPosition, targetOffset, logPosition);
+       // log.info("scanToOffset(): startPosition={}, targetOffset={}, logPosition={}",
+        //         startPosition, targetOffset, logPosition);
 
         int iterations = 0;
         while (position < logPosition) {
             iterations++;
-            if (iterations > 1000) {
+            if (iterations > Long.MAX_VALUE) {
                 log.error("scanToOffset() exceeded 1000 iterations! position={}, logPosition={}, startPosition={}",
                          position, logPosition, startPosition);
                 throw new IllegalStateException("Scan loop exceeded maximum iterations");
@@ -347,7 +535,7 @@ public class Segment {
             log.debug("Read recordOffset={} at position={}", recordOffset, position);
 
             if (recordOffset == targetOffset) {
-                log.info("Found target offset at position={}", position);
+                //log.info("Found target offset at position={}", position);
                 return position;
             }
 

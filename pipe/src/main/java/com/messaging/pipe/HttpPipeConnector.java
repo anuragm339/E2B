@@ -17,12 +17,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * HTTP-based implementation of PipeConnector
@@ -31,7 +35,8 @@ import java.util.function.Consumer;
 @Singleton
 public class HttpPipeConnector implements PipeConnector {
     private static final Logger log = LoggerFactory.getLogger(HttpPipeConnector.class);
-    private static final long POLL_INTERVAL_MS = 1000; // Poll every 1 second
+    private static final long MIN_POLL_INTERVAL_MS = 100; // Min delay between polls
+    private static final long MAX_POLL_INTERVAL_MS = 5000; // Max backoff when no data
     private static final int BATCH_SIZE = 100;
     private static final String OFFSET_FILE = "pipe-offset.properties";
     private static final long PERSIST_INTERVAL_MS = 5000; // Persist every 5 seconds
@@ -45,8 +50,10 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile PipeConnectionImpl connection;
     private volatile Consumer<MessageRecord> dataHandler;
     private volatile boolean running;
-    private volatile long currentOffset = 0;
+    private volatile long currentOffset = 1012001;
     private volatile long lastPersistedOffset = -1;
+    private volatile long lastPollDuration = 0;
+    private volatile long adaptiveDelay = MIN_POLL_INTERVAL_MS;
 
     public HttpPipeConnector(@Value("${broker.storage.data-dir:./data}") String dataDir) {
         this.httpClient = HttpClient.newBuilder()
@@ -54,7 +61,11 @@ public class HttpPipeConnector implements PipeConnector {
                 .build();
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
-        this.scheduler = Executors.newScheduledThreadPool(2); // 1 for polling, 1 for persistence
+        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(),runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("HttpPipeConnector" + t.getId());
+            return t;
+        });
         this.dataDir = dataDir;
         this.offsetFilePath = Paths.get(dataDir, OFFSET_FILE);
 
@@ -79,13 +90,8 @@ public class HttpPipeConnector implements PipeConnector {
             this.connection = new PipeConnectionImpl(parentUrl);
             this.running = true;
 
-            // Start polling for messages
-            scheduler.scheduleWithFixedDelay(
-                this::pollParent,
-                0,
-                POLL_INTERVAL_MS,
-                TimeUnit.MILLISECONDS
-            );
+            // Start adaptive polling for messages (schedules next poll after completion)
+            scheduleNextPoll(0);
 
             // Start periodic offset persistence
             scheduler.scheduleWithFixedDelay(
@@ -95,9 +101,48 @@ public class HttpPipeConnector implements PipeConnector {
                 TimeUnit.MILLISECONDS
             );
 
-            log.info("Connected to parent: {}", parentUrl);
+            log.info("Connected to parent: {} with adaptive polling", parentUrl);
             return connection;
-        });
+        }, scheduler);
+    }
+
+    /**
+     * Schedule next poll with adaptive delay based on previous response time and data availability
+     */
+    private void scheduleNextPoll(long delayMs) {
+        if (running) {
+            scheduler.schedule(this::pollParentAdaptive, delayMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * Poll parent and schedule next poll based on response
+     */
+    private void pollParentAdaptive() {
+        long startTime = System.currentTimeMillis();
+        try {
+            int messagesReceived = pollParent();
+            lastPollDuration = System.currentTimeMillis() - startTime;
+
+            // Adaptive delay calculation
+            if (messagesReceived > 0) {
+                // Got data - poll again quickly (but wait at least MIN_POLL_INTERVAL_MS)
+                adaptiveDelay = Math.max(MIN_POLL_INTERVAL_MS, lastPollDuration / 2);
+                log.debug("Received {} messages, next poll in {}ms", messagesReceived, adaptiveDelay);
+            } else {
+                // No data - exponential backoff up to MAX_POLL_INTERVAL_MS
+                adaptiveDelay = Math.min(adaptiveDelay * 2, MAX_POLL_INTERVAL_MS);
+                log.debug("No messages, backing off to {}ms", adaptiveDelay);
+            }
+
+        } catch (Exception e) {
+            log.error("Error in adaptive polling", e);
+            // On error, back off more
+            adaptiveDelay = Math.min(adaptiveDelay * 3, MAX_POLL_INTERVAL_MS);
+        } finally {
+            // Schedule next poll
+            scheduleNextPoll(adaptiveDelay);
+        }
     }
 
     @Override
@@ -153,11 +198,12 @@ public class HttpPipeConnector implements PipeConnector {
     }
 
     /**
-     * Poll parent broker for new messages
+     * Poll parent broker for new messages (synchronous with timeout)
+     * @return number of messages received
      */
-    private void pollParent() {
+    private int pollParent() {
         if (!running || connection == null) {
-            return;
+            return 0;
         }
 
         try {
@@ -166,44 +212,49 @@ public class HttpPipeConnector implements PipeConnector {
             if (!parentUrl.startsWith("http://") && !parentUrl.startsWith("https://")) {
                 parentUrl = "http://" + parentUrl;
             }
-            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + BATCH_SIZE;
+
+            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + 10;
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(pollUrl))
+                    .timeout(Duration.ofSeconds(10))  // Request timeout
                     .GET()
-                    .timeout(Duration.ofSeconds(5))
                     .build();
 
-            httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                    .thenAccept(response -> {
-                        if (response.statusCode() == 200) {
-                            handlePollResponse(response.body());
-                        } else if (response.statusCode() != 204) { // 204 = No content
-                            log.warn("Poll failed with status: {}", response.statusCode());
-                        }
-                    })
-                    .exceptionally(ex -> {
-                        log.error("Error polling parent", ex);
-                        return null;
-                    });
+            // Synchronous call with timeout to prevent indefinite waiting
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+            if (response.statusCode() == 200) {
+                return handlePollResponse(response.body());
+            } else if (response.statusCode() != 204) { // 204 = No content
+                log.warn("Poll failed with status: {}", response.statusCode());
+            }
+
+            return 0;
 
         } catch (Exception e) {
             log.error("Error in pollParent", e);
+            return 0;
         }
     }
 
     /**
      * Handle response from parent poll
+     * @return number of messages received
      */
-    private void handlePollResponse(String responseBody) {
+    private int handlePollResponse(String responseBody) {
         try {
             if (responseBody == null || responseBody.isEmpty()) {
-                return;
+                return 0;
             }
 
             // Parse response as array of MessageRecords
             MessageRecord[] records = objectMapper.readValue(responseBody, MessageRecord[].class);
-
+            List<MessageRecord> list = Arrays.asList(records);
+            Map<String, List<MessageRecord>> collect = list.stream().collect(Collectors.groupingBy(MessageRecord::getTopic));
+            collect.forEach((s, messageRecords) -> {
+                log.info("Topic: {}, Records: {}", s, messageRecords.size());
+            });
             for (MessageRecord record : records) {
                 if (dataHandler != null) {
                     dataHandler.accept(record);
@@ -215,12 +266,15 @@ public class HttpPipeConnector implements PipeConnector {
             }
 
             if (records.length > 0) {
-                log.info("Received {} messages from parent, current offset: {} (last record offset: {})",
+                log.debug("Received {} messages from parent, current offset: {} (last record offset: {})",
                         records.length, currentOffset, connection.lastReceivedOffset);
             }
 
+            return records.length;
+
         } catch (Exception e) {
             log.error("Error handling poll response", e);
+            return 0;
         }
     }
 

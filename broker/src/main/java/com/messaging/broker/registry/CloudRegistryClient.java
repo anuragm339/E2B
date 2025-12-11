@@ -65,7 +65,7 @@ public class CloudRegistryClient {
                 return topology;
 
             } catch (Exception e) {
-                log.error("Error querying Cloud Registry", e);
+//                log.error("Error querying Cloud Registry", e);
                 throw new RuntimeException("Failed to query Cloud Registry", e);
             }
         });

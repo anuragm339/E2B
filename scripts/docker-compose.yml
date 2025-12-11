@@ -29,7 +29,7 @@ services:
   # Messaging Broker
   broker:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/provider
+      context: ./provider
       dockerfile: Dockerfile
     container_name: messaging-broker
     environment:
@@ -61,12 +61,12 @@ services:
   # Consumer 1: Price Quote
   consumer-price-quote:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-price-quote
     environment:
       CONSUMER_TYPE: price-quote
-      CONSUMER_TOPICS: "prices-v1,reference-data-v5,non-promotable-products,prices-v4,minimum-price,deposit"
+      CONSUMER_TOPICS: "reference-data-v5,non-promotable-products,prices-v4,minimum-price,deposit"
       CONSUMER_GROUP: price-quote-group
       CONSUMER_PORT: 8090
       BROKER_HOST: broker
@@ -87,7 +87,7 @@ services:
   # Consumer 2: Product Service Lite
   consumer-product-svc-lite:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-product-svc-lite
     environment:
@@ -113,7 +113,7 @@ services:
   # Consumer 3: Search Enterprise
   consumer-search-enterprise:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-search-enterprise
     environment:
@@ -139,7 +139,7 @@ services:
   # Consumer 4: Tesco Location Service
   consumer-tesco-location-service:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-tesco-location-service
     environment:
@@ -165,7 +165,7 @@ services:
   # Consumer 5: Customer Order On Till
   consumer-customer-order-on-till:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-customer-order-on-till
     environment:
@@ -191,7 +191,7 @@ services:
   # Consumer 6: Colleague Facts
   consumer-colleague-facts:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-colleague-facts
     environment:
@@ -217,7 +217,7 @@ services:
   # Consumer 7: Loss Prevention API
   consumer-loss-prevention-api:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-loss-prevention-api
     environment:
@@ -243,7 +243,7 @@ services:
   # Consumer 8: Stored Value Services
   consumer-stored-value-services:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-stored-value-services
     environment:
@@ -269,7 +269,7 @@ services:
   # Consumer 9: Colleague Identity
   consumer-colleague-identity:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-colleague-identity
     environment:
@@ -295,7 +295,7 @@ services:
   # Consumer 10: Distributed Identity
   consumer-distributed-identity:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-distributed-identity
     environment:
@@ -321,7 +321,7 @@ services:
   # Consumer 11: DCXP Content
   consumer-dcxp-content:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-dcxp-content
     environment:
@@ -347,7 +347,7 @@ services:
   # Consumer 12: Restriction Service On Tills
   consumer-restriction-service-on-tills:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-restriction-service-on-tills
     environment:
@@ -373,7 +373,7 @@ services:
   # Consumer 13: DCXP UGC
   consumer-dcxp-ugc:
     build:
-      context: /Users/anuragmishra/Desktop/workspace/messaging/consumer-app
+      context: ./consumer-app
       dockerfile: Dockerfile
     container_name: consumer-dcxp-ugc
     environment:
@@ -409,7 +409,7 @@ services:
     ports:
       - "9090:9090"
     volumes:
-      - /Users/anuragmishra/Desktop/workspace/messaging/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus-data:/prometheus
     networks:
       - messaging-network
@@ -430,8 +430,9 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - /Users/anuragmishra/Desktop/workspace/messaging/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - /Users/anuragmishra/Desktop/workspace/messaging/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      - ./monitoring/grafana/dashboard-files:/var/lib/grafana/dashboards
       - grafana-data:/var/lib/grafana
     networks:
       - messaging-network

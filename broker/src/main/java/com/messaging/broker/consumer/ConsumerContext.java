@@ -25,6 +25,12 @@ public class ConsumerContext {
     private volatile long lastFailureTime;
     private volatile boolean paused;
 
+    // Batch size tracking for dynamic batch sizing (target: 1MB per batch)
+    private static final int DEFAULT_BATCH_SIZE = 100;
+    private static final long TARGET_BATCH_BYTES = 1024 * 1024; // 1MB
+    private volatile int averageMessageSizeBytes = 1024; // Start with 1KB estimate
+    private volatile int currentBatchSize = DEFAULT_BATCH_SIZE;
+
     public ConsumerContext(String consumerId, Consumer annotation, MessageHandler handler, ErrorHandler errorHandler) {
         this.consumerId = consumerId;
         this.topic = annotation.topic();
@@ -136,6 +142,29 @@ public class ConsumerContext {
                 return Long.MAX_VALUE;
         }
         return fixedRetryIntervalMs;
+    }
+
+    public int getCurrentBatchSize() {
+        return currentBatchSize;
+    }
+
+    public void updateAverageMessageSize(int totalBytesInBatch, int recordCount) {
+        if (recordCount == 0) {
+            return;
+        }
+
+        int batchAverage = totalBytesInBatch / recordCount;
+
+        // Rolling average: 80% old, 20% new (smooth out spikes)
+        this.averageMessageSizeBytes = (int) (averageMessageSizeBytes * 0.8 + batchAverage * 0.2);
+
+        // Recalculate batch size: target 1MB per batch
+        this.currentBatchSize = Math.max(1, (int) (TARGET_BATCH_BYTES / averageMessageSizeBytes));
+    }
+
+    public void reduceBatchSizeForRetry() {
+        // Halve the batch size for retry, minimum 1
+        this.currentBatchSize = Math.max(1, currentBatchSize / 2);
     }
 
     @Override

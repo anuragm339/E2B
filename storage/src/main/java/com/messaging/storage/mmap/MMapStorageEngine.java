@@ -60,8 +60,9 @@ public class MMapStorageEngine implements StorageEngine {
             if (manager == null) {
                 return new ArrayList<>();
             }
-
-            return manager.read(fromOffset, maxRecords);
+            List<MessageRecord> read = manager.read(fromOffset, maxRecords);
+            //log.info("Read {} records: topic={}, partition={}, fromOffset={}", read.size(), topic, partition, fromOffset);
+            return read;
         } catch (IOException e) {
             log.error("Failed to read records: topic={}, partition={}, offset={}",
                     topic, partition, fromOffset, e);
@@ -77,6 +78,16 @@ public class MMapStorageEngine implements StorageEngine {
         }
 
         return manager.getCurrentOffset();
+    }
+
+    @Override
+    public long getEarliestOffset(String topic, int partition) {
+        SegmentManager manager = managers.get(new TopicPartition(topic, partition));
+        if (manager == null) {
+            return 0;  // No segments exist, start from 0
+        }
+
+        return manager.getEarliestOffset();
     }
 
     @Override
