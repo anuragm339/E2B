@@ -261,7 +261,7 @@ public class ThreadMonitor {
     private String categorizeThread(String threadName) {
         if (threadName.contains("nioEventLoopGroup") || threadName.contains("netty")) {
             return "Network I/O";
-        } else if (threadName.contains("RemoteConsumerRegistry") || threadName.contains("consumer-delivery") || threadName.contains("delivery")) {
+        } else if (threadName.contains("RemoteConsumerRegistry") || threadName.contains("consumer-delivery") || threadName.contains("delivery") || threadName.contains("ConsumerOffsetFlusher")) {
             return "Consumer Delivery";
         } else if (threadName.contains("StorageReader") || threadName.contains("storage") || threadName.contains("segment")) {
             return "Storage";

@@ -191,7 +191,8 @@ public class SegmentManager {
     }
 
     /**
-     * Read messages with size limit (1MB batching)
+     * Read messages with cumulative size batching (SQL-like SUM() OVER pattern)
+     * Reads from first record >= fromOffset, handles offset gaps gracefully
      */
     public List<MessageRecord> readWithSizeLimit(long fromOffset, int maxRecords, int maxBytes) throws IOException {
      //   log.info("SegmentManager.read() called: topic={}, partition={}, fromOffset={}, maxRecords={}, maxBytes={}", topic, partition, fromOffset, maxRecords, maxBytes);
@@ -199,23 +200,18 @@ public class SegmentManager {
         List<MessageRecord> records = new ArrayList<>();
         int cumulativeSize = 0;
 
-        // Find the segment containing the starting offset
+        // Find the segment that might contain data >= fromOffset
         var entry = segments.floorEntry(fromOffset);
-       // log.info("segments.floorEntry({}) returned: {}", fromOffset, entry != null ? entry.getKey() : "null");
 
         if (entry == null) {
             // Check active segment
             Segment active = activeSegment.get();
-//            log.info("Checking active segment: baseOffset={}, nextOffset={}",
-//                    active != null ? active.getBaseOffset() : "null",
-//                    active != null ? active.getNextOffset() : "null");
-
-            if (active != null && fromOffset >= active.getBaseOffset() && fromOffset < active.getNextOffset()) {
+            if (active != null && fromOffset < active.getNextOffset()) {
 //                log.info("Using active segment for read");
                 entry = new java.util.AbstractMap.SimpleEntry<>(active.getBaseOffset(), active);
             } else {
-                log.info("No segment found for offset {}, returning empty list", fromOffset);
-                return records; // No data at this offset
+                log.debug("No segment found for offset {}, returning empty list", fromOffset);
+                return records; // No data at or after this offset
             }
         }
 
@@ -224,25 +220,46 @@ public class SegmentManager {
 
         while (records.size() < maxRecords && cumulativeSize < maxBytes) {
             try {
-                // Try to read from current segment
-                if (currentOffset >= currentSegment.getBaseOffset() &&
-                        currentOffset < currentSegment.getNextOffset()) {
-
+                // Try to read from current segment (will find exact or next available offset)
+                if (currentOffset < currentSegment.getNextOffset()) {
                     MessageRecord record = currentSegment.read(currentOffset);
+
+                    // Handle null return (no record at or after currentOffset in this segment)
+                    if (record == null) {
+                        // Move to next segment
+                        var nextEntry = segments.higherEntry(currentSegment.getBaseOffset());
+                        if (nextEntry == null) {
+                            // Check if active segment has more data
+                            Segment active = activeSegment.get();
+                            if (active != null && active != currentSegment) {
+                                currentSegment = active;
+                                currentOffset = active.getBaseOffset();
+                                continue;
+                            } else {
+                                break; // No more data
+                            }
+                        } else {
+                            currentSegment = nextEntry.getValue();
+                            currentOffset = currentSegment.getBaseOffset();
+                            continue;
+                        }
+                    }
 
                     // Calculate record size (approximate)
                     int recordSize = calculateRecordSize(record);
 
-                    // Check if adding this record would exceed size limit
+                    // Check if adding this record would exceed size limit (cumulative batching)
                     if (cumulativeSize + recordSize > maxBytes && !records.isEmpty()) {
-                        log.info("Size limit reached: cumulativeSize={}, recordSize={}, maxBytes={}",
+                        log.debug("Size limit reached: cumulativeSize={}, recordSize={}, maxBytes={}",
                                 cumulativeSize, recordSize, maxBytes);
                         break;
                     }
 
                     records.add(record);
                     cumulativeSize += recordSize;
-                    currentOffset++;
+                    // IMPORTANT: Use actual record offset + 1, not currentOffset + 1
+                    // This handles offset gaps correctly
+                    currentOffset = record.getOffset() + 1;
 
                 } else {
                     // Move to next segment
@@ -250,14 +267,15 @@ public class SegmentManager {
                     if (nextEntry == null) {
                         // Check if active segment has more data
                         Segment active = activeSegment.get();
-                        if (active != null && active != currentSegment &&
-                            currentOffset >= active.getBaseOffset() && currentOffset < active.getNextOffset()) {
+                        if (active != null && active != currentSegment) {
                             currentSegment = active;
+                            currentOffset = active.getBaseOffset();
                         } else {
                             break; // No more data
                         }
                     } else {
                         currentSegment = nextEntry.getValue();
+                        currentOffset = currentSegment.getBaseOffset();
                     }
                 }
             } catch (Exception e) {

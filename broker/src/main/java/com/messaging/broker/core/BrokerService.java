@@ -1,6 +1,7 @@
 package com.messaging.broker.core;
 
 import com.messaging.broker.consumer.ConsumerDeliveryManager;
+import com.messaging.broker.consumer.ConsumerOffsetTracker;
 import com.messaging.broker.consumer.RemoteConsumerRegistry;
 import com.messaging.broker.metrics.BrokerMetrics;
 import com.messaging.broker.registry.TopologyManager;
@@ -37,6 +38,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final RemoteConsumerRegistry remoteConsumers;
     private final TopologyManager topologyManager;
     private final BrokerMetrics metrics;
+    private final ConsumerOffsetTracker offsetTracker;
     private final int serverPort;
     private final ObjectMapper objectMapper;
 
@@ -48,6 +50,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             RemoteConsumerRegistry remoteConsumers,
             TopologyManager topologyManager,
             BrokerMetrics metrics,
+            ConsumerOffsetTracker offsetTracker,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
@@ -56,6 +59,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.remoteConsumers = remoteConsumers;
         this.topologyManager = topologyManager;
         this.metrics = metrics;
+        this.offsetTracker = offsetTracker;
         this.serverPort = serverPort;
         this.objectMapper = new ObjectMapper();
 
@@ -286,9 +290,17 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             JsonNode json = objectMapper.readTree(payload);
 
             String topic = json.get("topic").asText();
+            String group = json.get("group").asText();
             long offset = json.get("offset").asLong();
 
-            log.info("Client {} committed offset: topic={}, offset={}", clientId, topic, offset);
+            log.info("Client {} committed offset: topic={}, group={}, offset={}",
+                     clientId, topic, group, offset);
+
+            // CRITICAL: Persist offset to property file - property file is ONLY source of truth
+            String consumerId = group + ":" + topic;
+            offsetTracker.updateOffset(consumerId, offset);
+
+            log.debug("Persisted offset to property file: consumerId={}, offset={}", consumerId, offset);
 
             // Send ACK
             BrokerMessage ack = new BrokerMessage(

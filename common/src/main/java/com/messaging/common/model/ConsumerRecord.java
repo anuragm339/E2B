@@ -42,6 +42,22 @@ public class ConsumerRecord {
         return createdAt;
     }
 
+    public void setMsgKey(String msgKey) {
+        this.msgKey = msgKey;
+    }
+
+    public void setEventType(EventType eventType) {
+        this.eventType = eventType;
+    }
+
+    public void setData(String data) {
+        this.data = data;
+    }
+
+    public void setCreatedAt(Instant createdAt) {
+        this.createdAt = createdAt;
+    }
+
     // Package-private - only broker framework can access
     long getInternalOffset() {
         return internalOffset;

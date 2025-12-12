@@ -39,7 +39,7 @@ public class RemoteConsumerRegistry {
     private final long maxMessageSizePerConsumer;
     private final int readBatchSize;
 
-    // Map: clientId -> RemoteConsumer
+    // Map: "clientId:topic" -> RemoteConsumer (composite key to support multiple topic subscriptions per client)
     private final Map<String, RemoteConsumer> consumers;
 
     @Inject
@@ -78,21 +78,9 @@ public class RemoteConsumerRegistry {
     public void registerConsumer(String clientId, String topic, String group) {
         RemoteConsumer consumer = new RemoteConsumer(clientId, topic, group);
 
-        // Load persisted offset
+        // Load persisted offset from property file - ONLY source of truth
         String consumerId = group + ":" + topic;
-        long persistedOffset = offsetTracker.getOffset(consumerId);
-
-        // Get earliest available offset from storage
-        // If persisted offset is 0 (new consumer), use the earliest available offset in the topic
-        // This handles cases where the topic has been compacted or messages have been deleted
-        long earliestOffset = storage.getEarliestOffset(topic, 0);
-        long startOffset = persistedOffset;
-
-        if (persistedOffset < earliestOffset) {
-            startOffset = earliestOffset;
-            log.info("Adjusting consumer offset from {} to earliest available offset {} for topic={}",
-                     persistedOffset, earliestOffset, topic);
-        }
+        long startOffset = offsetTracker.getOffset(consumerId);
 
         consumer.setCurrentOffset(startOffset);
 
@@ -100,27 +88,41 @@ public class RemoteConsumerRegistry {
         metrics.updateConsumerOffset(clientId, topic, group, startOffset);
         metrics.updateConsumerLag(clientId, topic, group, 0);
 
-        consumers.put(clientId, consumer);
+        // Use composite key to support multiple topic subscriptions per client
+        String consumerKey = clientId + ":" + topic;
+        consumers.put(consumerKey, consumer);
 
-        // Start delivery task
-        startDelivery(consumer);
+//        // Start delivery task
+//        startDelivery(consumer);
 
-        log.debug("Registered remote consumer: clientId={}, topic={}, group={}, startOffset={}",
-                 clientId, topic, group, startOffset);
+        log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}",
+                 consumerKey, clientId, topic, group, startOffset);
     }
 
     /**
      * Unregister consumer when it disconnects
+     * Removes all topic subscriptions for this client
      */
     public void unregisterConsumer(String clientId) {
-        RemoteConsumer consumer = consumers.remove(clientId);
-        if (consumer != null) {
-            if (consumer.deliveryTask != null) {
-                consumer.deliveryTask.cancel(false);
+        // Find and remove all consumers for this clientId (all topics)
+        List<String> keysToRemove = new ArrayList<>();
+        for (Map.Entry<String, RemoteConsumer> entry : consumers.entrySet()) {
+            if (entry.getValue().clientId.equals(clientId)) {
+                keysToRemove.add(entry.getKey());
             }
-            // Clean up metrics
-            metrics.removeConsumerMetrics(clientId, consumer.topic);
-            log.info("Unregistered remote consumer: {}", clientId);
+        }
+
+        for (String key : keysToRemove) {
+            RemoteConsumer consumer = consumers.remove(key);
+            if (consumer != null) {
+                if (consumer.deliveryTask != null) {
+                    consumer.deliveryTask.cancel(false);
+                }
+                // Clean up metrics
+                metrics.removeConsumerMetrics(clientId, consumer.topic);
+                log.info("Unregistered remote consumer: consumerKey={}, clientId={}, topic={}",
+                         key, clientId, consumer.topic);
+            }
         }
     }
 
@@ -129,7 +131,7 @@ public class RemoteConsumerRegistry {
      */
     private void startDelivery(RemoteConsumer consumer) {
         Future<?> task = scheduler.scheduleWithFixedDelay(
-                () -> deliverMessages(consumer),
+                () -> deliverMessages(consumer,null),
                 500, // Wait 500ms before first delivery to allow ACK to complete
                 POLL_INTERVAL_MS,
                 TimeUnit.MILLISECONDS
@@ -140,7 +142,7 @@ public class RemoteConsumerRegistry {
     /**
      * Deliver messages to a remote consumer
      */
-    private void deliverMessages(RemoteConsumer consumer) {
+    private void deliverMessages(RemoteConsumer consumer,Long offset) {
         try {
             long currentOffset = consumer.getCurrentOffset();
 
@@ -164,7 +166,7 @@ public class RemoteConsumerRegistry {
                         log.error("Exception in storage.read(): ", e);
                         throw new RuntimeException(e);
                     }
-                }, storageExecutor).get(10, TimeUnit.MINUTES);
+                }, storageExecutor).get(10, TimeUnit.SECONDS);
 
                 metrics.stopStorageReadTimer(readSample);
                 metrics.recordStorageRead();
@@ -245,8 +247,15 @@ public class RemoteConsumerRegistry {
                          messagesSent, totalBytesSent, consumer.clientId);
             }
 
-            // Update offset
+            // Update offset in memory
             consumer.setCurrentOffset(currentOffset);
+
+            // CRITICAL: Persist offset to property file after successful delivery
+            // Property file is the ONLY source of truth for consumer offsets
+            String consumerId = consumer.group + ":" + consumer.topic;
+            offsetTracker.updateOffset(consumerId, currentOffset);
+            log.debug("Persisted offset to property file after successful delivery: consumerId={}, offset={}",
+                     consumerId, currentOffset);
 
             // Update consumer offset metric
             metrics.updateConsumerOffset(consumer.clientId, consumer.topic, consumer.group, currentOffset);
@@ -261,14 +270,6 @@ public class RemoteConsumerRegistry {
                 metrics.updateConsumerLag(consumer.clientId, consumer.topic, consumer.group, Math.max(0, lag));
             } catch (Exception e) {
                 log.debug("Could not calculate lag for consumer {}: {}", consumer.clientId, e.getMessage());
-            }
-
-            // Persist offset periodically (every 100 messages or every 5 seconds)
-            if (currentOffset % 100 == 0 ||
-                System.currentTimeMillis() - consumer.lastOffsetPersist > 5000) {
-                String consumerId = consumer.group + ":" + consumer.topic;
-                offsetTracker.updateOffset(consumerId, currentOffset);
-                consumer.lastOffsetPersist = System.currentTimeMillis();
             }
 
         } catch (Exception e) {
@@ -286,6 +287,12 @@ public class RemoteConsumerRegistry {
         // Create list of ConsumerRecords (offset is tracked separately by broker)
         List<ConsumerRecord> consumerRecords = new ArrayList<>(records.size());
         for (MessageRecord record : records) {
+            log.debug("Creating ConsumerRecord: msgKey={}, eventType={}, dataLen={}, createdAt={}",
+                     record.getMsgKey(),
+                     record.getEventType(),
+                     record.getData() != null ? record.getData().length() : 0,
+                     record.getCreatedAt());
+
             consumerRecords.add(new ConsumerRecord(
                 record.getMsgKey(),
                 record.getEventType(),
@@ -296,6 +303,7 @@ public class RemoteConsumerRegistry {
 
         // Serialize batch to JSON
         String json = objectMapper.writeValueAsString(consumerRecords);
+        log.debug("Serialized batch to JSON, length={} bytes", json.length());
 
         // Create DATA message
         BrokerMessage message = new BrokerMessage(
@@ -324,7 +332,7 @@ public class RemoteConsumerRegistry {
                 // DO NOT update consumer offset here - let consumer maintain its own offset
                 // based on what it has successfully delivered
                 // Submit immediate delivery task (non-blocking)
-                scheduler.submit(() -> deliverMessages(consumer));
+                scheduler.submit(() -> deliverMessages(consumer,offset));
             }
         }
     }
@@ -361,7 +369,6 @@ public class RemoteConsumerRegistry {
         final String topic;
         final String group;
         volatile long currentOffset;
-        volatile long lastOffsetPersist;
         volatile Future<?> deliveryTask;
 
         RemoteConsumer(String clientId, String topic, String group) {
@@ -369,7 +376,6 @@ public class RemoteConsumerRegistry {
             this.topic = topic;
             this.group = group;
             this.currentOffset = 0;
-            this.lastOffsetPersist = System.currentTimeMillis();
         }
 
         long getCurrentOffset() {
