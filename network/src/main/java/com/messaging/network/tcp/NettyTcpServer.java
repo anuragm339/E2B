@@ -149,6 +149,31 @@ public class NettyTcpServer implements NetworkServer {
     }
 
     @Override
+    public CompletableFuture<Void> sendFileRegion(String clientId, FileRegion fileRegion) {
+        Channel channel = clientChannels.get(clientId);
+        if (channel == null || !channel.isActive()) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Client not connected: " + clientId));
+        }
+
+        CompletableFuture<Void> future = new CompletableFuture<>();
+
+        // Send FileRegion directly to Netty channel for zero-copy transfer
+        // Netty will use sendfile() syscall for direct file-to-socket transfer
+        channel.writeAndFlush(fileRegion).addListener((ChannelFutureListener) channelFuture -> {
+            if (channelFuture.isSuccess()) {
+                future.complete(null);
+                log.debug("Zero-copy FileRegion sent successfully to client: {}", clientId);
+            } else {
+                future.completeExceptionally(channelFuture.cause());
+                log.error("Failed to send FileRegion to client: {}", clientId, channelFuture.cause());
+            }
+        });
+
+        return future;
+    }
+
+    @Override
     public void broadcast(BrokerMessage message) {
         for (Channel channel : clientChannels.values()) {
             if (channel.isActive()) {

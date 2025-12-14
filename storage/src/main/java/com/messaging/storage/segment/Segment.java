@@ -2,6 +2,8 @@ package com.messaging.storage.segment;
 
 import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
+import io.netty.channel.DefaultFileRegion;
+import io.netty.channel.FileRegion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,9 +23,9 @@ import java.util.zip.CRC32;
 public class Segment {
     private static final Logger log = LoggerFactory.getLogger(Segment.class);
     private static final int INDEX_ENTRY_SIZE = 12; // 8 bytes actual offset (long) + 4 bytes position
-    private static final long INITIAL_MMAP_SIZE = 64 * 1024 * 1024; // Start with 64MB
-    private static final long MMAP_GROWTH_SIZE = 64 * 1024 * 1024; // Grow by 64MB chunks
-    private static final long INDEX_INITIAL_SIZE = 1 * 1024 * 1024; // 1MB for index
+    private static final long INITIAL_MMAP_SIZE = 16 * 1024 * 1024; // Start with 16MB (reduced from 64MB)
+    private static final long MMAP_GROWTH_SIZE = 16 * 1024 * 1024; // Grow by 16MB chunks (reduced from 64MB)
+    private static final long INDEX_INITIAL_SIZE = 512 * 1024; // 512KB for index (reduced from 1MB)
 
     private  long baseOffset;
     private final Path logPath;
@@ -665,6 +667,87 @@ public class Segment {
     }
 
     /**
+     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
+     * Returns metadata about the batch that will be sent
+     */
+    public BatchFileRegion getBatchFileRegion(long startOffset, int maxRecords, long maxBytes) throws IOException {
+        // Find starting position
+        int startPosition = findPosition(startOffset);
+
+        if (startPosition == -1) {
+            // No records at or after startOffset
+            return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+        }
+
+        // Scan forward to determine batch size
+        BatchInfo batchInfo = scanBatch(startPosition, startOffset, maxRecords, maxBytes);
+
+        if (batchInfo.recordCount == 0) {
+            return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+        }
+
+        // Create FileRegion for zero-copy transfer
+        FileRegion fileRegion = new DefaultFileRegion(logChannel, startPosition, batchInfo.totalBytes);
+
+        return new BatchFileRegion(
+            fileRegion,
+            logChannel,
+            batchInfo.recordCount,
+            batchInfo.totalBytes,
+            batchInfo.lastOffset,
+            startPosition
+        );
+    }
+
+    /**
+     * Scan forward to determine batch boundaries
+     * Implements cumulative size batching
+     */
+    private BatchInfo scanBatch(int startPosition, long targetOffset, int maxRecords, long maxBytes) {
+        int position = startPosition;
+        int recordCount = 0;
+        long cumulativeBytes = 0;
+        long lastOffset = targetOffset - 1;
+
+        while (position < logPosition && recordCount < maxRecords) {
+            int recordStart = position;
+
+            // Read offset
+            long recordOffset = logBuffer.getLong(position);
+            position += 8;
+
+            // Read key length
+            int keyLen = logBuffer.getInt(position);
+            position += 4 + keyLen;
+
+            // Skip event type
+            position += 1;
+
+            // Read data length
+            int dataLen = logBuffer.getInt(position);
+            position += 4 + dataLen;
+
+            // Skip timestamp and CRC
+            position += 8 + 4;
+
+            // Calculate record size
+            long recordSize = position - recordStart;
+
+            // Check cumulative size limit (SQL-like: SUM() OVER)
+            if (cumulativeBytes + recordSize > maxBytes && recordCount > 0) {
+                // Would exceed limit, stop here
+                break;
+            }
+
+            cumulativeBytes += recordSize;
+            recordCount++;
+            lastOffset = recordOffset;
+        }
+
+        return new BatchInfo(recordCount, cumulativeBytes, lastOffset);
+    }
+
+    /**
      * Close the segment and release resources
      */
     public void close() throws IOException {
@@ -672,6 +755,43 @@ public class Segment {
 
         logChannel.close();
         indexChannel.close();
+    }
+
+    /**
+     * Metadata about a batch for zero-copy transfer
+     */
+    public static class BatchFileRegion {
+        public final FileRegion fileRegion;  // null if no records
+        public final FileChannel fileChannel;  // For reading batch data
+        public final int recordCount;
+        public final long totalBytes;
+        public final long lastOffset;
+        public final long filePosition;
+
+        public BatchFileRegion(FileRegion fileRegion, FileChannel fileChannel, int recordCount, long totalBytes,
+                              long lastOffset, long filePosition) {
+            this.fileRegion = fileRegion;
+            this.fileChannel = fileChannel;
+            this.recordCount = recordCount;
+            this.totalBytes = totalBytes;
+            this.lastOffset = lastOffset;
+            this.filePosition = filePosition;
+        }
+    }
+
+    /**
+     * Internal class for batch scanning
+     */
+    private static class BatchInfo {
+        final int recordCount;
+        final long totalBytes;
+        final long lastOffset;
+
+        BatchInfo(int recordCount, long totalBytes, long lastOffset) {
+            this.recordCount = recordCount;
+            this.totalBytes = totalBytes;
+            this.lastOffset = lastOffset;
+        }
     }
 
     // Getters

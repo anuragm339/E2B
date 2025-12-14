@@ -260,7 +260,7 @@ public class HttpPipeConnector implements PipeConnector {
                     dataHandler.accept(record);
                 }
                 // Use actual offset from the record, not just increment
-                currentOffset = record.getOffset() + 1;  // Next offset to fetch
+                currentOffset = record.getOffset();  // Next offset to fetch
                 connection.lastReceivedOffset = record.getOffset();
                 connection.lastMessageTime = System.currentTimeMillis();
             }

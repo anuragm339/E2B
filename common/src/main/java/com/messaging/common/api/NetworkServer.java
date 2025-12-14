@@ -1,6 +1,7 @@
 package com.messaging.common.api;
 
 import com.messaging.common.model.BrokerMessage;
+import io.netty.channel.FileRegion;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
@@ -29,6 +30,14 @@ public interface NetworkServer {
      * @return Future that completes when sent
      */
     CompletableFuture<Void> send(String clientId, BrokerMessage message);
+
+    /**
+     * Send FileRegion to specific client for zero-copy transfer
+     * @param clientId Client identifier
+     * @param fileRegion FileRegion to send
+     * @return Future that completes when sent
+     */
+    CompletableFuture<Void> sendFileRegion(String clientId, FileRegion fileRegion);
 
     /**
      * Broadcast message to all connected clients

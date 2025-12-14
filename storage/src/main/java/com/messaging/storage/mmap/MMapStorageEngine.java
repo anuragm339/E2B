@@ -70,6 +70,26 @@ public class MMapStorageEngine implements StorageEngine {
         }
     }
 
+    /**
+     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
+     * @return BatchFileRegion containing FileRegion for zero-copy transfer + metadata
+     */
+    public com.messaging.storage.segment.Segment.BatchFileRegion getZeroCopyBatch(
+            String topic, int partition, long fromOffset, int maxRecords, long maxBytes) {
+        try {
+            SegmentManager manager = managers.get(new TopicPartition(topic, partition));
+            if (manager == null) {
+                log.debug("No segment manager for topic={}, partition={}", topic, partition);
+                return new com.messaging.storage.segment.Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
+            }
+            return manager.getZeroCopyBatch(fromOffset, maxRecords, maxBytes);
+        } catch (IOException e) {
+            log.error("Failed to get zero-copy batch: topic={}, partition={}, offset={}",
+                    topic, partition, fromOffset, e);
+            throw new RuntimeException("Failed to get zero-copy batch", e);
+        }
+    }
+
     @Override
     public long getCurrentOffset(String topic, int partition) {
         SegmentManager manager = managers.get(new TopicPartition(topic, partition));

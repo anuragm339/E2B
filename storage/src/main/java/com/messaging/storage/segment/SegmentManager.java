@@ -289,6 +289,35 @@ public class SegmentManager {
     }
 
     /**
+     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
+     * Currently only supports reading from a single segment (no cross-segment batches)
+     */
+    public Segment.BatchFileRegion getZeroCopyBatch(long fromOffset, int maxRecords, long maxBytes) throws IOException {
+        log.debug("SegmentManager.getZeroCopyBatch() called: topic={}, partition={}, fromOffset={}, maxRecords={}, maxBytes={}",
+                topic, partition, fromOffset, maxRecords, maxBytes);
+
+        // Find the segment that contains this offset
+        var entry = segments.floorEntry(fromOffset);
+
+        if (entry == null) {
+            // Check active segment
+            Segment active = activeSegment.get();
+            if (active != null && fromOffset < active.getNextOffset()) {
+                log.debug("Using active segment for zero-copy read");
+                return active.getBatchFileRegion(fromOffset, maxRecords, maxBytes);
+            } else {
+                log.debug("No segment found for offset {}, returning null", fromOffset);
+                return new Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
+            }
+        }
+
+        Segment currentSegment = entry.getValue();
+
+        // Get zero-copy batch from segment
+        return currentSegment.getBatchFileRegion(fromOffset, maxRecords, maxBytes);
+    }
+
+    /**
      * Calculate approximate size of a message record
      */
     private int calculateRecordSize(MessageRecord record) {

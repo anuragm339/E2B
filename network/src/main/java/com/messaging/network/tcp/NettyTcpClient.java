@@ -6,6 +6,7 @@ import com.messaging.network.codec.BinaryMessageDecoder;
 import com.messaging.network.codec.BinaryMessageEncoder;
 import com.messaging.network.codec.JsonMessageDecoder;
 import com.messaging.network.codec.JsonMessageEncoder;
+import com.messaging.network.codec.ZeroCopyBatchDecoder;
 import com.messaging.network.handler.ClientMessageHandler;
 import io.micronaut.context.annotation.Requires;
 import io.netty.bootstrap.Bootstrap;
@@ -55,8 +56,8 @@ public class NettyTcpClient implements NetworkClient {
                         protected void initChannel(SocketChannel ch) throws Exception {
                             ChannelPipeline pipeline = ch.pipeline();
 
-                            // Codecs (Binary format for efficiency - zero-copy optimization)
-                            pipeline.addLast("decoder", new BinaryMessageDecoder());
+                            // Codecs (Zero-copy batch decoder for efficient file-to-network transfer)
+                            pipeline.addLast("decoder", new ZeroCopyBatchDecoder());
                             pipeline.addLast("encoder", new BinaryMessageEncoder());
 
                             // Business logic handler
