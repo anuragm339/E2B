@@ -32,8 +32,8 @@ public class BinaryMessageDecoder extends ByteToMessageDecoder {
         long messageId = in.readLong();
         int payloadLength = in.readInt();
 
-        log.debug("Decoding message: typeCode={}, messageId={}, payloadLength={}, readable={}",
-                  typeCode, messageId, payloadLength, in.readableBytes());
+//        log.debug("Decoding message: typeCode={}, messageId={}, payloadLength={}, readable={}",
+//                  typeCode, messageId, payloadLength, in.readableBytes());
 
         // Validate payload length
         if (payloadLength < 0 || payloadLength > 10 * 1024 * 1024) { // Max 10MB

@@ -2,6 +2,8 @@ package com.messaging.storage.segment;
 
 import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
+import io.netty.channel.DefaultFileRegion;
+import io.netty.channel.FileRegion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,12 +22,12 @@ import java.util.zip.CRC32;
  */
 public class Segment {
     private static final Logger log = LoggerFactory.getLogger(Segment.class);
-    private static final int INDEX_ENTRY_SIZE = 8; // 4 bytes relative offset + 4 bytes position
-    private static final long INITIAL_MMAP_SIZE = 64 * 1024 * 1024; // Start with 64MB
-    private static final long MMAP_GROWTH_SIZE = 64 * 1024 * 1024; // Grow by 64MB chunks
-    private static final long INDEX_INITIAL_SIZE = 1 * 1024 * 1024; // 1MB for index
+    private static final int INDEX_ENTRY_SIZE = 12; // 8 bytes actual offset (long) + 4 bytes position
+    private static final long INITIAL_MMAP_SIZE = 16 * 1024 * 1024; // Start with 16MB (reduced from 64MB)
+    private static final long MMAP_GROWTH_SIZE = 16 * 1024 * 1024; // Grow by 16MB chunks (reduced from 64MB)
+    private static final long INDEX_INITIAL_SIZE = 512 * 1024; // 512KB for index (reduced from 1MB)
 
-    private final long baseOffset;
+    private  long baseOffset;
     private final Path logPath;
     private final Path indexPath;
     private final FileChannel logChannel;
@@ -291,7 +293,9 @@ public class Segment {
             throw new IllegalStateException("Segment is not active");
         }
 
-        long offset = nextOffset++;
+
+        this.nextOffset=record.getOffset()+1;
+        long offset = record.getOffset();
 
         // Calculate CRC32 for the record with the new offset
         int crc32 = calculateCRC32(record, offset);
@@ -305,6 +309,9 @@ public class Segment {
             addIndexEntry(offset, logPosition - recordSize);
         }
 
+        if(this.baseOffset==0){
+            this.baseOffset=offset;
+        }
         return record.getOffset();
     }
 
@@ -410,9 +417,9 @@ public class Segment {
             expandIndexMapping();
         }
 
-        int relativeOffset = (int) (offset - baseOffset);
-        indexBuffer.putInt(indexPosition, relativeOffset);
-        indexPosition += 4;
+        // Store actual cloud offset as 8-byte long (not relative offset)
+        indexBuffer.putLong(indexPosition, offset);
+        indexPosition += 8;
         indexBuffer.putInt(indexPosition, position);
         indexPosition += 4;
     }
@@ -446,22 +453,26 @@ public class Segment {
     }
 
     /**
-     * Read a record at the given offset
+     * Read a record at the given offset or next available offset
+     * Returns null if no record exists at or after the requested offset
      */
     public MessageRecord read(long offset) throws IOException {
+        // Remove strict range validation - allow reading from next available offset
+        // This handles offset gaps gracefully
 
-
-        if (offset < baseOffset || offset >= nextOffset) {
-            throw new IllegalArgumentException("Offset " + offset + " out of range [" + baseOffset + ", " + nextOffset + ")");
-        }
-
-        // Find position using index
+        // Find position using index (returns exact match or next available)
         //log.info("Calling findPosition() for offset={}", offset);
         int position = findPosition(offset);
         //log.info("findPosition() returned position={}", position);
 
+        // Handle case where no offset >= target exists in this segment
+        if (position == -1) {
+            log.debug("No record found at or after offset {} in segment", offset);
+            return null;
+        }
+
         //log.info("Calling readRecordAt() at position={}", position);
-        MessageRecord record = readRecordAt(position, offset);
+        MessageRecord record = readRecordAt(position);
         //log.info("Successfully read record: key={}", record.getMsgKey());
 
         return record;
@@ -471,10 +482,10 @@ public class Segment {
      * Find the file position for a given offset using the index
      */
     private int findPosition(long offset) {
-        int relativeOffset = (int) (offset - baseOffset);
+        // No conversion needed - use actual offset directly
 
-        //log.info("findPosition(): relativeOffset={}, indexPosition={}, logPosition={}, active={}",
-            //     relativeOffset, indexPosition, logPosition, active);
+        //log.info("findPosition(): offset={}, indexPosition={}, logPosition={}, active={}",
+            //     offset, indexPosition, logPosition, active);
 
         // For active segments with no index or small index, use sequential scan from start
         // This is similar to how Kafka handles active segment reads
@@ -492,12 +503,12 @@ public class Segment {
 
         while (low <= high) {
             int mid = (low + high) / 2;
-            int midOffset = indexBuffer.getInt(mid * INDEX_ENTRY_SIZE);
+            long midOffset = indexBuffer.getLong(mid * INDEX_ENTRY_SIZE);  // Read actual offset as long
 
-            if (midOffset == relativeOffset) {
-                return indexBuffer.getInt(mid * INDEX_ENTRY_SIZE + 4);
-            } else if (midOffset < relativeOffset) {
-                resultPosition = indexBuffer.getInt(mid * INDEX_ENTRY_SIZE + 4);
+            if (midOffset == offset) {
+                return indexBuffer.getInt(mid * INDEX_ENTRY_SIZE + 8);  // Position is at offset+8 (long=8 bytes)
+            } else if (midOffset < offset) {
+                resultPosition = indexBuffer.getInt(mid * INDEX_ENTRY_SIZE + 8);  // Position is at offset+8
                 low = mid + 1;
             } else {
                 high = mid - 1;
@@ -512,7 +523,8 @@ public class Segment {
     }
 
     /**
-     * Scan forward from a position to find the exact offset
+     * Scan forward from a position to find the exact offset or next available offset
+     * Implements "OrNext" behavior - returns position of exact match or first offset > target
      */
     private int scanToOffset(int startPosition, long targetOffset) {
         int position = startPosition;
@@ -535,13 +547,14 @@ public class Segment {
             log.debug("Read recordOffset={} at position={}", recordOffset, position);
 
             if (recordOffset == targetOffset) {
-                //log.info("Found target offset at position={}", position);
+                //log.info("Found exact target offset at position={}", position);
                 return position;
             }
 
             if (recordOffset > targetOffset) {
-                log.error("Offset not found: targetOffset={}, recordOffset={}", targetOffset, recordOffset);
-                throw new IllegalStateException("Offset not found: " + targetOffset);
+                // Found first offset > target - return this position (handles offset gaps)
+                log.debug("Auto-advancing: Found offset {} (requested >= {})", recordOffset, targetOffset);
+                return position;
             }
 
             // Skip to next record
@@ -557,23 +570,21 @@ public class Segment {
             position += 4; // crc32
         }
 
-        log.error("Exited scan loop without finding offset. position={}, logPosition={}", position, logPosition);
-        throw new IllegalStateException("Offset not found: " + targetOffset);
+        // No offset >= target found in this segment
+        log.debug("No offset >= {} found in segment (scanned to end)", targetOffset);
+        return -1;
     }
 
     /**
      * Read a record at a specific file position
+     * No offset validation - reads whatever record exists at the position
      */
-    private MessageRecord readRecordAt(int position, long expectedOffset) throws IOException {
+    private MessageRecord readRecordAt(int position) throws IOException {
         MessageRecord record = new MessageRecord();
 
-        // Read offset
+        // Read offset (no validation - accept whatever offset is stored)
         long offset = logBuffer.getLong(position);
         position += 8;
-
-        if (offset != expectedOffset) {
-            throw new IOException("Offset mismatch: expected " + expectedOffset + ", found " + offset);
-        }
 
         record.setOffset(offset);
 
@@ -656,6 +667,87 @@ public class Segment {
     }
 
     /**
+     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
+     * Returns metadata about the batch that will be sent
+     */
+    public BatchFileRegion getBatchFileRegion(long startOffset, int maxRecords, long maxBytes) throws IOException {
+        // Find starting position
+        int startPosition = findPosition(startOffset);
+
+        if (startPosition == -1) {
+            // No records at or after startOffset
+            return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+        }
+
+        // Scan forward to determine batch size
+        BatchInfo batchInfo = scanBatch(startPosition, startOffset, maxRecords, maxBytes);
+
+        if (batchInfo.recordCount == 0) {
+            return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+        }
+
+        // Create FileRegion for zero-copy transfer
+        FileRegion fileRegion = new DefaultFileRegion(logChannel, startPosition, batchInfo.totalBytes);
+
+        return new BatchFileRegion(
+            fileRegion,
+            logChannel,
+            batchInfo.recordCount,
+            batchInfo.totalBytes,
+            batchInfo.lastOffset,
+            startPosition
+        );
+    }
+
+    /**
+     * Scan forward to determine batch boundaries
+     * Implements cumulative size batching
+     */
+    private BatchInfo scanBatch(int startPosition, long targetOffset, int maxRecords, long maxBytes) {
+        int position = startPosition;
+        int recordCount = 0;
+        long cumulativeBytes = 0;
+        long lastOffset = targetOffset - 1;
+
+        while (position < logPosition && recordCount < maxRecords) {
+            int recordStart = position;
+
+            // Read offset
+            long recordOffset = logBuffer.getLong(position);
+            position += 8;
+
+            // Read key length
+            int keyLen = logBuffer.getInt(position);
+            position += 4 + keyLen;
+
+            // Skip event type
+            position += 1;
+
+            // Read data length
+            int dataLen = logBuffer.getInt(position);
+            position += 4 + dataLen;
+
+            // Skip timestamp and CRC
+            position += 8 + 4;
+
+            // Calculate record size
+            long recordSize = position - recordStart;
+
+            // Check cumulative size limit (SQL-like: SUM() OVER)
+            if (cumulativeBytes + recordSize > maxBytes && recordCount > 0) {
+                // Would exceed limit, stop here
+                break;
+            }
+
+            cumulativeBytes += recordSize;
+            recordCount++;
+            lastOffset = recordOffset;
+        }
+
+        return new BatchInfo(recordCount, cumulativeBytes, lastOffset);
+    }
+
+    /**
      * Close the segment and release resources
      */
     public void close() throws IOException {
@@ -663,6 +755,43 @@ public class Segment {
 
         logChannel.close();
         indexChannel.close();
+    }
+
+    /**
+     * Metadata about a batch for zero-copy transfer
+     */
+    public static class BatchFileRegion {
+        public final FileRegion fileRegion;  // null if no records
+        public final FileChannel fileChannel;  // For reading batch data
+        public final int recordCount;
+        public final long totalBytes;
+        public final long lastOffset;
+        public final long filePosition;
+
+        public BatchFileRegion(FileRegion fileRegion, FileChannel fileChannel, int recordCount, long totalBytes,
+                              long lastOffset, long filePosition) {
+            this.fileRegion = fileRegion;
+            this.fileChannel = fileChannel;
+            this.recordCount = recordCount;
+            this.totalBytes = totalBytes;
+            this.lastOffset = lastOffset;
+            this.filePosition = filePosition;
+        }
+    }
+
+    /**
+     * Internal class for batch scanning
+     */
+    private static class BatchInfo {
+        final int recordCount;
+        final long totalBytes;
+        final long lastOffset;
+
+        BatchInfo(int recordCount, long totalBytes, long lastOffset) {
+            this.recordCount = recordCount;
+            this.totalBytes = totalBytes;
+            this.lastOffset = lastOffset;
+        }
     }
 
     // Getters
