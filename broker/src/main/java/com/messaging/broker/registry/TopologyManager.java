@@ -51,9 +51,10 @@ public class TopologyManager {
         this.pipeConnector = pipeConnector;
         this.registryUrl = registryUrl;
         this.nodeId = nodeId;
-        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), r -> {
+        // Use single thread - topology updates are infrequent (every 30s)
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r);
-            t.setName("TopologyManager-" + threadCounter.incrementAndGet());
+            t.setName("TopologyManager");
             return t;
         });
         this.running = false;

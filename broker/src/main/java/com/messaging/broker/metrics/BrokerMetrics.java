@@ -165,6 +165,14 @@ public class BrokerMetrics {
         bytesSent.increment(bytes);
     }
 
+    /**
+     * Record multiple messages sent in a batch (efficient version)
+     */
+    public void recordBatchMessagesSent(int messageCount, long totalBytes) {
+        messagesSent.increment(messageCount);
+        bytesSent.increment(totalBytes);
+    }
+
     public void recordMessageStored() {
         messagesStored.increment();
     }

@@ -49,8 +49,8 @@ public class RemoteConsumerRegistry {
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
-                                  @Value("${broker.consumer.max-message-size-per-consumer:1048576}") long maxMessageSizePerConsumer,
-                                  @Value("${broker.consumer.max-batch-size-per-consumer:100}") int readBatchSize) {
+                                  @Value("${broker.consumer.max-message-size-per-consumer:524288}") long maxMessageSizePerConsumer,  // Reduced from 1MB to 512KB
+                                  @Value("${broker.consumer.max-batch-size-per-consumer:50}") int readBatchSize) {  // Reduced from 100 to 50
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
@@ -59,11 +59,13 @@ public class RemoteConsumerRegistry {
         this.readBatchSize = readBatchSize;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
-        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(),runnable -> {
+        // Reduced thread pool: use half of available cores (min 2) to lower CPU usage
+        int schedulerThreads = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        this.scheduler = Executors.newScheduledThreadPool(schedulerThreads, runnable -> {
             Thread t = new Thread(runnable);
-            t.setName("RemoteConsumerRegistry" + t.getId());
+            t.setName("RemoteConsumerRegistry-" + t.getId());
             return t;
-        } );
+        });
         // Separate thread pool for storage operations to prevent deadlock
         // Reduced to 1x CPU cores to minimize memory usage (was 2x)
         this.storageExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors(), runnable -> {
@@ -210,8 +212,8 @@ public class RemoteConsumerRegistry {
                 metrics.recordConsumerMessageSent(consumer.clientId, consumer.topic, consumer.group, batchRegion.totalBytes);
                 metrics.stopConsumerDeliveryTimer(deliverySample, consumer.clientId, consumer.topic, consumer.group);
 
-                // Record global metrics
-                metrics.recordMessageSent(batchRegion.totalBytes);
+                // Record global metrics - efficient batch method
+                metrics.recordBatchMessagesSent(batchRegion.recordCount, batchRegion.totalBytes);
 
                 // Update offset to after the last message sent
                 currentOffset = batchRegion.lastOffset + 1;
@@ -319,20 +321,16 @@ public class RemoteConsumerRegistry {
     public void notifyNewMessage(String topic, long offset) {
         log.debug("New message notification: topic={}, offset={}", topic, offset);
 
+        long now = System.currentTimeMillis();
         // Find all consumers subscribed to this topic and trigger immediate delivery
         for (RemoteConsumer consumer : consumers.values()) {
             if (consumer.topic.equals(topic)) {
-                // Rate limiting: Only submit delivery task if last attempt was > 100ms ago
-                long now = System.currentTimeMillis();
-                long timeSinceLastDelivery = now - consumer.lastDeliveryAttempt;
-
-                if (timeSinceLastDelivery >= 100) {
+                // Rate limiting: Only submit delivery task if last attempt was > 200ms ago (increased from 100ms)
+                if (now - consumer.lastDeliveryAttempt >= 200) {
                     consumer.lastDeliveryAttempt = now;
-                    // Submit immediate delivery task (non-blocking)
                     scheduler.submit(() -> deliverMessages(consumer,offset));
                 } else {
-                    log.trace("Skipping delivery for consumer {} - last attempt was {}ms ago",
-                             consumer.clientId, timeSinceLastDelivery);
+                    log.debug("Skipping delivery for consumer {} - rate limited", consumer.clientId);
                 }
             }
         }

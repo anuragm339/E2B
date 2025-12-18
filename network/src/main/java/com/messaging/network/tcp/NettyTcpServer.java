@@ -44,7 +44,7 @@ public class NettyTcpServer implements NetworkServer {
 
     public NettyTcpServer(
             @Value("${broker.network.threads.boss:2}") int bossThreads,
-            @Value("${broker.network.threads.worker:16}") int workerThreads) {
+            @Value("${broker.network.threads.worker:8}") int workerThreads) {
 
         this.bossThreads = bossThreads;
         this.workerThreads = workerThreads;
