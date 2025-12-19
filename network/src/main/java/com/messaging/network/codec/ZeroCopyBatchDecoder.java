@@ -84,8 +84,29 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             return; // Wait for more data
         }
 
-        // Check if this is a zero-copy batch (DATA message with payload > 20 bytes containing header + data)
         BrokerMessage.MessageType messageType = BrokerMessage.MessageType.fromCode(typeCode);
+
+        // Handle BATCH_HEADER message - this signals that raw FileRegion bytes will follow
+        if (messageType == BrokerMessage.MessageType.BATCH_HEADER) {
+            // Read batch metadata from payload
+            byte[] payload = new byte[payloadLength];
+            in.readBytes(payload);
+
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(payload);
+            expectedRecordCount = buffer.getInt();
+            expectedTotalBytes = buffer.getLong();
+            lastOffset = buffer.getLong();
+
+            log.info("Received BATCH_HEADER: recordCount={}, totalBytes={}, lastOffset={}",
+                    expectedRecordCount, expectedTotalBytes, lastOffset);
+
+            // Transition to READING_ZERO_COPY_BATCH state to expect raw bytes
+            state = DecoderState.READING_ZERO_COPY_BATCH;
+
+            return; // Don't add anything to output, wait for batch data
+        }
+
+        // Check if this is a zero-copy batch (DATA message with payload > 20 bytes containing header + data)
         if (messageType == BrokerMessage.MessageType.DATA && payloadLength > ZERO_COPY_HEADER_SIZE) {
             // This might be a zero-copy batch - read the header first
             int headerRecordCount = in.readInt();
