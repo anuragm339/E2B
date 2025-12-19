@@ -49,8 +49,8 @@ public class RemoteConsumerRegistry {
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
-                                  @Value("${broker.consumer.max-message-size-per-consumer:1048576}") long maxMessageSizePerConsumer,
-                                  @Value("${broker.consumer.max-batch-size-per-consumer:100}") int readBatchSize) {
+                                  @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer,  // Reduced from 1MB to 512KB
+                                  @Value("${broker.consumer.max-batch-size-per-consumer}") int readBatchSize) {  // Reduced from 100 to 50
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
@@ -59,11 +59,13 @@ public class RemoteConsumerRegistry {
         this.readBatchSize = readBatchSize;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
-        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(),runnable -> {
+        // Reduced thread pool: use half of available cores (min 2) to lower CPU usage
+        int schedulerThreads = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
+        this.scheduler = Executors.newScheduledThreadPool(schedulerThreads, runnable -> {
             Thread t = new Thread(runnable);
-            t.setName("RemoteConsumerRegistry" + t.getId());
+            t.setName("RemoteConsumerRegistry-" + t.getId());
             return t;
-        } );
+        });
         // Separate thread pool for storage operations to prevent deadlock
         // Reduced to 1x CPU cores to minimize memory usage (was 2x)
         this.storageExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors(), runnable -> {
@@ -163,13 +165,18 @@ public class RemoteConsumerRegistry {
                 final long offsetToRead = currentOffset; // Must be final for lambda
                 Timer.Sample readSample = metrics.startStorageReadTimer();
 
-                // Cast to MMapStorageEngine to access zero-copy API
-                final MMapStorageEngine mmapStorage = (MMapStorageEngine) storage;
-
+                // Call getZeroCopyBatch on appropriate storage engine
                 batchRegion = CompletableFuture.supplyAsync(() -> {
                     try {
-                        return mmapStorage.getZeroCopyBatch(consumer.topic, 0, offsetToRead,
-                                                           readBatchSize, maxMessageSizePerConsumer);
+                        if (storage instanceof MMapStorageEngine) {
+                            return ((MMapStorageEngine) storage).getZeroCopyBatch(consumer.topic, 0, offsetToRead,
+                                    readBatchSize, maxMessageSizePerConsumer);
+                        } else if (storage instanceof com.messaging.storage.filechannel.FileChannelStorageEngine) {
+                            return ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage).getZeroCopyBatch(consumer.topic, 0, offsetToRead,
+                                    readBatchSize, maxMessageSizePerConsumer);
+                        } else {
+                            throw new IllegalStateException("Unknown storage engine type: " + storage.getClass().getName());
+                        }
                     } catch (Exception e) {
                         log.error("Exception in storage.getZeroCopyBatch(): ", e);
                         throw new RuntimeException(e);
@@ -210,8 +217,8 @@ public class RemoteConsumerRegistry {
                 metrics.recordConsumerMessageSent(consumer.clientId, consumer.topic, consumer.group, batchRegion.totalBytes);
                 metrics.stopConsumerDeliveryTimer(deliverySample, consumer.clientId, consumer.topic, consumer.group);
 
-                // Record global metrics
-                metrics.recordMessageSent(batchRegion.totalBytes);
+                // Record global metrics - efficient batch method
+                metrics.recordBatchMessagesSent(batchRegion.recordCount, batchRegion.totalBytes);
 
                 // Update offset to after the last message sent
                 currentOffset = batchRegion.lastOffset + 1;
@@ -258,57 +265,50 @@ public class RemoteConsumerRegistry {
     }
 
     /**
-     * Send a batch of messages to consumer using zero-copy FileRegion
+     * Send a batch of messages to consumer using Kafka-style zero-copy (sendfile syscall)
+     * This eliminates heap allocations and uses OS kernel zero-copy
      */
     private void sendBatchToConsumer(RemoteConsumer consumer, Segment.BatchFileRegion batchRegion, long startOffset)
             throws Exception {
 
-        // For now, fall back to reading the file content and sending as a single message
-        // This maintains the binary protocol but avoids the complexity of FileRegion state management
-        // TODO: Implement true zero-copy with chunked transfer once decoder state management is robust
-
-        // Read the FileRegion content into a byte array
-        // Note: This temporarily uses heap memory but still eliminates JSON serialization overhead
-        byte[] batchData = new byte[(int) batchRegion.totalBytes];
-        try {
-            // Read from FileChannel directly (no reflection needed)
-            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(batchData);
-            batchRegion.fileChannel.read(buffer, batchRegion.filePosition);
-
-        } catch (Exception e) {
-            log.error("Failed to read FileRegion content", e);
-            throw e;
+        if (batchRegion.fileRegion == null) {
+            log.debug("No data to send for consumer {}", consumer.clientId);
+            return;
         }
 
-        // Create combined message: header (20 bytes) + batch data
-        ByteBuffer messageBuffer = ByteBuffer.allocate(20 + (int)batchRegion.totalBytes);
-
+        // Step 1: Create and send header message with batch metadata
         // Header: [recordCount:4][totalBytes:8][lastOffset:8]
-        messageBuffer.putInt(batchRegion.recordCount);
-        messageBuffer.putLong(batchRegion.totalBytes);
-        messageBuffer.putLong(batchRegion.lastOffset);
+        ByteBuffer headerBuffer = ByteBuffer.allocate(20);
+        headerBuffer.putInt(batchRegion.recordCount);
+        headerBuffer.putLong(batchRegion.totalBytes);
+        headerBuffer.putLong(batchRegion.lastOffset);
+        headerBuffer.flip();
 
-        // Batch data
-        messageBuffer.put(batchData);
-        messageBuffer.flip();
+        byte[] header = new byte[20];
+        headerBuffer.get(header);
 
-        byte[] payload = new byte[messageBuffer.remaining()];
-        messageBuffer.get(payload);
-
-        log.debug("Created zero-copy batch message: recordCount={}, totalBytes={}, lastOffset={}, payload={}",
-                 batchRegion.recordCount, batchRegion.totalBytes, batchRegion.lastOffset, payload.length);
-
-        // Create DATA message with header + batch data
-        BrokerMessage message = new BrokerMessage(
-            BrokerMessage.MessageType.DATA,
+        // Send header using BATCH_HEADER message type
+        BrokerMessage headerMsg = new BrokerMessage(
+            BrokerMessage.MessageType.BATCH_HEADER,
             System.currentTimeMillis(),
-            payload
+            header
         );
 
-        // Send as single message
-        server.send(consumer.clientId, message).get(5, TimeUnit.SECONDS);
+        log.debug("Sending BATCH_HEADER to consumer {}: recordCount={}, totalBytes={}, lastOffset={}",
+                 consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, batchRegion.lastOffset);
 
-        log.debug("Sent binary batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
+        server.send(consumer.clientId, headerMsg).get(1, TimeUnit.SECONDS);
+
+        // Step 2: Send FileRegion for true zero-copy transfer (Kafka-style sendfile)
+        // This uses OS sendfile() syscall - data goes from file → kernel → socket
+        // NO user-space copies, NO heap allocations!
+        log.info("Sending zero-copy FileRegion of {} messages ({} bytes) to consumer {} for topic {} using sendfile()",
+                 batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic);
+
+        server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
+              .get(5, TimeUnit.SECONDS);
+
+        log.info("Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
     }
 
@@ -319,20 +319,16 @@ public class RemoteConsumerRegistry {
     public void notifyNewMessage(String topic, long offset) {
         log.debug("New message notification: topic={}, offset={}", topic, offset);
 
+        long now = System.currentTimeMillis();
         // Find all consumers subscribed to this topic and trigger immediate delivery
         for (RemoteConsumer consumer : consumers.values()) {
             if (consumer.topic.equals(topic)) {
-                // Rate limiting: Only submit delivery task if last attempt was > 100ms ago
-                long now = System.currentTimeMillis();
-                long timeSinceLastDelivery = now - consumer.lastDeliveryAttempt;
-
-                if (timeSinceLastDelivery >= 100) {
+                // Rate limiting: Only submit delivery task if last attempt was > 200ms ago (increased from 100ms)
+                if (now - consumer.lastDeliveryAttempt >= 200) {
                     consumer.lastDeliveryAttempt = now;
-                    // Submit immediate delivery task (non-blocking)
                     scheduler.submit(() -> deliverMessages(consumer,offset));
                 } else {
-                    log.trace("Skipping delivery for consumer {} - last attempt was {}ms ago",
-                             consumer.clientId, timeSinceLastDelivery);
+                    log.debug("Skipping delivery for consumer {} - rate limited", consumer.clientId);
                 }
             }
         }

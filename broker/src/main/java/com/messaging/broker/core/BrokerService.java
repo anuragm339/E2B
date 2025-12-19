@@ -114,10 +114,6 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // Store message in local storage
             // Use topic from record, fallback to default if not set
             String topic = record.getTopic();
-            if (topic == null || topic.isEmpty()) {
-                topic = "price-topic"; // Default fallback
-                log.warn("Message received without topic, using default: price-topic");
-            }
 
             Timer.Sample storageSample = metrics.startStorageWriteTimer();
             long offset = storage.append(topic, 0, record);

@@ -52,7 +52,8 @@ public class BrokerMessage {
         RESET((byte) 0x05),       // Data refresh: clear all local data
         READY((byte) 0x06),       // Data refresh complete: all data sent
         DISCONNECT((byte) 0x07),
-        HEARTBEAT((byte) 0x08);
+        HEARTBEAT((byte) 0x08),
+        BATCH_HEADER((byte) 0x09); // Zero-copy batch header (recordCount, totalBytes, lastOffset)
 
         private final byte code;
 
