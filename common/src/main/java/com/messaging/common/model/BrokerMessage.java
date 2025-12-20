@@ -53,7 +53,8 @@ public class BrokerMessage {
         READY((byte) 0x06),       // Data refresh complete: all data sent
         DISCONNECT((byte) 0x07),
         HEARTBEAT((byte) 0x08),
-        BATCH_HEADER((byte) 0x09); // Zero-copy batch header (recordCount, totalBytes, lastOffset)
+        BATCH_HEADER((byte) 0x09), // Zero-copy batch header (recordCount, totalBytes, lastOffset, topic)
+        BATCH_ACK((byte) 0x0A);    // Consumer acknowledgment of batch receipt
 
         private final byte code;
 

@@ -43,6 +43,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
     private int expectedRecordCount = 0;
     private long expectedTotalBytes = 0;
     private long lastOffset = 0;
+    private String currentBatchTopic = null; // Track which topic this batch belongs to
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
@@ -97,8 +98,14 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             expectedTotalBytes = buffer.getLong();
             lastOffset = buffer.getLong();
 
-            log.info("Received BATCH_HEADER: recordCount={}, totalBytes={}, lastOffset={}",
-                    expectedRecordCount, expectedTotalBytes, lastOffset);
+            // Parse topic name from header
+            int topicLen = buffer.getInt();
+            byte[] topicBytes = new byte[topicLen];
+            buffer.get(topicBytes);
+            currentBatchTopic = new String(topicBytes, StandardCharsets.UTF_8);
+
+            log.info("Received BATCH_HEADER: topic={}, recordCount={}, totalBytes={}, lastOffset={}",
+                    currentBatchTopic, expectedRecordCount, expectedTotalBytes, lastOffset);
 
             // Transition to READING_ZERO_COPY_BATCH state to expect raw bytes
             state = DecoderState.READING_ZERO_COPY_BATCH;
@@ -320,13 +327,14 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
         log.info("Decoded zero-copy batch: {} records, {} bytes", records.size(), bytesRead);
 
-        // Add records list to output (consumer will handle as batch)
-        out.add(records);
+        // Emit BatchDecodedEvent to pipeline (BatchAckHandler will send BATCH_ACK)
+        out.add(new BatchDecodedEvent(records, currentBatchTopic));
 
         // Reset state for next message
         state = DecoderState.READING_BROKER_MESSAGE;
         expectedRecordCount = 0;
         expectedTotalBytes = 0;
         lastOffset = 0;
+        currentBatchTopic = null;
     }
 }
