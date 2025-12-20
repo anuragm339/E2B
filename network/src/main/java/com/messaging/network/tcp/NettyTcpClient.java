@@ -2,6 +2,7 @@ package com.messaging.network.tcp;
 
 import com.messaging.common.api.NetworkClient;
 import com.messaging.common.model.BrokerMessage;
+import com.messaging.network.codec.BatchAckHandler;
 import com.messaging.network.codec.BinaryMessageDecoder;
 import com.messaging.network.codec.BinaryMessageEncoder;
 import com.messaging.network.codec.JsonMessageDecoder;
@@ -58,6 +59,7 @@ public class NettyTcpClient implements NetworkClient {
 
                             // Codecs (Zero-copy batch decoder for efficient file-to-network transfer)
                             pipeline.addLast("decoder", new ZeroCopyBatchDecoder());
+                            pipeline.addLast("batchAckHandler", new BatchAckHandler());
                             pipeline.addLast("encoder", new BinaryMessageEncoder());
 
                             // Business logic handler

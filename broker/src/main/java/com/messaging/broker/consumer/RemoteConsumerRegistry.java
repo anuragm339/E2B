@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Registry for TCP-connected remote consumers
@@ -45,6 +46,16 @@ public class RemoteConsumerRegistry {
 
     // Map: "clientId:topic" -> RemoteConsumer (composite key to support multiple topic subscriptions per client)
     private final Map<String, RemoteConsumer> consumers;
+
+    // ACK-based flow control tracking
+    // Map: "clientId:topic" -> in-flight delivery status (true = delivery in progress)
+    private final Map<String, AtomicBoolean> inFlightDeliveries;
+
+    // Map: clientId -> currently in-flight topic (ensures only ONE topic delivers to a consumer at a time)
+    private final Map<String, String> consumerCurrentTopic;
+
+    // Map: "clientId:topic:pending" -> next offset to commit on ACK
+    private final Map<String, Long> pendingOffsets;
 
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
@@ -74,6 +85,9 @@ public class RemoteConsumerRegistry {
             return t;
         });
         this.consumers = new ConcurrentHashMap<>();
+        this.inFlightDeliveries = new ConcurrentHashMap<>();
+        this.consumerCurrentTopic = new ConcurrentHashMap<>();
+        this.pendingOffsets = new ConcurrentHashMap<>();
         log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer, readBatchSize={}",
                  maxMessageSizePerConsumer, readBatchSize);
     }
@@ -149,6 +163,29 @@ public class RemoteConsumerRegistry {
      * Deliver messages to a remote consumer
      */
     private void deliverMessages(RemoteConsumer consumer,Long offset) {
+        String deliveryKey = consumer.clientId + ":" + consumer.topic;
+
+        // Try to acquire in-flight slot for this topic+consumer
+        AtomicBoolean inFlight = inFlightDeliveries.computeIfAbsent(
+            deliveryKey,
+            k -> new AtomicBoolean(false)
+        );
+
+        if (!inFlight.compareAndSet(false, true)) {
+            log.debug("Skipping delivery - topic {} already in-flight for consumer {}",
+                     consumer.topic, consumer.clientId);
+            return;
+        }
+
+        // Check if ANOTHER topic is already being delivered to this consumer
+        String previousTopic = consumerCurrentTopic.putIfAbsent(consumer.clientId, consumer.topic);
+        if (previousTopic != null && !previousTopic.equals(consumer.topic)) {
+            inFlight.set(false);
+            log.debug("Consumer {} is busy with topic {}, skipping topic {}",
+                     consumer.clientId, previousTopic, consumer.topic);
+            return;
+        }
+
         try {
             long currentOffset = consumer.getCurrentOffset();
 
@@ -168,10 +205,7 @@ public class RemoteConsumerRegistry {
                 // Call getZeroCopyBatch on appropriate storage engine
                 batchRegion = CompletableFuture.supplyAsync(() -> {
                     try {
-                        if (storage instanceof MMapStorageEngine) {
-                            return ((MMapStorageEngine) storage).getZeroCopyBatch(consumer.topic, 0, offsetToRead,
-                                    readBatchSize, maxMessageSizePerConsumer);
-                        } else if (storage instanceof com.messaging.storage.filechannel.FileChannelStorageEngine) {
+                       if (storage instanceof com.messaging.storage.filechannel.FileChannelStorageEngine) {
                             return ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage).getZeroCopyBatch(consumer.topic, 0, offsetToRead,
                                     readBatchSize, maxMessageSizePerConsumer);
                         } else {
@@ -225,25 +259,25 @@ public class RemoteConsumerRegistry {
 
                 log.debug("Sent {} messages ({} bytes) to consumer {}, next offset={}",
                          batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, currentOffset);
+
+                // Store pending offset (DON'T update properties file yet - wait for ACK!)
+                String pendingKey = deliveryKey + ":pending";
+                pendingOffsets.put(pendingKey, currentOffset);
+                log.debug("Stored pending offset for ACK: deliveryKey={}, offset={}", deliveryKey, currentOffset);
+
             } catch (Exception e) {
                 log.error("Failed to send batch to consumer {}: recordCount={}, firstOffset={}",
                          consumer.clientId, batchRegion.recordCount, currentOffset, e);
                 // Record failure
                 metrics.recordConsumerFailure(consumer.clientId, consumer.topic, consumer.group);
+                // Clear in-flight status on error
+                inFlight.set(false);
+                consumerCurrentTopic.remove(consumer.clientId, consumer.topic);
                 return; // Stop on error
             }
 
-            // Update offset in memory
-            consumer.setCurrentOffset(currentOffset);
-
-            // CRITICAL: Persist offset to property file after successful delivery
-            // Property file is the ONLY source of truth for consumer offsets
-            String consumerId = consumer.group + ":" + consumer.topic;
-            offsetTracker.updateOffset(consumerId, currentOffset);
-            log.debug("Persisted offset to property file after successful delivery: consumerId={}, offset={}",
-                     consumerId, currentOffset);
-
-            // Update consumer offset metric
+            // NOTE: Offset will be committed to properties file only after receiving BATCH_ACK
+            // Update consumer offset metric to pending value
             metrics.updateConsumerOffset(consumer.clientId, consumer.topic, consumer.group, currentOffset);
 
             // Calculate and update lag (difference between latest message and consumer offset)
@@ -261,6 +295,9 @@ public class RemoteConsumerRegistry {
         } catch (Exception e) {
             log.error("FATAL: Error delivering messages to consumer {}, task will continue",
                      consumer.clientId, e);
+            // Clear in-flight status on fatal error
+            inFlight.set(false);
+            consumerCurrentTopic.remove(consumer.clientId, consumer.topic);
         }
     }
 
@@ -277,14 +314,20 @@ public class RemoteConsumerRegistry {
         }
 
         // Step 1: Create and send header message with batch metadata
-        // Header: [recordCount:4][totalBytes:8][lastOffset:8]
-        ByteBuffer headerBuffer = ByteBuffer.allocate(20);
+        // Include topic name so consumer knows what to ACK
+        byte[] topicBytes = consumer.topic.getBytes(StandardCharsets.UTF_8);
+        int topicLen = topicBytes.length;
+
+        // Header: [recordCount:4][totalBytes:8][lastOffset:8][topicLen:4][topic:var]
+        ByteBuffer headerBuffer = ByteBuffer.allocate(20 + 4 + topicLen);
         headerBuffer.putInt(batchRegion.recordCount);
         headerBuffer.putLong(batchRegion.totalBytes);
         headerBuffer.putLong(batchRegion.lastOffset);
+        headerBuffer.putInt(topicLen);
+        headerBuffer.put(topicBytes);
         headerBuffer.flip();
 
-        byte[] header = new byte[20];
+        byte[] header = new byte[20 + 4 + topicLen];
         headerBuffer.get(header);
 
         // Send header using BATCH_HEADER message type
@@ -294,8 +337,8 @@ public class RemoteConsumerRegistry {
             header
         );
 
-        log.debug("Sending BATCH_HEADER to consumer {}: recordCount={}, totalBytes={}, lastOffset={}",
-                 consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, batchRegion.lastOffset);
+        log.debug("Sending BATCH_HEADER to consumer {}: topic={}, recordCount={}, totalBytes={}, lastOffset={}",
+                 consumer.clientId, consumer.topic, batchRegion.recordCount, batchRegion.totalBytes, batchRegion.lastOffset);
 
         server.send(consumer.clientId, headerMsg).get(1, TimeUnit.SECONDS);
 
@@ -310,6 +353,51 @@ public class RemoteConsumerRegistry {
 
         log.info("Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
+    }
+
+    /**
+     * Handle BATCH_ACK from consumer
+     * This is called when the consumer successfully processes a batch and sends acknowledgment
+     *
+     * @param clientId The client ID that sent the ACK
+     * @param topic The topic that was acknowledged
+     */
+    public void handleBatchAck(String clientId, String topic) {
+        String deliveryKey = clientId + ":" + topic;
+        String pendingKey = deliveryKey + ":pending";
+
+        log.debug("Received BATCH_ACK from clientId={}, topic={}", clientId, topic);
+
+        // Get pending offset for this delivery
+        Long offsetToCommit = pendingOffsets.remove(pendingKey);
+
+        if (offsetToCommit != null) {
+            // ✅ NOW update offset in properties file (source of truth)
+            RemoteConsumer consumer = consumers.get(deliveryKey);
+            if (consumer != null) {
+                String consumerId = consumer.group + ":" + topic;
+                offsetTracker.updateOffset(consumerId, offsetToCommit);
+                consumer.setCurrentOffset(offsetToCommit);
+
+                log.info("ACK received from clientId={}, topic={}, committed offset {} to properties file",
+                        clientId, topic, offsetToCommit);
+            } else {
+                log.warn("Received ACK for unknown consumer: deliveryKey={}", deliveryKey);
+            }
+        } else {
+            log.warn("Received ACK but no pending offset found for deliveryKey={}", deliveryKey);
+        }
+
+        // Clear in-flight status to allow next delivery
+        AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
+        if (inFlight != null) {
+            inFlight.set(false);
+            log.debug("Cleared in-flight status for deliveryKey={}", deliveryKey);
+        }
+
+        // Remove from consumerCurrentTopic to allow other topics to deliver
+        consumerCurrentTopic.remove(clientId, topic);
+        log.debug("Removed consumer {} from current topic tracking", clientId);
     }
 
     /**

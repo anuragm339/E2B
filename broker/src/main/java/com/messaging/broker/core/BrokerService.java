@@ -163,6 +163,10 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 handleReady(clientId, message);
                 break;
 
+            case BATCH_ACK:
+                handleBatchAck(clientId, message);
+                break;
+
             default:
                 log.warn("Unknown message type: {}", message.getType());
         }
@@ -359,6 +363,23 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
         } catch (Exception e) {
             log.error("Error handling READY from {}", clientId, e);
+        }
+    }
+
+    /**
+     * Handle BATCH_ACK message - consumer acknowledges receipt and processing of a batch
+     */
+    private void handleBatchAck(String clientId, BrokerMessage message) {
+        try {
+            // Payload contains topic name as bytes
+            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
+            log.debug("Received BATCH_ACK from client: {}, topic: {}", clientId, topic);
+
+            // Delegate to RemoteConsumerRegistry to handle ACK and commit offset
+            remoteConsumers.handleBatchAck(clientId, topic);
+
+        } catch (Exception e) {
+            log.error("Error handling BATCH_ACK from {}", clientId, e);
         }
     }
 
