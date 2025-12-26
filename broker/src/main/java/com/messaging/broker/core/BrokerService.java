@@ -4,6 +4,7 @@ import com.messaging.broker.consumer.ConsumerDeliveryManager;
 import com.messaging.broker.consumer.ConsumerOffsetTracker;
 import com.messaging.broker.consumer.RemoteConsumerRegistry;
 import com.messaging.broker.metrics.BrokerMetrics;
+import com.messaging.broker.refresh.DataRefreshManager;
 import com.messaging.broker.registry.TopologyManager;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
@@ -39,6 +40,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final TopologyManager topologyManager;
     private final BrokerMetrics metrics;
     private final ConsumerOffsetTracker offsetTracker;
+    private final DataRefreshManager dataRefreshManager;
     private final int serverPort;
     private final ObjectMapper objectMapper;
 
@@ -51,6 +53,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             TopologyManager topologyManager,
             BrokerMetrics metrics,
             ConsumerOffsetTracker offsetTracker,
+            DataRefreshManager dataRefreshManager,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
@@ -60,6 +63,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.topologyManager = topologyManager;
         this.metrics = metrics;
         this.offsetTracker = offsetTracker;
+        this.dataRefreshManager = dataRefreshManager;
         this.serverPort = serverPort;
         this.objectMapper = new ObjectMapper();
 
@@ -139,7 +143,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      * Handle incoming messages from clients
      */
     private void handleMessage(String clientId, BrokerMessage message) {
-        log.debug("Handling message from {}: type={}, id={}",
+        log.info("Handling message from {}: type={}, id={}",
                   clientId, message.getType(), message.getMessageId());
 
         switch (message.getType()) {
@@ -155,12 +159,12 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 handleCommitOffset(clientId, message);
                 break;
 
-            case RESET:
-                handleReset(clientId, message);
+            case RESET_ACK:
+                handleResetAck(clientId, message);
                 break;
 
-            case READY:
-                handleReady(clientId, message);
+            case READY_ACK:
+                handleReadyAck(clientId, message);
                 break;
 
             case BATCH_ACK:
@@ -317,27 +321,44 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     }
 
     /**
-     * Handle RESET message - trigger data refresh workflow
+     * Handle RESET ACK from consumer during data refresh workflow
      */
-    private void handleReset(String clientId, BrokerMessage message) {
+    private void handleResetAck(String clientId, BrokerMessage message) {
         try {
-            log.info("Received RESET request from client: {}", clientId);
+            // Extract topic from payload
+            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
+            String[] split = topic.split(",");
+            log.info("Received RESET ACK from client: {} for topic: {}", clientId, topic);
 
-            // TODO: Implement data refresh workflow
-            // 1. Send RESET to all consumers
-            // 2. Wait for ACKs
-            // 3. Replay all messages from offset 0
-            // 4. Send READY when complete
+            // Map clientId to stable group:topic identifier
+            String consumerGroupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
+            if (consumerGroupTopic == null) {
+                log.warn("Cannot map consumer to group:topic: clientId={}, topic={}", clientId, topic);
+                return;
+            }
 
-            // For now, just ACK
+            log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
+
+            // Delegate to DataRefreshManager with BOTH identifiers:
+            // - consumerGroupTopic for stable tracking
+            // - clientId for triggering replay
+            dataRefreshManager.handleResetAck(consumerGroupTopic, clientId, topic);
+
+            // Send ACK back to consumer to acknowledge receipt
             BrokerMessage ack = new BrokerMessage(
                 BrokerMessage.MessageType.ACK,
                 message.getMessageId(),
                 new byte[0]
             );
 
-            server.send(clientId, ack);
-            log.info("Sent ACK for RESET to client: {}", clientId);
+            server.send(clientId, ack).whenComplete((v, ex) -> {
+                if (ex != null) {
+                    log.error("Failed to send RESET ACK to {}", clientId, ex);
+                } else {
+                    log.debug("Sent ACK to {} for RESET", clientId);
+                }
+            });
+
 
         } catch (Exception e) {
             log.error("Error handling RESET from {}", clientId, e);
@@ -345,21 +366,28 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     }
 
     /**
-     * Handle READY message - data refresh complete acknowledgment
+     * Handle READY ACK from consumer during data refresh workflow
      */
-    private void handleReady(String clientId, BrokerMessage message) {
+    private void handleReadyAck(String clientId, BrokerMessage message) {
         try {
-            log.info("Received READY acknowledgment from client: {}", clientId);
+            // Extract topic from payload
+            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
 
-            // Send ACK
-            BrokerMessage ack = new BrokerMessage(
-                BrokerMessage.MessageType.ACK,
-                message.getMessageId(),
-                new byte[0]
-            );
+            log.info("Received READY ACK from client: {} for topic: {}", clientId, topic);
 
-            server.send(clientId, ack);
-            log.info("Sent ACK for READY to client: {}", clientId);
+            // Map clientId to stable group:topic identifier
+            String consumerGroupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
+            if (consumerGroupTopic == null) {
+                log.warn("Cannot map consumer to group:topic: clientId={}, topic={}", clientId, topic);
+                return;
+            }
+
+            log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
+
+            // Delegate to DataRefreshManager with stable identifier
+            dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
+
+            // Send ACK back to consumer to acknowledge receipt
 
         } catch (Exception e) {
             log.error("Error handling READY from {}", clientId, e);

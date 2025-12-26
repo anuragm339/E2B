@@ -43,6 +43,7 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile PipeConnectionImpl connection;
     private volatile Consumer<MessageRecord> dataHandler;
     private volatile boolean running;
+    private volatile boolean pausePipeCalls = false;  // For DataRefresh support
 
     private volatile long currentOffset = 0;
     private volatile long lastPersistedOffset = -1;
@@ -100,6 +101,17 @@ public class HttpPipeConnector implements PipeConnector {
      */
     private void pollLoop() {
         while (running) {
+            // Check if paused (for DataRefresh)
+            if (pausePipeCalls) {
+                try {
+                    Thread.sleep(1000);  // Sleep while paused
+                    continue;
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+
             long start = System.currentTimeMillis();
             try {
                 int received = pollParent();
@@ -150,6 +162,22 @@ public class HttpPipeConnector implements PipeConnector {
             disconnect();
             connectToParent(connection.parentUrl);
         }
+    }
+
+    /**
+     * Pause pipe calls (for DataRefresh workflow)
+     */
+    public void pausePipeCalls() {
+        this.pausePipeCalls = true;
+        log.info("Pipe calls PAUSED for data refresh");
+    }
+
+    /**
+     * Resume pipe calls (after DataRefresh completes)
+     */
+    public void resumePipeCalls() {
+        this.pausePipeCalls = false;
+        log.info("Pipe calls RESUMED after data refresh");
     }
 
     @Override

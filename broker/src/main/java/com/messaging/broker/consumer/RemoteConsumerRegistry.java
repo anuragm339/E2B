@@ -1,6 +1,8 @@
 package com.messaging.broker.consumer;
 
 import com.messaging.broker.metrics.BrokerMetrics;
+import com.messaging.broker.metrics.DataRefreshMetrics;
+import com.messaging.broker.refresh.DataRefreshManager;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.BrokerMessage;
@@ -25,6 +27,7 @@ import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * Registry for TCP-connected remote consumers
@@ -38,6 +41,8 @@ public class RemoteConsumerRegistry {
     private final NetworkServer server;
     private final ConsumerOffsetTracker offsetTracker;
     private final BrokerMetrics metrics;
+    private final DataRefreshMetrics dataRefreshMetrics;
+    private volatile DataRefreshManager dataRefreshManager; // Lazy injection to avoid circular dependency
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
     private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
@@ -60,12 +65,14 @@ public class RemoteConsumerRegistry {
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
+                                  DataRefreshMetrics dataRefreshMetrics,
                                   @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer,  // Reduced from 1MB to 512KB
                                   @Value("${broker.consumer.max-batch-size-per-consumer}") int readBatchSize) {  // Reduced from 100 to 50
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
         this.metrics = metrics;
+        this.dataRefreshMetrics = dataRefreshMetrics;
         this.maxMessageSizePerConsumer = maxMessageSizePerConsumer;
         this.readBatchSize = readBatchSize;
         this.objectMapper = new ObjectMapper();
@@ -90,6 +97,13 @@ public class RemoteConsumerRegistry {
         this.pendingOffsets = new ConcurrentHashMap<>();
         log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer, readBatchSize={}",
                  maxMessageSizePerConsumer, readBatchSize);
+    }
+
+    /**
+     * Lazy setter for DataRefreshManager to avoid circular dependency
+     */
+    public void setDataRefreshManager(DataRefreshManager dataRefreshManager) {
+        this.dataRefreshManager = dataRefreshManager;
     }
 
     /**
@@ -242,6 +256,8 @@ public class RemoteConsumerRegistry {
             try {
                 // Start timing for per-consumer delivery
                 Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
+                long deliveryStartTime = System.currentTimeMillis();
+
                 log.info("Sending zero-copy batch of {} messages ({} bytes) to consumer {} for topic {} starting at offset {}",
                          batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic, currentOffset);
 
@@ -253,6 +269,29 @@ public class RemoteConsumerRegistry {
 
                 // Record global metrics - efficient batch method
                 metrics.recordBatchMessagesSent(batchRegion.recordCount, batchRegion.totalBytes);
+
+                // Track data refresh metrics if this consumer is in refresh mode
+                if (dataRefreshManager != null && dataRefreshManager.isRefreshInProgress()) {
+                    String consumerGroupTopic = consumer.topic; // Use topic as consumer ID (matches DataRefreshManager expectations)
+
+                    // Record data transferred
+                    dataRefreshMetrics.recordDataTransferred(
+                        consumer.topic,
+                        consumerGroupTopic,
+                        batchRegion.totalBytes,
+                        batchRegion.recordCount
+                    );
+
+                    // Calculate and update transfer rate (bytes per second)
+                    long deliveryDurationMs = System.currentTimeMillis() - deliveryStartTime;
+                    if (deliveryDurationMs > 0) {
+                        double bytesPerSecond = (batchRegion.totalBytes * 1000.0) / deliveryDurationMs;
+                        dataRefreshMetrics.updateTransferRate(consumer.topic, consumerGroupTopic, bytesPerSecond);
+
+                        log.debug("Data refresh transfer: {} bytes in {}ms = {:.2f} MB/s for topic {}",
+                                batchRegion.totalBytes, deliveryDurationMs, bytesPerSecond / (1024 * 1024), consumer.topic);
+                    }
+                }
 
                 // Update offset to after the last message sent
                 currentOffset = batchRegion.lastOffset + 1;
@@ -423,6 +462,150 @@ public class RemoteConsumerRegistry {
     }
 
     /**
+     * Get all consumer clientIds subscribed to a topic (for DataRefresh)
+     */
+    public java.util.Set<String> getConsumersForTopic(String topic) {
+        java.util.Set<String> clientIds = new java.util.HashSet<>();
+        for (Map.Entry<String, RemoteConsumer> entry : consumers.entrySet()) {
+            if (entry.getValue().topic.equals(topic)) {
+                clientIds.add(entry.getValue().clientId);
+            }
+        }
+        log.debug("Found {} consumers for topic: {}", clientIds.size(), topic);
+        return clientIds;
+    }
+
+    /**
+     * Broadcast RESET message to all consumers of a topic (for DataRefresh)
+     */
+    public void broadcastResetToTopic(String topic) {
+        java.util.Set<String> clientIds = getConsumersForTopic(topic);
+        byte[] payload = topic.getBytes(StandardCharsets.UTF_8);
+
+        BrokerMessage resetMsg = new BrokerMessage(
+            BrokerMessage.MessageType.RESET,
+            System.currentTimeMillis(),
+            payload
+        );
+
+        for (String clientId : clientIds) {
+            try {
+                server.send(clientId, resetMsg);
+                log.info("Sent RESET to consumer: {} for topic: {}", clientId, topic);
+            } catch (Exception e) {
+                log.error("Failed to send RESET to consumer: {}", clientId, e);
+            }
+        }
+    }
+
+    /**
+     * Broadcast READY message to all consumers of a topic (for DataRefresh)
+     */
+    public void broadcastReadyToTopic(String topic) {
+        java.util.Set<String> clientIds = getConsumersForTopic(topic);
+        byte[] payload = topic.getBytes(StandardCharsets.UTF_8);
+
+        BrokerMessage readyMsg = new BrokerMessage(
+            BrokerMessage.MessageType.READY,
+            System.currentTimeMillis(),
+            payload
+        );
+
+        for (String clientId : clientIds) {
+            try {
+                server.send(clientId, readyMsg);
+                log.info("Sent READY to consumer: {} for topic: {}", clientId, topic);
+            } catch (Exception e) {
+                log.error("Failed to send READY to consumer: {}", clientId, e);
+            }
+        }
+    }
+
+    /**
+     * Reset offset for a specific consumer (for DataRefresh)
+     */
+    public void resetConsumerOffset(String clientId, String topic, long offset) {
+        String consumerKey = clientId + ":" + topic;
+        RemoteConsumer consumer = consumers.get(consumerKey);
+
+        if (consumer == null) {
+            log.warn("Cannot reset offset - consumer not found: consumerKey={}", consumerKey);
+            return;
+        }
+
+        consumer.setCurrentOffset(offset);
+
+        String consumerId = consumer.group + ":" + consumer.topic;
+        offsetTracker.resetOffset(consumerId, offset);
+
+        log.info("Reset offset to {} for consumer: {} ({})", offset, clientId, consumerId);
+    }
+
+    /**
+     * Check if all specified consumers have caught up to latest offset (for DataRefresh)
+     */
+    public boolean allConsumersCaughtUp(String topic, java.util.Set<String> consumerClientIds) {
+        long latestOffset = storage.getCurrentOffset(topic, 0);
+
+        for (String clientId : consumerClientIds) {
+            String consumerKey = clientId + ":" + topic;
+            RemoteConsumer consumer = consumers.entrySet()
+                    .stream()
+                    .filter(e -> e.getKey().contains(topic))
+                    .peek(e -> log.debug("Consumer key in registry: {}", e.getKey()))
+                    .map(Map.Entry::getValue)
+                    .findFirst()
+                    .orElse(null);
+
+            if (consumer == null) {
+                log.debug("Consumer not found: consumerKey={}", consumerKey);
+                return false;
+            }
+
+            if (consumer.getCurrentOffset() < latestOffset) {
+                log.debug("Consumer {} not caught up: {} < {}",
+                         clientId, consumer.getCurrentOffset(), latestOffset);
+                return false;
+            }
+        }
+
+        log.debug("All consumers caught up for topic {} at offset {}", topic, latestOffset);
+        return true;
+    }
+
+    /**
+     * Trigger delivery for a specific consumer (for DataRefresh immediate replay)
+     */
+    public void notifyNewMessageForConsumer(String clientId, String topic, long offset) {
+        String consumerKey = clientId + ":" + topic;
+        RemoteConsumer consumer = consumers.get(consumerKey);
+
+        if (consumer == null) {
+            log.warn("Cannot notify consumer - not found: consumerKey={}", consumerKey);
+            return;
+        }
+
+        log.info("Triggering delivery for consumer: {}, topic: {}, offset: {}", clientId, topic, offset);
+        scheduler.submit(() -> deliverMessages(consumer, offset));
+    }
+
+    /**
+     * Get consumer group:topic identifier for a client (for DataRefresh)
+     * Maps dynamic clientId to stable "group:topic" identifier
+     */
+    public String getConsumerGroupTopic(String clientId, String topic) {
+        String consumerKey = clientId + ":" + topic;
+        RemoteConsumer consumer = consumers.get(consumerKey);
+
+        if (consumer == null) {
+            log.warn("Consumer not found for clientId={}, topic={}", clientId, topic);
+            return null;
+        }
+
+        return consumer.topic;
+    }
+
+    /**
      * Shutdown registry
      */
     public void shutdown() {
@@ -446,6 +629,35 @@ public class RemoteConsumerRegistry {
         log.info("RemoteConsumerRegistry shutdown complete");
     }
 
+
+    /**
+     * Get all consumer client IDs for a topic (for DataRefresh replay)
+     * Returns ALL consumers subscribed to the topic, not just one
+     */
+    public java.util.List<String> getAllConsumerIds(String topic) {
+        return this.consumers.entrySet()
+                .stream()
+                .filter(e -> e.getValue().topic.equals(topic))
+                .peek(e -> log.debug("Found consumer for topic {}: key={}, clientId={}",
+                        topic, e.getKey(), e.getValue().clientId))
+                .map(e -> e.getValue().clientId)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * @deprecated Use getAllConsumerIds() instead - this only returns ONE consumer!
+     */
+    @Deprecated
+    public String getRemoteConsumers(String topic) {
+        RemoteConsumer remoteConsumer = this.consumers.entrySet()
+                .stream()
+                .filter(e -> e.getKey().contains(topic))
+                .peek(e -> log.debug("Consumer key in registry: {}", e.getKey()))
+                .map(Map.Entry::getValue)
+                .findFirst()
+                .orElse(null);
+        return remoteConsumer != null ? remoteConsumer.clientId : null;
+    }
     /**
      * Remote consumer metadata
      */
