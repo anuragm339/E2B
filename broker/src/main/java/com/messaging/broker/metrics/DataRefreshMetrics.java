@@ -83,13 +83,13 @@ public class DataRefreshMetrics {
     /**
      * Record refresh workflow started
      */
-    public void recordRefreshStarted(String topic, String refreshType) {
+    public void recordRefreshStarted(String topic, String refreshType, String refreshId) {
         refreshStartedTotal.increment();
         long startTimeMs = System.currentTimeMillis();
         refreshStartTimes.put(topic, startTimeMs);
 
         // Record start timestamp as gauge (in seconds since epoch)
-        String key = topic + ":" + refreshType;
+        String key = topic + ":" + refreshType + ":" + refreshId;
         AtomicDouble startTimeValue = refreshStartTimeValues.computeIfAbsent(key, k -> {
             AtomicDouble atomicTime = new AtomicDouble(0.0);
             refreshStartTimeGauges.computeIfAbsent(key, gk ->
@@ -97,6 +97,7 @@ public class DataRefreshMetrics {
                             .description("Timestamp when refresh started (seconds since epoch)")
                             .tag("topic", topic)
                             .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicTime;
@@ -107,8 +108,8 @@ public class DataRefreshMetrics {
     /**
      * Record refresh workflow completed
      */
-    public void recordRefreshCompleted(String topic, String refreshType, String status) {
-        String key = topic + ":" + refreshType + ":" + status;
+    public void recordRefreshCompleted(String topic, String refreshType, String status, String refreshId) {
+        String key = topic + ":" + refreshType + ":" + status + ":" + refreshId;
 
         Counter counter = refreshCompletedCounters.computeIfAbsent(key, k ->
                 Counter.builder("data_refresh_completed_total")
@@ -116,13 +117,14 @@ public class DataRefreshMetrics {
                         .tag("topic", topic)
                         .tag("refresh_type", refreshType)
                         .tag("status", status)
+                        .tag("refresh_id", refreshId)
                         .register(registry)
         );
         counter.increment();
 
         // Record end timestamp as gauge (in seconds since epoch)
         long endTimeMs = System.currentTimeMillis();
-        String gaugeKey = topic + ":" + refreshType;
+        String gaugeKey = topic + ":" + refreshType + ":" + refreshId;
         AtomicDouble endTimeValue = refreshEndTimeValues.computeIfAbsent(gaugeKey, k -> {
             AtomicDouble atomicTime = new AtomicDouble(0.0);
             refreshEndTimeGauges.computeIfAbsent(gaugeKey, gk ->
@@ -130,6 +132,7 @@ public class DataRefreshMetrics {
                             .description("Timestamp when refresh ended (seconds since epoch)")
                             .tag("topic", topic)
                             .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicTime;
@@ -140,21 +143,22 @@ public class DataRefreshMetrics {
         Long startTime = refreshStartTimes.remove(topic);
         if (startTime != null) {
             long durationMs = endTimeMs - startTime;
-            recordRefreshDuration(topic, refreshType, durationMs);
+            recordRefreshDuration(topic, refreshType, refreshId, durationMs);
         }
     }
 
     /**
      * Record total refresh duration
      */
-    private void recordRefreshDuration(String topic, String refreshType, long durationMs) {
-        String key = topic + ":" + refreshType;
+    private void recordRefreshDuration(String topic, String refreshType, String refreshId, long durationMs) {
+        String key = topic + ":" + refreshType + ":" + refreshId;
 
         Timer timer = refreshDurationTimers.computeIfAbsent(key, k ->
                 Timer.builder("data_refresh_duration_seconds")
                         .description("Duration of data refresh workflow")
                         .tag("topic", topic)
                         .tag("refresh_type", refreshType)
+                        .tag("refresh_id", refreshId)
                         .publishPercentileHistogram()
                         .serviceLevelObjectives(
                             Duration.ofMillis(100),

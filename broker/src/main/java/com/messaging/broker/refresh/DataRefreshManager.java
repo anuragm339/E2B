@@ -39,6 +39,9 @@ public class DataRefreshManager {
     private final Map<String, DataRefreshContext> activeRefreshes;
     private final Map<String, ScheduledFuture<?>> replayCheckTasks;
 
+    // Track current refresh batch ID - shared by all topics in the same batch
+    private volatile String currentRefreshId = null;
+
     public DataRefreshManager(
             RemoteConsumerRegistry remoteConsumers,
             PipeConnector pipeConnector,
@@ -107,10 +110,12 @@ public class DataRefreshManager {
         // This ensures dashboard shows only current refresh batch data
         // Prometheus historical data is preserved for time-series queries
         if (activeRefreshes.isEmpty()) {
+            // Generate new refresh_id for this batch (timestamp-based)
+            currentRefreshId = String.valueOf(System.currentTimeMillis());
             metrics.resetMetricsForNewRefresh();
-            log.info("Metrics reset for new refresh batch");
+            log.info("Starting new refresh batch with refresh_id: {}", currentRefreshId);
         } else {
-            log.info("Metrics NOT reset - adding to existing refresh batch");
+            log.info("Adding topic to existing refresh batch: {}", currentRefreshId);
         }
 
         DataRefreshContext context = new DataRefreshContext(
@@ -122,8 +127,8 @@ public class DataRefreshManager {
         context.setState(DataRefreshState.RESET_SENT);
         context.setResetSentTime(Instant.now());
 
-        // Record metrics: refresh started
-        metrics.recordRefreshStarted(topic, "LOCAL");
+        // Record metrics: refresh started (with refresh_id)
+        metrics.recordRefreshStarted(topic, "LOCAL", currentRefreshId);
 
         // Pause pipe calls before starting refresh
         pipeConnector.pausePipeCalls();
@@ -342,8 +347,8 @@ public class DataRefreshManager {
         context.setState(DataRefreshState.COMPLETED);
         stateStore.saveState(context);
 
-        // Record metrics: refresh completed successfully
-        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS");
+        // Record metrics: refresh completed successfully (with refresh_id)
+        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", currentRefreshId);
 
         // Resume pipe calls only if NO other refreshes are in progress
         boolean otherRefreshesActive = activeRefreshes.values().stream()
@@ -353,6 +358,9 @@ public class DataRefreshManager {
         if (!otherRefreshesActive) {
             pipeConnector.resumePipeCalls();
             log.info("Pipe calls RESUMED after refresh of topic: {} (no other active refreshes)", topic);
+            // Clear refresh_id when batch completes
+            log.info("Refresh batch {} completed", currentRefreshId);
+            currentRefreshId = null;
         } else {
             log.info("Pipe calls remain PAUSED (other topic refreshes still in progress)");
         }
