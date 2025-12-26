@@ -407,6 +407,26 @@ public class DataRefreshMetrics {
         // Reset transfer rates to 0
         transferRates.values().forEach(v -> v.set(0.0));
 
+        // Unregister and clear all Timer instances to reset histogram data
+        // Timers must be unregistered from the registry because Micrometer
+        // doesn't provide a way to reset accumulated histogram samples
+
+        // Unregister RESET ACK duration timers
+        resetAckDurationTimers.values().forEach(timer -> registry.remove(timer));
+        resetAckDurationTimers.clear();
+
+        // Unregister READY ACK duration timers
+        readyAckDurationTimers.values().forEach(timer -> registry.remove(timer));
+        readyAckDurationTimers.clear();
+
+        // Unregister replay duration timers
+        replayDurationTimers.values().forEach(timer -> registry.remove(timer));
+        replayDurationTimers.clear();
+
+        // Unregister refresh duration timers
+        refreshDurationTimers.values().forEach(timer -> registry.remove(timer));
+        refreshDurationTimers.clear();
+
         // Clear state tracking maps
         refreshStartTimes.clear();
         resetSentTimes.clear();
