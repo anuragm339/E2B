@@ -58,6 +58,7 @@ public class DataRefreshMetrics {
     private final Map<String, Long> refreshStartTimes;
     private final Map<String, Long> resetSentTimes;
     private final Map<String, Long> resetAckTimes;
+    private final Map<String, Long> readySentTimes;
     private final Map<String, Long> replayStartTimes;
 
     public DataRefreshMetrics(MeterRegistry registry) {
@@ -90,6 +91,7 @@ public class DataRefreshMetrics {
         this.refreshStartTimes = new ConcurrentHashMap<>();
         this.resetSentTimes = new ConcurrentHashMap<>();
         this.resetAckTimes = new ConcurrentHashMap<>();
+        this.readySentTimes = new ConcurrentHashMap<>();
         this.replayStartTimes = new ConcurrentHashMap<>();
     }
 
@@ -238,6 +240,14 @@ public class DataRefreshMetrics {
     }
 
     /**
+     * Record READY message sent to consumer
+     */
+    public void recordReadySent(String topic, String consumer, String refreshId) {
+        String key = topic + ":" + consumer + ":" + refreshId;
+        readySentTimes.put(key, System.currentTimeMillis());
+    }
+
+    /**
      * Record RESET ACK received from consumer
      */
     public void recordResetAckReceived(String topic, String consumer, String refreshId) {
@@ -272,6 +282,32 @@ public class DataRefreshMetrics {
     }
 
     /**
+     * Record RESET ACK duration from persisted timestamps (for resume after restart)
+     */
+    public void recordResetAckDuration(String topic, String consumer, String refreshId, long durationMs) {
+        String key = topic + ":" + consumer + ":" + refreshId;
+
+        Timer timer = resetAckDurationTimers.computeIfAbsent(key, k ->
+                Timer.builder("data_refresh_reset_ack_duration_seconds")
+                        .description("Time taken for consumer to ACK RESET message")
+                        .tag("topic", topic)
+                        .tag("consumer", consumer)
+                        .tag("refresh_id", refreshId)
+                        .publishPercentileHistogram()
+                        .serviceLevelObjectives(
+                            Duration.ofMillis(10),
+                            Duration.ofMillis(50),
+                            Duration.ofMillis(100),
+                            Duration.ofMillis(500),
+                            Duration.ofSeconds(1),
+                            Duration.ofSeconds(2)
+                        )
+                        .register(registry)
+        );
+        timer.record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    /**
      * Record replay started for consumer
      */
     public void recordReplayStarted(String topic, String consumer, String refreshId) {
@@ -285,14 +321,14 @@ public class DataRefreshMetrics {
     public void recordReadyAckReceived(String topic, String consumer, String refreshId) {
         String key = topic + ":" + consumer + ":" + refreshId;
 
-        // Measure time from RESET ACK to READY ACK (total replay time)
-        Long resetAckTime = resetAckTimes.get(key);
-        if (resetAckTime != null) {
-            long durationMs = System.currentTimeMillis() - resetAckTime;
+        // Measure time from READY sent to READY ACK received
+        Long readySentTime = readySentTimes.get(key);
+        if (readySentTime != null) {
+            long durationMs = System.currentTimeMillis() - readySentTime;
 
             Timer timer = readyAckDurationTimers.computeIfAbsent(key, k ->
                     Timer.builder("data_refresh_ready_ack_duration_seconds")
-                            .description("Time taken from RESET ACK to READY ACK (replay duration)")
+                            .description("Time taken from READY sent to READY ACK received")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
                             .tag("refresh_id", refreshId)
@@ -342,6 +378,34 @@ public class DataRefreshMetrics {
         // Cleanup
         resetSentTimes.remove(key);
         resetAckTimes.remove(key);
+    }
+
+    /**
+     * Record READY ACK duration from persisted timestamps (for resume after restart)
+     */
+    public void recordReadyAckDuration(String topic, String consumer, String refreshId, long durationMs) {
+        String key = topic + ":" + consumer + ":" + refreshId;
+
+        Timer timer = readyAckDurationTimers.computeIfAbsent(key, k ->
+                Timer.builder("data_refresh_ready_ack_duration_seconds")
+                        .description("Time taken from READY sent to READY ACK received")
+                        .tag("topic", topic)
+                        .tag("consumer", consumer)
+                        .tag("refresh_id", refreshId)
+                        .publishPercentileHistogram()
+                        .serviceLevelObjectives(
+                            Duration.ofMillis(100),
+                            Duration.ofMillis(500),
+                            Duration.ofSeconds(1),
+                            Duration.ofSeconds(5),
+                            Duration.ofSeconds(10),
+                            Duration.ofSeconds(30),
+                            Duration.ofSeconds(60),
+                            Duration.ofSeconds(120)
+                        )
+                        .register(registry)
+        );
+        timer.record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     /**

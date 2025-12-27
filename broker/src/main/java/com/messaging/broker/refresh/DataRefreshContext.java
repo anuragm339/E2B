@@ -44,6 +44,8 @@ public class DataRefreshContext {
     private final Set<String> receivedReadyAcks;
     private final Map<String, Long> consumerOffsets;  // Track replay progress per consumer
     private final Map<String, Boolean> consumerReplaying;  // Which consumers are actively replaying
+    private final Map<String, Instant> resetAckTimes;  // Track when each consumer sent RESET ACK
+    private final Map<String, Instant> readyAckTimes;  // Track when each consumer sent READY ACK
     private final Instant startTime;
     private volatile Instant resetSentTime;
     private volatile Instant readySentTime;
@@ -72,6 +74,8 @@ public class DataRefreshContext {
         this.receivedReadyAcks = ConcurrentHashMap.newKeySet();
         this.consumerOffsets = new ConcurrentHashMap<>();
         this.consumerReplaying = new ConcurrentHashMap<>();
+        this.resetAckTimes = new ConcurrentHashMap<>();
+        this.readyAckTimes = new ConcurrentHashMap<>();
         this.startTime = Instant.now();
         this.downtimePeriods = new ArrayList<>();
         this.lastShutdownTime = null;
@@ -89,12 +93,14 @@ public class DataRefreshContext {
 
     public void recordResetAck(String consumerId) {
         receivedResetAcks.add(consumerId);
+        resetAckTimes.put(consumerId, Instant.now());  // Record timestamp
         consumerReplaying.put(consumerId, true);  // Mark as replaying
         consumerOffsets.put(consumerId, 0L);      // Start from offset 0
     }
 
     public void recordReadyAck(String consumerId) {
         receivedReadyAcks.add(consumerId);
+        readyAckTimes.put(consumerId, Instant.now());  // Record timestamp
         consumerReplaying.put(consumerId, false); // No longer replaying
     }
 
@@ -156,6 +162,8 @@ public class DataRefreshContext {
     public Set<String> getReceivedResetAcks() { return receivedResetAcks; }
     public Set<String> getReceivedReadyAcks() { return receivedReadyAcks; }
     public Map<String, Long> getConsumerOffsets() { return consumerOffsets; }
+    public Map<String, Instant> getResetAckTimes() { return resetAckTimes; }
+    public Map<String, Instant> getReadyAckTimes() { return readyAckTimes; }
     public Instant getStartTime() { return startTime; }
     public Instant getResetSentTime() { return resetSentTime; }
     public void setResetSentTime(Instant time) { this.resetSentTime = time; }

@@ -89,8 +89,18 @@ public class DataRefreshStateStore {
             props.setProperty(consumerPrefix + ".reset.ack.received",
                             String.valueOf(context.getReceivedResetAcks().contains(consumerId)));
 
+            Instant resetAckTime = context.getResetAckTimes().get(consumerId);
+            if (resetAckTime != null) {
+                props.setProperty(consumerPrefix + ".reset.ack.time", resetAckTime.toString());
+            }
+
             props.setProperty(consumerPrefix + ".ready.ack.received",
                             String.valueOf(context.getReceivedReadyAcks().contains(consumerId)));
+
+            Instant readyAckTime = context.getReadyAckTimes().get(consumerId);
+            if (readyAckTime != null) {
+                props.setProperty(consumerPrefix + ".ready.ack.time", readyAckTime.toString());
+            }
 
             Long offset = context.getConsumerOffsets().get(consumerId);
             if (offset != null) {
@@ -274,10 +284,20 @@ public class DataRefreshStateStore {
                 context.getReceivedResetAcks().add(consumerId);
             }
 
+            String resetAckTimeStr = props.getProperty(consumerPrefix + ".reset.ack.time");
+            if (resetAckTimeStr != null) {
+                context.getResetAckTimes().put(consumerId, Instant.parse(resetAckTimeStr));
+            }
+
             boolean readyAck = Boolean.parseBoolean(
                     props.getProperty(consumerPrefix + ".ready.ack.received", "false"));
             if (readyAck) {
                 context.getReceivedReadyAcks().add(consumerId);
+            }
+
+            String readyAckTimeStr = props.getProperty(consumerPrefix + ".ready.ack.time");
+            if (readyAckTimeStr != null) {
+                context.getReadyAckTimes().put(consumerId, Instant.parse(readyAckTimeStr));
             }
 
             String offsetStr = props.getProperty(consumerPrefix + ".current.offset");
