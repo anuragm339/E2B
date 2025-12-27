@@ -67,6 +67,44 @@ broker:
     max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:1048576}  # 1MB max data per consumer per delivery cycle
     max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}  # Max messages to read from storage per cycle
 
+# DataRefresh Configuration
+# Expected consumers list for data refresh workflow using "group:topic" format
+# This is stable across reconnections (unlike socket addresses which are dynamic)
+data-refresh:
+  expected-consumers:
+    - "prices-v1"
+    - "reference-data-v5"
+    - "non-promotable-products"
+    - "prices-v4"
+    - "minimum-price"
+    - "deposit"
+    - "product-base-document"
+    - "search-product"
+    - "location"
+    - "location-clusters"
+    - "selling-restrictions"
+    - "colleague-facts-jobs"
+    - "colleague-facts-legacy"
+    - "loss-prevention-configuration"
+    - "loss-prevention-store-configuration"
+    - "loss-prevention-product"
+    - "loss-prevention-rule-config"
+    - "stored-value-services-banned-promotion"
+    - "stored-value-services-active-promotion"
+    - "colleague-card-pin"
+    - "dcxp-content"
+    - "restriction-rules"
+    - "dcxp-ugc"
+
+  # Future: service-topic mapping for service-level refresh
+  # Uncomment and configure when implementing service-level refresh
+  # service-topics:
+  #   price-quote-service:
+  #     - prices-v1
+  #     - prices-v4
+  #     - minimum-price
+  #     - reference-data-v5
+
 logger:
   levels:
     com.messaging: INFO

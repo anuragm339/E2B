@@ -42,6 +42,18 @@ public interface PipeConnector {
     void reconnect();
 
     /**
+     * Pause pipe calls (for DataRefresh workflow)
+     * Temporarily stops polling from parent broker
+     */
+    void pausePipeCalls();
+
+    /**
+     * Resume pipe calls (after DataRefresh completes)
+     * Resumes polling from parent broker
+     */
+    void resumePipeCalls();
+
+    /**
      * Disconnect from parent
      */
     void disconnect();

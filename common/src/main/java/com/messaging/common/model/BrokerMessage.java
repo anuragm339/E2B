@@ -54,7 +54,9 @@ public class BrokerMessage {
         DISCONNECT((byte) 0x07),
         HEARTBEAT((byte) 0x08),
         BATCH_HEADER((byte) 0x09), // Zero-copy batch header (recordCount, totalBytes, lastOffset, topic)
-        BATCH_ACK((byte) 0x0A);    // Consumer acknowledgment of batch receipt
+        BATCH_ACK((byte) 0x0A),    // Consumer acknowledgment of batch receipt
+        RESET_ACK((byte) 0x0B),    // Consumer acknowledgment of RESET message
+        READY_ACK((byte) 0x0C);    // Consumer acknowledgment of READY message
 
         private final byte code;
 
