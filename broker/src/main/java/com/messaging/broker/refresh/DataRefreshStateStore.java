@@ -55,6 +55,29 @@ public class DataRefreshStateStore {
             props.setProperty(topicPrefix + ".ready.sent.time", context.getReadySentTime().toString());
         }
 
+        // Save refresh ID (for per-batch metrics tracking)
+        if (context.getRefreshId() != null) {
+            props.setProperty(topicPrefix + ".refresh.id", context.getRefreshId());
+        }
+
+        // Save downtime periods
+        List<DataRefreshContext.DowntimePeriod> downtimePeriods = context.getDowntimePeriods();
+        props.setProperty(topicPrefix + ".downtime.count", String.valueOf(downtimePeriods.size()));
+
+        for (int i = 0; i < downtimePeriods.size(); i++) {
+            DataRefreshContext.DowntimePeriod period = downtimePeriods.get(i);
+            props.setProperty(topicPrefix + ".downtime." + i + ".shutdown",
+                             period.getShutdownTime().toString());
+            props.setProperty(topicPrefix + ".downtime." + i + ".startup",
+                             period.getStartupTime().toString());
+        }
+
+        // Save last shutdown time if exists (for ongoing outage)
+        Instant lastShutdown = context.getLastShutdownTime();
+        if (lastShutdown != null) {
+            props.setProperty(topicPrefix + ".last.shutdown.time", lastShutdown.toString());
+        }
+
         // Expected consumers for this topic
         props.setProperty(topicPrefix + ".expected.consumers",
                          String.join(",", context.getExpectedConsumers()));
@@ -210,6 +233,36 @@ public class DataRefreshStateStore {
         if (readySentTimeStr != null) {
             context.setReadySentTime(Instant.parse(readySentTimeStr));
         }
+
+        // Load refresh ID (for per-batch metrics tracking)
+        String refreshIdStr = props.getProperty(topicPrefix + ".refresh.id");
+        if (refreshIdStr != null) {
+            context.setRefreshId(refreshIdStr);
+        }
+
+        // Load downtime periods
+        int downtimeCount = Integer.parseInt(
+            props.getProperty(topicPrefix + ".downtime.count", "0"));
+
+        for (int i = 0; i < downtimeCount; i++) {
+            String shutdownStr = props.getProperty(topicPrefix + ".downtime." + i + ".shutdown");
+            String startupStr = props.getProperty(topicPrefix + ".downtime." + i + ".startup");
+
+            if (shutdownStr != null && startupStr != null) {
+                context.addDowntimePeriod(
+                    Instant.parse(shutdownStr),
+                    Instant.parse(startupStr)
+                );
+            }
+        }
+
+        // Load last shutdown time (for ongoing outage)
+        String lastShutdownStr = props.getProperty(topicPrefix + ".last.shutdown.time");
+        if (lastShutdownStr != null) {
+            context.setLastShutdownTime(Instant.parse(lastShutdownStr));
+        }
+
+        log.info("Loaded {} downtime period(s) for topic: {}", downtimeCount, topic);
 
         // Restore per-consumer state
         for (String consumerId : expectedConsumers) {

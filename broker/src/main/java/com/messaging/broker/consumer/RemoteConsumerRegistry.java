@@ -271,22 +271,33 @@ public class RemoteConsumerRegistry {
                 metrics.recordBatchMessagesSent(batchRegion.recordCount, batchRegion.totalBytes);
 
                 // Track data refresh metrics if this consumer is in refresh mode
+                log.info("Checking refresh status: dataRefreshManager={}, isRefreshInProgress={}",
+                         (dataRefreshManager != null), (dataRefreshManager != null && dataRefreshManager.isRefreshInProgress()));
                 if (dataRefreshManager != null && dataRefreshManager.isRefreshInProgress()) {
                     String consumerGroupTopic = consumer.topic; // Use topic as consumer ID (matches DataRefreshManager expectations)
+                    String refreshId = dataRefreshManager.getRefreshIdForTopic(consumer.topic);
 
-                    // Record data transferred
-                    dataRefreshMetrics.recordDataTransferred(
-                        consumer.topic,
-                        consumerGroupTopic,
-                        batchRegion.totalBytes,
-                        batchRegion.recordCount
-                    );
+                    log.info("Refresh in progress for topic: {}, refreshId: {}", consumer.topic, refreshId);
+
+                    // Record data transferred (with refresh_id for per-batch tracking)
+                    if (refreshId != null) {
+                        dataRefreshMetrics.recordDataTransferred(
+                            consumer.topic,
+                            consumerGroupTopic,
+                            batchRegion.totalBytes,
+                            batchRegion.recordCount,
+                            refreshId
+                        );
+                        log.info("Recorded data transfer with refresh_id: {}", refreshId);
+                    } else {
+                        log.warn("refreshId is NULL for topic: {}", consumer.topic);
+                    }
 
                     // Calculate and update transfer rate (bytes per second)
                     long deliveryDurationMs = System.currentTimeMillis() - deliveryStartTime;
-                    if (deliveryDurationMs > 0) {
+                    if (deliveryDurationMs > 0 && refreshId != null) {
                         double bytesPerSecond = (batchRegion.totalBytes * 1000.0) / deliveryDurationMs;
-                        dataRefreshMetrics.updateTransferRate(consumer.topic, consumerGroupTopic, bytesPerSecond);
+                        dataRefreshMetrics.updateTransferRate(consumer.topic, consumerGroupTopic, bytesPerSecond, refreshId);
 
                         log.debug("Data refresh transfer: {} bytes in {}ms = {:.2f} MB/s for topic {}",
                                 batchRegion.totalBytes, deliveryDurationMs, bytesPerSecond / (1024 * 1024), consumer.topic);

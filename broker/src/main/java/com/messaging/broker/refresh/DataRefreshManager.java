@@ -4,16 +4,15 @@ import com.messaging.broker.consumer.RemoteConsumerRegistry;
 import com.messaging.broker.metrics.DataRefreshMetrics;
 import com.messaging.common.api.PipeConnector;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 /**
  * Central orchestrator for DataRefresh workflow with immediate replay logic
@@ -29,6 +28,7 @@ public class DataRefreshManager {
     private static final Logger log = LoggerFactory.getLogger(DataRefreshManager.class);
     private static final long READY_ACK_TIMEOUT_MS = 10000;
     private static final long REPLAY_CHECK_INTERVAL_MS = 1000;
+    private static final long RESET_RETRY_INTERVAL_MS = 5000;  // Retry RESET every 5 seconds
 
     private final RemoteConsumerRegistry remoteConsumers;
     private final PipeConnector pipeConnector;
@@ -38,6 +38,7 @@ public class DataRefreshManager {
     private final ScheduledExecutorService scheduler;
     private final Map<String, DataRefreshContext> activeRefreshes;
     private final Map<String, ScheduledFuture<?>> replayCheckTasks;
+    private final Map<String, ScheduledFuture<?>> resetRetryTasks;
 
     // Track current refresh batch ID - shared by all topics in the same batch
     private volatile String currentRefreshId = null;
@@ -60,6 +61,7 @@ public class DataRefreshManager {
         });
         this.activeRefreshes = new ConcurrentHashMap<>();
         this.replayCheckTasks = new ConcurrentHashMap<>();
+        this.resetRetryTasks = new ConcurrentHashMap<>();
     }
 
     /**
@@ -80,16 +82,69 @@ public class DataRefreshManager {
 
         log.info("Resuming {} refresh(es) from saved state", savedRefreshes.size());
 
+        // IMPORTANT: Pause pipes BEFORE resuming any refresh
+        // This ensures no new messages flow during resume process
+        pipeConnector.pausePipeCalls();
+        log.info("Pipe calls PAUSED before resuming refreshes");
+
+        // Record startup time for all resumed refreshes
+        Instant startupTime = Instant.now();
+
+        // Group topics by refresh_id to handle batches properly
+        Map<String, List<DataRefreshContext>> batchGroups = new HashMap<>();
         for (Map.Entry<String, DataRefreshContext> entry : savedRefreshes.entrySet()) {
             String topic = entry.getKey();
             DataRefreshContext context = entry.getValue();
 
-            log.info("Resuming refresh for topic: {}, state: {}", topic, context.getState());
-            activeRefreshes.put(topic, context);
-            resumeRefresh(context);
+            String refreshId = context.getRefreshId();
+            if (refreshId == null) {
+                // Backward compatibility: generate refresh_id if missing
+                refreshId = String.valueOf(System.currentTimeMillis());
+                context.setRefreshId(refreshId);
+                log.warn("No refresh_id found for topic {}, generating new one: {}", topic, refreshId);
+            }
+
+            batchGroups.computeIfAbsent(refreshId, k -> new ArrayList<>()).add(context);
         }
 
-        log.info("Successfully resumed {} active refresh(es)", savedRefreshes.size());
+        log.info("Found {} batch(es) to resume", batchGroups.size());
+
+        // Process batches - set currentRefreshId to the most recent batch
+        // (batches are timestamp-based, so latest = highest value)
+        String latestRefreshId = batchGroups.keySet().stream()
+                .max(String::compareTo)
+                .orElse(null);
+        currentRefreshId = latestRefreshId;
+        log.info("Set currentRefreshId to most recent batch: {}", currentRefreshId);
+
+        // Resume all topics, grouped by batch
+        for (Map.Entry<String, List<DataRefreshContext>> batchEntry : batchGroups.entrySet()) {
+            String batchId = batchEntry.getKey();
+            List<DataRefreshContext> topicsInBatch = batchEntry.getValue();
+
+            log.info("Resuming batch {} with {} topic(s): {}",
+                    batchId,
+                    topicsInBatch.size(),
+                    topicsInBatch.stream().map(DataRefreshContext::getTopic).collect(Collectors.toList()));
+
+            for (DataRefreshContext context : topicsInBatch) {
+                String topic = context.getTopic();
+                log.info("Resuming topic: {} (batch: {}, state: {})", topic, batchId, context.getState());
+
+                // Record startup to close any open downtime period
+                context.recordStartup(startupTime);
+                long totalDowntime = context.getTotalDowntimeSeconds();
+                log.info("Recorded startup for topic: {} at {} (total downtime so far: {}s)",
+                         topic, startupTime, totalDowntime);
+
+                activeRefreshes.put(topic, context);
+                stateStore.saveState(context);  // Persist the updated context with startup time
+                resumeRefresh(context);
+            }
+        }
+
+        log.info("Successfully resumed {} active refresh(es) across {} batch(es)",
+                savedRefreshes.size(), batchGroups.size());
     }
 
     /**
@@ -106,16 +161,25 @@ public class DataRefreshManager {
         log.info("Starting refresh for topic: {} with {} expected consumer(s)",
                 topic, expectedConsumers.size());
 
+        // Thread-safe initialization of currentRefreshId and metrics reset
         // Reset all metrics ONLY if this is the first refresh (no active refreshes)
         // This ensures dashboard shows only current refresh batch data
         // Prometheus historical data is preserved for time-series queries
-        if (activeRefreshes.isEmpty()) {
-            // Generate new refresh_id for this batch (timestamp-based)
-            currentRefreshId = String.valueOf(System.currentTimeMillis());
-            metrics.resetMetricsForNewRefresh();
-            log.info("Starting new refresh batch with refresh_id: {}", currentRefreshId);
-        } else {
-            log.info("Adding topic to existing refresh batch: {}", currentRefreshId);
+        synchronized (this) {
+            if (activeRefreshes.isEmpty()) {
+                // Generate new refresh_id for this batch (timestamp-based)
+                currentRefreshId = String.valueOf(System.currentTimeMillis());
+                metrics.resetMetricsForNewRefresh();
+                log.info("Starting new refresh batch with refresh_id: {}", currentRefreshId);
+            } else {
+                log.info("Adding topic to existing refresh batch: {}", currentRefreshId);
+            }
+
+            // Ensure currentRefreshId is never null (defensive programming)
+            if (currentRefreshId == null) {
+                currentRefreshId = String.valueOf(System.currentTimeMillis());
+                log.warn("currentRefreshId was null, initializing to: {}", currentRefreshId);
+            }
         }
 
         DataRefreshContext context = new DataRefreshContext(
@@ -126,6 +190,7 @@ public class DataRefreshManager {
 
         context.setState(DataRefreshState.RESET_SENT);
         context.setResetSentTime(Instant.now());
+        context.setRefreshId(currentRefreshId);  // Store refresh_id for metrics tracking
 
         // Record metrics: refresh started (with refresh_id)
         metrics.recordRefreshStarted(topic, "LOCAL", currentRefreshId);
@@ -140,11 +205,21 @@ public class DataRefreshManager {
 
         // Record metrics: RESET sent to each expected consumer
         for (String consumer : expectedConsumers) {
-            metrics.recordResetSent(topic, consumer);
+            metrics.recordResetSent(topic, consumer, currentRefreshId);
         }
 
         // Persist state immediately
         stateStore.saveState(context);
+
+        // Schedule periodic RESET retry every 5 seconds until all ACKs received
+        ScheduledFuture<?> resetTask = scheduler.scheduleWithFixedDelay(
+                () -> retryResetBroadcast(topic),
+                RESET_RETRY_INTERVAL_MS,
+                RESET_RETRY_INTERVAL_MS,
+                TimeUnit.MILLISECONDS
+        );
+        resetRetryTasks.put(topic, resetTask);
+        log.info("Scheduled RESET retry task for topic {} (interval: {}ms)", topic, RESET_RETRY_INTERVAL_MS);
 
         return CompletableFuture.completedFuture(
             RefreshResult.success(topic, context.getState(), expectedConsumers.size())
@@ -185,7 +260,7 @@ public class DataRefreshManager {
                 context.getExpectedConsumers().size());
 
         // Record metrics: RESET ACK received
-        metrics.recordResetAckReceived(topic, consumerGroupTopic);
+        metrics.recordResetAckReceived(topic, consumerGroupTopic, context.getRefreshId());
 
         // Persist state after each ACK
         stateStore.saveState(context);
@@ -194,6 +269,13 @@ public class DataRefreshManager {
         if (context.getState() == DataRefreshState.RESET_SENT) {
             context.setState(DataRefreshState.REPLAYING);
             stateStore.saveState(context);
+
+            // Cancel RESET retry task (no longer need to retry)
+            ScheduledFuture<?> resetTask = resetRetryTasks.remove(topic);
+            if (resetTask != null) {
+                resetTask.cancel(false);
+                log.info("Cancelled RESET retry task for topic {} - transitioning to REPLAYING", topic);
+            }
 
             remoteConsumers.resetConsumerOffset(clientId, topic, 0);
             // Start periodic replay progress check
@@ -215,8 +297,11 @@ public class DataRefreshManager {
         log.info("Starting IMMEDIATE replay for consumer: {} on topic: {}", clientId, topic);
 
         try {
-            // Record metrics: replay started
-            metrics.recordReplayStarted(topic, topic);  // Use topic as consumer ID
+            DataRefreshContext context = activeRefreshes.get(topic);
+            if (context != null) {
+                // Record metrics: replay started
+                metrics.recordReplayStarted(topic, topic, context.getRefreshId());  // Use topic as consumer ID
+            }
 
             // Trigger delivery from offset 0
             remoteConsumers.notifyNewMessageForConsumer(clientId, topic, 0);
@@ -226,6 +311,38 @@ public class DataRefreshManager {
         } catch (Exception e) {
             log.error("Failed to start replay for consumer: {}", clientId, e);
         }
+    }
+
+    /**
+     * Retry RESET broadcast until all expected consumers ACK
+     * Called periodically by scheduler when in RESET_SENT state
+     */
+    private void retryResetBroadcast(String topic) {
+        DataRefreshContext context = activeRefreshes.get(topic);
+        if (context == null || context.getState() != DataRefreshState.RESET_SENT) {
+            // State changed, stop retrying
+            ScheduledFuture<?> task = resetRetryTasks.remove(topic);
+            if (task != null) {
+                task.cancel(false);
+            }
+            return;
+        }
+
+        Set<String> missingAcks = getMissingResetAcks(context);
+        if (missingAcks.isEmpty()) {
+            // All ACKs received, stop retrying (will transition to REPLAYING in handleResetAck)
+            log.info("All RESET ACKs received for topic {}, stopping retry scheduler", topic);
+            ScheduledFuture<?> task = resetRetryTasks.remove(topic);
+            if (task != null) {
+                task.cancel(false);
+            }
+            return;
+        }
+
+        // Re-broadcast RESET to all consumers (safe to send multiple times)
+        log.info("Retrying RESET broadcast for topic {} - still waiting for {} consumer(s): {}",
+                topic, missingAcks.size(), missingAcks);
+        remoteConsumers.broadcastResetToTopic(topic);
     }
 
     /**
@@ -324,7 +441,7 @@ public class DataRefreshManager {
                 context.getExpectedConsumers().size());
 
         // Record metrics: READY ACK received
-        metrics.recordReadyAckReceived(topic, consumerGroupTopic);
+        metrics.recordReadyAckReceived(topic, consumerGroupTopic, context.getRefreshId());
 
         // Persist state after each ACK
         stateStore.saveState(context);
@@ -347,22 +464,31 @@ public class DataRefreshManager {
         context.setState(DataRefreshState.COMPLETED);
         stateStore.saveState(context);
 
-        // Record metrics: refresh completed successfully (with refresh_id)
-        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", currentRefreshId);
+        // Record metrics: refresh completed successfully (with refresh_id AND context for downtime)
+        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", currentRefreshId, context);
 
-        // Resume pipe calls only if NO other refreshes are in progress
-        boolean otherRefreshesActive = activeRefreshes.values().stream()
+        // Resume pipe calls only if NO other refreshes IN THE SAME BATCH are in progress
+        // Check only topics with the same refresh_id (same batch)
+        String batchId = context.getRefreshId();
+        boolean otherRefreshesInBatchActive = activeRefreshes.values().stream()
                 .anyMatch(ctx -> !ctx.getTopic().equals(topic) &&
+                                 ctx.getRefreshId().equals(batchId) &&
                                  ctx.getState() != DataRefreshState.COMPLETED);
 
-        if (!otherRefreshesActive) {
+        if (!otherRefreshesInBatchActive) {
             pipeConnector.resumePipeCalls();
-            log.info("Pipe calls RESUMED after refresh of topic: {} (no other active refreshes)", topic);
+            log.info("Pipe calls RESUMED after refresh of topic: {} (all topics in batch {} completed)", topic, batchId);
             // Clear refresh_id when batch completes
             log.info("Refresh batch {} completed", currentRefreshId);
             currentRefreshId = null;
         } else {
-            log.info("Pipe calls remain PAUSED (other topic refreshes still in progress)");
+            // Count how many topics in this batch are still active
+            long activeTopicsInBatch = activeRefreshes.values().stream()
+                    .filter(ctx -> ctx.getRefreshId().equals(batchId) &&
+                                   ctx.getState() != DataRefreshState.COMPLETED)
+                    .count();
+            log.info("Pipe calls remain PAUSED ({} other topic(s) in batch {} still in progress)",
+                    activeTopicsInBatch, batchId);
         }
 
         // Clear state for this topic only (keeps other topics' state)
@@ -411,9 +537,31 @@ public class DataRefreshManager {
 
         switch (state) {
             case RESET_SENT:
-                // Still waiting for RESET ACKs
-                log.info("Resuming from RESET_SENT - waiting for ACKs from: {}", getMissingResetAcks(context));
-                // Normal handleResetAck() will handle incoming ACKs
+                // Still waiting for RESET ACKs - start periodic retry
+                Set<String> missingResetAcks = getMissingResetAcks(context);
+                log.info("Resuming from RESET_SENT - starting periodic RESET retry for {} consumer(s): {}",
+                        missingResetAcks.size(), missingResetAcks);
+
+                // Re-record RESET sent metrics with current refresh_id (in-memory map was cleared on restart)
+                String resumeRefreshId = context.getRefreshId();
+                for (String consumer : context.getExpectedConsumers()) {
+                    metrics.recordResetSent(topic, consumer, resumeRefreshId);
+                }
+                log.info("Re-recorded RESET sent metrics for topic {} with refresh_id: {}", topic, resumeRefreshId);
+
+                // Immediately send RESET once
+                remoteConsumers.broadcastResetToTopic(topic);
+                log.info("Initial RESET sent to all consumers for topic: {}", topic);
+
+                // Schedule periodic retry every 5 seconds until all ACKs received
+                ScheduledFuture<?> resetTask = scheduler.scheduleWithFixedDelay(
+                        () -> retryResetBroadcast(topic),
+                        RESET_RETRY_INTERVAL_MS,
+                        RESET_RETRY_INTERVAL_MS,
+                        TimeUnit.MILLISECONDS
+                );
+                resetRetryTasks.put(topic, resetTask);
+                log.info("Scheduled RESET retry task for topic {} (interval: {}ms)", topic, RESET_RETRY_INTERVAL_MS);
                 break;
 
             case REPLAYING:
@@ -486,6 +634,24 @@ public class DataRefreshManager {
     }
 
     /**
+     * Get current refresh ID for metrics tracking
+     */
+    public String getCurrentRefreshId() {
+        return currentRefreshId;
+    }
+
+    /**
+     * Get refresh ID for a specific topic
+     * More robust than getCurrentRefreshId() for multi-batch scenarios
+     */
+    public String getRefreshIdForTopic(String topic) {
+        DataRefreshContext context = activeRefreshes.get(topic);
+        String refreshId = context != null ? context.getRefreshId() : null;
+        log.info("getRefreshIdForTopic({}): context={}, refreshId={}", topic, (context != null), refreshId);
+        return refreshId;
+    }
+
+    /**
      * Get current refresh topic (if any)
      */
     public String getCurrentRefreshTopic() {
@@ -496,8 +662,37 @@ public class DataRefreshManager {
     /**
      * Shutdown executor on application shutdown
      */
+    @PreDestroy
     public void shutdown() {
         log.info("Shutting down DataRefreshManager");
+
+        // Cancel all scheduled tasks
+        int resetTaskCount = resetRetryTasks.size();
+        for (ScheduledFuture<?> task : resetRetryTasks.values()) {
+            task.cancel(false);
+        }
+        resetRetryTasks.clear();
+        log.info("Cancelled {} RESET retry task(s)", resetTaskCount);
+
+        int replayTaskCount = replayCheckTasks.size();
+        for (ScheduledFuture<?> task : replayCheckTasks.values()) {
+            task.cancel(false);
+        }
+        replayCheckTasks.clear();
+        log.info("Cancelled {} replay check task(s)", replayTaskCount);
+
+        // Record shutdown time for all active refreshes
+        if (!activeRefreshes.isEmpty()) {
+            Instant shutdownTime = Instant.now();
+            log.info("Recording shutdown time for {} active refresh(es)", activeRefreshes.size());
+
+            for (DataRefreshContext context : activeRefreshes.values()) {
+                context.recordShutdown(shutdownTime);
+                stateStore.saveState(context);
+                log.info("Recorded shutdown for topic: {} at {}", context.getTopic(), shutdownTime);
+            }
+        }
+
         scheduler.shutdown();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {

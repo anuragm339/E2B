@@ -1,10 +1,14 @@
 package com.messaging.broker.metrics;
 
+import com.messaging.broker.refresh.DataRefreshContext;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
 import jakarta.inject.Singleton;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -19,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Singleton
 public class DataRefreshMetrics {
+    private static final Logger log = LoggerFactory.getLogger(DataRefreshMetrics.class);
     private final MeterRegistry registry;
 
     // Counters
@@ -44,6 +49,10 @@ public class DataRefreshMetrics {
     private final Map<String, AtomicDouble> refreshStartTimeValues;
     private final Map<String, Gauge> refreshEndTimeGauges;
     private final Map<String, AtomicDouble> refreshEndTimeValues;
+    private final Map<String, Gauge> downtimeGauges;
+    private final Map<String, AtomicDouble> downtimeValues;
+    private final Map<String, Gauge> activeProcessingTimeGauges;
+    private final Map<String, AtomicDouble> activeProcessingTimeValues;
 
     // State tracking
     private final Map<String, Long> refreshStartTimes;
@@ -73,6 +82,10 @@ public class DataRefreshMetrics {
         this.refreshStartTimeValues = new ConcurrentHashMap<>();
         this.refreshEndTimeGauges = new ConcurrentHashMap<>();
         this.refreshEndTimeValues = new ConcurrentHashMap<>();
+        this.downtimeGauges = new ConcurrentHashMap<>();
+        this.downtimeValues = new ConcurrentHashMap<>();
+        this.activeProcessingTimeGauges = new ConcurrentHashMap<>();
+        this.activeProcessingTimeValues = new ConcurrentHashMap<>();
 
         this.refreshStartTimes = new ConcurrentHashMap<>();
         this.resetSentTimes = new ConcurrentHashMap<>();
@@ -108,7 +121,7 @@ public class DataRefreshMetrics {
     /**
      * Record refresh workflow completed
      */
-    public void recordRefreshCompleted(String topic, String refreshType, String status, String refreshId) {
+    public void recordRefreshCompleted(String topic, String refreshType, String status, String refreshId, DataRefreshContext context) {
         String key = topic + ":" + refreshType + ":" + status + ":" + refreshId;
 
         Counter counter = refreshCompletedCounters.computeIfAbsent(key, k ->
@@ -138,6 +151,48 @@ public class DataRefreshMetrics {
             return atomicTime;
         });
         endTimeValue.set(endTimeMs / 1000.0);
+
+        // Calculate downtime
+        long totalDowntimeSeconds = context.getTotalDowntimeSeconds();
+
+        // Record downtime gauge
+        AtomicDouble downtimeValue = downtimeValues.computeIfAbsent(gaugeKey, k -> {
+            AtomicDouble atomicDowntime = new AtomicDouble(0.0);
+            downtimeGauges.computeIfAbsent(gaugeKey, gk ->
+                Gauge.builder("data_refresh_downtime_seconds", atomicDowntime, AtomicDouble::get)
+                    .description("Total downtime during refresh (broker offline)")
+                    .tag("topic", topic)
+                    .tag("refresh_type", refreshType)
+                    .tag("refresh_id", refreshId)
+                    .register(registry)
+            );
+            return atomicDowntime;
+        });
+        downtimeValue.set(totalDowntimeSeconds);
+
+        // Calculate active processing time using actual end time (not "now")
+        long endTimeSeconds = endTimeMs / 1000;
+        long startTimeSeconds = context.getStartTime().getEpochSecond();
+        long totalDurationSeconds = endTimeSeconds - startTimeSeconds;
+        long activeProcessingSeconds = totalDurationSeconds - totalDowntimeSeconds;
+
+        // Record active processing time gauge
+        AtomicDouble activeTimeValue = activeProcessingTimeValues.computeIfAbsent(gaugeKey, k -> {
+            AtomicDouble atomicTime = new AtomicDouble(0.0);
+            activeProcessingTimeGauges.computeIfAbsent(gaugeKey, gk ->
+                Gauge.builder("data_refresh_active_processing_seconds", atomicTime, AtomicDouble::get)
+                    .description("Active processing time during refresh (excluding downtime)")
+                    .tag("topic", topic)
+                    .tag("refresh_type", refreshType)
+                    .tag("refresh_id", refreshId)
+                    .register(registry)
+            );
+            return atomicTime;
+        });
+        activeTimeValue.set(activeProcessingSeconds);
+
+        log.info("Refresh metrics for {}: total={}s, downtime={}s, active={}s",
+                 topic, totalDurationSeconds, totalDowntimeSeconds, activeProcessingSeconds);
 
         // Record total duration
         Long startTime = refreshStartTimes.remove(topic);
@@ -177,16 +232,16 @@ public class DataRefreshMetrics {
     /**
      * Record RESET message sent to consumer
      */
-    public void recordResetSent(String topic, String consumer) {
-        String key = topic + ":" + consumer;
+    public void recordResetSent(String topic, String consumer, String refreshId) {
+        String key = topic + ":" + consumer + ":" + refreshId;
         resetSentTimes.put(key, System.currentTimeMillis());
     }
 
     /**
      * Record RESET ACK received from consumer
      */
-    public void recordResetAckReceived(String topic, String consumer) {
-        String key = topic + ":" + consumer;
+    public void recordResetAckReceived(String topic, String consumer, String refreshId) {
+        String key = topic + ":" + consumer + ":" + refreshId;
 
         Long resetSentTime = resetSentTimes.get(key);
         if (resetSentTime != null) {
@@ -197,6 +252,7 @@ public class DataRefreshMetrics {
                             .description("Time taken for consumer to ACK RESET message")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
+                            .tag("refresh_id", refreshId)
                             .publishPercentileHistogram()
                             .serviceLevelObjectives(
                                 Duration.ofMillis(10),
@@ -218,16 +274,16 @@ public class DataRefreshMetrics {
     /**
      * Record replay started for consumer
      */
-    public void recordReplayStarted(String topic, String consumer) {
-        String key = topic + ":" + consumer;
+    public void recordReplayStarted(String topic, String consumer, String refreshId) {
+        String key = topic + ":" + consumer + ":" + refreshId;
         replayStartTimes.put(key, System.currentTimeMillis());
     }
 
     /**
      * Record READY ACK received from consumer
      */
-    public void recordReadyAckReceived(String topic, String consumer) {
-        String key = topic + ":" + consumer;
+    public void recordReadyAckReceived(String topic, String consumer, String refreshId) {
+        String key = topic + ":" + consumer + ":" + refreshId;
 
         // Measure time from RESET ACK to READY ACK (total replay time)
         Long resetAckTime = resetAckTimes.get(key);
@@ -239,6 +295,7 @@ public class DataRefreshMetrics {
                             .description("Time taken from RESET ACK to READY ACK (replay duration)")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
+                            .tag("refresh_id", refreshId)
                             .publishPercentileHistogram()
                             .serviceLevelObjectives(
                                 Duration.ofMillis(100),
@@ -265,6 +322,7 @@ public class DataRefreshMetrics {
                             .description("Pure replay duration (from replay start to READY ACK)")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
+                            .tag("refresh_id", refreshId)
                             .publishPercentileHistogram()
                             .serviceLevelObjectives(
                                 Duration.ofMillis(100),
@@ -289,8 +347,8 @@ public class DataRefreshMetrics {
     /**
      * Record data transferred during replay
      */
-    public void recordDataTransferred(String topic, String consumer, long bytes, long messages) {
-        String key = topic + ":" + consumer;
+    public void recordDataTransferred(String topic, String consumer, long bytes, long messages, String refreshId) {
+        String key = topic + ":" + consumer + ":" + refreshId;
 
         // Bytes gauge (resettable)
         AtomicLong bytesValue = bytesTransferredValues.computeIfAbsent(key, k -> {
@@ -300,6 +358,7 @@ public class DataRefreshMetrics {
                             .description("Total bytes transferred during current data refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
+                            .tag("refresh_id", refreshId)
                             .baseUnit("bytes")
                             .register(registry)
             );
@@ -315,6 +374,7 @@ public class DataRefreshMetrics {
                             .description("Total messages transferred during current data refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
+                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicMessages;
@@ -325,8 +385,8 @@ public class DataRefreshMetrics {
     /**
      * Update transfer rate (bytes per second)
      */
-    public void updateTransferRate(String topic, String consumer, double bytesPerSecond) {
-        String key = topic + ":" + consumer;
+    public void updateTransferRate(String topic, String consumer, double bytesPerSecond, String refreshId) {
+        String key = topic + ":" + consumer + ":" + refreshId;
 
         AtomicDouble rate = transferRates.computeIfAbsent(key, k -> {
             AtomicDouble atomicRate = new AtomicDouble(0.0);
@@ -337,6 +397,7 @@ public class DataRefreshMetrics {
                             .description("Current data transfer rate during refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
+                            .tag("refresh_id", refreshId)
                             .baseUnit("bytes_per_second")
                             .register(registry)
             );
@@ -410,6 +471,12 @@ public class DataRefreshMetrics {
 
         // Reset transfer rates to 0
         transferRates.values().forEach(v -> v.set(0.0));
+
+        // Reset downtime gauges to 0
+        downtimeValues.values().forEach(v -> v.set(0.0));
+
+        // Reset active processing time gauges to 0
+        activeProcessingTimeValues.values().forEach(v -> v.set(0.0));
 
         // Unregister and clear all Timer instances to reset histogram data
         // Timers must be unregistered from the registry because Micrometer
