@@ -104,7 +104,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             buffer.get(topicBytes);
             currentBatchTopic = new String(topicBytes, StandardCharsets.UTF_8);
 
-            log.info("Received BATCH_HEADER: topic={}, recordCount={}, totalBytes={}, lastOffset={}",
+            log.debug("Received BATCH_HEADER: topic={}, recordCount={}, totalBytes={}, lastOffset={}",
                     currentBatchTopic, expectedRecordCount, expectedTotalBytes, lastOffset);
 
             // Transition to READING_ZERO_COPY_BATCH state to expect raw bytes
@@ -325,7 +325,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             records.add(record);
         }
 
-        log.info("Decoded zero-copy batch: {} records, {} bytes", records.size(), bytesRead);
+        log.debug("Decoded zero-copy batch: {} records, {} bytes", records.size(), bytesRead);
 
         // Emit BatchDecodedEvent to pipeline (BatchAckHandler will send BATCH_ACK)
         out.add(new BatchDecodedEvent(records, currentBatchTopic));
