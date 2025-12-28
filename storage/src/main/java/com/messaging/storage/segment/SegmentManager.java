@@ -11,7 +11,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -23,6 +25,7 @@ import java.util.stream.Stream;
 public class SegmentManager {
     private static final Logger log = LoggerFactory.getLogger(SegmentManager.class);
     private static final Pattern SEGMENT_PATTERN = Pattern.compile("(\\d{20})\\.log");
+    private static final int METADATA_UPDATE_INTERVAL = 1000; // Update metadata every 1000 appends
 
     private final String topic;
     private final int partition;
@@ -31,6 +34,7 @@ public class SegmentManager {
     private final ConcurrentSkipListMap<Long, Segment> segments; // baseOffset -> Segment
     private final AtomicReference<Segment> activeSegment;
     private final SegmentMetadataStore metadataStore;
+    private final AtomicLong appendsSinceMetadataUpdate; // Track appends for periodic metadata updates
 
     public SegmentManager(String topic, int partition, Path dataDir, long maxSegmentSize) throws IOException {
         this.topic = topic;
@@ -40,6 +44,7 @@ public class SegmentManager {
         this.segments = new ConcurrentSkipListMap<>();
         this.activeSegment = new AtomicReference<>();
         this.metadataStore = new SegmentMetadataStore(dataDir.getParent());
+        this.appendsSinceMetadataUpdate = new AtomicLong(0);
 
         // Create data directory if it doesn't exist
         Files.createDirectories(dataDir);
@@ -99,8 +104,8 @@ public class SegmentManager {
 
                 segments.put(baseOffset, segment);
 
-                // Save metadata to database
-                saveSegmentMetadata(segment);
+//                // Save metadata to database
+//                saveSegmentMetadata(segment);
 
             } catch (IOException e) {
                 log.error("Failed to load segment: {}", logPath, e);
@@ -140,7 +145,12 @@ public class SegmentManager {
         // Don't modify the record - topic and partition are not written to segment file
         // The segment only stores: offset, msgKey, eventType, data, createdAt, crc32
 
-        return current.append(record);
+        long offset = current.append(record);
+
+        // Periodically update metadata for active segment (every METADATA_UPDATE_INTERVAL appends)
+        saveSegmentMetadata(current);
+
+        return offset;
     }
 
     /**
@@ -160,6 +170,9 @@ public class SegmentManager {
 
         // Save metadata for sealed segment
         saveSegmentMetadata(current);
+
+        // Reset append counter for new active segment
+        appendsSinceMetadataUpdate.set(0);
 
         // Create new active segment
         createNewSegment(current.getNextOffset());
@@ -347,6 +360,37 @@ public class SegmentManager {
     }
 
     /**
+     * Get maximum offset from segment metadata (for data refresh)
+     * This reads from the persistent metadata database and returns the true max offset,
+     * unlike getCurrentOffset() which returns the in-memory write head.
+     * Used during data refresh to determine when all historical data has been replayed.
+     *
+     * Metadata is now updated periodically (every 1000 appends), on segment roll, and on close,
+     * so the database should always have accurate data within the update interval.
+     */
+    public long getMaxOffsetFromMetadata() {
+        try {
+            List<SegmentMetadata> segmentList = metadataStore.getSegments(topic, partition);
+            if (segmentList.isEmpty()) {
+                return -1;
+            }
+
+            // Find the segment with the highest max_offset
+            long maxOffset = segmentList.stream()
+                    .mapToLong(SegmentMetadata::getMaxOffset)
+                    .max()
+                    .orElse(-1);
+
+            log.debug("Max offset from metadata for topic={}, partition={}: {}", topic, partition, maxOffset);
+            return maxOffset;
+        } catch (Exception e) {
+            log.error("Failed to get max offset from metadata for topic={}, partition={}", topic, partition, e);
+            // Fallback to in-memory offset
+            return getCurrentOffset();
+        }
+    }
+
+    /**
      * Get earliest (lowest) available offset
      * Returns the base offset of the first segment.
      * This may NOT be 0 if old segments have been deleted or after compaction.
@@ -405,6 +449,11 @@ public class SegmentManager {
      */
     private void saveSegmentMetadata(Segment segment) {
         try {
+            long recordCount = Optional.ofNullable(metadataStore.getSegments(topic, partition))
+                    .filter(list -> !list.isEmpty())
+                    .map(list -> list.get(0).getRecordCount())
+                    .orElse(0L) + 1;
+
             SegmentMetadata metadata = SegmentMetadata.builder()
                     .topic(topic)
                     .partition(partition)
@@ -413,7 +462,7 @@ public class SegmentManager {
                     .logFilePath(segment.getLogPath().toString())
                     .indexFilePath(segment.getIndexPath().toString())
                     .sizeBytes(segment.getSize())
-                    .recordCount(segment.getNextOffset() - segment.getBaseOffset())
+                    .recordCount(recordCount)
                     .build();
 
             metadataStore.saveSegment(metadata);
@@ -428,6 +477,10 @@ public class SegmentManager {
     public void close() throws IOException {
         Segment active = activeSegment.get();
         if (active != null) {
+            // Save final metadata for active segment before closing
+            saveSegmentMetadata(active);
+            log.info("Saved final metadata for active segment on close: topic={}, partition={}, maxOffset={}",
+                    topic, partition, active.getNextOffset() - 1);
             active.close();
         }
 

@@ -501,9 +501,21 @@ public class DataRefreshManager {
         log.info("Refresh state cleared for topic: {}", topic);
 
         // Cleanup after delay (keep context for status queries)
+        // Store refresh ID to ensure we only remove THIS refresh, not a newer one
+        final String completedRefreshId = context.getRefreshId();
         scheduler.schedule(() -> {
-            activeRefreshes.remove(topic);
-            log.info("Refresh context removed for topic: {}", topic);
+            // Only remove if the context still belongs to this refresh
+            // This prevents removing a newer refresh that started within 60 seconds
+            DataRefreshContext currentContext = activeRefreshes.get(topic);
+            if (currentContext != null && completedRefreshId.equals(currentContext.getRefreshId())) {
+                activeRefreshes.remove(topic);
+                log.info("Refresh context removed for topic: {} (refresh_id: {})", topic, completedRefreshId);
+            } else if (currentContext != null) {
+                log.info("Skipping context removal for topic: {} - newer refresh is active (current: {}, completed: {})",
+                        topic, currentContext.getRefreshId(), completedRefreshId);
+            } else {
+                log.debug("Context already removed for topic: {} (refresh_id: {})", topic, completedRefreshId);
+            }
         }, 60, TimeUnit.SECONDS);
     }
 

@@ -37,6 +37,16 @@ public interface StorageEngine {
     long getCurrentOffset(String topic, int partition);
 
     /**
+     * Get maximum offset from persistent segment metadata (for data refresh)
+     * This reads from the metadata database and returns the true max offset,
+     * unlike getCurrentOffset() which returns the in-memory write head.
+     * @param topic Topic name
+     * @param partition Partition number
+     * @return Maximum offset from metadata, or -1 if no segments
+     */
+    long getMaxOffsetFromMetadata(String topic, int partition);
+
+    /**
      * Get earliest (lowest) available offset for a topic-partition
      * This is the base offset of the first segment, not necessarily 0.
      * For example, after compaction or deletion, earliest offset might be 1000000.
