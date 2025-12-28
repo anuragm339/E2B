@@ -7,6 +7,10 @@ dependencies {
     implementation 'io.micronaut:micronaut-http-client'
     implementation 'io.micronaut:micronaut-http-server-netty'
 
+    // Metrics
+    implementation 'io.micronaut.micrometer:micronaut-micrometer-core'
+    implementation 'io.micrometer:micrometer-core'
+
     // Jackson for JSON
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'
     implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.15.3'
