@@ -165,7 +165,7 @@ public class RemoteConsumerRegistry {
      */
     private void startDelivery(RemoteConsumer consumer) {
         Future<?> task = scheduler.scheduleWithFixedDelay(
-                () -> deliverMessages(consumer,null),
+                () -> deliverMessages(consumer),
                 500, // Wait 500ms before first delivery to allow ACK to complete
                 POLL_INTERVAL_MS,
                 TimeUnit.MILLISECONDS
@@ -176,180 +176,162 @@ public class RemoteConsumerRegistry {
     /**
      * Deliver messages to a remote consumer
      */
-    private void deliverMessages(RemoteConsumer consumer,Long offset) {
+    private void deliverMessages(RemoteConsumer consumer) {
         String deliveryKey = consumer.clientId + ":" + consumer.topic;
+        String pendingKey = deliveryKey + ":pending";
 
-        // Try to acquire in-flight slot for this topic+consumer
         AtomicBoolean inFlight = inFlightDeliveries.computeIfAbsent(
-            deliveryKey,
-            k -> new AtomicBoolean(false)
+                deliveryKey, k -> new AtomicBoolean(false)
         );
 
-        if (!inFlight.compareAndSet(false, true)) {
-            log.debug("Skipping delivery - topic {} already in-flight for consumer {}",
-                     consumer.topic, consumer.clientId);
+        // 1️⃣ single in-flight
+        if (!inFlight.compareAndSet(false, true)) return;
+
+        // 2️⃣ ACK gating
+        if (pendingOffsets.containsKey(pendingKey)) {
+            inFlight.set(false);
             return;
         }
 
-        // Check if ANOTHER topic is already being delivered to this consumer
-        String previousTopic = consumerCurrentTopic.putIfAbsent(consumer.clientId, consumer.topic);
-        if (previousTopic != null && !previousTopic.equals(consumer.topic)) {
+        // 3️⃣ one-topic-at-a-time
+        String prev = consumerCurrentTopic.putIfAbsent(consumer.clientId, consumer.topic);
+        if (prev != null && !prev.equals(consumer.topic)) {
             inFlight.set(false);
-            log.debug("Consumer {} is busy with topic {}, skipping topic {}",
-                     consumer.clientId, previousTopic, consumer.topic);
             return;
         }
+
+        long startOffset = consumer.getCurrentOffset();
+        boolean sent = false;
+
+        Timer.Sample readSample = null;
+        Timer.Sample deliverySample = null;
+        long deliveryStartMs = System.currentTimeMillis();
 
         try {
-            long currentOffset = consumer.getCurrentOffset();
+            /* ================= STORAGE READ METRICS ================= */
+            readSample = metrics.startStorageReadTimer();
 
-            log.info("Attempting to deliver messages to consumer {}: and topic {}: offset={}",
-                     consumer.clientId,consumer.topic, currentOffset);
+            Segment.BatchFileRegion batch = storageExecutor.submit(() ->
+                    ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage)
+                            .getZeroCopyBatch(
+                                    consumer.topic,
+                                    0,
+                                    startOffset,
+                                    readBatchSize,
+                                    maxMessageSizePerConsumer
+                            )
+            ).get(10, TimeUnit.SECONDS);
 
-            // Read next batch of messages from storage using zero-copy
-            Segment.BatchFileRegion batchRegion;
-            try {
-                log.debug("About to call storage.getZeroCopyBatch() for consumer {}: topic={}, partition=0, offset={}",
-                         consumer.clientId, consumer.topic, currentOffset);
+            metrics.stopStorageReadTimer(readSample);
+            metrics.recordStorageRead();
 
-                // Use a CompletableFuture with timeout to prevent indefinite blocking
-                final long offsetToRead = currentOffset; // Must be final for lambda
-                Timer.Sample readSample = metrics.startStorageReadTimer();
-
-                // Call getZeroCopyBatch on appropriate storage engine
-                batchRegion = CompletableFuture.supplyAsync(() -> {
-                    try {
-                       if (storage instanceof com.messaging.storage.filechannel.FileChannelStorageEngine) {
-                            return ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage).getZeroCopyBatch(consumer.topic, 0, offsetToRead,
-                                    readBatchSize, maxMessageSizePerConsumer);
-                        } else {
-                            throw new IllegalStateException("Unknown storage engine type: " + storage.getClass().getName());
-                        }
-                    } catch (Exception e) {
-                        log.error("Exception in storage.getZeroCopyBatch(): ", e);
-                        throw new RuntimeException(e);
-                    }
-                }, storageExecutor).get(10, TimeUnit.SECONDS);
-
-                metrics.stopStorageReadTimer(readSample);
-                metrics.recordStorageRead();
-
-                log.debug("storage.getZeroCopyBatch() returned successfully: recordCount={}, bytes={}",
-                         batchRegion.recordCount, batchRegion.totalBytes);
-            } catch (TimeoutException e) {
-                log.error("TIMEOUT: storage.getZeroCopyBatch() did not complete within 10 seconds for consumer {}: topic={}, offset={}",
-                         consumer.clientId, consumer.topic, currentOffset);
-                return;
-            } catch (Exception e) {
-                log.error("Failed to read from storage for consumer {}: topic={}, offset={}",
-                         consumer.clientId, consumer.topic, currentOffset, e);
-                return;
-            }
-
-            if (batchRegion.recordCount == 0 || batchRegion.fileRegion == null) {
-                return; // No new messages
-            }
-
-            metrics.recordBatchSize(batchRegion.recordCount);
-
-            // Send the batch to consumer using zero-copy
-            try {
-                // Start timing for per-consumer delivery
-                Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
-                long deliveryStartTime = System.currentTimeMillis();
-
-                log.info("Sending zero-copy batch of {} messages ({} bytes) to consumer {} for topic {} starting at offset {}",
-                         batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic, currentOffset);
-
-                sendBatchToConsumer(consumer, batchRegion, currentOffset);
-
-                // Record per-consumer metrics
-                metrics.recordConsumerMessageSent(consumer.clientId, consumer.topic, consumer.group, batchRegion.totalBytes);
-                metrics.stopConsumerDeliveryTimer(deliverySample, consumer.clientId, consumer.topic, consumer.group);
-
-                // Record global metrics - efficient batch method
-                metrics.recordBatchMessagesSent(batchRegion.recordCount, batchRegion.totalBytes);
-
-                // Track data refresh metrics if this consumer is in refresh mode
-                log.info("Checking refresh status: dataRefreshManager={}, isRefreshInProgress={}",
-                         (dataRefreshManager != null), (dataRefreshManager != null && dataRefreshManager.isRefreshInProgress()));
-                if (dataRefreshManager != null && dataRefreshManager.isRefreshInProgress()) {
-                    String consumerGroupTopic = consumer.topic; // Use topic as consumer ID (matches DataRefreshManager expectations)
-                    String refreshId = dataRefreshManager.getRefreshIdForTopic(consumer.topic);
-
-                    log.info("Refresh in progress for topic: {}, refreshId: {}", consumer.topic, refreshId);
-
-                    // Record data transferred (with refresh_id for per-batch tracking)
-                    if (refreshId != null) {
-                        dataRefreshMetrics.recordDataTransferred(
-                            consumer.topic,
-                            consumerGroupTopic,
-                            batchRegion.totalBytes,
-                            batchRegion.recordCount,
-                            refreshId
-                        );
-                        log.info("Recorded data transfer with refresh_id: {}", refreshId);
-                    } else {
-                        log.warn("refreshId is NULL for topic: {}", consumer.topic);
-                    }
-
-                    // Calculate and update transfer rate (bytes per second)
-                    long deliveryDurationMs = System.currentTimeMillis() - deliveryStartTime;
-                    if (deliveryDurationMs > 0 && refreshId != null) {
-                        double bytesPerSecond = (batchRegion.totalBytes * 1000.0) / deliveryDurationMs;
-                        dataRefreshMetrics.updateTransferRate(consumer.topic, consumerGroupTopic, bytesPerSecond, refreshId);
-
-                        log.debug("Data refresh transfer: {} bytes in {}ms = {:.2f} MB/s for topic {}",
-                                batchRegion.totalBytes, deliveryDurationMs, bytesPerSecond / (1024 * 1024), consumer.topic);
-                    }
-                }
-
-                // Update offset to after the last message sent
-                currentOffset = batchRegion.lastOffset + 1;
-
-                log.debug("Sent {} messages ({} bytes) to consumer {}, next offset={}",
-                         batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, currentOffset);
-
-                // Store pending offset (DON'T update properties file yet - wait for ACK!)
-                String pendingKey = deliveryKey + ":pending";
-                pendingOffsets.put(pendingKey, currentOffset);
-                log.debug("Stored pending offset for ACK: deliveryKey={}, offset={}", deliveryKey, currentOffset);
-
-            } catch (Exception e) {
-                log.error("Failed to send batch to consumer {}: recordCount={}, firstOffset={}",
-                         consumer.clientId, batchRegion.recordCount, currentOffset, e);
-                // Record failure
-                metrics.recordConsumerFailure(consumer.clientId, consumer.topic, consumer.group);
-                // Clear in-flight status on error
+            if (batch.recordCount == 0 || batch.fileRegion == null) {
                 inFlight.set(false);
-                consumerCurrentTopic.remove(consumer.clientId, consumer.topic);
-                return; // Stop on error
+                consumerCurrentTopic.remove(consumer.clientId);
+                return;
             }
 
-            // NOTE: Offset will be committed to properties file only after receiving BATCH_ACK
-            // Update consumer offset metric to pending value
-            metrics.updateConsumerOffset(consumer.clientId, consumer.topic, consumer.group, currentOffset);
+            /* ================= BATCH VISIBILITY ================= */
+            metrics.recordBatchSize(batch.recordCount);
 
-            // Calculate and update lag (difference between latest message and consumer offset)
-            // Get head offset from storage (getCurrentOffset returns the highest offset written)
+            /* ================= OFFSET RESERVATION ================= */
+            long nextOffset = batch.lastOffset + 1;
+            consumer.setCurrentOffset(nextOffset);
+            pendingOffsets.put(pendingKey, nextOffset);
+
+            /* ================= ACK TIMEOUT METRIC ================= */
+            scheduler.schedule(() -> {
+                if (pendingOffsets.remove(pendingKey) != null) {
+                    log.warn("ACK timeout for {}", deliveryKey);
+                   // metrics.recordAckTimeout(consumer.clientId, consumer.topic, consumer.group);
+                    inFlight.set(false);
+                    consumerCurrentTopic.remove(consumer.clientId);
+                }
+            }, 30, TimeUnit.SECONDS);
+
+            /* ================= DELIVERY METRICS ================= */
+            deliverySample = metrics.startConsumerDeliveryTimer();
+
+            sendBatchToConsumer(consumer, batch, startOffset);
+            sent = true;
+
+            metrics.stopConsumerDeliveryTimer(
+                    deliverySample,
+                    consumer.clientId,
+                    consumer.topic,
+                    consumer.group
+            );
+
+
+
+            metrics.recordBatchMessagesSent(batch.recordCount, batch.totalBytes);
+            metrics.recordConsumerMessageSent(
+                    consumer.clientId,
+                    consumer.topic,
+                    consumer.group,
+                    batch.totalBytes
+            );
+
+            /* ================= CONSUMER LAG ================= */
             try {
                 long headOffset = storage.getCurrentOffset(consumer.topic, 0);
-                // headOffset is the last written offset, so next offset to write would be headOffset + 1
-                // lag is (headOffset + 1) - currentOffset
-                long lag = (headOffset + 1) - currentOffset;
-                metrics.updateConsumerLag(consumer.clientId, consumer.topic, consumer.group, Math.max(0, lag));
-            } catch (Exception e) {
-                log.debug("Could not calculate lag for consumer {}: {}", consumer.clientId, e.getMessage());
+                long lag = Math.max(0, (headOffset + 1) - nextOffset);
+                metrics.updateConsumerLag(
+                        consumer.clientId,
+                        consumer.topic,
+                        consumer.group,
+                        lag
+                );
+            } catch (Exception ignore) {
+                // lag is best-effort
+            }
+
+            /* ================= DATA REFRESH METRICS ================= */
+            if (dataRefreshManager != null && dataRefreshManager.isRefreshInProgress()) {
+                String refreshId = dataRefreshManager.getRefreshIdForTopic(consumer.topic);
+                if (refreshId != null) {
+                    dataRefreshMetrics.recordDataTransferred(
+                            consumer.topic,
+                            consumer.topic,
+                            batch.totalBytes,
+                            batch.recordCount,
+                            refreshId
+                    );
+
+                    long durationMs = System.currentTimeMillis() - deliveryStartMs;
+                    if (durationMs > 0) {
+                        double bytesPerSec = (batch.totalBytes * 1000.0) / durationMs;
+                        dataRefreshMetrics.updateTransferRate(
+                                consumer.topic,
+                                consumer.topic,
+                                bytesPerSec,
+                                refreshId
+                        );
+                    }
+                }
             }
 
         } catch (Exception e) {
-            log.error("FATAL: Error delivering messages to consumer {}, task will continue",
-                     consumer.clientId, e);
-            // Clear in-flight status on fatal error
+            log.error("Delivery failed for {}", deliveryKey, e);
+            metrics.recordConsumerFailure(
+                    consumer.clientId,
+                    consumer.topic,
+                    consumer.group
+            );
+
+            if (!sent) {
+                consumer.setCurrentOffset(startOffset);
+                pendingOffsets.remove(pendingKey);
+            }
+
             inFlight.set(false);
-            consumerCurrentTopic.remove(consumer.clientId, consumer.topic);
+            consumerCurrentTopic.remove(consumer.clientId);
         }
     }
+
+
+
+
 
     /**
      * Send a batch of messages to consumer using Kafka-style zero-copy (sendfile syscall)
@@ -397,12 +379,12 @@ public class RemoteConsumerRegistry {
         // Step 2: Send FileRegion for true zero-copy transfer (Kafka-style sendfile)
         // This uses OS sendfile() syscall - data goes from file → kernel → socket
         // NO user-space copies, NO heap allocations!
-        log.info("Sending zero-copy FileRegion of {} messages ({} bytes) to consumer {} for topic {} using sendfile()",
+        log.debug("Sending zero-copy FileRegion of {} messages ({} bytes) to consumer {} for topic {} using sendfile()",
                  batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic);
 
         // Increased timeout for larger batches (3MB batches may take longer to transfer)
         // Timeout = 10s base + 10s per MB (e.g., 3MB = 10 + 30 = 40 seconds)
-        log.info("Sending FileRegion with timeout of {}s for {} bytes", timeoutSeconds, batchRegion.totalBytes);
+        log.debug("Sending FileRegion with timeout of {}s for {} bytes", timeoutSeconds, batchRegion.totalBytes);
 
         server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
               .get(timeoutSeconds, TimeUnit.MINUTES);
@@ -422,38 +404,25 @@ public class RemoteConsumerRegistry {
         String deliveryKey = clientId + ":" + topic;
         String pendingKey = deliveryKey + ":pending";
 
-        log.debug("Received BATCH_ACK from clientId={}, topic={}", clientId, topic);
-
-        // Get pending offset for this delivery
-        Long offsetToCommit = pendingOffsets.remove(pendingKey);
-
-        if (offsetToCommit != null) {
-            // ✅ NOW update offset in properties file (source of truth)
-            RemoteConsumer consumer = consumers.get(deliveryKey);
-            if (consumer != null) {
-                String consumerId = consumer.group + ":" + topic;
-                offsetTracker.updateOffset(consumerId, offsetToCommit);
-                consumer.setCurrentOffset(offsetToCommit);
-
-                log.info("ACK received from clientId={}, topic={}, committed offset {} to properties file",
-                        clientId, topic, offsetToCommit);
-            } else {
-                log.warn("Received ACK for unknown consumer: deliveryKey={}", deliveryKey);
-            }
-        } else {
-            log.warn("Received ACK but no pending offset found for deliveryKey={}", deliveryKey);
+        Long committedOffset = pendingOffsets.remove(pendingKey);
+        if (committedOffset == null) {
+            log.warn("ACK with no pending offset: {}", deliveryKey);
+            return;
         }
 
-        // Clear in-flight status to allow next delivery
+        RemoteConsumer consumer = consumers.get(deliveryKey);
+        if (consumer != null) {
+            offsetTracker.updateOffset(consumer.group + ":" + topic, committedOffset);
+        }
+
         AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
         if (inFlight != null) {
             inFlight.set(false);
-            log.debug("Cleared in-flight status for deliveryKey={}", deliveryKey);
         }
 
-        // Remove from consumerCurrentTopic to allow other topics to deliver
         consumerCurrentTopic.remove(clientId, topic);
-        log.debug("Removed consumer {} from current topic tracking", clientId);
+
+        log.info("ACK committed for {} at offset {}", deliveryKey, committedOffset);
     }
 
     /**
@@ -470,7 +439,7 @@ public class RemoteConsumerRegistry {
                 // Rate limiting: Only submit delivery task if last attempt was > 200ms ago (increased from 100ms)
                 if (now - consumer.lastDeliveryAttempt >= 200) {
                     consumer.lastDeliveryAttempt = now;
-                    scheduler.submit(() -> deliverMessages(consumer,offset));
+                    scheduler.submit(() -> deliverMessages(consumer));
                 } else {
                     log.debug("Skipping delivery for consumer {} - rate limited", consumer.clientId);
                 }
@@ -607,19 +576,19 @@ public class RemoteConsumerRegistry {
             return;
         }
 
-        // Check InFlight status BEFORE scheduling to prevent duplicate deliveries during refresh
-        // This is the same pattern used in the Pipe flow to prevent duplicates
+        // Check if delivery already in progress (inFlight is managed by deliverMessages and cleared by handleAck)
+        // This prevents queueing duplicate tasks when checkReplayProgress() runs every 1 second
         String deliveryKey = consumer.clientId + ":" + consumer.topic;
         AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
 
         if (inFlight != null && inFlight.get()) {
-            log.debug("Skipping notify - topic {} already in-flight for consumer {}, delivery already scheduled",
-                     consumer.topic, consumer.clientId);
+            log.info("Skipping task submission - delivery already in progress for consumer: {}, topic: {}",
+                     consumer.clientId, consumer.topic);
             return;
         }
 
-        log.info("Triggering delivery for consumer: {}, topic: {}, offset: {}", clientId, topic, offset);
-        scheduler.submit(() -> deliverMessages(consumer, offset));
+        log.debug("Triggering delivery for consumer: {}, topic: {}, offset: {}", clientId, topic, offset);
+        scheduler.submit(() -> deliverMessages(consumer));
     }
 
     /**
