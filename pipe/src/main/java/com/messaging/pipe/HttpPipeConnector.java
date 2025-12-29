@@ -2,9 +2,11 @@ package com.messaging.pipe;
 
 import com.messaging.common.api.PipeConnector;
 import com.messaging.common.model.MessageRecord;
+import com.messaging.pipe.metrics.PipeMetrics;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -39,6 +41,7 @@ public class HttpPipeConnector implements PipeConnector {
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
     private final Path offsetFilePath;
+    private final PipeMetrics metrics;
 
     private volatile PipeConnectionImpl connection;
     private volatile Consumer<MessageRecord> dataHandler;
@@ -50,7 +53,8 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile long adaptiveDelay = MIN_POLL_INTERVAL_MS;
 
     public HttpPipeConnector(
-            @Value("${broker.storage.data-dir:./data}") String dataDir) {
+            @Value("${broker.storage.data-dir:./data}") String dataDir,
+            PipeMetrics metrics) {
 
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
@@ -58,6 +62,7 @@ public class HttpPipeConnector implements PipeConnector {
 
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
+        this.metrics = metrics;
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "HttpPipeConnector");
@@ -73,7 +78,7 @@ public class HttpPipeConnector implements PipeConnector {
         this.offsetFilePath = Paths.get(dataDir, OFFSET_FILE);
         loadOffset();
 
-        log.info("HttpPipeConnector initialized, offset={}", currentOffset);
+        log.info("HttpPipeConnector initialized with metrics, offset={}", currentOffset);
     }
 
     @Override
@@ -196,29 +201,50 @@ public class HttpPipeConnector implements PipeConnector {
     private int pollParent() throws IOException, InterruptedException {
         if (!running || connection == null) return 0;
 
-        String parentUrl = normalizeUrl(connection.parentUrl);
-        String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=5";  // Reduced from 10 to 5
+        // Start timing the pipe fetch operation
+        Timer.Sample sample = metrics.startFetchTimer();
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(pollUrl))
-                .timeout(Duration.ofSeconds(10))
-                .GET()
-                .build();
+        try {
+            String parentUrl = normalizeUrl(connection.parentUrl);
+            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=5";  // Reduced from 10 to 5
 
-        HttpResponse<InputStream> response =
-                httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(pollUrl))
+                    .timeout(Duration.ofSeconds(10))
+                    .GET()
+                    .build();
 
-        if (response.statusCode() == 200) {
-            try (InputStream is = response.body()) {
-                return streamAndHandle(is);
+            HttpResponse<InputStream> response =
+                    httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+
+            // Record latency after HTTP request completes
+            metrics.recordFetchLatency(sample);
+
+            if (response.statusCode() == 200) {
+                try (InputStream is = response.body()) {
+                    int count = streamAndHandle(is);
+                    if (count == 0) {
+                        metrics.recordEmptyFetch();
+                    }
+                    return count;
+                }
             }
-        }
 
-        if (response.statusCode() != 204) {
-            log.warn("Poll failed: {}", response.statusCode());
-        }
+            if (response.statusCode() == 204) {
+                // No content available - this is normal
+                metrics.recordEmptyFetch();
+            } else if (response.statusCode() != 204) {
+                log.warn("Poll failed: {}", response.statusCode());
+                metrics.recordFetchError();
+            }
 
-        return 0;
+            return 0;
+
+        } catch (IOException | InterruptedException e) {
+            // Record error metric before rethrowing
+            metrics.recordFetchError();
+            throw e;
+        }
     }
 
     /**
@@ -245,6 +271,11 @@ public class HttpPipeConnector implements PipeConnector {
             connection.lastReceivedOffset = record.getOffset();
             connection.lastMessageTime = System.currentTimeMillis();
             count++;
+        }
+
+        // Record metrics: messages received from pipe
+        if (count > 0) {
+            metrics.recordMessagesReceived(count);
         }
 
         return count;

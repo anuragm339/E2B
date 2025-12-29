@@ -390,7 +390,9 @@ public class RemoteConsumerRegistry {
         log.debug("Sending BATCH_HEADER to consumer {}: topic={}, recordCount={}, totalBytes={}, lastOffset={}",
                  consumer.clientId, consumer.topic, batchRegion.recordCount, batchRegion.totalBytes, batchRegion.lastOffset);
 
-        server.send(consumer.clientId, headerMsg).get(1, TimeUnit.SECONDS);
+        long timeoutSeconds = 1 + (batchRegion.totalBytes / (1024 * 1024) * 10);
+        // Increased header timeout from 1s to 10s for reliability
+        server.send(consumer.clientId, headerMsg).get(timeoutSeconds, TimeUnit.MINUTES);
 
         // Step 2: Send FileRegion for true zero-copy transfer (Kafka-style sendfile)
         // This uses OS sendfile() syscall - data goes from file → kernel → socket
@@ -398,10 +400,14 @@ public class RemoteConsumerRegistry {
         log.info("Sending zero-copy FileRegion of {} messages ({} bytes) to consumer {} for topic {} using sendfile()",
                  batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic);
 
-        server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
-              .get(5, TimeUnit.SECONDS);
+        // Increased timeout for larger batches (3MB batches may take longer to transfer)
+        // Timeout = 10s base + 10s per MB (e.g., 3MB = 10 + 30 = 40 seconds)
+        log.info("Sending FileRegion with timeout of {}s for {} bytes", timeoutSeconds, batchRegion.totalBytes);
 
-        log.info("Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
+        server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
+              .get(timeoutSeconds, TimeUnit.MINUTES);
+
+        log.info("✓ Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
     }
 
@@ -556,7 +562,12 @@ public class RemoteConsumerRegistry {
      * Check if all specified consumers have caught up to latest offset (for DataRefresh)
      */
     public boolean allConsumersCaughtUp(String topic, java.util.Set<String> consumerClientIds) {
-        long latestOffset = storage.getCurrentOffset(topic, 0);
+        // Use getMaxOffsetFromMetadata instead of getCurrentOffset for data refresh
+        // getCurrentOffset returns the in-memory write head which may be low during refresh (pipes paused)
+        // getMaxOffsetFromMetadata reads from persistent segment metadata to get the true max offset
+        long latestOffset = storage.getMaxOffsetFromMetadata(topic, 0);
+
+        log.debug("Checking if consumers caught up for topic {}: latestOffset from metadata = {}", topic, latestOffset);
 
         for (String clientId : consumerClientIds) {
             String consumerKey = clientId + ":" + topic;
@@ -574,13 +585,13 @@ public class RemoteConsumerRegistry {
             }
 
             if (consumer.getCurrentOffset() < latestOffset) {
-                log.debug("Consumer {} not caught up: {} < {}",
-                         clientId, consumer.getCurrentOffset(), latestOffset);
+                log.debug("Consumer {} not caught up: {} < {} (need {} more messages)",
+                         clientId, consumer.getCurrentOffset(), latestOffset, latestOffset - consumer.getCurrentOffset());
                 return false;
             }
         }
 
-        log.debug("All consumers caught up for topic {} at offset {}", topic, latestOffset);
+        log.info("✓ All consumers caught up for topic {} at offset {} (from metadata)", topic, latestOffset);
         return true;
     }
 
@@ -593,6 +604,17 @@ public class RemoteConsumerRegistry {
 
         if (consumer == null) {
             log.warn("Cannot notify consumer - not found: consumerKey={}", consumerKey);
+            return;
+        }
+
+        // Check InFlight status BEFORE scheduling to prevent duplicate deliveries during refresh
+        // This is the same pattern used in the Pipe flow to prevent duplicates
+        String deliveryKey = consumer.clientId + ":" + consumer.topic;
+        AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
+
+        if (inFlight != null && inFlight.get()) {
+            log.debug("Skipping notify - topic {} already in-flight for consumer {}, delivery already scheduled",
+                     consumer.topic, consumer.clientId);
             return;
         }
 

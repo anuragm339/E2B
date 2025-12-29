@@ -102,6 +102,7 @@ public class NettyTcpClient implements NetworkClient {
     public static class TcpConnection implements Connection {
         private Channel channel;
         private Consumer<BrokerMessage> messageHandler;
+        private Runnable disconnectHandler;
         private final ConcurrentHashMap<Long, CompletableFuture<Void>> pendingAcks;
 
         public TcpConnection() {
@@ -118,7 +119,20 @@ public class NettyTcpClient implements NetworkClient {
                 pendingAcks.values().forEach(f -> f.completeExceptionally(
                         new IllegalStateException("Connection closed")));
                 pendingAcks.clear();
+
+                // Notify disconnect handler
+                if (disconnectHandler != null) {
+                    try {
+                        disconnectHandler.run();
+                    } catch (Exception e) {
+                        log.error("Error in disconnect handler", e);
+                    }
+                }
             });
+        }
+
+        public void onDisconnect(Runnable handler) {
+            this.disconnectHandler = handler;
         }
 
         @Override

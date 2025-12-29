@@ -103,6 +103,16 @@ public class FileChannelStorageEngine implements StorageEngine {
     }
 
     @Override
+    public long getMaxOffsetFromMetadata(String topic, int partition) {
+        SegmentManager manager = managers.get(new TopicPartition(topic, partition));
+        if (manager == null) {
+            return -1;
+        }
+
+        return manager.getMaxOffsetFromMetadata();
+    }
+
+    @Override
     public long getEarliestOffset(String topic, int partition) {
         SegmentManager manager = managers.get(new TopicPartition(topic, partition));
         if (manager == null) {
