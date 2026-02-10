@@ -303,10 +303,10 @@ public class DataRefreshManager {
                 metrics.recordReplayStarted(topic, topic, context.getRefreshId());  // Use topic as consumer ID
             }
 
-            // Trigger delivery from offset 0
-            remoteConsumers.notifyNewMessageForConsumer(clientId, topic, 0);
+            // Note: Adaptive delivery manager will automatically discover and deliver messages
+            // No explicit trigger needed - watermark-based polling handles replay
 
-            log.info("Replay triggered for consumer: {} starting from offset 0", clientId);
+            log.info("Replay ready for consumer: {} starting from offset 0 (adaptive delivery will poll)", clientId);
 
         } catch (Exception e) {
             log.error("Failed to start replay for consumer: {}", clientId, e);
@@ -373,13 +373,15 @@ public class DataRefreshManager {
                 task.cancel(false);
             }
         } else {
-            // Get ALL consumers for this topic and trigger replay for each
+            // Trigger replay for each consumer (InFlight check in notifyNewMessageForConsumer prevents duplicates)
+            // This polling is necessary to keep driving deliveries during refresh
             List<String> allConsumerIds = remoteConsumers.getAllConsumerIds(topic);
             if (allConsumerIds == null || allConsumerIds.isEmpty()) {
-                log.info("No remote consumers found for topic {}, cannot start replay", topic);
+                log.debug("No remote consumers found for topic {}, cannot trigger replay", topic);
             } else {
-                log.debug("Triggering replay for {} consumers on topic {}", allConsumerIds.size(), topic);
+                log.debug("Checking replay progress for {} consumers on topic {}", allConsumerIds.size(), topic);
                 for (String clientId : allConsumerIds) {
+                    // The InFlight check in notifyNewMessageForConsumer will prevent duplicate scheduling
                     startReplayForConsumer(clientId, topic);
                 }
             }

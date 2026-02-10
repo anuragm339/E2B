@@ -10,16 +10,17 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Stores segment metadata in SQLite
+ * Stores segment metadata in SQLite for a specific topic
+ * Each topic has its own metadata database: {topicDir}/segment_metadata.db
  */
 public class SegmentMetadataStore {
     private static final Logger log = LoggerFactory.getLogger(SegmentMetadataStore.class);
-    
+
     private final String dbPath;
     private Connection connection;
 
-    public SegmentMetadataStore(Path dataDir) {
-        this.dbPath = dataDir.resolve("segment_metadata.db").toString();
+    public SegmentMetadataStore(Path topicDir) {
+        this.dbPath = topicDir.resolve("segment_metadata.db").toString();
         initDatabase();
     }
 
@@ -140,16 +141,50 @@ public class SegmentMetadataStore {
     }
 
     /**
+     * Get the maximum offset for a topic-partition
+     * This is used as the watermark to check if new data is available
+     *
+     * @param topic The topic name
+     * @param partition The partition number
+     * @return The maximum offset, or -1 if no data exists
+     */
+    public long getMaxOffset(String topic, int partition) {
+        String sql = "SELECT MAX(max_offset) FROM segment_metadata WHERE topic = ? AND partition = ?";
+
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setString(1, topic);
+            stmt.setInt(2, partition);
+
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    long maxOffset = rs.getLong(1);
+                    // If no rows found, getLong returns 0; check if it was NULL
+                    if (rs.wasNull()) {
+                        log.trace("No segments found for topic={}, partition={}", topic, partition);
+                        return -1;
+                    }
+                    log.trace("Max offset for topic={}, partition={}: {}", topic, partition, maxOffset);
+                    return maxOffset;
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Failed to get max offset for topic={}, partition={}", topic, partition, e);
+        }
+
+        return -1;  // No data or error
+    }
+
+    /**
      * Delete segment metadata
      */
     public void deleteSegment(String topic, int partition, long baseOffset) {
         String sql = "DELETE FROM segment_metadata WHERE topic = ? AND partition = ? AND base_offset = ?";
-        
+
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
             stmt.setString(1, topic);
             stmt.setInt(2, partition);
             stmt.setLong(3, baseOffset);
-            
+
             stmt.executeUpdate();
             log.info("Deleted segment metadata: topic={}, partition={}, baseOffset={}", topic, partition, baseOffset);
         } catch (SQLException e) {

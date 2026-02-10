@@ -1,5 +1,6 @@
 package com.messaging.broker.core;
 
+import com.messaging.broker.consumer.AdaptiveBatchDeliveryManager;
 import com.messaging.broker.consumer.ConsumerDeliveryManager;
 import com.messaging.broker.consumer.ConsumerOffsetTracker;
 import com.messaging.broker.consumer.RemoteConsumerRegistry;
@@ -37,6 +38,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final NetworkServer server;
     private final ConsumerDeliveryManager consumerDelivery;
     private final RemoteConsumerRegistry remoteConsumers;
+    private final AdaptiveBatchDeliveryManager adaptiveDeliveryManager;
     private final TopologyManager topologyManager;
     private final BrokerMetrics metrics;
     private final ConsumerOffsetTracker offsetTracker;
@@ -50,6 +52,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             NetworkServer server,
             ConsumerDeliveryManager consumerDelivery,
             RemoteConsumerRegistry remoteConsumers,
+            AdaptiveBatchDeliveryManager adaptiveDeliveryManager,
             TopologyManager topologyManager,
             BrokerMetrics metrics,
             ConsumerOffsetTracker offsetTracker,
@@ -60,6 +63,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.server = server;
         this.consumerDelivery = consumerDelivery;
         this.remoteConsumers = remoteConsumers;
+        this.adaptiveDeliveryManager = adaptiveDeliveryManager;
         this.topologyManager = topologyManager;
         this.metrics = metrics;
         this.offsetTracker = offsetTracker;
@@ -91,6 +95,10 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         // Start consumer delivery
         consumerDelivery.startDelivery();
         log.info("Consumer delivery started");
+
+        // Start adaptive batch delivery manager (watermark-based polling)
+        adaptiveDeliveryManager.start();
+        log.info("Adaptive batch delivery manager started");
 
         // Start topology manager - it will query Cloud Registry and connect to parent
         topologyManager.onMessageReceived(this::handlePipeMessage);
@@ -128,9 +136,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             log.debug("Stored message from parent: topic={}, offset={}, key={}",
                     topic, offset, record.getMsgKey());
 
-            // PUSH MODEL: Immediately notify remote consumers about new message
-            // This triggers instant delivery instead of waiting for scheduler poll
-            remoteConsumers.notifyNewMessage(topic, offset);
+            // Broker will discover new messages via adaptive polling (watermark-based)
+            // No notification needed - Pipe is now fully decoupled from Broker
 
             metrics.stopE2ETimer(e2eSample);
 
@@ -218,8 +225,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             log.info("Stored message: topic={}, offset={}, key={}, type={}",
                      topic, offset, msgKey, eventType);
 
-            // PUSH MODEL: Immediately notify consumers
-            remoteConsumers.notifyNewMessage(topic, offset);
+            // Broker will discover new messages via adaptive polling (watermark-based)
+            // No notification needed - Pipe is now fully decoupled from Broker
 
             metrics.stopE2ETimer(e2eSample);
 
@@ -416,13 +423,22 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      */
     private void handleDisconnect(String clientId) {
         log.info("Handling disconnect for client: {}", clientId);
-        remoteConsumers.unregisterConsumer(clientId);
-        metrics.recordConsumerDisconnection();
+        int unregisteredCount = remoteConsumers.unregisterConsumer(clientId);
+
+        // Decrement metrics for each topic subscription that was removed
+        for (int i = 0; i < unregisteredCount; i++) {
+            metrics.recordConsumerDisconnection();
+        }
+
+        log.info("Disconnected client {} with {} topic subscriptions", clientId, unregisteredCount);
     }
 
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down broker...");
+
+        // Stop adaptive delivery manager
+        adaptiveDeliveryManager.stop();
 
         // Stop topology manager (will disconnect from parent)
         topologyManager.shutdown();

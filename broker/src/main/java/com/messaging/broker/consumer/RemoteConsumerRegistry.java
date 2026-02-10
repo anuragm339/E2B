@@ -35,7 +35,6 @@ import java.util.stream.Collectors;
 @Singleton
 public class RemoteConsumerRegistry {
     private static final Logger log = LoggerFactory.getLogger(RemoteConsumerRegistry.class);
-    private static final long POLL_INTERVAL_MS = 100;
 
     private final StorageEngine storage;
     private final NetworkServer server;
@@ -43,11 +42,11 @@ public class RemoteConsumerRegistry {
     private final BrokerMetrics metrics;
     private final DataRefreshMetrics dataRefreshMetrics;
     private volatile DataRefreshManager dataRefreshManager; // Lazy injection to avoid circular dependency
+    private volatile AdaptiveBatchDeliveryManager adaptiveDeliveryManager; // Lazy injection to avoid circular dependency
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
     private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
     private final long maxMessageSizePerConsumer;
-    private final int readBatchSize;
 
     // Map: "clientId:topic" -> RemoteConsumer (composite key to support multiple topic subscriptions per client)
     private final Map<String, RemoteConsumer> consumers;
@@ -56,9 +55,6 @@ public class RemoteConsumerRegistry {
     // Map: "clientId:topic" -> in-flight delivery status (true = delivery in progress)
     private final Map<String, AtomicBoolean> inFlightDeliveries;
 
-    // Map: clientId -> currently in-flight topic (ensures only ONE topic delivers to a consumer at a time)
-    private final Map<String, String> consumerCurrentTopic;
-
     // Map: "clientId:topic:pending" -> next offset to commit on ACK
     private final Map<String, Long> pendingOffsets;
 
@@ -66,15 +62,13 @@ public class RemoteConsumerRegistry {
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
                                   DataRefreshMetrics dataRefreshMetrics,
-                                  @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer,  // Reduced from 1MB to 512KB
-                                  @Value("${broker.consumer.max-batch-size-per-consumer}") int readBatchSize) {  // Reduced from 100 to 50
+                                  @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer) {
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
         this.metrics = metrics;
         this.dataRefreshMetrics = dataRefreshMetrics;
         this.maxMessageSizePerConsumer = maxMessageSizePerConsumer;
-        this.readBatchSize = readBatchSize;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
         // Reduced thread pool: use half of available cores (min 2) to lower CPU usage
@@ -93,10 +87,9 @@ public class RemoteConsumerRegistry {
         });
         this.consumers = new ConcurrentHashMap<>();
         this.inFlightDeliveries = new ConcurrentHashMap<>();
-        this.consumerCurrentTopic = new ConcurrentHashMap<>();
         this.pendingOffsets = new ConcurrentHashMap<>();
-        log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer, readBatchSize={}",
-                 maxMessageSizePerConsumer, readBatchSize);
+        log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer (size-only batching)",
+                 maxMessageSizePerConsumer);
     }
 
     /**
@@ -104,6 +97,10 @@ public class RemoteConsumerRegistry {
      */
     public void setDataRefreshManager(DataRefreshManager dataRefreshManager) {
         this.dataRefreshManager = dataRefreshManager;
+    }
+
+    public void setAdaptiveBatchDeliveryManager(AdaptiveBatchDeliveryManager adaptiveDeliveryManager) {
+        this.adaptiveDeliveryManager = adaptiveDeliveryManager;
     }
 
     /**
@@ -126,8 +123,11 @@ public class RemoteConsumerRegistry {
         String consumerKey = clientId + ":" + topic;
         consumers.put(consumerKey, consumer);
 
-//        // Start delivery task
-//        startDelivery(consumer);
+        // Notify adaptive delivery manager to start polling for this consumer
+        if (adaptiveDeliveryManager != null) {
+            adaptiveDeliveryManager.registerConsumer(consumer);
+            log.info("Triggered adaptive delivery for new consumer: {}:{}", clientId, topic);
+        }
 
         log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}",
                  consumerKey, clientId, topic, group, startOffset);
@@ -136,8 +136,10 @@ public class RemoteConsumerRegistry {
     /**
      * Unregister consumer when it disconnects
      * Removes all topic subscriptions for this client
+     *
+     * @return Number of topic subscriptions removed
      */
-    public void unregisterConsumer(String clientId) {
+    public int unregisterConsumer(String clientId) {
         // Find and remove all consumers for this clientId (all topics)
         List<String> keysToRemove = new ArrayList<>();
         for (Map.Entry<String, RemoteConsumer> entry : consumers.entrySet()) {
@@ -146,37 +148,44 @@ public class RemoteConsumerRegistry {
             }
         }
 
+        int removedCount = 0;
         for (String key : keysToRemove) {
             RemoteConsumer consumer = consumers.remove(key);
             if (consumer != null) {
                 if (consumer.deliveryTask != null) {
                     consumer.deliveryTask.cancel(false);
                 }
-                // Clean up metrics
-                metrics.removeConsumerMetrics(clientId, consumer.topic);
-                log.info("Unregistered remote consumer: consumerKey={}, clientId={}, topic={}",
-                         key, clientId, consumer.topic);
+                // Clean up metrics (though with stable identifiers, metrics are now retained)
+                metrics.removeConsumerMetrics(clientId, consumer.topic, consumer.group);
+                log.info("Unregistered remote consumer: consumerKey={}, clientId={}, topic={}, group={}",
+                         key, clientId, consumer.topic, consumer.group);
+                removedCount++;
             }
         }
+
+        log.info("Unregistered {} topic subscriptions for client: {}", removedCount, clientId);
+        return removedCount;
     }
 
     /**
-     * Start message delivery for a consumer
+     * Get all registered consumers
+     * Used by AdaptiveBatchDeliveryManager to schedule delivery tasks
+     *
+     * @return List of all registered consumers
      */
-    private void startDelivery(RemoteConsumer consumer) {
-        Future<?> task = scheduler.scheduleWithFixedDelay(
-                () -> deliverMessages(consumer),
-                500, // Wait 500ms before first delivery to allow ACK to complete
-                POLL_INTERVAL_MS,
-                TimeUnit.MILLISECONDS
-        );
-        consumer.deliveryTask = task;
+    public List<RemoteConsumer> getAllConsumers() {
+        return new ArrayList<>(consumers.values());
     }
 
     /**
-     * Deliver messages to a remote consumer
+     * Deliver batch to consumer (for AdaptiveBatchDeliveryManager)
+     * Returns true if data was found and delivered, false if skipped
+     *
+     * @param consumer Consumer to deliver to
+     * @param batchSizeBytes Max batch size in bytes
+     * @return true if data delivered, false if no data or delivery blocked
      */
-    private void deliverMessages(RemoteConsumer consumer) {
+    public boolean deliverBatch(RemoteConsumer consumer, long batchSizeBytes) {
         String deliveryKey = consumer.clientId + ":" + consumer.topic;
         String pendingKey = deliveryKey + ":pending";
 
@@ -184,28 +193,27 @@ public class RemoteConsumerRegistry {
                 deliveryKey, k -> new AtomicBoolean(false)
         );
 
-        // 1️⃣ single in-flight
-        if (!inFlight.compareAndSet(false, true)) return;
+        // Gate 1: Check in-flight (per topic:consumer)
+        if (!inFlight.compareAndSet(false, true)) {
+            log.info("DEBUG deliverBatch: Gate 1 BLOCKED (in-flight) for {}", deliveryKey);
+            return false;  // Already delivering to this consumer:topic
+        }
 
-        // 2️⃣ ACK gating
+        // Gate 2: Check pending ACK
         if (pendingOffsets.containsKey(pendingKey)) {
+            log.info("DEBUG deliverBatch: Gate 2 BLOCKED (pending ACK) for {}, pendingOffset={}",
+                     deliveryKey, pendingOffsets.get(pendingKey));
             inFlight.set(false);
-            return;
+            return false;  // Waiting for ACK
         }
 
-        // 3️⃣ one-topic-at-a-time
-        String prev = consumerCurrentTopic.putIfAbsent(consumer.clientId, consumer.topic);
-        if (prev != null && !prev.equals(consumer.topic)) {
-            inFlight.set(false);
-            return;
-        }
+        log.info("DEBUG deliverBatch: Gates passed, proceeding with batch read for {}", deliveryKey);
+
+        // Gate 3 removed: Parallel topic delivery now allowed
 
         long startOffset = consumer.getCurrentOffset();
-        boolean sent = false;
-
         Timer.Sample readSample = null;
         Timer.Sample deliverySample = null;
-        long deliveryStartMs = System.currentTimeMillis();
 
         try {
             /* ================= STORAGE READ METRICS ================= */
@@ -217,43 +225,51 @@ public class RemoteConsumerRegistry {
                                     consumer.topic,
                                     0,
                                     startOffset,
-                                    readBatchSize,
-                                    maxMessageSizePerConsumer
+                                    batchSizeBytes
                             )
-            ).get(10, TimeUnit.SECONDS);
+            ).get(10, TimeUnit.MINUTES);
 
             metrics.stopStorageReadTimer(readSample);
             metrics.recordStorageRead();
 
+            log.info("DEBUG deliverBatch: Batch read complete for {}, recordCount={}, fileRegion={}",
+                     deliveryKey, batch.recordCount, (batch.fileRegion != null ? "present" : "NULL"));
+
             if (batch.recordCount == 0 || batch.fileRegion == null) {
+                log.info("DEBUG deliverBatch: EMPTY BATCH (recordCount={}, fileRegion={}) for {}, startOffset={}",
+                         batch.recordCount, (batch.fileRegion != null ? "present" : "NULL"), deliveryKey, startOffset);
                 inFlight.set(false);
-                consumerCurrentTopic.remove(consumer.clientId);
-                return;
+                return false;  // No data available
             }
 
             /* ================= BATCH VISIBILITY ================= */
             metrics.recordBatchSize(batch.recordCount);
 
             /* ================= OFFSET RESERVATION ================= */
+            // Store original offset BEFORE reservation (for timeout revert)
+            long originalOffset = startOffset;
             long nextOffset = batch.lastOffset + 1;
             consumer.setCurrentOffset(nextOffset);
             pendingOffsets.put(pendingKey, nextOffset);
 
-            /* ================= ACK TIMEOUT METRIC ================= */
+            /* ================= ACK TIMEOUT SETUP ================= */
             scheduler.schedule(() -> {
                 if (pendingOffsets.remove(pendingKey) != null) {
-                    log.warn("ACK timeout for {}", deliveryKey);
-                   // metrics.recordAckTimeout(consumer.clientId, consumer.topic, consumer.group);
+                    log.warn("ACK timeout for {}, reverting offset from {} to {}",
+                             deliveryKey, nextOffset, originalOffset);
+
+                    // REVERT consumer offset to prevent delivery gap
+                    consumer.setCurrentOffset(originalOffset);
                     inFlight.set(false);
-                    consumerCurrentTopic.remove(consumer.clientId);
+
+                    metrics.recordAckTimeout(consumer.topic);
                 }
-            }, 30, TimeUnit.SECONDS);
+            }, 30, TimeUnit.MINUTES);
 
             /* ================= DELIVERY METRICS ================= */
             deliverySample = metrics.startConsumerDeliveryTimer();
 
             sendBatchToConsumer(consumer, batch, startOffset);
-            sent = true;
 
             metrics.stopConsumerDeliveryTimer(
                     deliverySample,
@@ -262,75 +278,26 @@ public class RemoteConsumerRegistry {
                     consumer.group
             );
 
-
-
-            metrics.recordBatchMessagesSent(batch.recordCount, batch.totalBytes);
-            metrics.recordConsumerMessageSent(
-                    consumer.clientId,
-                    consumer.topic,
-                    consumer.group,
-                    batch.totalBytes
-            );
-
-            /* ================= CONSUMER LAG ================= */
-            try {
-                long headOffset = storage.getCurrentOffset(consumer.topic, 0);
-                long lag = Math.max(0, (headOffset + 1) - nextOffset);
-                metrics.updateConsumerLag(
-                        consumer.clientId,
-                        consumer.topic,
-                        consumer.group,
-                        lag
-                );
-            } catch (Exception ignore) {
-                // lag is best-effort
-            }
-
-            /* ================= DATA REFRESH METRICS ================= */
-            if (dataRefreshManager != null && dataRefreshManager.isRefreshInProgress()) {
-                String refreshId = dataRefreshManager.getRefreshIdForTopic(consumer.topic);
-                if (refreshId != null) {
-                    dataRefreshMetrics.recordDataTransferred(
-                            consumer.topic,
-                            consumer.topic,
-                            batch.totalBytes,
-                            batch.recordCount,
-                            refreshId
-                    );
-
-                    long durationMs = System.currentTimeMillis() - deliveryStartMs;
-                    if (durationMs > 0) {
-                        double bytesPerSec = (batch.totalBytes * 1000.0) / durationMs;
-                        dataRefreshMetrics.updateTransferRate(
-                                consumer.topic,
-                                consumer.topic,
-                                bytesPerSec,
-                                refreshId
-                        );
-                    }
-                }
-            }
+            return true;  // Data delivered successfully
 
         } catch (Exception e) {
             log.error("Delivery failed for {}", deliveryKey, e);
-            metrics.recordConsumerFailure(
-                    consumer.clientId,
-                    consumer.topic,
-                    consumer.group
-            );
+            inFlight.set(false);
 
-            if (!sent) {
-                consumer.setCurrentOffset(startOffset);
-                pendingOffsets.remove(pendingKey);
+            // Revert offset reservation on error
+            consumer.setCurrentOffset(startOffset);
+            pendingOffsets.remove(pendingKey);
+
+            // Check if this is a connection error (Broken pipe, Connection reset, etc.)
+            if (isConnectionError(e)) {
+                log.warn("Connection error detected for {}, unregistering consumer", deliveryKey);
+                // Unregister consumer to stop adaptive polling
+                unregisterConsumer(consumer.clientId);
             }
 
-            inFlight.set(false);
-            consumerCurrentTopic.remove(consumer.clientId);
+            return false;  // Delivery failed
         }
     }
-
-
-
 
 
     /**
@@ -350,16 +317,16 @@ public class RemoteConsumerRegistry {
         byte[] topicBytes = consumer.topic.getBytes(StandardCharsets.UTF_8);
         int topicLen = topicBytes.length;
 
-        // Header: [recordCount:4][totalBytes:8][lastOffset:8][topicLen:4][topic:var]
-        ByteBuffer headerBuffer = ByteBuffer.allocate(20 + 4 + topicLen);
+        // UNIFIED FORMAT Header: [recordCount:4][totalBytes:8][topicLen:4][topic:var]
+        // Removed lastOffset - consumer doesn't need it (broker tracks offsets)
+        ByteBuffer headerBuffer = ByteBuffer.allocate(12 + 4 + topicLen);
         headerBuffer.putInt(batchRegion.recordCount);
         headerBuffer.putLong(batchRegion.totalBytes);
-        headerBuffer.putLong(batchRegion.lastOffset);
         headerBuffer.putInt(topicLen);
         headerBuffer.put(topicBytes);
         headerBuffer.flip();
 
-        byte[] header = new byte[20 + 4 + topicLen];
+        byte[] header = new byte[12 + 4 + topicLen];
         headerBuffer.get(header);
 
         // Send header using BATCH_HEADER message type
@@ -369,8 +336,8 @@ public class RemoteConsumerRegistry {
             header
         );
 
-        log.debug("Sending BATCH_HEADER to consumer {}: topic={}, recordCount={}, totalBytes={}, lastOffset={}",
-                 consumer.clientId, consumer.topic, batchRegion.recordCount, batchRegion.totalBytes, batchRegion.lastOffset);
+        log.debug("Sending BATCH_HEADER to consumer {}: topic={}, recordCount={}, totalBytes={}",
+                 consumer.clientId, consumer.topic, batchRegion.recordCount, batchRegion.totalBytes);
 
         long timeoutSeconds = 1 + (batchRegion.totalBytes / (1024 * 1024) * 10);
         // Increased header timeout from 1s to 10s for reliability
@@ -379,8 +346,9 @@ public class RemoteConsumerRegistry {
         // Step 2: Send FileRegion for true zero-copy transfer (Kafka-style sendfile)
         // This uses OS sendfile() syscall - data goes from file → kernel → socket
         // NO user-space copies, NO heap allocations!
-        log.debug("Sending zero-copy FileRegion of {} messages ({} bytes) to consumer {} for topic {} using sendfile()",
-                 batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic);
+        log.info("Sending zero-copy FileRegion: position={}, count={}, records={}, bytes={}, consumer={}, topic={}, startOffset={}",
+                 batchRegion.fileRegion.position(), batchRegion.fileRegion.count(),
+                 batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic, startOffset);
 
         // Increased timeout for larger batches (3MB batches may take longer to transfer)
         // Timeout = 10s base + 10s per MB (e.g., 3MB = 10 + 30 = 40 seconds)
@@ -391,6 +359,13 @@ public class RemoteConsumerRegistry {
 
         log.info("✓ Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
+
+        // Record metrics for messages and bytes sent (global counters)
+        metrics.recordBatchMessagesSent(batchRegion.recordCount, batchRegion.totalBytes);
+
+        // Record per-consumer metrics (efficient batch version)
+        metrics.recordConsumerBatchSent(consumer.clientId, consumer.topic, consumer.group,
+                                       batchRegion.recordCount, batchRegion.totalBytes);
     }
 
     /**
@@ -413,6 +388,8 @@ public class RemoteConsumerRegistry {
         RemoteConsumer consumer = consumers.get(deliveryKey);
         if (consumer != null) {
             offsetTracker.updateOffset(consumer.group + ":" + topic, committedOffset);
+            // Update Prometheus gauge metric to reflect new offset
+            metrics.updateConsumerOffset(clientId, topic, consumer.group, committedOffset);
         }
 
         AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
@@ -420,31 +397,7 @@ public class RemoteConsumerRegistry {
             inFlight.set(false);
         }
 
-        consumerCurrentTopic.remove(clientId, topic);
-
         log.info("ACK committed for {} at offset {}", deliveryKey, committedOffset);
-    }
-
-    /**
-     * Notify consumers about new message (PUSH model)
-     * This immediately triggers delivery instead of waiting for scheduler
-     */
-    public void notifyNewMessage(String topic, long offset) {
-        log.debug("New message notification: topic={}, offset={}", topic, offset);
-
-        long now = System.currentTimeMillis();
-        // Find all consumers subscribed to this topic and trigger immediate delivery
-        for (RemoteConsumer consumer : consumers.values()) {
-            if (consumer.topic.equals(topic)) {
-                // Rate limiting: Only submit delivery task if last attempt was > 200ms ago (increased from 100ms)
-                if (now - consumer.lastDeliveryAttempt >= 200) {
-                    consumer.lastDeliveryAttempt = now;
-                    scheduler.submit(() -> deliverMessages(consumer));
-                } else {
-                    log.debug("Skipping delivery for consumer {} - rate limited", consumer.clientId);
-                }
-            }
-        }
     }
 
     /**
@@ -565,33 +518,6 @@ public class RemoteConsumerRegistry {
     }
 
     /**
-     * Trigger delivery for a specific consumer (for DataRefresh immediate replay)
-     */
-    public void notifyNewMessageForConsumer(String clientId, String topic, long offset) {
-        String consumerKey = clientId + ":" + topic;
-        RemoteConsumer consumer = consumers.get(consumerKey);
-
-        if (consumer == null) {
-            log.warn("Cannot notify consumer - not found: consumerKey={}", consumerKey);
-            return;
-        }
-
-        // Check if delivery already in progress (inFlight is managed by deliverMessages and cleared by handleAck)
-        // This prevents queueing duplicate tasks when checkReplayProgress() runs every 1 second
-        String deliveryKey = consumer.clientId + ":" + consumer.topic;
-        AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
-
-        if (inFlight != null && inFlight.get()) {
-            log.info("Skipping task submission - delivery already in progress for consumer: {}, topic: {}",
-                     consumer.clientId, consumer.topic);
-            return;
-        }
-
-        log.debug("Triggering delivery for consumer: {}, topic: {}, offset: {}", clientId, topic, offset);
-        scheduler.submit(() -> deliverMessages(consumer));
-    }
-
-    /**
      * Get consumer group:topic identifier for a client (for DataRefresh)
      * Maps dynamic clientId to stable "group:topic" identifier
      */
@@ -660,10 +586,36 @@ public class RemoteConsumerRegistry {
                 .orElse(null);
         return remoteConsumer != null ? remoteConsumer.clientId : null;
     }
+
+    /**
+     * Check if exception is a connection error (Broken pipe, Connection reset, etc.)
+     */
+    private boolean isConnectionError(Exception e) {
+        // Check for IOException with connection-related messages
+        Throwable cause = e;
+        while (cause != null) {
+            if (cause instanceof java.io.IOException) {
+                String message = cause.getMessage();
+                if (message != null) {
+                    message = message.toLowerCase();
+                    if (message.contains("broken pipe") ||
+                        message.contains("connection reset") ||
+                        message.contains("connection refused") ||
+                        message.contains("socket closed") ||
+                        message.contains("stream closed")) {
+                        return true;
+                    }
+                }
+            }
+            cause = cause.getCause();
+        }
+        return false;
+    }
+
     /**
      * Remote consumer metadata
      */
-    private static class RemoteConsumer {
+    public static class RemoteConsumer {
         final String clientId;
         final String topic;
         final String group;

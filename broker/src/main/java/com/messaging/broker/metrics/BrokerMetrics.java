@@ -39,6 +39,8 @@ public class BrokerMetrics {
     private final Counter storageWrites;
     private final Counter consumerConnections;
     private final Counter consumerDisconnections;
+    private final ConcurrentHashMap<String, Counter> consumerAckTimeouts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> offsetGapsDetected = new ConcurrentHashMap<>();
 
     // Gauges
     private final AtomicLong activeConsumers = new AtomicLong(0);
@@ -50,6 +52,7 @@ public class BrokerMetrics {
     private final Timer storageWriteLatency;
     private final Timer messageDeliveryLatency;
     private final Timer endToEndLatency;
+    private final Timer binarySearchLatency;
 
     // Distribution Summaries
     private final DistributionSummary messageSizeBytes;
@@ -130,6 +133,11 @@ public class BrokerMetrics {
 
         this.endToEndLatency = Timer.builder("broker.message.e2e.latency")
             .description("End-to-end message latency (receive to delivery)")
+            .publishPercentiles(0.5, 0.95, 0.99)
+            .register(registry);
+
+        this.binarySearchLatency = Timer.builder("broker.storage.binary_search.latency")
+            .description("Latency of binary search through index file for offset lookup")
             .publishPercentiles(0.5, 0.95, 0.99)
             .register(registry);
 
@@ -237,6 +245,14 @@ public class BrokerMetrics {
         sample.stop(endToEndLatency);
     }
 
+    public Timer.Sample startBinarySearchTimer() {
+        return Timer.start(registry);
+    }
+
+    public void stopBinarySearchTimer(Timer.Sample sample) {
+        sample.stop(binarySearchLatency);
+    }
+
     // Distribution methods
     public void recordMessageSize(long bytes) {
         messageSizeBytes.record(bytes);
@@ -262,16 +278,16 @@ public class BrokerMetrics {
     // ==================== PER-CONSUMER METRICS ====================
 
     /**
-     * Record a message sent to a specific consumer
+     * Record a message sent to a specific consumer group
+     * Uses topic+group as key for stable metrics across consumer reconnections
      */
     public void recordConsumerMessageSent(String consumerId, String topic, String group, long bytes) {
-        String key = consumerId + ":" + topic;
+        String key = group + ":" + topic;
 
-        // Get or create counter for this consumer+topic
+        // Get or create counter for this group+topic
         Counter counter = consumerMessagesSent.computeIfAbsent(key, k ->
             Counter.builder("broker.consumer.messages.sent")
-                .description("Messages sent to specific consumer")
-                .tag("consumer_id", consumerId)
+                .description("Messages sent to consumer group for topic")
                 .tag("topic", topic)
                 .tag("group", group)
                 .register(registry)
@@ -281,8 +297,7 @@ public class BrokerMetrics {
         // Track bytes
         Counter bytesCounter = consumerBytesSent.computeIfAbsent(key, k ->
             Counter.builder("broker.consumer.bytes.sent")
-                .description("Bytes sent to specific consumer")
-                .tag("consumer_id", consumerId)
+                .description("Bytes sent to consumer group for topic")
                 .tag("topic", topic)
                 .tag("group", group)
                 .baseUnit("bytes")
@@ -292,14 +307,42 @@ public class BrokerMetrics {
     }
 
     /**
-     * Record an ACK from a specific consumer
+     * Record a batch of messages sent to a specific consumer (efficient version for zero-copy batches)
+     * Uses topic+group as key for stable metrics across consumer reconnections
+     */
+    public void recordConsumerBatchSent(String consumerId, String topic, String group, int messageCount, long totalBytes) {
+        String key = group + ":" + topic;
+
+        // Get or create counter for this group+topic
+        Counter counter = consumerMessagesSent.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.messages.sent")
+                .description("Messages sent to consumer group for topic")
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry)
+        );
+        counter.increment(messageCount);
+
+        // Track bytes
+        Counter bytesCounter = consumerBytesSent.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.bytes.sent")
+                .description("Bytes sent to consumer group for topic")
+                .tag("topic", topic)
+                .tag("group", group)
+                .baseUnit("bytes")
+                .register(registry)
+        );
+        bytesCounter.increment(totalBytes);
+    }
+
+    /**
+     * Record an ACK from a specific consumer group
      */
     public void recordConsumerAck(String consumerId, String topic, String group) {
-        String key = consumerId + ":" + topic;
+        String key = group + ":" + topic;
         Counter counter = consumerAcks.computeIfAbsent(key, k ->
             Counter.builder("broker.consumer.acks")
-                .description("ACKs received from consumer")
-                .tag("consumer_id", consumerId)
+                .description("ACKs received from consumer group")
                 .tag("topic", topic)
                 .tag("group", group)
                 .register(registry)
@@ -308,14 +351,13 @@ public class BrokerMetrics {
     }
 
     /**
-     * Record a delivery failure for a specific consumer
+     * Record a delivery failure for a specific consumer group
      */
     public void recordConsumerFailure(String consumerId, String topic, String group) {
-        String key = consumerId + ":" + topic;
+        String key = group + ":" + topic;
         Counter counter = consumerFailures.computeIfAbsent(key, k ->
             Counter.builder("broker.consumer.failures")
-                .description("Failed message deliveries to consumer")
-                .tag("consumer_id", consumerId)
+                .description("Failed message deliveries to consumer group")
                 .tag("topic", topic)
                 .tag("group", group)
                 .register(registry)
@@ -324,14 +366,13 @@ public class BrokerMetrics {
     }
 
     /**
-     * Record a retry for a specific consumer
+     * Record a retry for a specific consumer group
      */
     public void recordConsumerRetry(String consumerId, String topic, String group) {
-        String key = consumerId + ":" + topic;
+        String key = group + ":" + topic;
         Counter counter = consumerRetries.computeIfAbsent(key, k ->
             Counter.builder("broker.consumer.retries")
-                .description("Message retry attempts for consumer")
-                .tag("consumer_id", consumerId)
+                .description("Message retry attempts for consumer group")
                 .tag("topic", topic)
                 .tag("group", group)
                 .register(registry)
@@ -340,15 +381,14 @@ public class BrokerMetrics {
     }
 
     /**
-     * Update the current offset for a consumer
+     * Update the current offset for a consumer group
      */
     public void updateConsumerOffset(String consumerId, String topic, String group, long offset) {
-        String key = consumerId + ":" + topic;
+        String key = group + ":" + topic;
         AtomicLong gauge = consumerOffsets.computeIfAbsent(key, k -> {
             AtomicLong atomicOffset = new AtomicLong(0);
             Gauge.builder("broker.consumer.offset", atomicOffset, AtomicLong::get)
-                .description("Current offset for consumer")
-                .tag("consumer_id", consumerId)
+                .description("Current offset for consumer group")
                 .tag("topic", topic)
                 .tag("group", group)
                 .register(registry);
@@ -358,15 +398,14 @@ public class BrokerMetrics {
     }
 
     /**
-     * Update the lag for a consumer (difference between head and consumer offset)
+     * Update the lag for a consumer group (difference between head and consumer offset)
      */
     public void updateConsumerLag(String consumerId, String topic, String group, long lag) {
-        String key = consumerId + ":" + topic;
+        String key = group + ":" + topic;
         AtomicLong gauge = consumerLag.computeIfAbsent(key, k -> {
             AtomicLong atomicLag = new AtomicLong(0);
             Gauge.builder("broker.consumer.lag", atomicLag, AtomicLong::get)
-                .description("Message lag for consumer (head - consumer offset)")
-                .tag("consumer_id", consumerId)
+                .description("Message lag for consumer group (head - consumer offset)")
                 .tag("topic", topic)
                 .tag("group", group)
                 .register(registry);
@@ -383,14 +422,13 @@ public class BrokerMetrics {
     }
 
     /**
-     * Stop timing delivery to a specific consumer
+     * Stop timing delivery to a specific consumer group
      */
     public void stopConsumerDeliveryTimer(Timer.Sample sample, String consumerId, String topic, String group) {
-        String key = consumerId + ":" + topic;
+        String key = group + ":" + topic;
         Timer timer = consumerDeliveryLatency.computeIfAbsent(key, k ->
             Timer.builder("broker.consumer.delivery.latency")
-                .description("Delivery latency to specific consumer")
-                .tag("consumer_id", consumerId)
+                .description("Delivery latency to consumer group")
                 .tag("topic", topic)
                 .tag("group", group)
                 .publishPercentiles(0.5, 0.95, 0.99)
@@ -400,21 +438,73 @@ public class BrokerMetrics {
     }
 
     /**
-     * Remove all metrics for a consumer when they disconnect
+     * Remove all metrics for a consumer group when they disconnect
+     * NOTE: With stable group+topic identifiers, metrics should persist across reconnections.
+     * This method may no longer be necessary and could be deprecated in the future.
      */
-    public void removeConsumerMetrics(String consumerId, String topic) {
-        String key = consumerId + ":" + topic;
+    public void removeConsumerMetrics(String consumerId, String topic, String group) {
+        String key = group + ":" + topic;
 
-        // Remove from caches - actual metrics will remain in registry until scrape
-        consumerMessagesSent.remove(key);
-        consumerBytesSent.remove(key);
-        consumerAcks.remove(key);
-        consumerFailures.remove(key);
-        consumerRetries.remove(key);
-        consumerOffsets.remove(key);
-        consumerLag.remove(key);
-        consumerDeliveryLatency.remove(key);
+        // NOTE: Removing metrics on disconnect causes graph breaks.
+        // With stable identifiers, we should NOT remove metrics to preserve historical data.
+        // Commenting out removal - metrics will persist across consumer reconnections.
 
-        log.debug("Removed metrics cache for consumer: {} topic: {}", consumerId, topic);
+        // consumerMessagesSent.remove(key);
+        // consumerBytesSent.remove(key);
+        // consumerAcks.remove(key);
+        // consumerFailures.remove(key);
+        // consumerRetries.remove(key);
+        // consumerOffsets.remove(key);
+        // consumerLag.remove(key);
+        // consumerDeliveryLatency.remove(key);
+
+        log.debug("Consumer disconnected but metrics retained for group: {} topic: {} (stable identifier: {})",
+                  group, topic, key);
+    }
+
+    /**
+     * Record successful adaptive poll (data found and delivered)
+     */
+    public void recordAdaptivePollSuccess(String topic) {
+        // Could add specific metrics here if needed
+        log.trace("Adaptive poll success: topic={}", topic);
+    }
+
+    /**
+     * Record skipped adaptive poll (no data or delivery blocked)
+     */
+    public void recordAdaptivePollSkipped(String topic) {
+        // Could add specific metrics here if needed
+        log.trace("Adaptive poll skipped: topic={}", topic);
+    }
+
+    /**
+     * Record ACK timeout for a specific topic
+     */
+    public void recordAckTimeout(String topic) {
+        Counter counter = consumerAckTimeouts.computeIfAbsent(topic, t ->
+            Counter.builder("broker.consumer.ack.timeouts")
+                .description("ACK timeouts for consumer deliveries")
+                .tag("topic", topic)
+                .register(registry)
+        );
+        counter.increment();
+        log.debug("Recorded ACK timeout for topic: {}", topic);
+    }
+
+    /**
+     * Record when an offset gap is detected during binary search
+     */
+    public void recordOffsetGapDetected(String topic, String partition) {
+        String key = topic + ":" + partition;
+        Counter counter = offsetGapsDetected.computeIfAbsent(key, k ->
+            Counter.builder("broker.storage.offset_gaps_detected")
+                .description("Number of offset gaps detected during reads")
+                .tag("topic", topic)
+                .tag("partition", partition)
+                .register(registry)
+        );
+        counter.increment();
+        log.debug("Recorded offset gap for topic: {}, partition: {}", topic, partition);
     }
 }

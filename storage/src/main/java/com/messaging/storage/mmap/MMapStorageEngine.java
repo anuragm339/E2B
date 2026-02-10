@@ -3,8 +3,10 @@ package com.messaging.storage.mmap;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.storage.segment.SegmentManager;
+import com.messaging.storage.watermark.StorageWatermarkTracker;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.annotation.Value;
+import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,24 +31,37 @@ public class MMapStorageEngine implements StorageEngine {
     private final Path dataDir;
     private final long maxSegmentSize;
     private final Map<TopicPartition, SegmentManager> managers;
+    private final StorageWatermarkTracker watermarkTracker;
+    private final com.messaging.storage.metadata.SegmentMetadataStoreFactory metadataStoreFactory;
 
+    @Inject
     public MMapStorageEngine(
             @Value("${broker.storage.data-dir:/data}") String dataDir,
-            @Value("${broker.storage.segment-size:1073741824}") long maxSegmentSize) {
+            @Value("${broker.storage.segment-size:1073741824}") long maxSegmentSize,
+            StorageWatermarkTracker watermarkTracker,
+            com.messaging.storage.metadata.SegmentMetadataStoreFactory metadataStoreFactory) {
 
         this.dataDir = Paths.get(dataDir);
         this.maxSegmentSize = maxSegmentSize;
+        this.watermarkTracker = watermarkTracker;
+        this.metadataStoreFactory = metadataStoreFactory;
         this.managers = new ConcurrentHashMap<>();
 
-        log.info("Initialized MMapStorageEngine: dataDir={}, maxSegmentSize={}",
-                this.dataDir, this.maxSegmentSize);
+        log.info("Initialized MMapStorageEngine: dataDir={}, maxSegmentSize={}, watermarkTracker={}, metadataStoreFactory={}",
+                this.dataDir, this.maxSegmentSize, watermarkTracker != null, metadataStoreFactory != null);
     }
 
     @Override
     public long append(String topic, int partition, MessageRecord record) {
         try {
             SegmentManager manager = getOrCreateManager(topic, partition);
-            return manager.append(record);
+            long offset = manager.append(record);
+
+            // Update watermark atomically after successful append
+            // This enables Broker to check for new data without disk I/O
+            watermarkTracker.updateWatermark(topic, partition, offset);
+
+            return offset;
         } catch (IOException e) {
             log.error("Failed to append record: topic={}, partition={}", topic, partition, e);
             throw new RuntimeException("Failed to append record", e);
@@ -75,14 +90,14 @@ public class MMapStorageEngine implements StorageEngine {
      * @return BatchFileRegion containing FileRegion for zero-copy transfer + metadata
      */
     public com.messaging.storage.segment.Segment.BatchFileRegion getZeroCopyBatch(
-            String topic, int partition, long fromOffset, int maxRecords, long maxBytes) {
+            String topic, int partition, long fromOffset, long maxBytes) {
         try {
             SegmentManager manager = managers.get(new TopicPartition(topic, partition));
             if (manager == null) {
                 log.debug("No segment manager for topic={}, partition={}", topic, partition);
                 return new com.messaging.storage.segment.Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
             }
-            return manager.getZeroCopyBatch(fromOffset, maxRecords, maxBytes);
+            return manager.getZeroCopyBatch(fromOffset, maxBytes);
         } catch (IOException e) {
             log.error("Failed to get zero-copy batch: topic={}, partition={}, offset={}",
                     topic, partition, fromOffset, e);
@@ -214,7 +229,11 @@ public class MMapStorageEngine implements StorageEngine {
                         .resolve(topic)
                         .resolve("partition-" + partition);
 
-                return new SegmentManager(topic, partition, partitionDir, maxSegmentSize);
+                // Get topic-specific metadata store from factory
+                com.messaging.storage.metadata.SegmentMetadataStore metadataStore =
+                    metadataStoreFactory.getStoreForTopic(topic);
+
+                return new SegmentManager(topic, partition, partitionDir, maxSegmentSize, metadataStore);
             } catch (IOException e) {
                 throw new RuntimeException("Failed to create segment manager", e);
             }

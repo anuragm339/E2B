@@ -36,14 +36,14 @@ public class SegmentManager {
     private final SegmentMetadataStore metadataStore;
     private final AtomicLong appendsSinceMetadataUpdate; // Track appends for periodic metadata updates
 
-    public SegmentManager(String topic, int partition, Path dataDir, long maxSegmentSize) throws IOException {
+    public SegmentManager(String topic, int partition, Path dataDir, long maxSegmentSize, SegmentMetadataStore metadataStore) throws IOException {
         this.topic = topic;
         this.partition = partition;
         this.dataDir = dataDir;
         this.maxSegmentSize = maxSegmentSize;
         this.segments = new ConcurrentSkipListMap<>();
         this.activeSegment = new AtomicReference<>();
-        this.metadataStore = new SegmentMetadataStore(dataDir.getParent());
+        this.metadataStore = metadataStore;
         this.appendsSinceMetadataUpdate = new AtomicLong(0);
 
         // Create data directory if it doesn't exist
@@ -304,30 +304,39 @@ public class SegmentManager {
     /**
      * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
      * Currently only supports reading from a single segment (no cross-segment batches)
+     * Size-only batching: Limited by maxBytes only, no message count limit
      */
-    public Segment.BatchFileRegion getZeroCopyBatch(long fromOffset, int maxRecords, long maxBytes) throws IOException {
-        log.debug("SegmentManager.getZeroCopyBatch() called: topic={}, partition={}, fromOffset={}, maxRecords={}, maxBytes={}",
-                topic, partition, fromOffset, maxRecords, maxBytes);
+    public Segment.BatchFileRegion getZeroCopyBatch(long fromOffset, long maxBytes) throws IOException {
+        log.info("DEBUG SegmentManager.getZeroCopyBatch(): topic={}, partition={}, fromOffset={}, maxBytes={}, segments.size={}",
+                topic, partition, fromOffset, maxBytes, segments.size());
 
         // Find the segment that contains this offset
         var entry = segments.floorEntry(fromOffset);
 
         if (entry == null) {
+            log.info("DEBUG SegmentManager: segments.floorEntry({}) returned NULL", fromOffset);
             // Check active segment
             Segment active = activeSegment.get();
+            log.info("DEBUG SegmentManager: activeSegment={}, baseOffset={}, nextOffset={}",
+                     (active != null ? "present" : "NULL"),
+                     (active != null ? active.getBaseOffset() : "N/A"),
+                     (active != null ? active.getNextOffset() : "N/A"));
             if (active != null && fromOffset < active.getNextOffset()) {
-                log.debug("Using active segment for zero-copy read");
-                return active.getBatchFileRegion(fromOffset, maxRecords, maxBytes);
+                log.info("DEBUG SegmentManager: Using active segment for zero-copy read (fromOffset={} < nextOffset={})",
+                         fromOffset, active.getNextOffset());
+                return active.getBatchFileRegion(fromOffset, maxBytes);
             } else {
-                log.debug("No segment found for offset {}, returning null", fromOffset);
+                log.info("DEBUG SegmentManager: No segment found for offset {}, returning EMPTY BatchFileRegion", fromOffset);
                 return new Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
             }
         }
 
         Segment currentSegment = entry.getValue();
+        log.info("DEBUG SegmentManager: Found segment via floorEntry, baseOffset={}, nextOffset={}",
+                 currentSegment.getBaseOffset(), currentSegment.getNextOffset());
 
-        // Get zero-copy batch from segment
-        return currentSegment.getBatchFileRegion(fromOffset, maxRecords, maxBytes);
+        // Get zero-copy batch from segment (size-only batching)
+        return currentSegment.getBatchFileRegion(fromOffset, maxBytes);
     }
 
     /**
