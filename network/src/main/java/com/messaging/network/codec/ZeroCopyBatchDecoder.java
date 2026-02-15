@@ -1,5 +1,7 @@
 package com.messaging.network.codec;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.common.model.ConsumerRecord;
 import com.messaging.common.model.EventType;
@@ -76,7 +78,8 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
         if (payloadLength < 0 || payloadLength > 10 * 1024 * 1024) {
             log.error("Invalid payload length: {}", payloadLength);
             in.resetReaderIndex();
-            throw new IllegalArgumentException("Invalid payload length: " + payloadLength);
+            throw new NetworkException(ErrorCode.NETWORK_DECODING_ERROR, "Invalid payload length: " + payloadLength)
+                .withContext("payloadLength", payloadLength);
         }
 
         // Check if we have enough bytes for the payload
@@ -130,7 +133,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
                 // Parse the batch data directly from the current buffer
                 List<ConsumerRecord> records = parseBatchData(in, (int)headerTotalBytes, headerRecordCount);
-                log.info("Decoded zero-copy batch: {} records, {} bytes", records.size(), headerTotalBytes);
+                log.debug("Decoded zero-copy batch: {} records, {} bytes", records.size(), headerTotalBytes);
 
                 // Add records list to output
                 out.add(records);
@@ -238,7 +241,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             records.add(record);
         }
 
-        log.info("Parsed batch data: {} records, {} bytes", records.size(), bytesRead);
+        log.debug("Parsed batch data: {} records, {} bytes", records.size(), bytesRead);
         return records;
     }
 
@@ -267,7 +270,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
                 hex.append(String.format("%02X ", first32[i]));
                 if ((i + 1) % 16 == 0) hex.append("\n                ");
             }
-            log.info("First 32 bytes received:\n                {}", hex.toString());
+            log.debug("First 32 bytes received:\n                {}", hex.toString());
         }
 
         // Parse raw segment data into ConsumerRecords
@@ -283,7 +286,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             int keyLen = in.readInt();
             bytesRead += 4;
 
-            log.info("Record {}: keyLen={} (0x{}) at bytesRead={}",
+            log.debug("Record {}: keyLen={} (0x{}) at bytesRead={}",
                      records.size(), keyLen, Integer.toHexString(keyLen), bytesRead - 4);
 
             if (keyLen < 0 || keyLen > 1024 * 1024) {

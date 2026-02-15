@@ -1,5 +1,8 @@
 package com.messaging.common.model;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
+
 /**
  * Message exchanged between broker components via network
  */
@@ -74,7 +77,11 @@ public class BrokerMessage {
                     return type;
                 }
             }
-            throw new IllegalArgumentException("Unknown message type code: " + code);
+            NetworkException ex = new NetworkException(ErrorCode.NETWORK_DECODING_ERROR,
+                "Unknown message type code: " + code);
+            ex.withContext("messageTypeCode", code);
+            // Wrap in RuntimeException since enum methods can't declare checked exceptions
+            throw new RuntimeException("Invalid message type code: " + code, ex);
         }
     }
 }

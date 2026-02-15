@@ -1,5 +1,7 @@
 package com.messaging.broker.registry;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.TopologyResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.inject.Singleton;
@@ -55,7 +57,11 @@ public class CloudRegistryClient {
 
                 if (response.statusCode() != 200) {
                     log.error("Failed to query Cloud Registry: status={}", response.statusCode());
-                    throw new RuntimeException("Cloud Registry query failed: " + response.statusCode());
+                    throw new MessagingException(ErrorCode.REGISTRY_TOPOLOGY_FETCH_FAILED,
+                        "Cloud Registry query failed: " + response.statusCode())
+                        .withContext("registryUrl", registryUrl)
+                        .withContext("nodeId", nodeId)
+                        .withContext("statusCode", response.statusCode());
                 }
 
                 TopologyResponse topology = objectMapper.readValue(response.body(), TopologyResponse.class);
@@ -64,9 +70,15 @@ public class CloudRegistryClient {
 
                 return topology;
 
+            } catch (MessagingException e) {
+                // CompletableFuture lambda can't throw checked exceptions - wrap in RuntimeException
+                throw new RuntimeException("Failed to query Cloud Registry: " + e.getMessage(), e);
             } catch (Exception e) {
-//                log.error("Error querying Cloud Registry", e);
-                throw new RuntimeException("Failed to query Cloud Registry", e);
+                MessagingException ex = new MessagingException(ErrorCode.REGISTRY_TOPOLOGY_FETCH_FAILED,
+                    "Failed to query Cloud Registry", e)
+                    .withContext("registryUrl", registryUrl)
+                    .withContext("nodeId", nodeId);
+                throw new RuntimeException("Failed to query Cloud Registry", ex);
             }
         });
     }

@@ -1,5 +1,9 @@
 package com.messaging.storage.segment;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
+import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.storage.metadata.SegmentMetadata;
 import com.messaging.storage.metadata.SegmentMetadataStore;
@@ -36,7 +40,7 @@ public class SegmentManager {
     private final SegmentMetadataStore metadataStore;
     private final AtomicLong appendsSinceMetadataUpdate; // Track appends for periodic metadata updates
 
-    public SegmentManager(String topic, int partition, Path dataDir, long maxSegmentSize, SegmentMetadataStore metadataStore) throws IOException {
+    public SegmentManager(String topic, int partition, Path dataDir, long maxSegmentSize, SegmentMetadataStore metadataStore) throws  StorageException {
         this.topic = topic;
         this.partition = partition;
         this.dataDir = dataDir;
@@ -47,7 +51,11 @@ public class SegmentManager {
         this.appendsSinceMetadataUpdate = new AtomicLong(0);
 
         // Create data directory if it doesn't exist
-        Files.createDirectories(dataDir);
+        try {
+            Files.createDirectories(dataDir);
+        } catch (IOException e) {
+           throw new StorageException(ErrorCode.STORAGE_IO_ERROR, "Failed to create data directory: " + dataDir, e);
+        }
 
         // Load existing segments
         loadSegments();
@@ -69,13 +77,15 @@ public class SegmentManager {
     /**
      * Load existing segments from disk
      */
-    private void loadSegments() throws IOException {
+    private void loadSegments() throws StorageException {
         List<Path> logFiles = new ArrayList<>();
 
         // Collect all log files first
         try (Stream<Path> paths = Files.list(dataDir)) {
             paths.filter(path -> path.toString().endsWith(".log"))
                     .forEach(logFiles::add);
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.STORAGE_IO_ERROR, "Failed to list segment files", e);
         }
 
         // Sort by filename (which contains offset)
@@ -90,7 +100,7 @@ public class SegmentManager {
                 long baseOffset = extractOffsetFromFilename(logPath.getFileName().toString());
                 Path indexPath = dataDir.resolve(String.format("%020d.index", baseOffset));
 
-                Segment segment = new Segment(logPath, indexPath, baseOffset, maxSegmentSize);
+                Segment segment = new Segment(logPath, indexPath, baseOffset, maxSegmentSize, topic, partition);
 
                 // Only seal old segments, keep the last one active
                 if (!isLastSegment) {
@@ -107,7 +117,7 @@ public class SegmentManager {
 //                // Save metadata to database
 //                saveSegmentMetadata(segment);
 
-            } catch (IOException e) {
+            } catch (StorageException e) {
                 log.error("Failed to load segment: {}", logPath, e);
             }
         }
@@ -121,14 +131,17 @@ public class SegmentManager {
         if (matcher.matches()) {
             return Long.parseLong(matcher.group(1));
         }
-        throw new IllegalArgumentException("Invalid segment filename: " + filename);
+        // Use RuntimeException for corrupted filesystem state (unchecked exception appropriate here)
+        // This will be caught by the caller (loadSegments) which already handles StorageException
+        throw new RuntimeException("Invalid segment filename: " + filename +
+                " for topic=" + topic + " partition=" + partition);
     }
 
     /**
      * Append a message record
      * NOTE: Does NOT modify the input record object
      */
-    public long append(MessageRecord record) throws IOException {
+    public long append(MessageRecord record) throws MessagingException {
         Segment current = activeSegment.get();
 
         // Check if we need to roll to a new segment
@@ -156,10 +169,13 @@ public class SegmentManager {
     /**
      * Roll to a new segment
      */
-    private synchronized void rollSegment() throws IOException {
+    private synchronized void rollSegment() throws StorageException {
         Segment current = activeSegment.get();
         if (current == null) {
-            throw new IllegalStateException("No active segment");
+            throw ExceptionLogger.logAndThrow(log,
+                new StorageException(ErrorCode.STORAGE_WRITE_FAILED, "No active segment")
+                    .withTopic(topic)
+                    .withPartition(partition));
         }
 
         // Seal the current segment
@@ -184,11 +200,11 @@ public class SegmentManager {
     /**
      * Create a new segment
      */
-    private void createNewSegment(long baseOffset) throws IOException {
+    private void createNewSegment(long baseOffset) throws StorageException {
         Path logPath = dataDir.resolve(String.format("%020d.log", baseOffset));
         Path indexPath = dataDir.resolve(String.format("%020d.index", baseOffset));
 
-        Segment segment = new Segment(logPath, indexPath, baseOffset, maxSegmentSize);
+        Segment segment = new Segment(logPath, indexPath, baseOffset, maxSegmentSize, topic, partition);
         activeSegment.set(segment);
 
         log.info("Created new segment: topic={}, partition={}, baseOffset={}",
@@ -198,7 +214,7 @@ public class SegmentManager {
     /**
      * Read messages from a starting offset
      */
-    public List<MessageRecord> read(long fromOffset, int maxRecords) throws IOException {
+    public List<MessageRecord> read(long fromOffset, int maxRecords) throws MessagingException {
         // Default max size: 1MB
         return readWithSizeLimit(fromOffset, maxRecords, 1048576);
     }
@@ -207,7 +223,7 @@ public class SegmentManager {
      * Read messages with cumulative size batching (SQL-like SUM() OVER pattern)
      * Reads from first record >= fromOffset, handles offset gaps gracefully
      */
-    public List<MessageRecord> readWithSizeLimit(long fromOffset, int maxRecords, int maxBytes) throws IOException {
+    public List<MessageRecord> readWithSizeLimit(long fromOffset, int maxRecords, int maxBytes) throws MessagingException {
      //   log.info("SegmentManager.read() called: topic={}, partition={}, fromOffset={}, maxRecords={}, maxBytes={}", topic, partition, fromOffset, maxRecords, maxBytes);
 
         List<MessageRecord> records = new ArrayList<>();
@@ -292,8 +308,9 @@ public class SegmentManager {
                     }
                 }
             } catch (Exception e) {
-                log.error("Error reading offset {}", currentOffset, e);
-                break;
+                ExceptionLogger.logAndThrow(log, new StorageException(ErrorCode.STORAGE_IO_ERROR,
+                        String.format("Failed to read from segment: topic=%s partition=%d offset=%d",
+                                topic, partition, currentOffset), e));
             }
         }
 
@@ -306,7 +323,7 @@ public class SegmentManager {
      * Currently only supports reading from a single segment (no cross-segment batches)
      * Size-only batching: Limited by maxBytes only, no message count limit
      */
-    public Segment.BatchFileRegion getZeroCopyBatch(long fromOffset, long maxBytes) throws IOException {
+    public Segment.BatchFileRegion getZeroCopyBatch(long fromOffset, long maxBytes) throws MessagingException {
         log.info("DEBUG SegmentManager.getZeroCopyBatch(): topic={}, partition={}, fromOffset={}, maxBytes={}, segments.size={}",
                 topic, partition, fromOffset, maxBytes, segments.size());
 
@@ -435,15 +452,20 @@ public class SegmentManager {
     /**
      * Replace segments after compaction
      */
-    public synchronized void replaceSegments(List<Segment> oldSegments, Segment newSegment) throws IOException {
+    public synchronized void replaceSegments(List<Segment> oldSegments, Segment newSegment) throws MessagingException {
         // Remove old segments from map
         for (Segment old : oldSegments) {
             segments.remove(old.getBaseOffset());
             old.close();
 
             // Delete files
-            Files.deleteIfExists(old.getLogPath());
-            Files.deleteIfExists(old.getIndexPath());
+            try {
+                Files.deleteIfExists(old.getLogPath());
+                Files.deleteIfExists(old.getIndexPath());
+            } catch (IOException e) {
+                log.error("Failed to delete segment files for offset {}", old.getBaseOffset(), e);
+                // Continue with other segments even if delete fails
+            }
         }
 
         // Add new compacted segment
@@ -483,7 +505,7 @@ public class SegmentManager {
     /**
      * Close all segments
      */
-    public void close() throws IOException {
+    public void close() throws MessagingException {
         Segment active = activeSegment.get();
         if (active != null) {
             // Save final metadata for active segment before closing

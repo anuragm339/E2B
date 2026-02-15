@@ -1,6 +1,8 @@
 package com.messaging.pipe;
 
 import com.messaging.common.api.PipeConnector;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.pipe.metrics.PipeMetrics;
 import com.fasterxml.jackson.core.JsonParser;
@@ -72,7 +74,9 @@ public class HttpPipeConnector implements PipeConnector {
         try {
             Files.createDirectories(Paths.get(dataDir));
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to create data dir", e);
+            // Wrap in RuntimeException as constructor can't throw checked exceptions
+            log.error("Failed to create data directory: {}", dataDir, e);
+            throw new RuntimeException("Failed to create data directory: " + dataDir, e);
         }
 
         this.offsetFilePath = Paths.get(dataDir, OFFSET_FILE);

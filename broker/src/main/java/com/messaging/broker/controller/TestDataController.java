@@ -133,7 +133,7 @@ public class TestDataController {
     /**
      * Load data from SQLite database
      */
-    private int loadDataFromSqlite(String filePath, String tableName, String topic) throws SQLException {
+    private int loadDataFromSqlite(String filePath, String tableName, String topic) throws Exception {
         String jdbcUrl = "jdbc:sqlite:" + filePath;
         int count = 0;
 

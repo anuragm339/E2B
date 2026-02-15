@@ -278,6 +278,37 @@ public class RemoteConsumerRegistry {
                     consumer.group
             );
 
+            /* ================= DATA REFRESH METRICS (if in refresh mode) ================= */
+            log.debug("DEBUG: Checking data refresh metrics - dataRefreshManager={}, topic={}",
+                     (dataRefreshManager != null ? "available" : "NULL"), consumer.topic);
+
+            if (dataRefreshManager != null) {
+                String refreshId = dataRefreshManager.getRefreshIdForTopic(consumer.topic);
+                String refreshType = dataRefreshManager.getRefreshTypeForTopic(consumer.topic);
+                log.info("DEBUG: refreshId for topic {} = {}, refreshType = {}", consumer.topic, refreshId, refreshType);
+
+                if (refreshId != null && refreshType != null) {
+                    log.info("DEBUG: Recording data refresh metrics - topic={}, group={}, bytes={}, messages={}, refreshId={}, refreshType={}",
+                             consumer.topic, consumer.group, batch.totalBytes, batch.recordCount, refreshId, refreshType);
+
+                    // Record data transferred during refresh
+                    dataRefreshMetrics.recordDataTransferred(
+                            consumer.topic,
+                            consumer.group,  // Using group instead of clientId for stable identifier
+                            batch.totalBytes,
+                            batch.recordCount,
+                            refreshId,
+                            refreshType
+                    );
+
+                    log.info("DEBUG: Data refresh metrics recorded successfully");
+                } else {
+                    log.debug("DEBUG: refreshId or refreshType is NULL for topic {} - not in refresh mode", consumer.topic);
+                }
+            } else {
+                log.warn("DEBUG: dataRefreshManager is NULL - cannot record data refresh metrics");
+            }
+
             return true;  // Data delivered successfully
 
         } catch (Exception e) {
@@ -484,12 +515,14 @@ public class RemoteConsumerRegistry {
      * Check if all specified consumers have caught up to latest offset (for DataRefresh)
      */
     public boolean allConsumersCaughtUp(String topic, java.util.Set<String> consumerClientIds) {
-        // Use getMaxOffsetFromMetadata instead of getCurrentOffset for data refresh
-        // getCurrentOffset returns the in-memory write head which may be low during refresh (pipes paused)
-        // getMaxOffsetFromMetadata reads from persistent segment metadata to get the true max offset
-        long latestOffset = storage.getMaxOffsetFromMetadata(topic, 0);
+        // CRITICAL FIX: Use getCurrentOffset (actual storage write head) instead of getMaxOffsetFromMetadata (stale)
+        // getMaxOffsetFromMetadata reads from segment metadata DB which is only updated periodically (every 1000 appends)
+        // During data refresh replay, metadata can lag behind actual storage by tens of thousands of offsets
+        // This was causing READY to be sent prematurely when consumers caught up to the STALE metadata offset,
+        // missing the remaining records that had been written but not yet reflected in metadata
+        long latestOffset = storage.getCurrentOffset(topic, 0);
 
-        log.debug("Checking if consumers caught up for topic {}: latestOffset from metadata = {}", topic, latestOffset);
+        log.debug("Checking if consumers caught up for topic {}: latestOffset from CURRENT storage = {}", topic, latestOffset);
 
         for (String clientId : consumerClientIds) {
             String consumerKey = clientId + ":" + topic;
@@ -506,14 +539,21 @@ public class RemoteConsumerRegistry {
                 return false;
             }
 
-            if (consumer.getCurrentOffset() < latestOffset) {
-                log.debug("Consumer {} not caught up: {} < {} (need {} more messages)",
-                         clientId, consumer.getCurrentOffset(), latestOffset, latestOffset - consumer.getCurrentOffset());
+            // CRITICAL FIX: Use COMMITTED offset from offsetTracker (consumer-offsets.properties)
+            // instead of in-memory currentOffset which is RESERVED (not yet ACKed)
+            // consumer.getCurrentOffset() returns the next offset to SEND
+            // offsetTracker.getOffset() returns the last offset that was ACKNOWLEDGED
+            String consumerId = consumer.group + ":" + topic;
+            long committedOffset = offsetTracker.getOffset(consumerId);
+
+            if (committedOffset < latestOffset) {
+                log.info("Consumer {} not caught up: committed={} < latest={} (need {} more messages)",
+                         consumerId, committedOffset, latestOffset, latestOffset - committedOffset);
                 return false;
             }
         }
 
-        log.info("✓ All consumers caught up for topic {} at offset {} (from metadata)", topic, latestOffset);
+        log.info("✓ All consumers caught up for topic {} at offset {} (all ACKs received)", topic, latestOffset);
         return true;
     }
 

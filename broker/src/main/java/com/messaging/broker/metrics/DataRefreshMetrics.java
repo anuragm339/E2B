@@ -411,7 +411,7 @@ public class DataRefreshMetrics {
     /**
      * Record data transferred during replay
      */
-    public void recordDataTransferred(String topic, String consumer, long bytes, long messages, String refreshId) {
+    public void recordDataTransferred(String topic, String consumer, long bytes, long messages, String refreshId, String refreshType) {
         String key = topic + ":" + consumer + ":" + refreshId;
 
         // Bytes gauge (resettable)
@@ -423,6 +423,7 @@ public class DataRefreshMetrics {
                             .tag("topic", topic)
                             .tag("consumer", consumer)
                             .tag("refresh_id", refreshId)
+                            .tag("refresh_type", refreshType)
                             .baseUnit("bytes")
                             .register(registry)
             );
@@ -439,6 +440,7 @@ public class DataRefreshMetrics {
                             .tag("topic", topic)
                             .tag("consumer", consumer)
                             .tag("refresh_id", refreshId)
+                            .tag("refresh_type", refreshType)
                             .register(registry)
             );
             return atomicMessages;

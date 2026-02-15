@@ -1,5 +1,8 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.common.exception.ConsumerException;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
 import io.micronaut.context.annotation.Value;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -50,7 +53,9 @@ public class DeliveryStateStore {
         try {
             Files.createDirectories(Paths.get(dataDir));
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to create data directory", e);
+            // Constructor can't throw checked exceptions - wrap in RuntimeException
+            log.error("Failed to create data directory: {}", dataDir, e);
+            throw new RuntimeException("Failed to create data directory: " + dataDir, e);
         }
 
         loadFromDisk();
@@ -173,7 +178,12 @@ public class DeliveryStateStore {
             Files.move(tempFile, stateFilePath, StandardCopyOption.REPLACE_EXISTING);
 
         } catch (IOException e) {
-            log.error("Failed to persist delivery state", e);
+            ConsumerException ex = new ConsumerException(ErrorCode.CONSUMER_OFFSET_COMMIT_FAILED,
+                "Failed to persist delivery state", e);
+            ex.withContext("stateFilePath", stateFilePath.toString());
+            ex.withContext("cacheSize", cache.size());
+            ExceptionLogger.logError(log, ex);
+            // Don't throw - this is background flush, just log the error
         }
     }
 
@@ -203,7 +213,11 @@ public class DeliveryStateStore {
             log.info("Loaded {} delivery states from disk", cache.size());
 
         } catch (IOException e) {
-            log.error("Failed to load delivery state, starting fresh", e);
+            ConsumerException ex = new ConsumerException(ErrorCode.CONSUMER_OFFSET_INVALID,
+                "Failed to load delivery state, starting fresh", e);
+            ex.withContext("stateFilePath", stateFilePath.toString());
+            ExceptionLogger.logError(log, ex);
+            // Don't throw - we can start with empty state
         }
     }
 

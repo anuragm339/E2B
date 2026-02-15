@@ -1,6 +1,8 @@
 package com.messaging.network.codec;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -27,13 +29,14 @@ public class JsonMessageEncoder extends MessageToByteEncoder<BrokerMessage> {
         // Validate message
         if (msg == null) {
             log.error("Attempted to encode null BrokerMessage");
-            throw new IllegalArgumentException("BrokerMessage cannot be null");
+            throw new NetworkException(ErrorCode.NETWORK_ENCODING_ERROR, "BrokerMessage cannot be null");
         }
 
         if (msg.getType() == null) {
             log.error("Attempted to encode BrokerMessage with null type: messageId={}, payload={}",
                      msg.getMessageId(), msg.getPayload() != null ? msg.getPayload().length + " bytes" : "null");
-            throw new IllegalArgumentException("BrokerMessage type cannot be null");
+            throw new NetworkException(ErrorCode.NETWORK_ENCODING_ERROR, "BrokerMessage type cannot be null")
+                .withContext("messageId", msg.getMessageId());
         }
 
         // Create JSON object

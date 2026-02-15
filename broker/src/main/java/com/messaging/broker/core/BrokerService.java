@@ -79,8 +79,13 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         log.info("Application started, initializing broker...");
 
         // Recover storage
-        storage.recover();
-        log.info("Storage recovered");
+        try {
+            storage.recover();
+            log.info("Storage recovered");
+        } catch (Exception e) {
+            log.error("Failed to recover storage", e);
+            throw new RuntimeException("Storage recovery failed", e);
+        }
 
         // Register message handler
         server.registerHandler(this::handleMessage);
@@ -451,7 +456,11 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
         // Shutdown server and storage
         server.shutdown();
-        storage.close();
+        try {
+            storage.close();
+        } catch (Exception e) {
+            log.error("Error closing storage during shutdown", e);
+        }
 
         log.info("Broker shutdown complete");
     }

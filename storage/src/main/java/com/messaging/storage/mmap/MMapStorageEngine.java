@@ -1,7 +1,12 @@
 package com.messaging.storage.mmap;
 
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
+import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.MessageRecord;
+import com.messaging.storage.segment.Segment;
 import com.messaging.storage.segment.SegmentManager;
 import com.messaging.storage.watermark.StorageWatermarkTracker;
 import io.micronaut.context.annotation.Requires;
@@ -52,57 +57,39 @@ public class MMapStorageEngine implements StorageEngine {
     }
 
     @Override
-    public long append(String topic, int partition, MessageRecord record) {
-        try {
-            SegmentManager manager = getOrCreateManager(topic, partition);
-            long offset = manager.append(record);
+    public long append(String topic, int partition, MessageRecord record) throws MessagingException {
+        SegmentManager manager = getOrCreateManager(topic, partition);
+        long offset = manager.append(record);
 
-            // Update watermark atomically after successful append
-            // This enables Broker to check for new data without disk I/O
-            watermarkTracker.updateWatermark(topic, partition, offset);
+        // Update watermark atomically after successful append
+        // This enables Broker to check for new data without disk I/O
+        watermarkTracker.updateWatermark(topic, partition, offset);
 
-            return offset;
-        } catch (IOException e) {
-            log.error("Failed to append record: topic={}, partition={}", topic, partition, e);
-            throw new RuntimeException("Failed to append record", e);
-        }
+        return offset;
     }
 
     @Override
-    public List<MessageRecord> read(String topic, int partition, long fromOffset, int maxRecords) {
-        try {
-            SegmentManager manager = managers.get(new TopicPartition(topic, partition));
-            if (manager == null) {
-                return new ArrayList<>();
-            }
-            List<MessageRecord> read = manager.read(fromOffset, maxRecords);
-            //log.info("Read {} records: topic={}, partition={}, fromOffset={}", read.size(), topic, partition, fromOffset);
-            return read;
-        } catch (IOException e) {
-            log.error("Failed to read records: topic={}, partition={}, offset={}",
-                    topic, partition, fromOffset, e);
-            throw new RuntimeException("Failed to read records", e);
+    public List<MessageRecord> read(String topic, int partition, long fromOffset, int maxRecords) throws MessagingException {
+        SegmentManager manager = managers.get(new TopicPartition(topic, partition));
+        if (manager == null) {
+            return new ArrayList<>();
         }
+        List<MessageRecord> read = manager.read(fromOffset, maxRecords);
+        //log.info("Read {} records: topic={}, partition={}, fromOffset={}", read.size(), topic, partition, fromOffset);
+        return read;
     }
 
     /**
      * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
      * @return BatchFileRegion containing FileRegion for zero-copy transfer + metadata
      */
-    public com.messaging.storage.segment.Segment.BatchFileRegion getZeroCopyBatch(
-            String topic, int partition, long fromOffset, long maxBytes) {
-        try {
-            SegmentManager manager = managers.get(new TopicPartition(topic, partition));
-            if (manager == null) {
-                log.debug("No segment manager for topic={}, partition={}", topic, partition);
-                return new com.messaging.storage.segment.Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
-            }
-            return manager.getZeroCopyBatch(fromOffset, maxBytes);
-        } catch (IOException e) {
-            log.error("Failed to get zero-copy batch: topic={}, partition={}, offset={}",
-                    topic, partition, fromOffset, e);
-            throw new RuntimeException("Failed to get zero-copy batch", e);
+    public Segment.BatchFileRegion getZeroCopyBatch(String topic, int partition, long fromOffset, long maxBytes) throws MessagingException {
+        SegmentManager manager = managers.get(new TopicPartition(topic, partition));
+        if (manager == null) {
+            log.debug("No segment manager for topic={}, partition={}", topic, partition);
+            return new com.messaging.storage.segment.Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
         }
+        return manager.getZeroCopyBatch(fromOffset, maxBytes);
     }
 
     @Override
@@ -154,7 +141,7 @@ public class MMapStorageEngine implements StorageEngine {
     }
 
     @Override
-    public void recover() {
+    public void recover() throws MessagingException {
         try {
             log.info("Starting recovery from data directory: {}", dataDir);
 
@@ -195,22 +182,19 @@ public class MMapStorageEngine implements StorageEngine {
             log.info("Recovery completed. Loaded {} topic-partitions", managers.size());
 
         } catch (IOException e) {
-            log.error("Failed to recover from data directory", e);
-            throw new RuntimeException("Recovery failed", e);
+            throw ExceptionLogger.logAndThrow(log,
+                new StorageException(ErrorCode.STORAGE_RECOVERY_FAILED, "Failed to recover from data directory", e)
+                    .withContext("dataDir", dataDir.toString()));
         }
     }
 
     @Override
-    public void close() {
+    public void close() throws MessagingException {
         log.info("Closing storage engine, flushing all data...");
 
         for (Map.Entry<TopicPartition, SegmentManager> entry : managers.entrySet()) {
-            try {
-                entry.getValue().close();
-                log.info("Closed segment manager for {}", entry.getKey());
-            } catch (IOException e) {
-                log.error("Failed to close segment manager for {}", entry.getKey(), e);
-            }
+            entry.getValue().close();
+            log.info("Closed segment manager for {}", entry.getKey());
         }
 
         managers.clear();
@@ -234,8 +218,8 @@ public class MMapStorageEngine implements StorageEngine {
                     metadataStoreFactory.getStoreForTopic(topic);
 
                 return new SegmentManager(topic, partition, partitionDir, maxSegmentSize, metadataStore);
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to create segment manager", e);
+            } catch (StorageException e) {
+                throw new RuntimeException(e); // Wrap for computeIfAbsent
             }
         });
     }

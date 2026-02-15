@@ -1,5 +1,7 @@
 package com.messaging.network.codec;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -19,20 +21,23 @@ public class BinaryMessageEncoder extends MessageToByteEncoder<BrokerMessage> {
         // Validate message
         if (msg == null) {
             log.error("Attempted to encode null BrokerMessage");
-            throw new IllegalArgumentException("BrokerMessage cannot be null");
+            throw new NetworkException(ErrorCode.NETWORK_ENCODING_ERROR, "BrokerMessage cannot be null");
         }
 
         if (msg.getType() == null) {
             log.error("Attempted to encode BrokerMessage with null type: messageId={}, payload={}",
                      msg.getMessageId(), msg.getPayload() != null ? msg.getPayload().length + " bytes" : "null");
-            throw new IllegalArgumentException("BrokerMessage type cannot be null");
+            throw new NetworkException(ErrorCode.NETWORK_ENCODING_ERROR, "BrokerMessage type cannot be null")
+                .withContext("messageId", msg.getMessageId());
         }
 
         byte typeCode = msg.getType().getCode();
         if (typeCode == 0) {
             log.error("Attempted to encode BrokerMessage with invalid type code 0: type={}, messageId={}",
                      msg.getType(), msg.getMessageId());
-            throw new IllegalArgumentException("Invalid BrokerMessage type code: 0");
+            throw new NetworkException(ErrorCode.NETWORK_ENCODING_ERROR, "Invalid BrokerMessage type code: 0")
+                .withContext("type", msg.getType())
+                .withContext("messageId", msg.getMessageId());
         }
 
         // Write type

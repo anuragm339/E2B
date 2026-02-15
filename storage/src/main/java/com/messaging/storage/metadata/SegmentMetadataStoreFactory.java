@@ -1,5 +1,6 @@
 package com.messaging.storage.metadata;
 
+import com.messaging.common.exception.StorageException;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -36,10 +37,15 @@ public class SegmentMetadataStoreFactory {
      */
     public SegmentMetadataStore getStoreForTopic(String topic) {
         return stores.computeIfAbsent(topic, t -> {
-            Path topicDir = dataDir.resolve(topic);
-            SegmentMetadataStore store = new SegmentMetadataStore(topicDir);
-            log.debug("Created SegmentMetadataStore for topic: {}", topic);
-            return store;
+            try {
+                Path topicDir = dataDir.resolve(topic);
+                SegmentMetadataStore store = new SegmentMetadataStore(topicDir);
+                log.debug("Created SegmentMetadataStore for topic: {}", topic);
+                return store;
+            } catch (StorageException e) {
+                // Wrap in RuntimeException for computeIfAbsent
+                throw new RuntimeException("Failed to create SegmentMetadataStore for topic: " + topic, e);
+            }
         });
     }
 
