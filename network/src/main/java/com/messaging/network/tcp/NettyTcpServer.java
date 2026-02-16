@@ -160,6 +160,14 @@ public class NettyTcpServer implements NetworkServer {
                     new IllegalStateException("Client not connected: " + clientId));
         }
 
+        // Check if channel is writable before attempting to send
+        // This prevents queueing writes when consumer is slow or disconnecting
+        if (!channel.isWritable()) {
+            log.warn("Channel not writable for client: {}, backpressure detected", clientId);
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException("Channel not writable (backpressure): " + clientId));
+        }
+
         CompletableFuture<Void> future = new CompletableFuture<>();
 
         // Send FileRegion directly to Netty channel for zero-copy transfer
@@ -169,8 +177,17 @@ public class NettyTcpServer implements NetworkServer {
                 future.complete(null);
                 log.debug("Zero-copy FileRegion sent successfully to client: {}", clientId);
             } else {
-                future.completeExceptionally(channelFuture.cause());
-                log.error("Failed to send FileRegion to client: {}", clientId, channelFuture.cause());
+                // Only log error if it's not a connection-related issue (already handled elsewhere)
+                Throwable cause = channelFuture.cause();
+                String causeClassName = cause != null ? cause.getClass().getName() : "null";
+                // Check for closed channel exceptions (including Netty's internal StacklessClosedChannelException)
+                if (!(cause instanceof java.nio.channels.ClosedChannelException) &&
+                    !causeClassName.contains("ClosedChannelException")) {
+                    log.error("Failed to send FileRegion to client: {}", clientId, cause);
+                } else {
+                    log.debug("FileRegion send failed due to closed channel: {}", clientId);
+                }
+                future.completeExceptionally(cause);
             }
         });
 

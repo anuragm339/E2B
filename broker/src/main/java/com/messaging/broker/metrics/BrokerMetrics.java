@@ -29,6 +29,14 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, AtomicLong> consumerLag = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Timer> consumerDeliveryLatency = new ConcurrentHashMap<>();
 
+    // Failed transfer metrics - track bytes/messages that failed to send
+    private final ConcurrentHashMap<String, Counter> consumerBytesFailed = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerMessagesFailed = new ConcurrentHashMap<>();
+
+    // Consumer stuck detection - track last successful delivery and ACK times
+    private final ConcurrentHashMap<String, AtomicLong> consumerLastDeliveryTime = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> consumerLastAckTime = new ConcurrentHashMap<>();
+
     // Counters
     private final Counter messagesReceived;
     private final Counter messagesSent;
@@ -506,5 +514,107 @@ public class BrokerMetrics {
         );
         counter.increment();
         log.debug("Recorded offset gap for topic: {}, partition: {}", topic, partition);
+    }
+
+    /**
+     * Record failed transfer (bytes and messages that failed to send to consumer)
+     * This allows calculation of successful bytes = total bytes - failed bytes
+     */
+    public void recordConsumerTransferFailed(String consumerId, String topic, String group, int messageCount, long totalBytes) {
+        String key = group + ":" + topic;
+
+        // Track failed bytes
+        Counter bytesCounter = consumerBytesFailed.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.bytes.failed")
+                .description("Bytes that failed to send to consumer group")
+                .tag("topic", topic)
+                .tag("group", group)
+                .baseUnit("bytes")
+                .register(registry)
+        );
+        bytesCounter.increment(totalBytes);
+
+        // Track failed messages
+        Counter messagesCounter = consumerMessagesFailed.computeIfAbsent(key, k ->
+            Counter.builder("broker.consumer.messages.failed")
+                .description("Messages that failed to send to consumer group")
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry)
+        );
+        messagesCounter.increment(messageCount);
+
+        log.debug("Recorded failed transfer for group: {} topic: {} - {} messages, {} bytes",
+                 group, topic, messageCount, totalBytes);
+    }
+
+    /**
+     * Update last successful delivery timestamp for stuck detection
+     * This tracks when the broker last successfully sent data to a consumer
+     */
+    public void updateConsumerLastDeliveryTime(String consumerId, String topic, String group) {
+        String key = group + ":" + topic;
+        long currentTime = System.currentTimeMillis();
+
+        AtomicLong gauge = consumerLastDeliveryTime.computeIfAbsent(key, k -> {
+            AtomicLong atomicTime = new AtomicLong(currentTime);
+            Gauge.builder("broker.consumer.last_delivery_time_ms", atomicTime, AtomicLong::get)
+                .description("Timestamp (epoch ms) of last successful delivery to consumer group")
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry);
+            return atomicTime;
+        });
+        gauge.set(currentTime);
+    }
+
+    /**
+     * Update last ACK timestamp for stuck detection
+     * This tracks when the broker last received an ACK from a consumer
+     */
+    public void updateConsumerLastAckTime(String consumerId, String topic, String group) {
+        String key = group + ":" + topic;
+        long currentTime = System.currentTimeMillis();
+
+        AtomicLong gauge = consumerLastAckTime.computeIfAbsent(key, k -> {
+            AtomicLong atomicTime = new AtomicLong(currentTime);
+            Gauge.builder("broker.consumer.last_ack_time_ms", atomicTime, AtomicLong::get)
+                .description("Timestamp (epoch ms) of last ACK received from consumer group")
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry);
+            return atomicTime;
+        });
+        gauge.set(currentTime);
+    }
+
+    /**
+     * Calculate time since last delivery (for stuck detection in Grafana)
+     * This is a derived metric: (current_time - last_delivery_time_ms) / 1000
+     * Can be used in Grafana with query:
+     * (time() * 1000 - broker_consumer_last_delivery_time_ms) / 1000
+     */
+    public long getTimeSinceLastDelivery(String group, String topic) {
+        String key = group + ":" + topic;
+        AtomicLong lastTime = consumerLastDeliveryTime.get(key);
+        if (lastTime == null) {
+            return -1; // No delivery yet
+        }
+        return (System.currentTimeMillis() - lastTime.get()) / 1000; // Return seconds
+    }
+
+    /**
+     * Calculate time since last ACK (for stuck detection in Grafana)
+     * This is a derived metric: (current_time - last_ack_time_ms) / 1000
+     * Can be used in Grafana with query:
+     * (time() * 1000 - broker_consumer_last_ack_time_ms) / 1000
+     */
+    public long getTimeSinceLastAck(String group, String topic) {
+        String key = group + ":" + topic;
+        AtomicLong lastTime = consumerLastAckTime.get(key);
+        if (lastTime == null) {
+            return -1; // No ACK yet
+        }
+        return (System.currentTimeMillis() - lastTime.get()) / 1000; // Return seconds
     }
 }

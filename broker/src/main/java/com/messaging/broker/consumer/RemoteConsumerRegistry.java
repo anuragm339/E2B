@@ -47,6 +47,7 @@ public class RemoteConsumerRegistry {
     private final ScheduledExecutorService scheduler;
     private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
     private final long maxMessageSizePerConsumer;
+    private static final int MAX_CONSECUTIVE_FAILURES = 10; // Max retries before giving up
 
     // Map: "clientId:topic" -> RemoteConsumer (composite key to support multiple topic subscriptions per client)
     private final Map<String, RemoteConsumer> consumers;
@@ -207,6 +208,28 @@ public class RemoteConsumerRegistry {
             return false;  // Waiting for ACK
         }
 
+        // Gate 3: Check maximum consecutive failures
+        if (consumer.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            log.error("Consumer {} has exceeded max consecutive failures ({}), unregistering",
+                     deliveryKey, MAX_CONSECUTIVE_FAILURES);
+            inFlight.set(false);
+            unregisterConsumer(consumer.clientId);
+            return false;  // Consumer has failed too many times
+        }
+
+        // Gate 4: Check exponential backoff after failures
+        long backoffDelay = consumer.getBackoffDelay();
+        if (backoffDelay > 0) {
+            long timeSinceLastFailure = System.currentTimeMillis() - consumer.lastFailureTime;
+            if (timeSinceLastFailure < backoffDelay) {
+                long remainingDelay = backoffDelay - timeSinceLastFailure;
+                log.debug("DEBUG deliverBatch: Gate 4 BLOCKED (backoff) for {}, consecutiveFailures={}, remainingDelay={}ms",
+                         deliveryKey, consumer.consecutiveFailures, remainingDelay);
+                inFlight.set(false);
+                return false;  // Still in backoff period
+            }
+        }
+
         log.info("DEBUG deliverBatch: Gates passed, proceeding with batch read for {}", deliveryKey);
 
         // Gate 3 removed: Parallel topic delivery now allowed
@@ -214,12 +237,13 @@ public class RemoteConsumerRegistry {
         long startOffset = consumer.getCurrentOffset();
         Timer.Sample readSample = null;
         Timer.Sample deliverySample = null;
+        Segment.BatchFileRegion batch = null;
 
         try {
             /* ================= STORAGE READ METRICS ================= */
             readSample = metrics.startStorageReadTimer();
 
-            Segment.BatchFileRegion batch = storageExecutor.submit(() ->
+            batch = storageExecutor.submit(() ->
                     ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage)
                             .getZeroCopyBatch(
                                     consumer.topic,
@@ -309,6 +333,8 @@ public class RemoteConsumerRegistry {
                 log.warn("DEBUG: dataRefreshManager is NULL - cannot record data refresh metrics");
             }
 
+            // Reset failure counter on successful delivery
+            consumer.resetFailures();
             return true;  // Data delivered successfully
 
         } catch (Exception e) {
@@ -318,6 +344,23 @@ public class RemoteConsumerRegistry {
             // Revert offset reservation on error
             consumer.setCurrentOffset(startOffset);
             pendingOffsets.remove(pendingKey);
+
+            // Record failure for exponential backoff
+            consumer.recordFailure();
+
+            // Record failed transfer metrics (bytes and messages that didn't make it to consumer)
+            if (batch != null) {
+                metrics.recordConsumerTransferFailed(
+                    consumer.clientId,
+                    consumer.topic,
+                    consumer.group,
+                    batch.recordCount,
+                    batch.totalBytes
+                );
+                log.warn("Recorded failed transfer: topic={}, group={}, messages={}, bytes={}, consecutiveFailures={}, nextBackoff={}ms",
+                        consumer.topic, consumer.group, batch.recordCount, batch.totalBytes,
+                        consumer.consecutiveFailures, consumer.getBackoffDelay());
+            }
 
             // Check if this is a connection error (Broken pipe, Connection reset, etc.)
             if (isConnectionError(e)) {
@@ -397,6 +440,9 @@ public class RemoteConsumerRegistry {
         // Record per-consumer metrics (efficient batch version)
         metrics.recordConsumerBatchSent(consumer.clientId, consumer.topic, consumer.group,
                                        batchRegion.recordCount, batchRegion.totalBytes);
+
+        // Update last successful delivery timestamp for stuck detection
+        metrics.updateConsumerLastDeliveryTime(consumer.clientId, consumer.topic, consumer.group);
     }
 
     /**
@@ -421,6 +467,12 @@ public class RemoteConsumerRegistry {
             offsetTracker.updateOffset(consumer.group + ":" + topic, committedOffset);
             // Update Prometheus gauge metric to reflect new offset
             metrics.updateConsumerOffset(clientId, topic, consumer.group, committedOffset);
+
+            // Update last ACK timestamp for stuck detection
+            metrics.updateConsumerLastAckTime(clientId, topic, consumer.group);
+
+            // Record consumer ACK metric
+            metrics.recordConsumerAck(clientId, topic, consumer.group);
         }
 
         AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
@@ -662,6 +714,8 @@ public class RemoteConsumerRegistry {
         volatile long currentOffset;
         volatile Future<?> deliveryTask;
         volatile long lastDeliveryAttempt; // Rate limiting: timestamp of last delivery attempt
+        volatile int consecutiveFailures; // Track consecutive failures for exponential backoff
+        volatile long lastFailureTime; // Timestamp of last failure
 
         RemoteConsumer(String clientId, String topic, String group) {
             this.clientId = clientId;
@@ -669,6 +723,8 @@ public class RemoteConsumerRegistry {
             this.group = group;
             this.currentOffset = 0;
             this.lastDeliveryAttempt = 0; // Allow immediate first delivery
+            this.consecutiveFailures = 0;
+            this.lastFailureTime = 0;
         }
 
         long getCurrentOffset() {
@@ -677,6 +733,29 @@ public class RemoteConsumerRegistry {
 
         void setCurrentOffset(long offset) {
             this.currentOffset = offset;
+        }
+
+        /**
+         * Calculate backoff delay based on consecutive failures (exponential backoff)
+         * @return delay in milliseconds before next retry
+         */
+        long getBackoffDelay() {
+            if (consecutiveFailures == 0) {
+                return 0; // No delay on first attempt
+            }
+            // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, max 5000ms
+            long delay = Math.min(100L * (1L << (consecutiveFailures - 1)), 5000L);
+            return delay;
+        }
+
+        void recordFailure() {
+            consecutiveFailures++;
+            lastFailureTime = System.currentTimeMillis();
+        }
+
+        void resetFailures() {
+            consecutiveFailures = 0;
+            lastFailureTime = 0;
         }
     }
 }
