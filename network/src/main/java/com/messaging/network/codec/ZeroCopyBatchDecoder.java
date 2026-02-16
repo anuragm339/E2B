@@ -1,5 +1,7 @@
 package com.messaging.network.codec;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.common.model.ConsumerRecord;
 import com.messaging.common.model.EventType;
@@ -76,7 +78,8 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
         if (payloadLength < 0 || payloadLength > 10 * 1024 * 1024) {
             log.error("Invalid payload length: {}", payloadLength);
             in.resetReaderIndex();
-            throw new IllegalArgumentException("Invalid payload length: " + payloadLength);
+            throw new NetworkException(ErrorCode.NETWORK_DECODING_ERROR, "Invalid payload length: " + payloadLength)
+                .withContext("payloadLength", payloadLength);
         }
 
         // Check if we have enough bytes for the payload
@@ -93,10 +96,11 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             byte[] payload = new byte[payloadLength];
             in.readBytes(payload);
 
+            // UNIFIED FORMAT: [recordCount:4][totalBytes:8][topicLen:4][topic:var]
+            // Removed lastOffset - consumer doesn't need it
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(payload);
             expectedRecordCount = buffer.getInt();
             expectedTotalBytes = buffer.getLong();
-            lastOffset = buffer.getLong();
 
             // Parse topic name from header
             int topicLen = buffer.getInt();
@@ -104,8 +108,8 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             buffer.get(topicBytes);
             currentBatchTopic = new String(topicBytes, StandardCharsets.UTF_8);
 
-            log.debug("Received BATCH_HEADER: topic={}, recordCount={}, totalBytes={}, lastOffset={}",
-                    currentBatchTopic, expectedRecordCount, expectedTotalBytes, lastOffset);
+            log.debug("Received BATCH_HEADER: topic={}, recordCount={}, totalBytes={}",
+                    currentBatchTopic, expectedRecordCount, expectedTotalBytes);
 
             // Transition to READING_ZERO_COPY_BATCH state to expect raw bytes
             state = DecoderState.READING_ZERO_COPY_BATCH;
@@ -129,7 +133,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
                 // Parse the batch data directly from the current buffer
                 List<ConsumerRecord> records = parseBatchData(in, (int)headerTotalBytes, headerRecordCount);
-                log.info("Decoded zero-copy batch: {} records, {} bytes", records.size(), headerTotalBytes);
+                log.debug("Decoded zero-copy batch: {} records, {} bytes", records.size(), headerTotalBytes);
 
                 // Add records list to output
                 out.add(records);
@@ -237,7 +241,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             records.add(record);
         }
 
-        log.info("Parsed batch data: {} records, {} bytes", records.size(), bytesRead);
+        log.debug("Parsed batch data: {} records, {} bytes", records.size(), bytesRead);
         return records;
     }
 
@@ -254,25 +258,39 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
         log.debug("Decoding zero-copy batch: {} bytes", expectedTotalBytes);
 
+        // DEBUG: Log first 32 bytes in hex to see what we're receiving
+        if (in.readableBytes() >= 32) {
+            in.markReaderIndex();
+            byte[] first32 = new byte[32];
+            in.readBytes(first32);
+            in.resetReaderIndex();
+
+            StringBuilder hex = new StringBuilder();
+            for (int i = 0; i < 32; i++) {
+                hex.append(String.format("%02X ", first32[i]));
+                if ((i + 1) % 16 == 0) hex.append("\n                ");
+            }
+            log.debug("First 32 bytes received:\n                {}", hex.toString());
+        }
+
         // Parse raw segment data into ConsumerRecords
         List<ConsumerRecord> records = new ArrayList<>(expectedRecordCount);
         long bytesRead = 0;
 
         while (bytesRead < expectedTotalBytes && records.size() < expectedRecordCount) {
-            // Record format: [offset:8][keyLen:4][key:var][eventType:1][dataLen:4][data:var][createdAt:8][crc32:4]
-
-            // Read offset
-            if (in.readableBytes() < 8) break;
-            long offset = in.readLong();
-            bytesRead += 8;
+            // UNIFIED FORMAT: [keyLen:4][key:var][eventType:1][dataLen:4][data:var][timestamp:8]
+            // NO offset at beginning, NO CRC at end
 
             // Read key
             if (in.readableBytes() < 4) break;
             int keyLen = in.readInt();
             bytesRead += 4;
 
+            log.debug("Record {}: keyLen={} (0x{}) at bytesRead={}",
+                     records.size(), keyLen, Integer.toHexString(keyLen), bytesRead - 4);
+
             if (keyLen < 0 || keyLen > 1024 * 1024) {
-                log.error("Invalid keyLen: {}", keyLen);
+                log.error("Invalid keyLen: {} (0x{})", keyLen, Integer.toHexString(keyLen));
                 break;
             }
 
@@ -310,11 +328,6 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             if (in.readableBytes() < 8) break;
             long createdAtMillis = in.readLong();
             bytesRead += 8;
-
-            // Read CRC32 (skip validation for now)
-            if (in.readableBytes() < 4) break;
-            int crc32 = in.readInt();
-            bytesRead += 4;
 
             // Convert byte to EventType and long to Instant
             EventType eventTypeEnum = (eventType == 'M') ? EventType.MESSAGE : EventType.DELETE;

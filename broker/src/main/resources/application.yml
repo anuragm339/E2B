@@ -65,7 +65,17 @@ broker:
     default-fixed-retry-interval: 30000
     ack-timeout: 5000
     max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:1048576}  # 1MB max data per consumer per delivery cycle
-    max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}  # Max messages to read from storage per cycle
+    # DEPRECATED: max-batch-size-per-consumer no longer used (size-only batching now)
+    # max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}
+
+    # Adaptive polling configuration (watermark-based delivery)
+    adaptive-polling:
+      min-delay-ms: 1          # Immediate poll when data found (near-push latency)
+      max-delay-ms: 1000       # Max backoff delay when idle (exponential backoff)
+
+    # Per-topic fairness configuration
+    fairness:
+      max-in-flight-per-topic: 4  # Max concurrent deliveries per topic (prevents hot topics from starving quiet ones)
 
 # DataRefresh Configuration
 # Expected consumers list for data refresh workflow using "group:topic" format

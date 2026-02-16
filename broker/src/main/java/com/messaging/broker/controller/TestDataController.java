@@ -96,8 +96,8 @@ public class TestDataController {
                 long offset = storage.append(topic, 0, record);
                 offsets.add(offset);
 
-                // Push notification to consumers
-                remoteConsumers.notifyNewMessage(topic, offset);
+                // Note: Adaptive delivery manager will automatically discover and deliver messages
+                // No explicit notification needed - watermark-based polling handles delivery
             }
 
             return Map.of(
@@ -133,7 +133,7 @@ public class TestDataController {
     /**
      * Load data from SQLite database
      */
-    private int loadDataFromSqlite(String filePath, String tableName, String topic) throws SQLException {
+    private int loadDataFromSqlite(String filePath, String tableName, String topic) throws Exception {
         String jdbcUrl = "jdbc:sqlite:" + filePath;
         int count = 0;
 
@@ -176,8 +176,8 @@ public class TestDataController {
                     long offset = storage.append(topic, 0, record);
                     count++;
 
-                    // Push notification to consumers
-                    remoteConsumers.notifyNewMessage(topic, offset);
+                    // Note: Adaptive delivery manager will automatically discover and deliver messages
+                    // No explicit notification needed - watermark-based polling handles delivery
 
                     if (count % 100 == 0) {
                         log.info("Loaded {} records from SQLite", count);

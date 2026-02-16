@@ -1,5 +1,9 @@
 package com.messaging.storage.segment;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
+import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
 import io.netty.channel.DefaultFileRegion;
@@ -23,8 +27,14 @@ import java.util.zip.CRC32;
  */
 public class Segment {
     private static final Logger log = LoggerFactory.getLogger(Segment.class);
-    private static final int INDEX_ENTRY_SIZE = 12; // 8 bytes offset + 4 bytes position
+
+    // Unified format constants
+    private static final int INDEX_ENTRY_SIZE = 20; // offset:8 + logPosition:4 + recordSize:4 + crc32:4
     private static final int WRITE_BUFFER_SIZE = 16 * 1024; // 16KB reusable buffer
+    private static final int FILE_HEADER_SIZE = 6; // magic:4 + version:2
+    private static final byte[] LOG_MAGIC = "MLOG".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] INDEX_MAGIC = "MIDX".getBytes(StandardCharsets.UTF_8);
+    private static final short FORMAT_VERSION = 1;
 
     private long baseOffset;
     private final Path logPath;
@@ -33,7 +43,25 @@ public class Segment {
     private final FileChannel indexChannel;
     private final long maxSize;
 
-    // In-memory index: offset -> file position
+    // Topic and partition context for rich exception logging
+    private final String topic;
+    private final int partition;
+
+    /**
+     * In-memory index: offset -> file position
+     *
+     * @deprecated This in-memory index is kept only for backward compatibility during segment recovery.
+     * New reads use file-based binary search via findIndexEntryForOffset(), which provides:
+     * - O(log n) lookup time (similar to this ConcurrentSkipListMap)
+     * - O(1) memory usage (vs O(n) for this map)
+     * - Thread-safe positioned reads without synchronization
+     *
+     * Memory savings: ~50MB per 1M records (8 bytes key + 4 bytes value + ~40 bytes overhead per entry).
+     * With binary search: ~400 bytes per lookup (20 iterations × 20 bytes per index entry).
+     *
+     * Will be completely removed in next major version after successful rollout.
+     */
+    @Deprecated
     private final ConcurrentSkipListMap<Long, Integer> index;
 
     // Thread-local buffers for reads (to avoid allocation)
@@ -41,39 +69,190 @@ public class Segment {
 
     private long nextOffset;
     private long logPosition; // Current write position in log file
+    private long recordCount; // Number of records actually in this segment (for dense indexing)
     private boolean active;
 
-    public Segment(Path logPath, Path indexPath, long baseOffset, long maxSize) throws IOException {
+    public Segment(Path logPath, Path indexPath, long baseOffset, long maxSize, String topic, int partition) throws StorageException {
         this.baseOffset = baseOffset;
         this.logPath = logPath;
         this.indexPath = indexPath;
         this.nextOffset = baseOffset;
         this.logPosition = 0;
+        this.recordCount = 0;
         this.active = true;
         this.maxSize = maxSize;
+        this.topic = topic;
+        this.partition = partition;
         this.index = new ConcurrentSkipListMap<>();
 
-        // Open log file channel
-        this.logChannel = FileChannel.open(logPath,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.CREATE);
+        try {
+            // Open log file channel
+            this.logChannel = FileChannel.open(logPath,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.CREATE);
 
-        // Open index file channel
-        this.indexChannel = FileChannel.open(indexPath,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.CREATE);
+            // Open index file channel
+            this.indexChannel = FileChannel.open(indexPath,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE,
+                    StandardOpenOption.CREATE);
 
-        // Initialize write position from file size
-        this.logPosition = logChannel.size();
+            // Initialize files with headers if new, or validate existing headers
+            initializeOrValidateHeaders();
 
-        log.info("Created segment with baseOffset={} at {}, logSize={}MB",
-                baseOffset, logPath, logPosition / (1024 * 1024));
+            // Initialize write position from file size
+            this.logPosition = logChannel.size();
 
-        // If segment has existing data, recover index and nextOffset
-        if (logPosition > 0) {
-            recoverIndex();
+            log.info("Created segment with baseOffset={} at {}, logSize={}MB",
+                    baseOffset, logPath, logPosition / (1024 * 1024));
+
+            // If segment has existing data, recover index and nextOffset
+            if (logPosition > FILE_HEADER_SIZE) {
+                recoverIndex();
+            }
+        } catch (IOException e) {
+            throw new StorageException(ErrorCode.STORAGE_IO_ERROR,
+                "Failed to open segment files: " + logPath, e)
+                .withTopic(topic)
+                .withPartition(partition)
+                .withSegmentPath(logPath.toString());
+        }
+    }
+
+    /**
+     * Initialize new files with headers or validate existing headers
+     */
+    private void initializeOrValidateHeaders() throws StorageException {
+        try {
+            long logSize = logChannel.size();
+            long indexSize = indexChannel.size();
+
+            if (logSize == 0 && indexSize == 0) {
+                // New files - write headers
+                writeFileHeaders();
+            } else if (logSize >= FILE_HEADER_SIZE && indexSize >= FILE_HEADER_SIZE) {
+                // Existing files - validate headers
+                validateFileHeaders();
+            } else {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.corruption("Corrupted segment files: log=" + logSize + "bytes, index=" + indexSize + "bytes")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(logPath.toString())
+                        .withContext("logSize", logSize)
+                        .withContext("indexSize", indexSize));
+            }
+        } catch (IOException | MessagingException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.ioError("Failed to initialize or validate segment headers", e)
+                    .withTopic(topic)
+                    .withPartition(partition)
+                    .withSegmentPath(logPath.toString()));
+        }
+    }
+
+    /**
+     * Write file headers to new segment files
+     */
+    private void writeFileHeaders() throws MessagingException {
+        try {
+            // Write log header: [MLOG][version]
+            ByteBuffer logHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
+            logHeader.put(LOG_MAGIC);
+            logHeader.putShort(FORMAT_VERSION);
+            logHeader.flip();
+            logChannel.write(logHeader, 0);
+
+            // Write index header: [MIDX][version]
+            ByteBuffer indexHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
+            indexHeader.put(INDEX_MAGIC);
+            indexHeader.putShort(FORMAT_VERSION);
+            indexHeader.flip();
+            indexChannel.write(indexHeader, 0);
+
+            logChannel.force(false);
+            indexChannel.force(false);
+
+            log.info("Initialized new segment files with unified format headers");
+        } catch (IOException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.writeFailed(topic, partition, e)
+                    .withSegmentPath(logPath.toString())
+                    .withContext("operation", "writeFileHeaders"));
+        }
+    }
+
+    /**
+     * Validate file headers for existing segment files
+     */
+    private void validateFileHeaders() throws StorageException {
+        try {
+            // Validate log header
+            ByteBuffer logHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
+            logChannel.read(logHeader, 0);
+            logHeader.flip();
+
+            byte[] logMagic = new byte[4];
+            logHeader.get(logMagic);
+            short logVersion = logHeader.getShort();
+
+            if (!java.util.Arrays.equals(logMagic, LOG_MAGIC)) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.corruption("Invalid log file magic bytes")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(logPath.toString())
+                        .withContext("expectedMagic", "MLOG")
+                        .withContext("actualMagic", new String(logMagic, StandardCharsets.UTF_8)));
+            }
+
+            if (logVersion != FORMAT_VERSION) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.corruption("Unsupported log file version")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(logPath.toString())
+                        .withContext("expectedVersion", FORMAT_VERSION)
+                        .withContext("actualVersion", logVersion));
+            }
+
+            // Validate index header
+            ByteBuffer indexHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
+            indexChannel.read(indexHeader, 0);
+            indexHeader.flip();
+
+            byte[] indexMagic = new byte[4];
+            indexHeader.get(indexMagic);
+            short indexVersion = indexHeader.getShort();
+
+            if (!java.util.Arrays.equals(indexMagic, INDEX_MAGIC)) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.corruption("Invalid index file magic bytes")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(indexPath.toString())
+                        .withContext("expectedMagic", "MIDX")
+                        .withContext("actualMagic", new String(indexMagic, StandardCharsets.UTF_8)));
+            }
+
+            if (indexVersion != FORMAT_VERSION) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.corruption("Unsupported index file version")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(indexPath.toString())
+                        .withContext("expectedVersion", FORMAT_VERSION)
+                        .withContext("actualVersion", indexVersion));
+            }
+
+            log.debug("Validated segment file headers: version {}", FORMAT_VERSION);
+        } catch (IOException | MessagingException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.ioError("Failed to validate segment headers", e)
+                    .withTopic(topic)
+                    .withPartition(partition)
+                    .withSegmentPath(logPath.toString()));
         }
     }
 
@@ -100,458 +279,411 @@ public class Segment {
     }
 
     /**
-     * Recover index from index file
+     * Recover index from index file (unified format).
+     * Index entry: [offset:8][logPosition:4][recordSize:4][crc32:4]
+     *
+     * NOTE: This method still populates the deprecated in-memory index for backward compatibility.
+     * However, new reads no longer use this index - they use file-based binary search instead.
+     * This ensures segment recovery works during transition period.
+     * Will be simplified in future version to only recover metadata (nextOffset, recordCount).
      */
-    private void recoverFromIndexFile(long indexSize) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
-        long position = 0;
+    private void recoverFromIndexFile(long indexSize) throws MessagingException {
+        try {
+            ByteBuffer buffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+            long position = FILE_HEADER_SIZE;  // Skip file header
+            long highestOffset = baseOffset - 1;
 
-        while (position < indexSize) {
-            buffer.clear();
-            int bytesRead = indexChannel.read(buffer, position);
-            if (bytesRead < INDEX_ENTRY_SIZE) break;
+            while (position < indexSize) {
+                buffer.clear();
+                int bytesRead = indexChannel.read(buffer, position);
+                if (bytesRead < INDEX_ENTRY_SIZE) break;
 
-            buffer.flip();
-            long offset = buffer.getLong();
-            int logPos = buffer.getInt();
+                buffer.flip();
+                long offset = buffer.getLong();
+                int logPos = buffer.getInt();
+                int recordSize = buffer.getInt();
+                int crc = buffer.getInt();
 
-            index.put(offset, logPos);
-            position += INDEX_ENTRY_SIZE;
-        }
+                index.put(offset, logPos);
 
-        // Find highest offset by scanning from last indexed position
-        if (!index.isEmpty()) {
-            long lastIndexedOffset = index.lastKey();
-            int lastIndexedPosition = index.get(lastIndexedOffset);
+                if (offset > highestOffset) {
+                    highestOffset = offset;
+                }
 
-            long highestOffset = scanForHighestOffset(lastIndexedPosition);
-            this.nextOffset = highestOffset + 1;
-
-            log.info("Recovered index with {} entries, nextOffset={}", index.size(), nextOffset);
-        } else {
-            recoverFromLogScan();
-        }
-    }
-
-    /**
-     * Scan from position to find highest offset
-     */
-    private long scanForHighestOffset(int startPosition) throws IOException {
-        long highestOffset = baseOffset - 1;
-        long position = startPosition;
-        ByteBuffer buffer = ByteBuffer.allocate(20); // Header buffer
-
-        while (position < logPosition) {
-            buffer.clear();
-            buffer.limit(8); // Read offset only
-            int bytesRead = logChannel.read(buffer, position);
-            if (bytesRead < 8) break;
-
-            buffer.flip();
-            long recordOffset = buffer.getLong();
-
-            if (recordOffset > highestOffset) {
-                highestOffset = recordOffset;
+                position += INDEX_ENTRY_SIZE;
             }
 
-            // Skip rest of record
-            position += 8;
+            this.nextOffset = highestOffset + 1;
+            this.recordCount = index.size(); // Set recordCount for dense indexing
 
-            // Read key length
-            buffer.clear();
-            buffer.limit(4);
-            bytesRead = logChannel.read(buffer, position);
-            if (bytesRead < 4) break;
-            buffer.flip();
-            int keyLen = buffer.getInt();
-            position += 4 + keyLen;
-
-            // Skip event type (1 byte)
-            position += 1;
-
-            // Read data length
-            buffer.clear();
-            buffer.limit(4);
-            bytesRead = logChannel.read(buffer, position);
-            if (bytesRead < 4) break;
-            buffer.flip();
-            int dataLen = buffer.getInt();
-            position += 4 + dataLen;
-
-            // Skip timestamp (8) + crc32 (4)
-            position += 12;
+            log.info("Recovered index with {} entries, nextOffset={}, recordCount={}", index.size(), nextOffset, recordCount);
+        } catch ( IOException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.ioError("Failed to recover index from index file", e)
+                    .withTopic(topic)
+                    .withPartition(partition)
+                    .withSegmentPath(indexPath.toString())
+                    .withContext("indexSize", indexSize));
         }
-
-        return highestOffset;
     }
 
     /**
-     * Fallback: Recover by scanning the entire log file
+     * Fallback: Recover by scanning the entire log file (UNIFIED FORMAT - NOT SUPPORTED)
+     *
+     * In the unified format, log files don't contain offsets, so we can't scan them
+     * to rebuild the index. The index file is mandatory for recovery.
      */
     private void recoverFromLogScan() {
-        log.warn("Using log scan for recovery at baseOffset={}", baseOffset);
+        log.error("Log scan recovery not supported in unified format - index file is mandatory!");
+        log.error("Segment at baseOffset={} has corrupted or missing index file", baseOffset);
+        log.error("Solution: Delete this segment and re-ingest data from source");
 
-        try {
-            index.clear();
-            long position = 0;
-            long highestOffset = baseOffset - 1;
-            long recordCount = 0;
-            ByteBuffer buffer = ByteBuffer.allocate(20);
-
-            while (position < logPosition) {
-                int recordStart = (int) position;
-
-                // Read offset
-                buffer.clear();
-                buffer.limit(8);
-                int bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 8) break;
-                buffer.flip();
-                long recordOffset = buffer.getLong();
-                position += 8;
-
-                if (recordOffset > highestOffset) {
-                    highestOffset = recordOffset;
-                }
-
-                // Read key length
-                buffer.clear();
-                buffer.limit(4);
-                bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 4) break;
-                buffer.flip();
-                int keyLen = buffer.getInt();
-                position += 4;
-
-                if (keyLen < 0 || keyLen > 1000) {
-                    log.warn("Invalid keyLen={}, stopping scan", keyLen);
-                    break;
-                }
-                position += keyLen;
-
-                // Skip event type
-                position += 1;
-
-                // Read data length
-                buffer.clear();
-                buffer.limit(4);
-                bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 4) break;
-                buffer.flip();
-                int dataLen = buffer.getInt();
-                position += 4;
-
-                if (dataLen < 0 || dataLen > 10 * 1024 * 1024) {
-                    log.warn("Invalid dataLen={}, stopping scan", dataLen);
-                    break;
-                }
-                position += dataLen;
-
-                // Skip timestamp + crc32
-                position += 12;
-
-                recordCount++;
-
-                // Add to index every 4KB
-                if (recordStart % 4096 < 100) { // Within 100 bytes of 4KB boundary
-                    index.put(recordOffset, recordStart);
-                    writeIndexEntry(recordOffset, recordStart);
-                }
-            }
-
-            this.logPosition = position;
-            this.nextOffset = highestOffset + 1;
-
-            log.info("Recovered segment (log scan): baseOffset={}, recordCount={}, nextOffset={}, indexEntries={}",
-                    baseOffset, recordCount, nextOffset, index.size());
-
-        } catch (Exception e) {
-            log.error("Error in log scan recovery", e);
-            this.nextOffset = baseOffset;
-        }
+        // Use RuntimeException for fatal unrecoverable error (unchecked exception appropriate here)
+        // This will propagate up to caller and cause broker initialization failure
+        throw new RuntimeException("Cannot recover unified format segment without index file. " +
+                "topic=" + topic + " partition=" + partition + " baseOffset=" + baseOffset +
+                " segmentPath=" + logPath + ". Delete segment files and re-ingest data.");
     }
 
     /**
      * Append a message record to the segment
      */
-    public synchronized long append(MessageRecord record) throws IOException {
+    public synchronized long append(MessageRecord record) throws MessagingException {
         if (!active) {
-            throw new IllegalStateException("Segment is not active");
+            throw ExceptionLogger.logAndThrow(log,
+                new StorageException(ErrorCode.STORAGE_WRITE_FAILED, "Segment is not active")
+                    .withTopic(topic)
+                    .withPartition(partition)
+                    .withSegmentPath(logPath.toString())
+                    .withContext("baseOffset", baseOffset));
         }
 
-        this.nextOffset = record.getOffset() + 1;
         long offset = record.getOffset();
 
-        // Calculate CRC32
-        int crc32 = calculateCRC32(record, offset);
+        // baseOffset is IMMUTABLE - set only during construction
+        // DO NOT update it here, as it would corrupt loaded segments
+        // The baseOffset is set in the constructor based on:
+        // 1. Filename offset (for loaded segments)
+        // 2. Explicit parameter (for new segments)
 
-        // Write record to log file
-        int recordSize = writeRecord(record, offset, crc32);
+        this.nextOffset = offset + 1;
 
-        // Update index every 4KB
-        if ((logPosition - recordSize) % 4096 < recordSize) {
-            int recordStart = (int) (logPosition - recordSize);
-            index.put(offset, recordStart);
-            writeIndexEntry(offset, recordStart);
-        }
+        // Write record using unified format (split log/index)
+        writeRecord(record, offset);
 
-        if (this.baseOffset == 0) {
-            this.baseOffset = offset;
-        }
-
-        return record.getOffset();
+        return offset;
     }
 
     /**
-     * Write record to log file using FileChannel
+     * Write record using unified format: split log/index writes
+     * Log: [keyLen:4][key][eventType:1][dataLen:4][data][timestamp:8]
+     * Index: [offset:8][logPosition:4][recordSize:4][crc32:4]
      */
-    private int writeRecord(MessageRecord record, long offset, int crc32) throws IOException {
-        // Prepare data
-        byte[] keyBytes = record.getMsgKey().getBytes(StandardCharsets.UTF_8);
-        byte[] dataBytes = record.getData() != null ?
-                record.getData().getBytes(StandardCharsets.UTF_8) : new byte[0];
-
-        int recordSize = 8 + 4 + keyBytes.length + 1 + 4 + dataBytes.length + 8 + 4;
-
-        // Check segment size limit
-        if (logPosition + recordSize > maxSize) {
-            throw new IOException("Segment full");
-        }
-
-        // Build record in buffer
-        ByteBuffer buffer = ByteBuffer.allocate(recordSize);
-        buffer.putLong(offset);
-        buffer.putInt(keyBytes.length);
-        buffer.put(keyBytes);
-        buffer.put((byte) record.getEventType().getCode());
-        buffer.putInt(dataBytes.length);
-        if (dataBytes.length > 0) {
-            buffer.put(dataBytes);
-        }
-        buffer.putLong(record.getCreatedAt().toEpochMilli());
-        buffer.putInt(crc32);
-        buffer.flip();
-
-        // Write to file
-        int written = 0;
-        while (buffer.hasRemaining()) {
-            written += logChannel.write(buffer, logPosition + written);
-        }
-
-        logPosition += written;
-
-        // Force to disk for durability
-        logChannel.force(false);
-
-        return recordSize;
-    }
-
-    /**
-     * Write index entry to index file
-     */
-    private void writeIndexEntry(long offset, int position) {
+    private void writeRecord(MessageRecord record, long offset) throws MessagingException {
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
-            buffer.putLong(offset);
-            buffer.putInt(position);
-            buffer.flip();
+            // Prepare data
+            byte[] keyBytes = record.getMsgKey().getBytes(StandardCharsets.UTF_8);
+            byte[] dataBytes = record.getData() != null ?
+                    record.getData().getBytes(StandardCharsets.UTF_8) : new byte[0];
 
-            long indexPos = index.headMap(offset, true).size() * INDEX_ENTRY_SIZE;
-            indexChannel.write(buffer, indexPos);
+            // Calculate log record size (NO offset, NO CRC in log)
+            int logRecordSize = 4 + keyBytes.length + 1 + 4 + dataBytes.length + 8;
+
+            // Check segment size limit
+            if (logPosition + logRecordSize > maxSize) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.writeFailed(topic, partition, new IOException("Segment full"))
+                        .withSegmentPath(logPath.toString())
+                        .withContext("logPosition", logPosition)
+                        .withContext("recordSize", logRecordSize)
+                        .withContext("maxSize", maxSize));
+            }
+
+            // 1. Write to LOG file (message data only)
+            ByteBuffer logBuffer = ByteBuffer.allocate(logRecordSize);
+            logBuffer.putInt(keyBytes.length);          // keyLen: 4 bytes
+            logBuffer.put(keyBytes);                    // key: variable
+            logBuffer.put((byte) record.getEventType().getCode());  // eventType: 1 byte
+            logBuffer.putInt(dataBytes.length);         // dataLen: 4 bytes
+            if (dataBytes.length > 0) {
+                logBuffer.put(dataBytes);               // data: variable
+            }
+            logBuffer.putLong(record.getCreatedAt().toEpochMilli());  // timestamp: 8 bytes
+            logBuffer.flip();
+
+            // Save log position BEFORE writing
+            long recordLogPosition = logPosition;
+
+            log.info("DEBUG writeRecord: path={}, offset={}, logPosition={}, recordSize={}, baseOffset={}",
+                     logPath, offset, logPosition, logRecordSize, baseOffset);
+
+            // Write log data
+            int written = 0;
+            while (logBuffer.hasRemaining()) {
+                written += logChannel.write(logBuffer, logPosition + written);
+            }
+            logPosition += written;
+
+            log.info("DEBUG writeRecord AFTER write: newLogPosition={}, written={}", logPosition, written);
+
+            // 2. Calculate CRC32 from log data
+            logBuffer.rewind();
+            CRC32 crc = new CRC32();
+            crc.update(logBuffer);
+            int crc32Value = (int) crc.getValue();
+
+            // 3. Write to INDEX file (metadata: offset, position, size, CRC)
+            ByteBuffer indexBuffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+            indexBuffer.putLong(offset);                        // offset: 8 bytes
+            indexBuffer.putInt((int) recordLogPosition);        // logPosition: 4 bytes
+            indexBuffer.putInt(logRecordSize);                  // recordSize: 4 bytes
+            indexBuffer.putInt(crc32Value);                     // crc32: 4 bytes
+            indexBuffer.flip();
+
+            // Write index entry using DENSE indexing based on recordCount
+            // This creates sequential index entries regardless of actual offset values
+            long indexPosition = FILE_HEADER_SIZE + (recordCount * INDEX_ENTRY_SIZE);
+            indexChannel.write(indexBuffer, indexPosition);
+
+            // Increment record count for next write
+            recordCount++;
+
+            // Update in-memory index (offset -> log position)
+            // DEPRECATED: Commented out - new reads use file-based binary search
+            // index.put(offset, (int) recordLogPosition);
+
+            // Force to disk for durability
+            logChannel.force(false);
             indexChannel.force(false);
-        } catch (IOException e) {
-            log.error("Failed to write index entry", e);
+        } catch (IOException | MessagingException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.writeFailed(topic, partition, e)
+                    .withSegmentPath(logPath.toString())
+                    .withContext("offset", offset)
+                    .withContext("operation", "writeRecord"));
         }
     }
 
     /**
      * Read a record at the given offset or next available offset
      */
-    public MessageRecord read(long offset) throws IOException {
-        int position = findPosition(offset);
-
-        if (position == -1) {
-            log.debug("No record found at or after offset {} in segment", offset);
+    public MessageRecord read(long offset) throws MessagingException {
+        if (offset < baseOffset || offset >= nextOffset) {
+            log.debug("Offset {} out of range [{}, {})", offset, baseOffset, nextOffset);
             return null;
         }
 
-        return readRecordAt(position);
+        return readRecordAtOffset(offset);
+    }
+
+
+    /**
+     * Read record at specific file position using index-based lookup (unified format)
+     * Index entry: [offset:8][logPosition:4][recordSize:4][crc32:4]
+     * Log record: [keyLen:4][key][eventType:1][dataLen:4][data][timestamp:8]
+     */
+    private MessageRecord readRecordAt(int position) throws MessagingException {
+        // For unified format, 'position' is the offset, not the file position
+        // We need to read from the index first
+        // This is a fallback for the old scan-based lookup
+        // In the new format, we should use readRecordAtOffset() directly
+        throw ExceptionLogger.logAndThrow(log,
+            new StorageException(ErrorCode.STORAGE_READ_FAILED, "readRecordAt(position) deprecated - use readRecordAtOffset(offset)")
+                .withTopic(topic)
+                .withPartition(partition)
+                .withSegmentPath(logPath.toString())
+                .withContext("deprecatedMethod", "readRecordAt"));
     }
 
     /**
-     * Find file position for given offset using in-memory index
+     * Binary search through index file to find entry for targetOffset.
+     * Finds first entry where offset >= targetOffset, gracefully handling offset gaps.
+     *
+     * This method implements Kafka-style file-based index lookup with O(log n) complexity
+     * and O(1) memory usage. It uses positioned reads which are thread-safe without
+     * synchronization, allowing concurrent reads from multiple consumers.
+     *
+     * @param targetOffset The offset to search for
+     * @return IndexEntry for first offset >= targetOffset, or null if not found
+     * @throws StorageException If index file read fails
      */
-    private int findPosition(long offset) {
-        // Use in-memory index for fast lookup
-        Long floorKey = index.floorKey(offset);
-
-        if (floorKey == null) {
-            // No index entry, scan from start
-            return scanToOffset(0, offset);
-        }
-
-        int startPosition = index.get(floorKey);
-        return scanToOffset(startPosition, offset);
-    }
-
-    /**
-     * Scan forward from position to find exact offset or next available
-     */
-    private int scanToOffset(int startPosition, long targetOffset) {
+    private IndexEntry findIndexEntryForOffset(long targetOffset) throws MessagingException {
         try {
-            long position = startPosition;
-            ByteBuffer buffer = ByteBuffer.allocate(20);
+            long indexSize = indexChannel.size();
+            long numEntries = (indexSize - FILE_HEADER_SIZE) / INDEX_ENTRY_SIZE;
 
-            while (position < logPosition) {
-                // Read offset
-                buffer.clear();
-                buffer.limit(8);
-                int bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 8) break;
-                buffer.flip();
-                long recordOffset = buffer.getLong();
-
-                if (recordOffset == targetOffset) {
-                    return (int) position;
-                }
-
-                if (recordOffset > targetOffset) {
-                    log.debug("Auto-advancing: Found offset {} (requested >= {})", recordOffset, targetOffset);
-                    return (int) position;
-                }
-
-                // Skip to next record
-                position += 8;
-
-                // Read key length
-                buffer.clear();
-                buffer.limit(4);
-                bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 4) break;
-                buffer.flip();
-                int keyLen = buffer.getInt();
-                position += 4 + keyLen;
-
-                // Skip event type
-                position += 1;
-
-                // Read data length
-                buffer.clear();
-                buffer.limit(4);
-                bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 4) break;
-                buffer.flip();
-                int dataLen = buffer.getInt();
-                position += 4 + dataLen;
-
-                // Skip timestamp + crc32
-                position += 12;
+            // Edge cases: empty segment or offset before segment start
+            if (numEntries == 0) {
+                log.debug("Empty segment: baseOffset={}, no entries", baseOffset);
+                return null;
             }
 
-            return -1;
+            if (targetOffset < baseOffset) {
+                log.debug("Offset {} before segment baseOffset={}", targetOffset, baseOffset);
+                return null;
+            }
+
+            // Binary search variables
+            long left = 0;                    // First entry index (0-based)
+            long right = numEntries - 1;      // Last entry index
+            IndexEntry result = null;         // Best match so far (first offset >= target)
+
+            // Allocate buffer for reading index entries (20 bytes per entry)
+            ByteBuffer searchBuffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+
+            while (left <= right) {
+                long mid = left + (right - left) / 2;
+
+                // Calculate file position for this entry (DENSE indexing)
+                long filePosition = FILE_HEADER_SIZE + (mid * INDEX_ENTRY_SIZE);
+
+                // Positioned read - thread-safe, doesn't modify channel position
+                searchBuffer.clear();
+                int bytesRead = indexChannel.read(searchBuffer, filePosition);
+
+                if (bytesRead < INDEX_ENTRY_SIZE) {
+                    // Incomplete entry (shouldn't happen unless file is corrupted)
+                    log.warn("Incomplete index entry at position {}, bytes read: {}",
+                             filePosition, bytesRead);
+                    break;
+                }
+
+                searchBuffer.flip();
+
+                // Parse index entry: [offset:8][logPos:4][size:4][crc32:4]
+                long entryOffset = searchBuffer.getLong();
+                int logPosition = searchBuffer.getInt();
+                int recordSize = searchBuffer.getInt();
+                int crc32 = searchBuffer.getInt();
+
+                IndexEntry entry = new IndexEntry(entryOffset, logPosition, recordSize, crc32);
+
+                if (entryOffset == targetOffset) {
+                    // Exact match found
+                    log.debug("Binary search: exact match for offset={}, logPos={}",
+                              targetOffset, logPosition);
+                    return entry;
+                } else if (entryOffset < targetOffset) {
+                    // Target is in right half
+                    left = mid + 1;
+                } else {
+                    // entryOffset > targetOffset
+                    // This could be our answer (first offset >= target) if gap exists
+                    result = entry;
+                    right = mid - 1; // Continue looking for closer match in left half
+                }
+            }
+
+            if (result != null) {
+                log.debug("Binary search: offset gap detected, requested={}, found={}, segment={}",
+                          targetOffset, result.offset, baseOffset);
+            } else {
+                log.debug("Binary search: offset {} beyond segment end (nextOffset={})",
+                          targetOffset, nextOffset);
+            }
+
+            return result;
         } catch (IOException e) {
-            log.error("Error scanning to offset", e);
-            return -1;
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.readFailed(topic, partition, targetOffset, e)
+                    .withSegmentPath(indexPath.toString())
+                    .withContext("operation", "findIndexEntryForOffset"));
         }
     }
 
     /**
-     * Read record at specific file position using FileChannel
+     * Read record by offset using binary search-based lookup.
+     * Handles offset gaps gracefully by finding exact match or returning null.
+     *
+     * NEW IMPLEMENTATION: Uses file-based binary search instead of arithmetic calculation.
+     * This fixes the bug where SPARSE indexing assumption (offset - baseOffset) failed
+     * when offsets had gaps (e.g., 100202, 110000, 150000).
      */
-    private MessageRecord readRecordAt(int position) throws IOException {
-        MessageRecord record = new MessageRecord();
-        long pos = position;
-        ByteBuffer buffer = readBuffer.get();
+    private MessageRecord readRecordAtOffset(long offset) throws MessagingException {
+        try {
+            // 1. Binary search for index entry
+            IndexEntry entry = findIndexEntryForOffset(offset);
 
-        // Read offset
-        buffer.clear();
-        buffer.limit(8);
-        logChannel.read(buffer, pos);
-        buffer.flip();
-        long offset = buffer.getLong();
-        record.setOffset(offset);
-        pos += 8;
+            if (entry == null) {
+                log.debug("No record found at or after offset {} in segment baseOffset={}",
+                          offset, baseOffset);
+                return null; // No data at or after this offset
+            }
 
-        // Read key
-        buffer.clear();
-        buffer.limit(4);
-        logChannel.read(buffer, pos);
-        buffer.flip();
-        int keyLen = buffer.getInt();
-        pos += 4;
+            // 2. Handle offset gaps - if exact match not found, return null
+            // This triggers SegmentManager to continue traversal to next segment
+            if (entry.offset != offset) {
+                log.debug("Offset gap detected: requested={}, found={}, segment baseOffset={}",
+                          offset, entry.offset, baseOffset);
+                return null; // Trigger SegmentManager traversal
+            }
 
-        byte[] keyBytes = new byte[keyLen];
-        buffer.clear();
-        buffer.limit(keyLen);
-        logChannel.read(buffer, pos);
-        buffer.flip();
-        buffer.get(keyBytes);
-        record.setMsgKey(new String(keyBytes, StandardCharsets.UTF_8));
-        pos += keyLen;
+            // 3. Read from log file using entry metadata
+            ByteBuffer logBuffer = ByteBuffer.allocate(entry.recordSize);
+            int bytesRead = logChannel.read(logBuffer, entry.logPosition);
 
-        // Read event type
-        buffer.clear();
-        buffer.limit(1);
-        logChannel.read(buffer, pos);
-        buffer.flip();
-        byte eventTypeCode = buffer.get();
-        record.setEventType(EventType.fromCode((char) eventTypeCode));
-        pos += 1;
+            if (bytesRead < entry.recordSize) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.readFailed(topic, partition, offset,
+                        new IOException("Incomplete read: expected " + entry.recordSize + ", got " + bytesRead))
+                        .withSegmentPath(logPath.toString())
+                        .withContext("logPosition", entry.logPosition)
+                        .withContext("expectedBytes", entry.recordSize)
+                        .withContext("actualBytes", bytesRead));
+            }
+            logBuffer.flip();
 
-        // Read data
-        buffer.clear();
-        buffer.limit(4);
-        logChannel.read(buffer, pos);
-        buffer.flip();
-        int dataLen = buffer.getInt();
-        pos += 4;
+            // 4. Validate CRC32
+            logBuffer.mark();
+            CRC32 crc = new CRC32();
+            crc.update(logBuffer);
+            int calculatedCrc = (int) crc.getValue();
 
-        if (dataLen > 0) {
-            byte[] dataBytes = new byte[dataLen];
-            ByteBuffer dataBuffer = ByteBuffer.wrap(dataBytes);
-            logChannel.read(dataBuffer, pos);
-            record.setData(new String(dataBytes, StandardCharsets.UTF_8));
-            pos += dataLen;
+            if (calculatedCrc != entry.crc32) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.crcMismatch("CRC32 validation failed", offset)
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(logPath.toString())
+                        .withContext("expectedCrc", entry.crc32)
+                        .withContext("actualCrc", calculatedCrc));
+            }
+
+            logBuffer.reset();
+
+            // 5. Parse message data from log (same parsing logic as before)
+            MessageRecord record = new MessageRecord();
+            record.setOffset(entry.offset); // Use actual offset from index
+
+            // Read key
+            int keyLen = logBuffer.getInt();
+            byte[] keyBytes = new byte[keyLen];
+            logBuffer.get(keyBytes);
+            record.setMsgKey(new String(keyBytes, StandardCharsets.UTF_8));
+
+            // Read event type
+            byte eventTypeCode = logBuffer.get();
+            record.setEventType(EventType.fromCode((char) eventTypeCode));
+
+            // Read data
+            int dataLen = logBuffer.getInt();
+            if (dataLen > 0) {
+                byte[] dataBytes = new byte[dataLen];
+                logBuffer.get(dataBytes);
+                record.setData(new String(dataBytes, StandardCharsets.UTF_8));
+            }
+
+            // Read timestamp
+            long createdAtMillis = logBuffer.getLong();
+            record.setCreatedAt(Instant.ofEpochMilli(createdAtMillis));
+
+            return record;
+        } catch (IOException | MessagingException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.readFailed(topic, partition, offset, e)
+                    .withSegmentPath(logPath.toString())
+                    .withContext("operation", "readRecordAtOffset"));
         }
-
-        // Read timestamp
-        buffer.clear();
-        buffer.limit(8);
-        logChannel.read(buffer, pos);
-        buffer.flip();
-        long createdAtMillis = buffer.getLong();
-        record.setCreatedAt(Instant.ofEpochMilli(createdAtMillis));
-        pos += 8;
-
-        // Read and verify CRC32
-        buffer.clear();
-        buffer.limit(4);
-        logChannel.read(buffer, pos);
-        buffer.flip();
-        int storedCrc32 = buffer.getInt();
-        record.setCrc32(storedCrc32);
-
-        int calculatedCrc32 = calculateCRC32(record, offset);
-        if (storedCrc32 != calculatedCrc32) {
-            throw new IOException("CRC32 mismatch for offset " + offset);
-        }
-
-        return record;
-    }
-
-    /**
-     * Calculate CRC32 checksum
-     */
-    private int calculateCRC32(MessageRecord record, long offset) {
-        CRC32 crc = new CRC32();
-        crc.update(ByteBuffer.allocate(8).putLong(offset).array());
-        crc.update(record.getMsgKey().getBytes(StandardCharsets.UTF_8));
-        crc.update((byte) record.getEventType().getCode());
-        if (record.getData() != null) {
-            crc.update(record.getData().getBytes(StandardCharsets.UTF_8));
-        }
-        crc.update(ByteBuffer.allocate(8).putLong(record.getCreatedAt().toEpochMilli()).array());
-        return (int) crc.getValue();
     }
 
     /**
@@ -575,117 +707,169 @@ public class Segment {
     }
 
     /**
-     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
-     * This is the KEY method for Kafka-style zero-copy using sendfile() syscall
+     * Zero-copy batch read using binary search for first entry, then sequential scan.
+     * Handles offset gaps gracefully by scanning actual index entries.
+     *
+     * NEW IMPLEMENTATION: Uses file-based binary search to find starting point,
+     * then sequential scan through index entries to accumulate batch.
+     * This fixes the bug where SPARSE indexing (currentOffset++) failed with offset gaps.
+     *
+     * Index entry format: [offset:8][logPosition:4][recordSize:4][crc32:4] = 20 bytes
      */
-    public BatchFileRegion getBatchFileRegion(long startOffset, int maxRecords, long maxBytes) throws IOException {
-        // Find starting position
-        int startPosition = findPosition(startOffset);
-
-        if (startPosition == -1) {
+    public BatchFileRegion getBatchFileRegion(long startOffset, long maxBytes) throws MessagingException {
+        if (startOffset < baseOffset || startOffset >= nextOffset) {
+            log.debug("Offset {} outside segment range [{}, {})", startOffset, baseOffset, nextOffset);
             return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
         }
 
-        // Scan forward to determine batch size
-        BatchInfo batchInfo = scanBatch(startPosition, startOffset, maxRecords, maxBytes);
-
-        if (batchInfo.recordCount == 0) {
-            return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
-        }
-
-        // Open a separate READ-ONLY FileChannel for zero-copy transfer
-        // This prevents interference with the write channel (Kafka-style)
-        // The FileRegion will close this channel when transfer completes
-        FileChannel readChannel = FileChannel.open(logPath, StandardOpenOption.READ);
-
-        // Create FileRegion for zero-copy transfer
-        // This is what enables sendfile() syscall - NO heap allocations!
-        FileRegion fileRegion = new DefaultFileRegion(readChannel, startPosition, batchInfo.totalBytes);
-
-        return new BatchFileRegion(
-            fileRegion,
-            readChannel,  // Pass the read channel (will be closed by FileRegion)
-            batchInfo.recordCount,
-            batchInfo.totalBytes,
-            batchInfo.lastOffset,
-            startPosition
-        );
-    }
-
-    /**
-     * Scan forward to determine batch boundaries using FileChannel
-     */
-    private BatchInfo scanBatch(int startPosition, long targetOffset, int maxRecords, long maxBytes) {
         try {
-            long position = startPosition;
-            int recordCount = 0;
-            long cumulativeBytes = 0;
-            long lastOffset = targetOffset - 1;
-            ByteBuffer buffer = ByteBuffer.allocate(20);
+            // 1. Binary search to find first entry >= startOffset
+            IndexEntry firstEntry = findIndexEntryForOffset(startOffset);
 
-            while (position < logPosition && recordCount < maxRecords) {
-                long recordStart = position;
-
-                // Read offset
-                buffer.clear();
-                buffer.limit(8);
-                int bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 8) break;
-                buffer.flip();
-                long recordOffset = buffer.getLong();
-                position += 8;
-
-                // Read key length
-                buffer.clear();
-                buffer.limit(4);
-                bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 4) break;
-                buffer.flip();
-                int keyLen = buffer.getInt();
-                position += 4 + keyLen;
-
-                // Skip event type
-                position += 1;
-
-                // Read data length
-                buffer.clear();
-                buffer.limit(4);
-                bytesRead = logChannel.read(buffer, position);
-                if (bytesRead < 4) break;
-                buffer.flip();
-                int dataLen = buffer.getInt();
-                position += 4 + dataLen;
-
-                // Skip timestamp + crc32
-                position += 12;
-
-                // Calculate record size
-                long recordSize = position - recordStart;
-
-                // Check cumulative size limit
-                if (cumulativeBytes + recordSize > maxBytes && recordCount > 0) {
-                    break;
-                }
-
-                cumulativeBytes += recordSize;
-                recordCount++;
-                lastOffset = recordOffset;
+            if (firstEntry == null) {
+                log.debug("No entries found at or after offset {} in segment baseOffset={}",
+                          startOffset, baseOffset);
+                return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
             }
 
-            return new BatchInfo(recordCount, cumulativeBytes, lastOffset);
-        } catch (IOException e) {
-            log.error("Error scanning batch", e);
-            return new BatchInfo(0, 0, targetOffset - 1);
+            // 2. Sequential scan from first entry to accumulate batch
+            // We already have the first entry from binary search, so we can start accumulating
+            long indexSize = indexChannel.size();
+            int recordCount = 0;
+            long firstLogPosition = firstEntry.logPosition;
+            long lastLogPosition = firstEntry.logPosition;  // Track last record's position
+            int lastRecordSize = firstEntry.recordSize;      // Track last record's size
+            long lastOffset = firstEntry.offset;
+
+            log.debug("Starting batch accumulation: startOffset={}, firstEntry.offset={}, firstEntry.logPosition={}, maxBytes={}",
+                      startOffset, firstEntry.offset, firstEntry.logPosition, maxBytes);
+
+            // Start by adding the first entry we found via binary search
+            recordCount++;
+
+            log.debug("Added first entry to batch: offset={}, recordSize={}, logPosition={}, recordCount={}",
+                      firstEntry.offset, firstEntry.recordSize, firstEntry.logPosition, recordCount);
+
+            // Now scan forward from the next index entry to accumulate more records
+            // We need to find where firstEntry is in the index, then continue from there
+            long currentIndexPos = FILE_HEADER_SIZE;
+            ByteBuffer scanBuffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+            boolean foundFirstEntry = false;
+
+            // Sequential scan through index file
+            while (currentIndexPos < indexSize) {
+                scanBuffer.clear();
+                int bytesRead = indexChannel.read(scanBuffer, currentIndexPos);
+
+                if (bytesRead < INDEX_ENTRY_SIZE) {
+                    log.debug("Reached end of index file at position {}", currentIndexPos);
+                    break; // End of index
+                }
+
+                scanBuffer.flip();
+                long offset = scanBuffer.getLong();
+                int logPosition = scanBuffer.getInt();
+                int recordSize = scanBuffer.getInt();
+                int crc32 = scanBuffer.getInt();
+
+                // Skip until we find our first entry
+                if (!foundFirstEntry) {
+                    if (offset == firstEntry.offset) {
+                        foundFirstEntry = true;
+                        // Skip this entry as we already added it above
+                    }
+                    currentIndexPos += INDEX_ENTRY_SIZE;
+                    continue;
+                }
+
+                // Calculate what the batch size would be if we add this record
+                // totalBytes = (endOfLastRecord) - firstLogPosition
+                long batchSizeWithThisRecord = (logPosition + recordSize) - firstLogPosition;
+
+                // Check if adding this record would exceed maxBytes
+                if (batchSizeWithThisRecord > maxBytes && recordCount > 0) {
+                    log.debug("Batch size limit reached: batchSize={}, maxBytes={}", batchSizeWithThisRecord, maxBytes);
+                    break; // Would exceed size limit
+                }
+
+                lastLogPosition = logPosition;
+                lastRecordSize = recordSize;
+                lastOffset = offset;
+                recordCount++;
+                currentIndexPos += INDEX_ENTRY_SIZE;
+
+                log.debug("Added to batch: offset={}, recordSize={}, logPosition={}, recordCount={}",
+                          offset, recordSize, logPosition, recordCount);
+            }
+
+            if (recordCount == 0) {
+                log.debug("No records accumulated for batch starting at offset {}", startOffset);
+                return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+            }
+
+            // 3. Create FileRegion for zero-copy transfer (Kafka-style sendfile)
+            // Calculate actual batch size: from first record start to last record end
+            long totalBytes = (lastLogPosition + lastRecordSize) - firstLogPosition;
+
+            // Open separate READ-ONLY channel to avoid interference with writes
+            FileChannel readChannel = FileChannel.open(logPath, StandardOpenOption.READ);
+            FileRegion fileRegion = new DefaultFileRegion(readChannel, firstLogPosition, totalBytes);
+
+            log.debug("Created zero-copy batch: offset={}-{}, bytes={}, records={}, firstLogPos={}",
+                      startOffset, lastOffset, totalBytes, recordCount, firstLogPosition);
+
+            return new BatchFileRegion(
+                fileRegion,
+                readChannel,  // Will be closed by FileRegion
+                recordCount,
+                totalBytes,
+                lastOffset,
+                firstLogPosition
+            );
+        } catch (IOException | MessagingException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.readFailed(topic, partition, startOffset, e)
+                    .withSegmentPath(logPath.toString())
+                    .withContext("operation", "getBatchFileRegion")
+                    .withContext("maxBytes", maxBytes));
         }
     }
+
 
     /**
      * Close the segment and release resources
      */
-    public void close() throws IOException {
-        seal();
-        logChannel.close();
-        indexChannel.close();
+    public void close() throws MessagingException {
+        try {
+            seal();
+            logChannel.close();
+            indexChannel.close();
+        } catch (IOException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.ioError("Failed to close segment", e)
+                    .withTopic(topic)
+                    .withPartition(partition)
+                    .withSegmentPath(logPath.toString())
+                    .withContext("operation", "close"));
+        }
+    }
+
+    /**
+     * Helper class representing a parsed index entry.
+     * Used during binary search through index file for offset lookups.
+     */
+    private static class IndexEntry {
+        final long offset;      // Message offset (from cloud-server, can have gaps)
+        final int logPosition;  // Position in log file where record starts
+        final int recordSize;   // Size of log record in bytes
+        final int crc32;        // CRC32 checksum for validation
+
+        IndexEntry(long offset, int logPosition, int recordSize, int crc32) {
+            this.offset = offset;
+            this.logPosition = logPosition;
+            this.recordSize = recordSize;
+            this.crc32 = crc32;
+        }
     }
 
     /**
@@ -710,20 +894,6 @@ public class Segment {
         }
     }
 
-    /**
-     * Internal class for batch scanning
-     */
-    private static class BatchInfo {
-        final int recordCount;
-        final long totalBytes;
-        final long lastOffset;
-
-        BatchInfo(int recordCount, long totalBytes, long lastOffset) {
-            this.recordCount = recordCount;
-            this.totalBytes = totalBytes;
-            this.lastOffset = lastOffset;
-        }
-    }
 
     // Getters
     public long getBaseOffset() {

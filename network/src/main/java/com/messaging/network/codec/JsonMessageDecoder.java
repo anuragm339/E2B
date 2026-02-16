@@ -1,6 +1,8 @@
 package com.messaging.network.codec;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -35,7 +37,9 @@ public class JsonMessageDecoder extends ByteToMessageDecoder {
         // Sanity check
         if (readableBytes > MAX_MESSAGE_SIZE) {
             log.error("Message too large: {} bytes", readableBytes);
-            throw new IllegalArgumentException("Message too large: " + readableBytes);
+            throw new NetworkException(ErrorCode.NETWORK_DECODING_ERROR, "Message too large: " + readableBytes)
+                .withContext("readableBytes", readableBytes)
+                .withContext("maxMessageSize", MAX_MESSAGE_SIZE);
         }
 
         for (int i = in.readerIndex(); i < in.readerIndex() + readableBytes; i++) {

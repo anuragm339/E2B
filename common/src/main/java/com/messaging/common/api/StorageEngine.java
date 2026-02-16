@@ -1,5 +1,7 @@
 package com.messaging.common.api;
 
+import com.messaging.common.exception.MessagingException;
+import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.MessageRecord;
 import java.util.List;
 
@@ -16,7 +18,7 @@ public interface StorageEngine {
      * @param record Message record to store
      * @return Assigned offset
      */
-    long append(String topic, int partition, MessageRecord record);
+    long append(String topic, int partition, MessageRecord record) throws MessagingException;
 
     /**
      * Read messages from storage
@@ -26,7 +28,7 @@ public interface StorageEngine {
      * @param maxRecords Maximum number of records to return
      * @return List of message records
      */
-    List<MessageRecord> read(String topic, int partition, long fromOffset, int maxRecords);
+    List<MessageRecord> read(String topic, int partition, long fromOffset, int maxRecords) throws MessagingException;
 
     /**
      * Get current (highest) offset for a topic-partition
@@ -75,12 +77,12 @@ public interface StorageEngine {
     /**
      * Recover state from disk on startup
      */
-    void recover();
+    void recover() throws MessagingException;
 
     /**
      * Gracefully shutdown and flush all data
      */
-    void close();
+    void close() throws MessagingException;
 
     /**
      * Validation result

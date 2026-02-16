@@ -1,5 +1,8 @@
 package com.messaging.broker.registry;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.TopologyResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -64,8 +67,13 @@ public class TopologyPropertiesStore {
                         ? topology.getRequestToFollow().get(0) 
                         : "none");
         } catch (IOException e) {
-            log.error("Failed to save topology properties", e);
-            throw new RuntimeException("Failed to save topology properties", e);
+            MessagingException ex = new MessagingException(ErrorCode.REGISTRY_TOPOLOGY_FETCH_FAILED,
+                "Failed to save topology properties", e)
+                .withContext("propertiesFile", propertiesFile.toString())
+                .withContext("nodeId", topology.getNodeId());
+            ExceptionLogger.logError(log, ex);
+            // Method doesn't declare checked exceptions - wrap in RuntimeException
+            throw new RuntimeException("Failed to save topology properties", ex);
         }
     }
 

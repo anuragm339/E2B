@@ -3,6 +3,9 @@ package com.messaging.broker.refresh;
 import com.messaging.broker.consumer.RemoteConsumerRegistry;
 import com.messaging.broker.metrics.DataRefreshMetrics;
 import com.messaging.common.api.PipeConnector;
+import com.messaging.common.exception.DataRefreshException;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
@@ -262,6 +265,12 @@ public class DataRefreshManager {
         // Record metrics: RESET ACK received
         metrics.recordResetAckReceived(topic, consumerGroupTopic, context.getRefreshId());
 
+        // CRITICAL FIX: Reset offset to 0 for THIS consumer (do this for EVERY RESET_ACK)
+        // Previously this was only done for the first RESET_ACK, causing incomplete replays
+        remoteConsumers.resetConsumerOffset(clientId, topic, 0);
+        log.info("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}",
+                 clientId, consumerGroupTopic, topic);
+
         // Persist state after each ACK
         stateStore.saveState(context);
 
@@ -277,7 +286,6 @@ public class DataRefreshManager {
                 log.info("Cancelled RESET retry task for topic {} - transitioning to REPLAYING", topic);
             }
 
-            remoteConsumers.resetConsumerOffset(clientId, topic, 0);
             // Start periodic replay progress check
             ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
                     () -> checkReplayProgress(topic),
@@ -303,13 +311,18 @@ public class DataRefreshManager {
                 metrics.recordReplayStarted(topic, topic, context.getRefreshId());  // Use topic as consumer ID
             }
 
-            // Trigger delivery from offset 0
-            remoteConsumers.notifyNewMessageForConsumer(clientId, topic, 0);
+            // Note: Adaptive delivery manager will automatically discover and deliver messages
+            // No explicit trigger needed - watermark-based polling handles replay
 
-            log.info("Replay triggered for consumer: {} starting from offset 0", clientId);
+            log.info("Replay ready for consumer: {} starting from offset 0 (adaptive delivery will poll)", clientId);
 
         } catch (Exception e) {
-            log.error("Failed to start replay for consumer: {}", clientId, e);
+            DataRefreshException ex = new DataRefreshException(ErrorCode.DATA_REFRESH_REPLAY_FAILED,
+                "Failed to start replay for consumer", e);
+            ex.withContext("clientId", clientId);
+            ex.withContext("topic", topic);
+            ExceptionLogger.logError(log, ex);
+            // Don't rethrow - replay will be retried automatically
         }
     }
 
@@ -373,13 +386,15 @@ public class DataRefreshManager {
                 task.cancel(false);
             }
         } else {
-            // Get ALL consumers for this topic and trigger replay for each
+            // Trigger replay for each consumer (InFlight check in notifyNewMessageForConsumer prevents duplicates)
+            // This polling is necessary to keep driving deliveries during refresh
             List<String> allConsumerIds = remoteConsumers.getAllConsumerIds(topic);
             if (allConsumerIds == null || allConsumerIds.isEmpty()) {
-                log.info("No remote consumers found for topic {}, cannot start replay", topic);
+                log.debug("No remote consumers found for topic {}, cannot trigger replay", topic);
             } else {
-                log.debug("Triggering replay for {} consumers on topic {}", allConsumerIds.size(), topic);
+                log.debug("Checking replay progress for {} consumers on topic {}", allConsumerIds.size(), topic);
                 for (String clientId : allConsumerIds) {
+                    // The InFlight check in notifyNewMessageForConsumer will prevent duplicate scheduling
                     startReplayForConsumer(clientId, topic);
                 }
             }
@@ -716,6 +731,16 @@ public class DataRefreshManager {
         String refreshId = context != null ? context.getRefreshId() : null;
         log.info("getRefreshIdForTopic({}): context={}, refreshId={}", topic, (context != null), refreshId);
         return refreshId;
+    }
+
+    /**
+     * Get refresh type for a topic currently undergoing refresh
+     * @param topic Topic name
+     * @return Refresh type (e.g., "LOCAL", "GLOBAL") or null if not in refresh
+     */
+    public String getRefreshTypeForTopic(String topic) {
+        DataRefreshContext context = activeRefreshes.get(topic);
+        return context != null ? context.getRefreshType() : null;
     }
 
     /**

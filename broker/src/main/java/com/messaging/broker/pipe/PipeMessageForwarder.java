@@ -1,6 +1,9 @@
 package com.messaging.broker.pipe;
 
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.MessageRecord;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -34,8 +37,13 @@ public class PipeMessageForwarder {
                      records.size(), topic, offset);
             return records;
         } catch (Exception e) {
-            log.error("Error reading messages for child", e);
-            throw new RuntimeException("Failed to read messages", e);
+            MessagingException ex = new MessagingException(ErrorCode.PIPE_MESSAGE_FORWARD_FAILED,
+                "Failed to read messages for child broker", e);
+            ex.withContext("topic", topic);
+            ex.withContext("offset", offset);
+            ex.withContext("limit", limit);
+            ExceptionLogger.logError(log, ex);
+            throw new RuntimeException("Failed to read messages for child broker", ex);
         }
     }
 

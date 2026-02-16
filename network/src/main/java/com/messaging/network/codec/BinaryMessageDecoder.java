@@ -1,5 +1,7 @@
 package com.messaging.network.codec;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -46,7 +48,9 @@ public class BinaryMessageDecoder extends ByteToMessageDecoder {
                 hex.append(String.format("%02X ", b));
             }
             log.error("Invalid payload length: {}. First 20 bytes: {}", payloadLength, hex);
-            throw new IllegalArgumentException("Invalid payload length: " + payloadLength);
+            throw new NetworkException(ErrorCode.NETWORK_DECODING_ERROR, "Invalid payload length: " + payloadLength)
+                .withContext("payloadLength", payloadLength)
+                .withContext("firstBytes", hex.toString());
         }
 
         // Check if we have enough bytes for the payload

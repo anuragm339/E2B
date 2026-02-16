@@ -1,10 +1,17 @@
 package com.messaging.storage.filechannel;
 
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
+import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.MessageRecord;
+import com.messaging.storage.metadata.SegmentMetadataStore;
 import com.messaging.storage.segment.SegmentManager;
+import com.messaging.storage.watermark.StorageWatermarkTracker;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.annotation.Value;
+import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,44 +38,46 @@ public class FileChannelStorageEngine implements StorageEngine {
     private final Path dataDir;
     private final long maxSegmentSize;
     private final Map<TopicPartition, SegmentManager> managers;
+    private final StorageWatermarkTracker watermarkTracker;
+    private final com.messaging.storage.metadata.SegmentMetadataStoreFactory metadataStoreFactory;
 
+    @Inject
     public FileChannelStorageEngine(
             @Value("${broker.storage.data-dir:/data}") String dataDir,
-            @Value("${broker.storage.segment-size:1073741824}") long maxSegmentSize) {
+            @Value("${broker.storage.segment-size:1073741824}") long maxSegmentSize,
+            StorageWatermarkTracker watermarkTracker,
+            com.messaging.storage.metadata.SegmentMetadataStoreFactory metadataStoreFactory) {
 
         this.dataDir = Paths.get(dataDir);
         this.maxSegmentSize = maxSegmentSize;
+        this.watermarkTracker = watermarkTracker;
+        this.metadataStoreFactory = metadataStoreFactory;
         this.managers = new ConcurrentHashMap<>();
 
-        log.info("Initialized FileChannelStorageEngine: dataDir={}, maxSegmentSize={}",
-                this.dataDir, this.maxSegmentSize);
+        log.info("Initialized FileChannelStorageEngine: dataDir={}, maxSegmentSize={}, watermarkTracker={}, metadataStoreFactory={}",
+                this.dataDir, this.maxSegmentSize, watermarkTracker != null, metadataStoreFactory != null);
     }
 
     @Override
-    public long append(String topic, int partition, MessageRecord record) {
-        try {
-            SegmentManager manager = getOrCreateManager(topic, partition);
-            return manager.append(record);
-        } catch (IOException e) {
-            log.error("Failed to append record: topic={}, partition={}", topic, partition, e);
-            throw new RuntimeException("Failed to append record", e);
-        }
+    public long append(String topic, int partition, MessageRecord record) throws MessagingException {
+        SegmentManager manager = getOrCreateManager(topic, partition);
+        long offset = manager.append(record);
+
+        // Update watermark atomically after successful append
+        // This enables Broker to check for new data without disk I/O
+        watermarkTracker.updateWatermark(topic, partition, offset);
+
+        return offset;
     }
 
     @Override
-    public List<MessageRecord> read(String topic, int partition, long fromOffset, int maxRecords) {
-        try {
-            SegmentManager manager = managers.get(new TopicPartition(topic, partition));
-            if (manager == null) {
-                return new ArrayList<>();
-            }
-            List<MessageRecord> read = manager.read(fromOffset, maxRecords);
-            return read;
-        } catch (IOException e) {
-            log.error("Failed to read records: topic={}, partition={}, offset={}",
-                    topic, partition, fromOffset, e);
-            throw new RuntimeException("Failed to read records", e);
+    public List<MessageRecord> read(String topic, int partition, long fromOffset, int maxRecords) throws MessagingException {
+        SegmentManager manager = managers.get(new TopicPartition(topic, partition));
+        if (manager == null) {
+            return new ArrayList<>();
         }
+        List<MessageRecord> read = manager.read(fromOffset, maxRecords);
+        return read;
     }
 
     /**
@@ -77,18 +86,16 @@ public class FileChannelStorageEngine implements StorageEngine {
      * @return BatchFileRegion containing FileRegion for zero-copy transfer + metadata
      */
     public com.messaging.storage.segment.Segment.BatchFileRegion getZeroCopyBatch(
-            String topic, int partition, long fromOffset, int maxRecords, long maxBytes) {
+            String topic, int partition, long fromOffset, long maxBytes) throws MessagingException{
         try {
             SegmentManager manager = managers.get(new TopicPartition(topic, partition));
             if (manager == null) {
                 log.debug("No segment manager for topic={}, partition={}", topic, partition);
                 return new com.messaging.storage.segment.Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
             }
-            return manager.getZeroCopyBatch(fromOffset, maxRecords, maxBytes);
-        } catch (IOException e) {
-            log.error("Failed to get zero-copy batch: topic={}, partition={}, offset={}",
-                    topic, partition, fromOffset, e);
-            throw new RuntimeException("Failed to get zero-copy batch", e);
+            return manager.getZeroCopyBatch(fromOffset, maxBytes);
+        } catch (Exception e) {
+            throw ExceptionLogger.logAndThrow(log, new StorageException(ErrorCode.STORAGE_READ_FAILED, String.format("Failed to get zero-copy batch: topic=%s partition=%d fromOffset=%d maxBytes=%d", topic, partition, fromOffset, maxBytes), e));
         }
     }
 
@@ -141,7 +148,7 @@ public class FileChannelStorageEngine implements StorageEngine {
     }
 
     @Override
-    public void recover() {
+    public void recover() throws MessagingException {
         try {
             log.info("Starting recovery from data directory: {}", dataDir);
 
@@ -174,16 +181,15 @@ public class FileChannelStorageEngine implements StorageEngine {
                                             log.error("Failed to recover partition: {}", partitionDir, e);
                                         }
                                     });
-                        } catch (IOException e) {
-                            log.error("Failed to list partitions for topic: {}", topicName, e);
+                        } catch (Exception e) {
+                            log.error("Failed to recover topic: {}", topicName, e);
                         }
                     });
 
             log.info("Recovery completed. Loaded {} topic-partitions", managers.size());
 
         } catch (IOException e) {
-            log.error("Failed to recover from data directory", e);
-            throw new RuntimeException("Recovery failed", e);
+            throw ExceptionLogger.logAndThrow(log, new StorageException(ErrorCode.STORAGE_RECOVERY_FAILED, "Failed to recover storage engine", e));
         }
     }
 
@@ -195,7 +201,7 @@ public class FileChannelStorageEngine implements StorageEngine {
             try {
                 entry.getValue().close();
                 log.info("Closed segment manager for {}", entry.getKey());
-            } catch (IOException e) {
+            } catch (MessagingException e) {
                 log.error("Failed to close segment manager for {}", entry.getKey(), e);
             }
         }
@@ -216,9 +222,11 @@ public class FileChannelStorageEngine implements StorageEngine {
                         .resolve(topic)
                         .resolve("partition-" + partition);
 
-                return new SegmentManager(topic, partition, partitionDir, maxSegmentSize);
-            } catch (IOException e) {
-                throw new RuntimeException("Failed to create segment manager", e);
+                // Get topic-specific metadata store from factory
+                SegmentMetadataStore metadataStore = metadataStoreFactory.getStoreForTopic(topic);
+                return new SegmentManager(topic, partition, partitionDir, maxSegmentSize, metadataStore);
+            } catch (StorageException e) {
+                throw new RuntimeException(e); // Wrap for computeIfAbsent
             }
         });
     }

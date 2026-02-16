@@ -1,6 +1,8 @@
 package com.messaging.network.tcp;
 
 import com.messaging.common.api.NetworkServer;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.network.codec.BinaryMessageDecoder;
 import com.messaging.network.codec.BinaryMessageEncoder;
@@ -111,7 +113,9 @@ public class NettyTcpServer implements NetworkServer {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.error("Server startup interrupted", e);
-            throw new RuntimeException("Failed to start server", e);
+            // Wrap in RuntimeException as interface doesn't allow checked exceptions
+            // This is a fatal error that should crash broker startup
+            throw new RuntimeException("Failed to start server on port " + port, e);
         }
     }
 
