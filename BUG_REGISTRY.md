@@ -310,34 +310,34 @@ cat /data/consumer-offsets.properties
 
 ### B3-1 + B3-2 — `config.getExpectedConsumers()` ignored + `getConsumerGroupTopic()` wrong return value
 
-**Status:** `PARTIAL` (B3-2 FIXED `921fa05`, B3-1 still OPEN)
-**Commit:** `921fa05` (B3-2 only)
+**Status:** `FIXED`
+**Commit:** `921fa05` (B3-2), `8f5c741` (B3-1)
 **Severity:** High
 **Batch:** 3
-**Note:** Must fix together — fixing one without the other breaks refresh.
+**Note:** Fixed together — B3-2 fixed first, B3-1 required subsequent fix after dependency was identified.
 
 **File:**
 - `broker/src/main/java/com/messaging/broker/refresh/DataRefreshManager.java:162`
 - `broker/src/main/java/com/messaging/broker/consumer/RemoteConsumerRegistry.java:638`
 
 **Bug B3-1:**
-`startRefresh()` always hardcodes `expectedConsumers = Set.of(topic)` ignoring `application.yml` config.
-Multi-group refresh completes after first group ACKs.
+`startRefresh()` always hardcoded `expectedConsumers = Set.of(topic)` (bare topic name). After B3-2
+fixed `getConsumerGroupTopic()` to return `"group:topic"`, `handleResetAck()` compared
+`Set{"prices-v1"}.contains("price-quote-group:prices-v1")` → false, rejecting every RESET ACK.
 
 **Bug B3-2:**
-`getConsumerGroupTopic()` returns `consumer.topic` (just topic string) instead of `group + ":" + topic`.
-If B3-1 is fixed to use configured `group:topic` identifiers, all RESET/READY ACKs will be rejected
-because they return just the topic name but the expected set has `group:topic`.
+`getConsumerGroupTopic()` returned `consumer.topic` (just topic string) instead of `group + ":" + topic`.
 
 **Fix:**
-- B3-1: Replace `Set.of(topic)` with `config.getExpectedConsumers()` filtered for this topic
 - B3-2: Return `consumer.group + ":" + consumer.topic` from `getConsumerGroupTopic()`
+- B3-1: Add `getGroupTopicIdentifiers(topic)` to `RemoteConsumerRegistry` (iterates live consumers,
+  returns `Set<"group:topic">`). `startRefresh()` uses this instead of `Set.of(topic)`.
+  Skips refresh early if no consumers are registered (prevents hang).
 
 **Verification:**
 ```bash
-# Verify configured expected consumers are logged at refresh start
+# After fix: should show all registered group:topic pairs, not just bare topic name
 docker logs messaging-broker 2>&1 | grep "Starting refresh for topic"
-# After fix: should show all configured groups, not just the topic name
 ```
 
 ---
@@ -1157,7 +1157,7 @@ docker logs messaging-broker 2>&1 | grep "SQLITE_BUSY\|database is locked"
 | High     | 10    | 0     | 10   |
 | Medium   | 11    | 0     | 11   |
 | Low      | 4     | 0     | 4    |
-| **Total**| **31**| **6** | **25**|
+| **Total**| **31**| **7** | **24**|
 
 ### Fix Order
 ```
@@ -1169,13 +1169,15 @@ Round 1 — Critical: ✅ ALL DONE
   [x] B6-3   Header+FileRegion split → decoder stuck              c6d49ed
   [x] B7-3   Partial parse always emits ACK                       e06412f
 
+Round 1 add-on — High (prerequisite for Critical fixes to work):
+  [x] B3-1   startRefresh() expectedConsumers format mismatch     8f5c741
+
 Round 2 — High:
   [ ] B6-1   Segment boundary stall (check active segment as fallback)
   [ ] B6-2   Offset below earliest segment → silent freeze
   [ ] B7-2   Crash window log→index → permanent record loss (WAL pattern)
   [ ] B1-6   pendingOffsets not cleared on unregister
   [ ] B4-3   Late ACK leaves inFlight stuck true
-  [ ] B3-1   config.getExpectedConsumers() ignored in startRefresh (B3-2 already fixed)
   [ ] B2-6   ACK after unregister drops offset commit
   [ ] B1-2   deliveryTask never assigned
   [ ] B1-3   ClassCastException sealed segment
