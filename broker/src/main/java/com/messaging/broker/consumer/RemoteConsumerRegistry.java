@@ -113,7 +113,11 @@ public class RemoteConsumerRegistry {
     /**
      * Register a remote consumer when it subscribes
      */
-    public void registerConsumer(String clientId, String topic, String group) {
+    /**
+     * Register a consumer for message delivery.
+     * @return true if this is a new registration, false if re-registering an existing key (duplicate SUBSCRIBE)
+     */
+    public boolean registerConsumer(String clientId, String topic, String group) {
         RemoteConsumer consumer = new RemoteConsumer(clientId, topic, group);
 
         // Load persisted offset from property file - ONLY source of truth
@@ -127,7 +131,9 @@ public class RemoteConsumerRegistry {
         metrics.updateConsumerLag(clientId, topic, group, 0);
 
         // Use composite key to support multiple topic subscriptions per client
+        // B2-3 fix: detect re-registration before put() so BrokerService can avoid double-counting activeConsumers metric
         String consumerKey = clientId + ":" + topic;
+        boolean isNew = !consumers.containsKey(consumerKey);
         consumers.put(consumerKey, consumer);
         deliveryKeyToGroup.put(consumerKey, group); // B2-6: persist group for late-ACK offset commit
 
@@ -137,8 +143,9 @@ public class RemoteConsumerRegistry {
             log.info("Triggered adaptive delivery for new consumer: {}:{}", clientId, topic);
         }
 
-        log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}",
-                 consumerKey, clientId, topic, group, startOffset);
+        log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}, isNew={}",
+                 consumerKey, clientId, topic, group, startOffset, isNew);
+        return isNew;
     }
 
     /**
@@ -323,7 +330,7 @@ public class RemoteConsumerRegistry {
                     consumer.setCurrentOffset(originalOffset);
                     inFlight.set(false);
 
-                    metrics.recordAckTimeout(consumer.topic);
+                    metrics.recordAckTimeout(consumer.topic, consumer.group);  // B2-7 fix: pass group
                 }
             }, 30, TimeUnit.MINUTES);
 

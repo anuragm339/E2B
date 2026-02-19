@@ -404,6 +404,14 @@ public class DataRefreshManager {
             } else {
                 log.debug("Checking replay progress for {} consumers on topic {}", allConsumerIds.size(), topic);
                 for (String clientId : allConsumerIds) {
+                    // B3-7 fix: only trigger replay for consumers that ACKed RESET.
+                    // Previously called for ALL consumers, inflating data_refresh_replay_started_total.
+                    String groupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
+                    if (groupTopic == null || !ackedConsumers.contains(groupTopic)) {
+                        log.debug("Skipping replay trigger for clientId={} (groupTopic={} not in ackedConsumers={})",
+                                clientId, groupTopic, ackedConsumers);
+                        continue;
+                    }
                     // The InFlight check in notifyNewMessageForConsumer will prevent duplicate scheduling
                     startReplayForConsumer(clientId, topic);
                 }

@@ -487,17 +487,20 @@ public class BrokerMetrics {
     }
 
     /**
-     * Record ACK timeout for a specific topic
+     * Record ACK timeout for a specific topic and consumer group.
+     * B2-7 fix: added group parameter so Grafana can filter ACK timeout alerts by consumer group.
      */
-    public void recordAckTimeout(String topic) {
-        Counter counter = consumerAckTimeouts.computeIfAbsent(topic, t ->
+    public void recordAckTimeout(String topic, String group) {
+        String key = topic + ":" + group;
+        Counter counter = consumerAckTimeouts.computeIfAbsent(key, k ->
             Counter.builder("broker.consumer.ack.timeouts")
                 .description("ACK timeouts for consumer deliveries")
                 .tag("topic", topic)
+                .tag("group", group)
                 .register(registry)
         );
         counter.increment();
-        log.debug("Recorded ACK timeout for topic: {}", topic);
+        log.debug("Recorded ACK timeout for topic={} group={}", topic, group);
     }
 
     /**
