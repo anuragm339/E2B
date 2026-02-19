@@ -460,10 +460,11 @@ public class DataRefreshManager {
             return;
         }
 
-//        if (context.getReceivedReadyAcks().contains(consumerGroupTopic)) {
-//            log.debug("Duplicate READY ACK from {} for topic {}, ignoring", consumerGroupTopic, topic);
-//            return;
-//        }
+        // B3-4 fix: guard was commented out, allowing duplicate READY ACKs to double-record metrics.
+        if (context.getReceivedReadyAcks().contains(consumerGroupTopic)) {
+            log.debug("Duplicate READY ACK from {} for topic {}, ignoring", consumerGroupTopic, topic);
+            return;
+        }
 
         context.recordReadyAck(consumerGroupTopic);
         log.info("READY ACK received from {} for topic {} ({}/{})",
