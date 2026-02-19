@@ -494,26 +494,27 @@ public class DataRefreshMetrics {
     }
 
     /**
-     * Helper class for atomic long gauge
+     * Helper class for atomic long gauge.
+     * B2-5 fix: was using volatile long + non-atomic compound += which loses concurrent increments.
+     * Now backed by java.util.concurrent.atomic.AtomicLong for correct CAS-based addAndGet().
      */
     private static class AtomicLong {
-        private volatile long value;
+        private final java.util.concurrent.atomic.AtomicLong value;
 
         AtomicLong(long initialValue) {
-            this.value = initialValue;
+            this.value = new java.util.concurrent.atomic.AtomicLong(initialValue);
         }
 
         void set(long newValue) {
-            this.value = newValue;
+            this.value.set(newValue);
         }
 
         long addAndGet(long delta) {
-            this.value += delta;
-            return this.value;
+            return this.value.addAndGet(delta);
         }
 
         double get() {
-            return value;
+            return value.get();
         }
     }
 
