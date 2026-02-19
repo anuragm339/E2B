@@ -441,8 +441,19 @@ public class RemoteConsumerRegistry {
         // Timeout scales with batch size: 1s base + 10s per MB (e.g., 2MB = 21 seconds)
         log.debug("Sending FileRegion with timeout of {}s for {} bytes", timeoutSeconds, batchRegion.totalBytes);
 
-        server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
-              .get(timeoutSeconds, TimeUnit.SECONDS);
+        try {
+            server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
+                  .get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // CRITICAL: BATCH_HEADER was already sent — consumer decoder has transitioned to
+            // READING_ZERO_COPY_BATCH and is waiting for expectedTotalBytes that will never arrive.
+            // Close the connection so the consumer reconnects and decoder resets to initial state.
+            log.error("FileRegion send failed after BATCH_HEADER was already sent for consumer {} topic {}." +
+                      " Closing connection to reset consumer decoder state.",
+                      consumer.clientId, consumer.topic, e);
+            server.closeConnection(consumer.clientId);
+            throw e;
+        }
 
         log.info("✓ Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
