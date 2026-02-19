@@ -702,6 +702,24 @@ public class RemoteConsumerRegistry {
 
 
     /**
+     * Get stable "group:topic" identifiers for all registered consumers of a topic.
+     * Used by DataRefreshManager.startRefresh() to build the expectedConsumers set,
+     * ensuring ACK matching uses the same format that handleResetAck() receives.
+     *
+     * @param topic Topic name
+     * @return Set of "group:topic" strings for currently registered consumers of this topic
+     */
+    public java.util.Set<String> getGroupTopicIdentifiers(String topic) {
+        java.util.Set<String> result = new java.util.HashSet<>();
+        for (RemoteConsumer consumer : consumers.values()) {
+            if (consumer.topic.equals(topic)) {
+                result.add(consumer.group + ":" + consumer.topic);
+            }
+        }
+        return result;
+    }
+
+    /**
      * Get all consumer client IDs for a topic (for DataRefresh replay)
      * Returns ALL consumers subscribed to the topic, not just one
      */

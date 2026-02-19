@@ -156,13 +156,23 @@ public class DataRefreshManager {
      */
     public CompletableFuture<RefreshResult> startRefresh(String topic) {
 
-        // For per-topic refresh, we expect ONE consumer per topic
-        // The expected consumer identifier is the topic name itself
-        // This matches how consumers are registered in application.yml
-        Set<String> expectedConsumers = Set.of(topic);
+        // Build expected consumers from currently-registered consumers for this topic.
+        // Use "group:topic" identifiers — the same format that handleResetAck() receives
+        // from getConsumerGroupTopic(). This ensures ACK matching works correctly.
+        Set<String> expectedConsumers = new java.util.HashSet<>(
+                remoteConsumers.getGroupTopicIdentifiers(topic)
+        );
 
-        log.info("Starting refresh for topic: {} with {} expected consumer(s)",
-                topic, expectedConsumers.size());
+        if (expectedConsumers.isEmpty()) {
+            // No consumers registered for this topic — nothing to refresh
+            log.warn("No consumers registered for topic: {} — skipping refresh", topic);
+            return CompletableFuture.completedFuture(
+                RefreshResult.success(topic, DataRefreshState.COMPLETED, 0)
+            );
+        }
+
+        log.info("Starting refresh for topic: {} with {} expected consumer(s): {}",
+                topic, expectedConsumers.size(), expectedConsumers);
 
         // Thread-safe initialization of currentRefreshId and metrics reset
         // Reset all metrics ONLY if this is the first refresh (no active refreshes)
