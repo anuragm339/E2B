@@ -49,13 +49,13 @@ public class TopicFairScheduler {
      * @param delay Delay before execution
      * @param unit Time unit for delay
      */
-    public void schedule(String topic, Runnable task, long delay, TimeUnit unit) {
+    public ScheduledFuture<?> schedule(String topic, Runnable task, long delay, TimeUnit unit) {
         // Get or create semaphore for this topic
         Semaphore semaphore = topicSemaphores.computeIfAbsent(
             topic, k -> new Semaphore(maxInFlightPerTopic)
         );
 
-        scheduler.schedule(() -> {
+        return scheduler.schedule(() -> {
             // Try to acquire permit (non-blocking)
             if (semaphore.tryAcquire()) {
                 try {

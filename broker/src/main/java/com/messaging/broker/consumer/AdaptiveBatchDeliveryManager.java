@@ -112,7 +112,9 @@ public class AdaptiveBatchDeliveryManager {
         }
 
         log.info("DEBUG: Scheduling adaptive delivery for {}:{} with delay={}ms", consumer.clientId, consumer.topic, delayMs);
-        fairScheduler.schedule(consumer.topic, () -> {
+        // B1-2 fix: capture the ScheduledFuture and assign it to consumer.deliveryTask so that
+        // unregisterConsumer() can cancel the task and stop delivery after disconnect.
+        java.util.concurrent.ScheduledFuture<?> future = fairScheduler.schedule(consumer.topic, () -> {
             log.info("DEBUG: Executing delivery task for {}:{}", consumer.clientId, consumer.topic);
             // Try delivery and get result (true = data found, false = no data/skipped)
             boolean dataFound = tryDeliverBatch(consumer);
@@ -134,6 +136,7 @@ public class AdaptiveBatchDeliveryManager {
             scheduleAdaptiveDelivery(consumer, nextDelay);
 
         }, delayMs, TimeUnit.MILLISECONDS);
+        consumer.deliveryTask = future;
     }
 
     /**
