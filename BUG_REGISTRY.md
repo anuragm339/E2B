@@ -23,8 +23,8 @@
 
 ### B1-1 — Adaptive delivery loop dies permanently on semaphore miss
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `84a393a`
 **Severity:** Critical
 **Batch:** 1
 
@@ -67,8 +67,8 @@ docker logs messaging-broker 2>&1 | grep "Skipping task" | wc -l
 
 ### B3-3 — `allConsumersCaughtUp()` ignores clientId, uses substring match
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `921fa05`
 **Severity:** Critical
 **Batch:** 3
 
@@ -105,8 +105,8 @@ docker logs messaging-broker 2>&1 | grep "All consumers caught up"
 
 ### B3-5 — `resumeRefresh(COMPLETED)` deletes entire state file
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `9bd9993`
 **Severity:** Critical
 **Batch:** 3
 
@@ -141,8 +141,8 @@ cat /data/data-refresh-state.properties | grep "topic\."
 
 ### B5-1 — READY broadcast to non-reset consumers
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `3830980`
 **Severity:** Critical
 **Batch:** 5
 
@@ -310,8 +310,8 @@ cat /data/consumer-offsets.properties
 
 ### B3-1 + B3-2 — `config.getExpectedConsumers()` ignored + `getConsumerGroupTopic()` wrong return value
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `PARTIAL` (B3-2 FIXED `921fa05`, B3-1 still OPEN)
+**Commit:** `921fa05` (B3-2 only)
 **Severity:** High
 **Batch:** 3
 **Note:** Must fix together — fixing one without the other breaks refresh.
@@ -1011,8 +1011,8 @@ docker logs messaging-broker 2>&1 | grep "RuntimeException\|Cannot recover"
 
 ### B6-3 — Header sent, FileRegion fails → `ZeroCopyBatchDecoder` stuck in `READING_ZERO_COPY_BATCH`
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `c6d49ed`
 **Severity:** Critical
 **Batch:** 6
 
@@ -1061,8 +1061,8 @@ docker logs messaging-broker 2>&1 | grep "Gate 2 BLOCKED" | tail -20
 
 ### B7-3 — `decodeZeroCopyBatch()` always emits `BatchDecodedEvent` on partial parse → missing data + offset advanced
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `e06412f`
 **Severity:** Critical
 **Batch:** 7
 
@@ -1153,21 +1153,21 @@ docker logs messaging-broker 2>&1 | grep "SQLITE_BUSY\|database is locked"
 
 | Severity | Total | Fixed | Open |
 |----------|-------|-------|------|
-| Critical | 6     | 0     | 6    |
+| Critical | 6     | 6     | 0    |
 | High     | 10    | 0     | 10   |
 | Medium   | 11    | 0     | 11   |
 | Low      | 4     | 0     | 4    |
-| **Total**| **31**| **0** | **31**|
+| **Total**| **31**| **6** | **25**|
 
 ### Fix Order
 ```
-Round 1 — Critical:
-  [ ] B3-5   clearState() wrong overload (1-line fix)
-  [ ] B1-1   Adaptive delivery loop dies
-  [ ] B3-3   allConsumersCaughtUp() wrong consumer lookup
-  [ ] B5-1   READY broadcast to non-reset consumers
-  [ ] B6-3   Header+FileRegion split → decoder stuck (close channel on FileRegion fail)
-  [ ] B7-3   Partial parse always emits ACK → offset advanced past lost records
+Round 1 — Critical: ✅ ALL DONE
+  [x] B3-5   clearState() wrong overload (1-line fix)             9bd9993
+  [x] B1-1   Adaptive delivery loop dies                          84a393a
+  [x] B3-3   allConsumersCaughtUp() wrong consumer lookup         921fa05
+  [x] B5-1   READY broadcast to non-reset consumers               3830980
+  [x] B6-3   Header+FileRegion split → decoder stuck              c6d49ed
+  [x] B7-3   Partial parse always emits ACK                       e06412f
 
 Round 2 — High:
   [ ] B6-1   Segment boundary stall (check active segment as fallback)
@@ -1175,7 +1175,7 @@ Round 2 — High:
   [ ] B7-2   Crash window log→index → permanent record loss (WAL pattern)
   [ ] B1-6   pendingOffsets not cleared on unregister
   [ ] B4-3   Late ACK leaves inFlight stuck true
-  [ ] B3-1+B3-2  config ignored + getConsumerGroupTopic() wrong return (fix together)
+  [ ] B3-1   config.getExpectedConsumers() ignored in startRefresh (B3-2 already fixed)
   [ ] B2-6   ACK after unregister drops offset commit
   [ ] B1-2   deliveryTask never assigned
   [ ] B1-3   ClassCastException sealed segment
@@ -1203,4 +1203,4 @@ Round 4 — Low:
 ---
 
 *Last updated: 2026-02-19*
-*Total bugs found: 31 | Fixed: 0 | Open: 31*
+*Total bugs found: 31 | Fixed: 6 | Open: 25*
