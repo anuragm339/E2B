@@ -327,6 +327,19 @@ public class SegmentManager {
         log.info("DEBUG SegmentManager.getZeroCopyBatch(): topic={}, partition={}, fromOffset={}, maxBytes={}, segments.size={}",
                 topic, partition, fromOffset, maxBytes, segments.size());
 
+        // B6-2 fix: detect consumer offset below earliest available data.
+        // This happens when segments have been deleted (compaction/wipe) while consumer was offline.
+        // Without this check, getBatchFileRegion() returns empty silently and delivery stalls forever.
+        long earliestBase = segments.isEmpty()
+                ? (activeSegment.get() != null ? activeSegment.get().getBaseOffset() : 0L)
+                : segments.firstKey();
+        if (fromOffset < earliestBase) {
+            log.warn("Consumer offset {} is below earliest available segment baseOffset={} for topic={} — " +
+                     "data has been compacted/deleted. Resetting read position to earliest available offset.",
+                     fromOffset, earliestBase, topic);
+            fromOffset = earliestBase;
+        }
+
         // Find the segment that contains this offset
         var entry = segments.floorEntry(fromOffset);
 
