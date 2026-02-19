@@ -303,7 +303,17 @@ public class RemoteConsumerRegistry {
             consumer.setCurrentOffset(nextOffset);
             pendingOffsets.put(pendingKey, nextOffset);
 
+            /* ================= DELIVERY METRICS ================= */
+            deliverySample = metrics.startConsumerDeliveryTimer();
+
+            sendBatchToConsumer(consumer, batch, startOffset);
+
             /* ================= ACK TIMEOUT SETUP ================= */
+            // B2-4 fix: schedule timeout AFTER successful send so it only fires for
+            // batches the consumer actually received (not for send failures).
+            // Previously the timeout was scheduled before sendBatchToConsumer(), so a
+            // send failure left a 30-min timer that would incorrectly revert the offset
+            // for a batch the consumer never received.
             scheduler.schedule(() -> {
                 if (pendingOffsets.remove(pendingKey) != null) {
                     log.warn("ACK timeout for {}, reverting offset from {} to {}",
@@ -316,11 +326,6 @@ public class RemoteConsumerRegistry {
                     metrics.recordAckTimeout(consumer.topic);
                 }
             }, 30, TimeUnit.MINUTES);
-
-            /* ================= DELIVERY METRICS ================= */
-            deliverySample = metrics.startConsumerDeliveryTimer();
-
-            sendBatchToConsumer(consumer, batch, startOffset);
 
             metrics.stopConsumerDeliveryTimer(
                     deliverySample,
