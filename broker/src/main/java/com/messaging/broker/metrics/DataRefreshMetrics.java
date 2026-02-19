@@ -103,8 +103,10 @@ public class DataRefreshMetrics {
         long startTimeMs = System.currentTimeMillis();
         refreshStartTimes.put(topic, startTimeMs);
 
-        // Record start timestamp as gauge (in seconds since epoch)
-        String key = topic + ":" + refreshType + ":" + refreshId;
+        // B4-6 fix: use topic+refreshType as gauge key (not refreshId) to avoid unbounded cardinality.
+        // refreshId is a timestamp-unique value; using it as a Prometheus tag creates one new time series
+        // per refresh run that never expires, causing TSDB growth proportional to number of refreshes.
+        String key = topic + ":" + refreshType;
         AtomicDouble startTimeValue = refreshStartTimeValues.computeIfAbsent(key, k -> {
             AtomicDouble atomicTime = new AtomicDouble(0.0);
             refreshStartTimeGauges.computeIfAbsent(key, gk ->
@@ -112,7 +114,6 @@ public class DataRefreshMetrics {
                             .description("Timestamp when refresh started (seconds since epoch)")
                             .tag("topic", topic)
                             .tag("refresh_type", refreshType)
-                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicTime;
@@ -124,7 +125,9 @@ public class DataRefreshMetrics {
      * Record refresh workflow completed
      */
     public void recordRefreshCompleted(String topic, String refreshType, String status, String refreshId, DataRefreshContext context) {
-        String key = topic + ":" + refreshType + ":" + status + ":" + refreshId;
+        // B4-6 fix: omit refresh_id from Prometheus tags to prevent unbounded time series cardinality.
+        // Counter key uses only stable label values (topic, refreshType, status).
+        String key = topic + ":" + refreshType + ":" + status;
 
         Counter counter = refreshCompletedCounters.computeIfAbsent(key, k ->
                 Counter.builder("data_refresh_completed_total")
@@ -132,14 +135,14 @@ public class DataRefreshMetrics {
                         .tag("topic", topic)
                         .tag("refresh_type", refreshType)
                         .tag("status", status)
-                        .tag("refresh_id", refreshId)
                         .register(registry)
         );
         counter.increment();
 
         // Record end timestamp as gauge (in seconds since epoch)
         long endTimeMs = System.currentTimeMillis();
-        String gaugeKey = topic + ":" + refreshType + ":" + refreshId;
+        // B4-6 fix: gaugeKey uses topic+refreshType only (no refreshId)
+        String gaugeKey = topic + ":" + refreshType;
         AtomicDouble endTimeValue = refreshEndTimeValues.computeIfAbsent(gaugeKey, k -> {
             AtomicDouble atomicTime = new AtomicDouble(0.0);
             refreshEndTimeGauges.computeIfAbsent(gaugeKey, gk ->
@@ -147,7 +150,6 @@ public class DataRefreshMetrics {
                             .description("Timestamp when refresh ended (seconds since epoch)")
                             .tag("topic", topic)
                             .tag("refresh_type", refreshType)
-                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicTime;
@@ -165,7 +167,6 @@ public class DataRefreshMetrics {
                     .description("Total downtime during refresh (broker offline)")
                     .tag("topic", topic)
                     .tag("refresh_type", refreshType)
-                    .tag("refresh_id", refreshId)
                     .register(registry)
             );
             return atomicDowntime;
@@ -186,7 +187,6 @@ public class DataRefreshMetrics {
                     .description("Active processing time during refresh (excluding downtime)")
                     .tag("topic", topic)
                     .tag("refresh_type", refreshType)
-                    .tag("refresh_id", refreshId)
                     .register(registry)
             );
             return atomicTime;
@@ -208,14 +208,14 @@ public class DataRefreshMetrics {
      * Record total refresh duration
      */
     private void recordRefreshDuration(String topic, String refreshType, String refreshId, long durationMs) {
-        String key = topic + ":" + refreshType + ":" + refreshId;
+        // B4-6 fix: omit refresh_id from Prometheus tags
+        String key = topic + ":" + refreshType;
 
         Timer timer = refreshDurationTimers.computeIfAbsent(key, k ->
                 Timer.builder("data_refresh_duration_seconds")
                         .description("Duration of data refresh workflow")
                         .tag("topic", topic)
                         .tag("refresh_type", refreshType)
-                        .tag("refresh_id", refreshId)
                         .publishPercentileHistogram()
                         .serviceLevelObjectives(
                             Duration.ofMillis(100),
@@ -251,18 +251,20 @@ public class DataRefreshMetrics {
      * Record RESET ACK received from consumer
      */
     public void recordResetAckReceived(String topic, String consumer, String refreshId) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // Internal state key still uses refreshId to distinguish concurrent refreshes
+        String stateKey = topic + ":" + consumer + ":" + refreshId;
+        // B4-6 fix: Timer key omits refreshId to avoid unbounded Prometheus cardinality
+        String timerKey = topic + ":" + consumer;
 
-        Long resetSentTime = resetSentTimes.get(key);
+        Long resetSentTime = resetSentTimes.get(stateKey);
         if (resetSentTime != null) {
             long durationMs = System.currentTimeMillis() - resetSentTime;
 
-            Timer timer = resetAckDurationTimers.computeIfAbsent(key, k ->
+            Timer timer = resetAckDurationTimers.computeIfAbsent(timerKey, k ->
                     Timer.builder("data_refresh_reset_ack_duration_seconds")
                             .description("Time taken for consumer to ACK RESET message")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .publishPercentileHistogram()
                             .serviceLevelObjectives(
                                 Duration.ofMillis(10),
@@ -277,7 +279,7 @@ public class DataRefreshMetrics {
             timer.record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
 
             // Track when RESET ACK was received for replay duration
-            resetAckTimes.put(key, System.currentTimeMillis());
+            resetAckTimes.put(stateKey, System.currentTimeMillis());
         }
     }
 
@@ -285,14 +287,14 @@ public class DataRefreshMetrics {
      * Record RESET ACK duration from persisted timestamps (for resume after restart)
      */
     public void recordResetAckDuration(String topic, String consumer, String refreshId, long durationMs) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // B4-6 fix: omit refreshId from Timer tag
+        String timerKey = topic + ":" + consumer;
 
-        Timer timer = resetAckDurationTimers.computeIfAbsent(key, k ->
+        Timer timer = resetAckDurationTimers.computeIfAbsent(timerKey, k ->
                 Timer.builder("data_refresh_reset_ack_duration_seconds")
                         .description("Time taken for consumer to ACK RESET message")
                         .tag("topic", topic)
                         .tag("consumer", consumer)
-                        .tag("refresh_id", refreshId)
                         .publishPercentileHistogram()
                         .serviceLevelObjectives(
                             Duration.ofMillis(10),
@@ -319,19 +321,21 @@ public class DataRefreshMetrics {
      * Record READY ACK received from consumer
      */
     public void recordReadyAckReceived(String topic, String consumer, String refreshId) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // Internal state key still uses refreshId to distinguish concurrent refreshes
+        String stateKey = topic + ":" + consumer + ":" + refreshId;
+        // B4-6 fix: Timer key omits refreshId to avoid unbounded Prometheus cardinality
+        String timerKey = topic + ":" + consumer;
 
         // Measure time from READY sent to READY ACK received
-        Long readySentTime = readySentTimes.get(key);
+        Long readySentTime = readySentTimes.get(stateKey);
         if (readySentTime != null) {
             long durationMs = System.currentTimeMillis() - readySentTime;
 
-            Timer timer = readyAckDurationTimers.computeIfAbsent(key, k ->
+            Timer timer = readyAckDurationTimers.computeIfAbsent(timerKey, k ->
                     Timer.builder("data_refresh_ready_ack_duration_seconds")
                             .description("Time taken from READY sent to READY ACK received")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .publishPercentileHistogram()
                             .serviceLevelObjectives(
                                 Duration.ofMillis(100),
@@ -349,16 +353,15 @@ public class DataRefreshMetrics {
         }
 
         // Measure pure replay duration (from replay start to READY ACK)
-        Long replayStartTime = replayStartTimes.remove(key);
+        Long replayStartTime = replayStartTimes.remove(stateKey);
         if (replayStartTime != null) {
             long durationMs = System.currentTimeMillis() - replayStartTime;
 
-            Timer timer = replayDurationTimers.computeIfAbsent(key, k ->
+            Timer timer = replayDurationTimers.computeIfAbsent(timerKey, k ->
                     Timer.builder("data_refresh_replay_duration_seconds")
                             .description("Pure replay duration (from replay start to READY ACK)")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .publishPercentileHistogram()
                             .serviceLevelObjectives(
                                 Duration.ofMillis(100),
@@ -376,22 +379,22 @@ public class DataRefreshMetrics {
         }
 
         // Cleanup
-        resetSentTimes.remove(key);
-        resetAckTimes.remove(key);
+        resetSentTimes.remove(stateKey);
+        resetAckTimes.remove(stateKey);
     }
 
     /**
      * Record READY ACK duration from persisted timestamps (for resume after restart)
      */
     public void recordReadyAckDuration(String topic, String consumer, String refreshId, long durationMs) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // B4-6 fix: omit refreshId from Timer tag
+        String timerKey = topic + ":" + consumer;
 
-        Timer timer = readyAckDurationTimers.computeIfAbsent(key, k ->
+        Timer timer = readyAckDurationTimers.computeIfAbsent(timerKey, k ->
                 Timer.builder("data_refresh_ready_ack_duration_seconds")
                         .description("Time taken from READY sent to READY ACK received")
                         .tag("topic", topic)
                         .tag("consumer", consumer)
-                        .tag("refresh_id", refreshId)
                         .publishPercentileHistogram()
                         .serviceLevelObjectives(
                             Duration.ofMillis(100),
@@ -412,7 +415,8 @@ public class DataRefreshMetrics {
      * Record data transferred during replay
      */
     public void recordDataTransferred(String topic, String consumer, long bytes, long messages, String refreshId, String refreshType) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // B4-6 fix: omit refreshId from Prometheus tags; use topic+consumer+refreshType as stable key
+        String key = topic + ":" + consumer + ":" + refreshType;
 
         // Bytes gauge (resettable)
         AtomicLong bytesValue = bytesTransferredValues.computeIfAbsent(key, k -> {
@@ -422,7 +426,6 @@ public class DataRefreshMetrics {
                             .description("Total bytes transferred during current data refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .tag("refresh_type", refreshType)
                             .baseUnit("bytes")
                             .register(registry)
@@ -439,7 +442,6 @@ public class DataRefreshMetrics {
                             .description("Total messages transferred during current data refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .tag("refresh_type", refreshType)
                             .register(registry)
             );
@@ -452,7 +454,8 @@ public class DataRefreshMetrics {
      * Update transfer rate (bytes per second)
      */
     public void updateTransferRate(String topic, String consumer, double bytesPerSecond, String refreshId) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // B4-6 fix: omit refreshId from Prometheus tags
+        String key = topic + ":" + consumer;
 
         AtomicDouble rate = transferRates.computeIfAbsent(key, k -> {
             AtomicDouble atomicRate = new AtomicDouble(0.0);
@@ -463,7 +466,6 @@ public class DataRefreshMetrics {
                             .description("Current data transfer rate during refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .baseUnit("bytes_per_second")
                             .register(registry)
             );
