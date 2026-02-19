@@ -591,13 +591,7 @@ public class RemoteConsumerRegistry {
 
         for (String clientId : consumerClientIds) {
             String consumerKey = clientId + ":" + topic;
-            RemoteConsumer consumer = consumers.entrySet()
-                    .stream()
-                    .filter(e -> e.getKey().contains(topic))
-                    .peek(e -> log.debug("Consumer key in registry: {}", e.getKey()))
-                    .map(Map.Entry::getValue)
-                    .findFirst()
-                    .orElse(null);
+            RemoteConsumer consumer = consumers.get(consumerKey);
 
             if (consumer == null) {
                 log.debug("Consumer not found: consumerKey={}", consumerKey);
@@ -635,7 +629,7 @@ public class RemoteConsumerRegistry {
             return null;
         }
 
-        return consumer.topic;
+        return consumer.group + ":" + consumer.topic;
     }
 
     /**
