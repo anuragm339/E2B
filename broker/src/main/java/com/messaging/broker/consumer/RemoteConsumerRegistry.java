@@ -156,6 +156,14 @@ public class RemoteConsumerRegistry {
                 if (consumer.deliveryTask != null) {
                     consumer.deliveryTask.cancel(false);
                 }
+                // B1-6 fix: clear stale pendingOffsets entry so Gate 2 does not block
+                // the same consumer if it reconnects and re-registers before the ACK
+                // timeout fires (which could take up to 30 minutes).
+                String pendingKey = key + ":pending";
+                Long stalePending = pendingOffsets.remove(pendingKey);
+                if (stalePending != null) {
+                    log.info("Cleared stale pending offset {} for key={} on unregister", stalePending, pendingKey);
+                }
                 // Clean up metrics (though with stable identifiers, metrics are now retained)
                 metrics.removeConsumerMetrics(clientId, consumer.topic, consumer.group);
                 log.info("Unregistered remote consumer: consumerKey={}, clientId={}, topic={}, group={}",
