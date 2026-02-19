@@ -385,8 +385,13 @@ public class DataRefreshManager {
         }
 
         boolean allCaughtUp = remoteConsumers.allConsumersCaughtUp(topic, ackedConsumers);
+        boolean allResetAcksReceived = context.allResetAcksReceived();
+        if (!allResetAcksReceived) {
+            Set<String> missing = getMissingResetAcks(context);
+            log.info("Waiting for RESET ACKs from: {}", missing);
+        }
 
-        if (allCaughtUp) {
+        if (allCaughtUp && allResetAcksReceived) {
             log.info("All consumers caught up for topic {}, sending READY", topic);
             sendReady(topic, context);
 
