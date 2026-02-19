@@ -240,11 +240,30 @@ public class DataRefreshMetrics {
     }
 
     /**
+     * Record RESET message sent at a specific time (for resume-after-restart).
+     * B9-1 fix: resumeRefresh() must record the original RESET sent time, not System.currentTimeMillis(),
+     * so that ACK duration measured after resume reflects actual consumer response time.
+     */
+    public void recordResetSentAt(String topic, String consumer, String refreshId, long sentTimeMs) {
+        String key = topic + ":" + consumer + ":" + refreshId;
+        resetSentTimes.put(key, sentTimeMs);
+    }
+
+    /**
      * Record READY message sent to consumer
      */
     public void recordReadySent(String topic, String consumer, String refreshId) {
         String key = topic + ":" + consumer + ":" + refreshId;
         readySentTimes.put(key, System.currentTimeMillis());
+    }
+
+    /**
+     * Record READY message sent at a specific time (for resume-after-restart).
+     * B9-1 fix: analogous to recordResetSentAt — preserves original READY sent time.
+     */
+    public void recordReadySentAt(String topic, String consumer, String refreshId, long sentTimeMs) {
+        String key = topic + ":" + consumer + ":" + refreshId;
+        readySentTimes.put(key, sentTimeMs);
     }
 
     /**

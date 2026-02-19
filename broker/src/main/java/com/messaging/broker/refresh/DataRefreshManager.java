@@ -589,12 +589,18 @@ public class DataRefreshManager {
                 log.info("Resuming from RESET_SENT - starting periodic RESET retry for {} consumer(s): {}",
                         missingResetAcks.size(), missingResetAcks);
 
-                // Re-record RESET sent metrics with current refresh_id (in-memory map was cleared on restart)
+                // B9-1 fix: populate resetSentTimes with original RESET sent time from context,
+                // not System.currentTimeMillis(). When ACK arrives after resume, the measured
+                // duration = (ackTime - originalResetSentTime) instead of (ackTime - resumeTime).
                 String resumeRefreshId = context.getRefreshId();
+                Instant originalResetSentTime = context.getResetSentTime();
                 for (String consumer : context.getExpectedConsumers()) {
-                    metrics.recordResetSent(topic, consumer, resumeRefreshId);
+                    long resetSentMs = originalResetSentTime != null
+                            ? originalResetSentTime.toEpochMilli()
+                            : System.currentTimeMillis();
+                    metrics.recordResetSentAt(topic, consumer, resumeRefreshId, resetSentMs);
                 }
-                log.info("Re-recorded RESET sent metrics for topic {} with refresh_id: {}", topic, resumeRefreshId);
+                log.info("Re-populated RESET timing map for topic {} with refresh_id: {}", topic, resumeRefreshId);
 
                 // Immediately send RESET once
                 remoteConsumers.broadcastResetToTopic(topic);
@@ -616,23 +622,30 @@ public class DataRefreshManager {
                 log.info("Resuming from REPLAYING - {} consumers ACKed, checking progress",
                         context.getReceivedResetAcks().size());
 
-                // Re-record RESET sent metrics with current refresh_id (Timer was cleared on restart)
+                // B9-1 fix: Re-populate timing maps with original sent times from context, not System.currentTimeMillis().
+                // Using "now" would make the subsequent ACK duration measurement include broker downtime,
+                // inflating the Timer by hours or days if the broker was restarted mid-refresh.
                 String replayingRefreshId = context.getRefreshId();
+                Instant resetSentInstant = context.getResetSentTime();
                 for (String consumer : context.getExpectedConsumers()) {
-                    metrics.recordResetSent(topic, consumer, replayingRefreshId);
-
-                    // If RESET ACK was already received before restart, record the historical duration
                     if (context.getReceivedResetAcks().contains(consumer)) {
-                        Instant resetSentTime = context.getResetSentTime();
+                        // Already ACKed before restart — record the historical duration directly
                         Instant resetAckTime = context.getResetAckTimes().get(consumer);
-                        if (resetSentTime != null && resetAckTime != null) {
-                            long durationMs = java.time.Duration.between(resetSentTime, resetAckTime).toMillis();
+                        if (resetSentInstant != null && resetAckTime != null) {
+                            long durationMs = java.time.Duration.between(resetSentInstant, resetAckTime).toMillis();
                             metrics.recordResetAckDuration(topic, consumer, replayingRefreshId, durationMs);
                             log.info("Recorded historical RESET ACK duration for consumer {}: {}ms", consumer, durationMs);
                         }
+                    } else {
+                        // Still waiting for ACK — populate timing map with original sent time so that
+                        // when ACK arrives the measured duration = (ackTime - originalResetSentTime)
+                        long sentTimeMs = resetSentInstant != null
+                                ? resetSentInstant.toEpochMilli()
+                                : System.currentTimeMillis();
+                        metrics.recordResetSentAt(topic, consumer, replayingRefreshId, sentTimeMs);
                     }
                 }
-                log.info("Re-recorded RESET sent metrics for topic {} with refresh_id: {}", topic, replayingRefreshId);
+                log.info("Re-populated RESET timing maps for topic {} with refresh_id: {}", topic, replayingRefreshId);
 
                 ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
                         () -> checkReplayProgress(topic),
@@ -647,35 +660,40 @@ public class DataRefreshManager {
                 // Continue waiting for READY ACKs
                 log.info("Resuming from READY_SENT - waiting for ACKs from: {}", getMissingReadyAcks(context));
 
-                // Re-record both RESET and READY sent metrics (Timers were cleared on restart)
+                // B9-1 fix: populate timing maps with ORIGINAL sent times from context.
+                // recordResetSent()/recordReadySent() would store System.currentTimeMillis() which
+                // inflates the subsequent ACK duration Timer by including broker downtime.
                 String readySentRefreshId = context.getRefreshId();
+                Instant resumeResetSentInstant = context.getResetSentTime();
+                Instant resumeReadySentInstant = context.getReadySentTime();
                 for (String consumer : context.getExpectedConsumers()) {
-                    metrics.recordResetSent(topic, consumer, readySentRefreshId);
-                    metrics.recordReadySent(topic, consumer, readySentRefreshId);
-
-                    // Record historical RESET ACK duration if available
+                    // Record historical RESET ACK duration (all consumers in READY_SENT already ACKed RESET)
                     if (context.getReceivedResetAcks().contains(consumer)) {
-                        Instant resetSentTime = context.getResetSentTime();
                         Instant resetAckTime = context.getResetAckTimes().get(consumer);
-                        if (resetSentTime != null && resetAckTime != null) {
-                            long durationMs = java.time.Duration.between(resetSentTime, resetAckTime).toMillis();
+                        if (resumeResetSentInstant != null && resetAckTime != null) {
+                            long durationMs = java.time.Duration.between(resumeResetSentInstant, resetAckTime).toMillis();
                             metrics.recordResetAckDuration(topic, consumer, readySentRefreshId, durationMs);
                             log.info("Recorded historical RESET ACK duration for consumer {}: {}ms", consumer, durationMs);
                         }
                     }
 
-                    // Record historical READY ACK duration if already received before restart
                     if (context.getReceivedReadyAcks().contains(consumer)) {
-                        Instant readySentTime = context.getReadySentTime();
+                        // Already received READY ACK before restart — record historical duration directly
                         Instant readyAckTime = context.getReadyAckTimes().get(consumer);
-                        if (readySentTime != null && readyAckTime != null) {
-                            long durationMs = java.time.Duration.between(readySentTime, readyAckTime).toMillis();
+                        if (resumeReadySentInstant != null && readyAckTime != null) {
+                            long durationMs = java.time.Duration.between(resumeReadySentInstant, readyAckTime).toMillis();
                             metrics.recordReadyAckDuration(topic, consumer, readySentRefreshId, durationMs);
                             log.info("Recorded historical READY ACK duration for consumer {}: {}ms", consumer, durationMs);
                         }
+                    } else {
+                        // Still waiting for READY ACK — populate readySentTimes with original READY sent time
+                        long readySentMs = resumeReadySentInstant != null
+                                ? resumeReadySentInstant.toEpochMilli()
+                                : System.currentTimeMillis();
+                        metrics.recordReadySentAt(topic, consumer, readySentRefreshId, readySentMs);
                     }
                 }
-                log.info("Re-recorded RESET and READY sent metrics for topic {} with refresh_id: {}", topic, readySentRefreshId);
+                log.info("Re-populated RESET/READY timing maps for topic {} with refresh_id: {}", topic, readySentRefreshId);
 
                 scheduler.schedule(
                         () -> checkReadyAckTimeout(topic),
