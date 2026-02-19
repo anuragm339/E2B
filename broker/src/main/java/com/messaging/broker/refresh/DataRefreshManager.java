@@ -415,8 +415,9 @@ public class DataRefreshManager {
             metrics.recordReadySent(topic, consumer, context.getRefreshId());
         }
 
-        remoteConsumers.broadcastReadyToTopic(topic);
-        log.info("READY sent to all consumers for topic: {}", topic);
+        // Only send READY to consumers that have ACKed RESET — not all connected consumers
+        remoteConsumers.sendReadyToAckedConsumers(topic, context.getReceivedResetAcks());
+        log.info("READY sent to {} ACKed consumers for topic: {}", context.getReceivedResetAcks().size(), topic);
 
         // Persist state
         stateStore.saveState(context);

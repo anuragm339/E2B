@@ -557,6 +557,39 @@ public class RemoteConsumerRegistry {
     }
 
     /**
+     * Send READY only to consumers whose group:topic identifier is in the provided set.
+     * Used by DataRefreshManager to avoid sending READY to consumers that never ACKed RESET.
+     *
+     * @param topic            Topic name
+     * @param ackedGroupTopics Set of "group:topic" identifiers that have ACKed RESET
+     */
+    public void sendReadyToAckedConsumers(String topic, java.util.Set<String> ackedGroupTopics) {
+        byte[] payload = topic.getBytes(StandardCharsets.UTF_8);
+        BrokerMessage readyMsg = new BrokerMessage(
+            BrokerMessage.MessageType.READY,
+            System.currentTimeMillis(),
+            payload
+        );
+
+        for (RemoteConsumer consumer : consumers.values()) {
+            if (!consumer.topic.equals(topic)) continue;
+            String groupTopic = consumer.group + ":" + consumer.topic;
+            if (!ackedGroupTopics.contains(groupTopic)) {
+                log.warn("Skipping READY for consumer {} — did not ACK RESET (groupTopic={})",
+                        consumer.clientId, groupTopic);
+                continue;
+            }
+            try {
+                server.send(consumer.clientId, readyMsg);
+                log.info("Sent READY to consumer: {} (groupTopic={}) for topic: {}",
+                        consumer.clientId, groupTopic, topic);
+            } catch (Exception e) {
+                log.error("Failed to send READY to consumer: {}", consumer.clientId, e);
+            }
+        }
+    }
+
+    /**
      * Reset offset for a specific consumer (for DataRefresh)
      */
     public void resetConsumerOffset(String clientId, String topic, long offset) {
