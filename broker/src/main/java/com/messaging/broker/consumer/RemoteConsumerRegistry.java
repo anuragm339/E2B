@@ -258,15 +258,22 @@ public class RemoteConsumerRegistry {
             /* ================= STORAGE READ METRICS ================= */
             readSample = metrics.startStorageReadTimer();
 
-            batch = storageExecutor.submit(() ->
-                    ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage)
-                            .getZeroCopyBatch(
-                                    consumer.topic,
-                                    0,
-                                    startOffset,
-                                    batchSizeBytes
-                            )
-            ).get(10, TimeUnit.MINUTES);
+            // B1-3 fix: storage is injected as StorageEngine (interface); hard-casting to
+            // FileChannelStorageEngine throws ClassCastException when MMapStorageEngine is used.
+            // Use instanceof to dispatch to the correct concrete type.
+            final long capturedOffset = startOffset;
+            batch = storageExecutor.submit(() -> {
+                if (storage instanceof com.messaging.storage.filechannel.FileChannelStorageEngine) {
+                    return ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage)
+                            .getZeroCopyBatch(consumer.topic, 0, capturedOffset, batchSizeBytes);
+                } else if (storage instanceof com.messaging.storage.mmap.MMapStorageEngine) {
+                    return ((com.messaging.storage.mmap.MMapStorageEngine) storage)
+                            .getZeroCopyBatch(consumer.topic, 0, capturedOffset, batchSizeBytes);
+                } else {
+                    throw new IllegalStateException("StorageEngine implementation does not support " +
+                            "getZeroCopyBatch(): " + storage.getClass().getName());
+                }
+            }).get(10, TimeUnit.MINUTES);
 
             metrics.stopStorageReadTimer(readSample);
             metrics.recordStorageRead();
