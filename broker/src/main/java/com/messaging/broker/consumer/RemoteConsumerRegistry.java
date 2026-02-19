@@ -247,6 +247,11 @@ public class RemoteConsumerRegistry {
 
         log.info("DEBUG deliverBatch: Gates passed, proceeding with batch read for {}", deliveryKey);
 
+        // B2-2 fix: record retry metric when a previously-failed consumer is being retried
+        if (consumer.consecutiveFailures > 0) {
+            metrics.recordConsumerRetry(consumer.clientId, consumer.topic, consumer.group);
+        }
+
         // Gate 3 removed: Parallel topic delivery now allowed
 
         long startOffset = consumer.getCurrentOffset();
@@ -357,10 +362,23 @@ public class RemoteConsumerRegistry {
 
             // Reset failure counter on successful delivery
             consumer.resetFailures();
+
+            // B2-1 fix: update consumer lag metric after each successful delivery.
+            // lag = storageHead - newConsumerOffset (after offset was advanced to nextOffset)
+            try {
+                long storageHead = storage.getCurrentOffset(consumer.topic, 0);
+                long lag = Math.max(0, storageHead - consumer.getCurrentOffset());
+                metrics.updateConsumerLag(consumer.clientId, consumer.topic, consumer.group, lag);
+            } catch (Exception lagEx) {
+                log.debug("Could not update consumer lag metric for {}: {}", deliveryKey, lagEx.getMessage());
+            }
+
             return true;  // Data delivered successfully
 
         } catch (Exception e) {
             log.error("Delivery failed for {}", deliveryKey, e);
+            // B2-2 fix: record failure metric so broker_consumer_failures_total is non-zero
+            metrics.recordConsumerFailure(consumer.clientId, consumer.topic, consumer.group);
             inFlight.set(false);
 
             // Revert offset reservation on error
