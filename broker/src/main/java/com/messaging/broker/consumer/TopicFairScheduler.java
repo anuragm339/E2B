@@ -66,8 +66,11 @@ public class TopicFairScheduler {
                     semaphore.release();
                 }
             } else {
-                // No permit available - skip this cycle (fairness enforced)
-                log.trace("Skipping task for topic={} - max in-flight reached", topic);
+                // No permit available — reschedule the task so the delivery loop
+                // does not die. The task itself is responsible for rescheduling
+                // on success/failure, but it never runs here so we must reschedule.
+                log.trace("Skipping task for topic={} - max in-flight reached, rescheduling", topic);
+                schedule(topic, task, delay, unit);
             }
         }, delay, unit);
     }
