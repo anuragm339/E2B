@@ -185,8 +185,8 @@ docker logs messaging-broker 2>&1 | grep "READY sent"
 
 ### B1-2 — `deliveryTask` field never stored, cancel() is a no-op
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `d843a41`
 **Severity:** High
 **Batch:** 1
 
@@ -212,8 +212,8 @@ docker logs messaging-broker 2>&1 | grep "deliverBatch" | grep "<disconnected-cl
 
 ### B1-3 — ClassCastException reading sealed segments
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `442e4f4`
 **Severity:** High
 **Batch:** 1
 
@@ -234,8 +234,8 @@ docker logs messaging-broker 2>&1 | grep "ClassCastException"
 
 ### B1-6 — `pendingOffsets` not cleared on unregister — re-registration stalls 30 min
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `37c0d31`
 **Severity:** High
 **Batch:** 1
 
@@ -274,8 +274,8 @@ docker logs messaging-broker 2>&1 | grep "Gate 2 BLOCKED" | grep "<clientId>"
 
 ### B2-6 — ACK after unregister drops offset commit — message duplication
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `719e64a`
 **Severity:** High
 **Batch:** 2
 
@@ -344,8 +344,8 @@ docker logs messaging-broker 2>&1 | grep "Starting refresh for topic"
 
 ### B4-3 — Late ACK after timeout leaves `inFlight` stuck true — delivery permanently stalls
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `bb57609`
 **Severity:** High
 **Batch:** 4
 
@@ -864,8 +864,8 @@ curl -s http://localhost:8081/prometheus | grep "data_refresh_replay_started_tot
 
 ### B6-1 / B7-1 — Segment boundary permanent stall (active segment never checked as fallback)
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `f633440`
 **Severity:** High (upgraded from Low — stall is permanent, not transient)
 **Batch:** 6 (revised in Batch 7)
 
@@ -914,8 +914,8 @@ curl -s http://localhost:8081/prometheus | grep "broker_consumer_lag"
 
 ### B6-2 — Consumer offset below earliest segment → silent delivery freeze
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `654abf2`
 **Severity:** High
 **Batch:** 6
 
@@ -957,8 +957,8 @@ docker logs messaging-broker 2>&1 | grep "below earliest"
 
 ### B7-2 — Crash window between log write and index write causes permanent record loss
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `fe5a76e`
 **Severity:** High
 **Batch:** 7
 
@@ -1157,7 +1157,7 @@ docker logs messaging-broker 2>&1 | grep "SQLITE_BUSY\|database is locked"
 | High     | 10    | 0     | 10   |
 | Medium   | 11    | 0     | 11   |
 | Low      | 4     | 0     | 4    |
-| **Total**| **31**| **7** | **24**|
+| **Total**| **31**| **15** | **16**|
 
 ### Fix Order
 ```
@@ -1172,15 +1172,15 @@ Round 1 — Critical: ✅ ALL DONE
 Round 1 add-on — High (prerequisite for Critical fixes to work):
   [x] B3-1   startRefresh() expectedConsumers format mismatch     8f5c741
 
-Round 2 — High:
-  [ ] B6-1   Segment boundary stall (check active segment as fallback)
-  [ ] B6-2   Offset below earliest segment → silent freeze
-  [ ] B7-2   Crash window log→index → permanent record loss (WAL pattern)
-  [ ] B1-6   pendingOffsets not cleared on unregister
-  [ ] B4-3   Late ACK leaves inFlight stuck true
-  [ ] B2-6   ACK after unregister drops offset commit
-  [ ] B1-2   deliveryTask never assigned
-  [ ] B1-3   ClassCastException sealed segment
+Round 2 — High: ✅ ALL DONE
+  [x] B6-1   Segment boundary stall (active segment fallback)     f633440
+  [x] B6-2   Offset below earliest segment → silent freeze        654abf2
+  [x] B7-2   Crash window log→index → orphan bytes truncated      fe5a76e
+  [x] B1-6   pendingOffsets not cleared on unregister             37c0d31
+  [x] B4-3   Late ACK leaves inFlight stuck true                  bb57609
+  [x] B2-6   ACK after unregister drops offset commit             719e64a
+  [x] B1-2   deliveryTask never assigned                          d843a41
+  [x] B1-3   ClassCastException sealed segment (instanceof fix)   442e4f4
 
 Round 3 — Medium:
   [ ] B2-1   Consumer lag never updated
