@@ -758,15 +758,308 @@ curl -s http://localhost:8081/prometheus | grep "data_refresh_replay_started_tot
 
 ---
 
+---
+
+## HIGH Bugs (Batches 6 & 7 additions)
+
+---
+
+### B6-1 / B7-1 — Segment boundary permanent stall (active segment never checked as fallback)
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** High (upgraded from Low — stall is permanent, not transient)
+**Batch:** 6 (revised in Batch 7)
+
+**File:**
+- `storage/src/main/java/com/messaging/storage/segment/SegmentManager.java:326-357`
+- `storage/src/main/java/com/messaging/storage/segment/Segment.java:719-836`
+
+**Bug:**
+After a segment rolls over, the new active segment has `baseOffset = oldSealedSegment.nextOffset`.
+`getZeroCopyBatch(topic, fromOffset)` calls `floorEntry(fromOffset)`. When `fromOffset` equals
+the new active's `baseOffset`, `floorEntry()` returns the OLD sealed segment (since its
+`baseOffset ≤ fromOffset`). `getBatchFileRegion(fromOffset)` on the sealed segment returns
+empty because `startOffset >= nextOffset` (equality). Because `entry != null`, the active segment
+fallback at lines 333-348 is **never reached**. This repeats on every poll cycle — permanent stall.
+
+```java
+// SegmentManager.java:326-357
+Map.Entry<Long, Segment> entry = segments.floorEntry(fromOffset);
+if (entry != null) {
+    result = entry.getValue().getBatchFileRegion(fromOffset, maxBatchBytes);
+    // ← active segment fallback only runs when entry == null
+}
+```
+
+**Fix:**
+After `getBatchFileRegion()` returns empty from the sealed segment, also check the active segment:
+```java
+if (entry != null) {
+    result = entry.getValue().getBatchFileRegion(fromOffset, maxBatchBytes);
+}
+// NEW: If sealed segment returned empty, check active segment as fallback
+if ((result == null || result.isEmpty()) && activeSegment != null) {
+    result = activeSegment.getBatchFileRegion(fromOffset, maxBatchBytes);
+}
+```
+
+**Verification:**
+```bash
+# Trigger segment rollover (fill > 1GB) then check delivery continues
+docker logs messaging-broker 2>&1 | grep "Rolled segment"
+# After rollover: consumer lag should not stall
+curl -s http://localhost:8081/prometheus | grep "broker_consumer_lag"
+```
+
+---
+
+### B6-2 — Consumer offset below earliest segment → silent delivery freeze
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** High
+**Batch:** 6
+
+**File:**
+- `storage/src/main/java/com/messaging/storage/segment/SegmentManager.java:326-357`
+- `storage/src/main/java/com/messaging/storage/segment/Segment.java:719-836`
+
+**Bug:**
+If a consumer's stored offset is below the earliest segment's `baseOffset` (e.g., after log
+compaction or a storage wipe while consumer was down), `floorEntry(fromOffset)` returns `null`
+(no segment has baseOffset ≤ fromOffset). The active segment fallback runs but
+`getBatchFileRegion(fromOffset)` returns empty because `fromOffset < segment.baseOffset`.
+No exception is thrown, no log is emitted — delivery silently freezes. The consumer never
+catches up and no alert is raised.
+
+**Fix:**
+Detect when `fromOffset < earliestBaseOffset` and either:
+1. Reset consumer offset to `earliestBaseOffset` (skip lost data, log a warning), or
+2. Throw a recoverable exception that triggers consumer re-registration
+
+```java
+long earliest = segments.isEmpty() ? activeSegment.baseOffset : segments.firstKey();
+if (fromOffset < earliest) {
+    log.warn("Consumer offset {} is below earliest segment base {}, resetting to earliest",
+             fromOffset, earliest);
+    fromOffset = earliest;  // or unregister consumer to force re-subscribe
+}
+```
+
+**Verification:**
+```bash
+# Manually set a consumer offset below segment base, restart broker
+# Before fix: consumer silently stalls
+# After fix: log shows "below earliest" warning and delivery resumes
+docker logs messaging-broker 2>&1 | grep "below earliest"
+```
+
+---
+
+### B7-2 — Crash window between log write and index write causes permanent record loss
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** High
+**Batch:** 7
+
+**File:**
+- `storage/src/main/java/com/messaging/storage/segment/Segment.java:382-464`
+
+**Bug:**
+`writeRecord()` writes to the log file first (line 425), then to the index file (line 446),
+then `force()`s both (lines 456-457). If the JVM crashes or host loses power between lines
+425 and 446, the log file has the record but the index file does not. On restart,
+`recoverFromLogScan()` at line 336 throws `RuntimeException`:
+
+```java
+// Segment.java:340
+throw new RuntimeException(
+    "Cannot recover unified format segment without index file. " +
+    "Log scan recovery not supported for this format.");
+```
+
+The record is permanently inaccessible. The segment cannot even be opened.
+
+**Fix:**
+Write and `force()` the index BEFORE writing the log (write-ahead-log pattern):
+```java
+// Write index entry first and sync it
+indexChannel.write(indexEntry);
+indexChannel.force(false);  // index durable first
+
+// Then write log record
+logChannel.write(ByteBuffer.wrap(record));
+logChannel.force(false);  // log durable second
+```
+Or use a journal/WAL file for crash recovery.
+
+**Verification:**
+```bash
+# Kill broker mid-write with SIGKILL, restart and verify no exception in logs
+kill -9 $(docker inspect --format='{{.State.Pid}}' messaging-broker)
+docker compose up -d broker
+docker logs messaging-broker 2>&1 | grep "RuntimeException\|Cannot recover"
+# Before fix: RuntimeException on startup
+# After fix: clean startup with any complete records intact
+```
+
+---
+
+## CRITICAL Bugs (Batches 6 & 7 additions)
+
+---
+
+### B6-3 — Header sent, FileRegion fails → `ZeroCopyBatchDecoder` stuck in `READING_ZERO_COPY_BATCH`
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** Critical
+**Batch:** 6
+
+**File:**
+- `broker/src/main/java/com/messaging/broker/consumer/RemoteConsumerRegistry.java:395-445`
+- `network/src/main/java/com/messaging/network/codec/ZeroCopyBatchDecoder.java:39-44,115`
+
+**Bug:**
+`sendBatchToConsumer()` sends the `BATCH_HEADER` message at line 432, then sends the
+`FileRegion` at line 444. If the header send succeeds but the FileRegion send fails
+(e.g., channel closes mid-transfer), the consumer's `ZeroCopyBatchDecoder` has already
+transitioned to state `READING_ZERO_COPY_BATCH` and is waiting for `expectedTotalBytes`.
+These bytes never arrive. No state reset is triggered from the broker side. The consumer's
+decoder is permanently stuck — all subsequent messages on that TCP connection are silently
+discarded (interpreted as zero-copy batch bytes).
+
+```java
+// RemoteConsumerRegistry.java:432 — header sent, decoder transitions state
+server.send(consumer.clientId, headerMsg).get(timeoutSeconds, TimeUnit.SECONDS);
+
+// RemoteConsumerRegistry.java:444 — if this throws, decoder is stuck
+server.sendFileRegion(consumer.clientId, batchRegion.fileRegion).get(timeoutSeconds, TimeUnit.SECONDS);
+```
+
+**Fix:**
+On `sendFileRegion()` failure, close the consumer's TCP channel to force decoder reset
+(consumer will reconnect and re-subscribe, resetting decoder to `READING_BROKER_MESSAGE`):
+```java
+try {
+    server.sendFileRegion(...).get(timeout, SECONDS);
+} catch (Exception e) {
+    log.error("FileRegion send failed after header was sent — closing channel to reset decoder");
+    server.closeChannel(consumer.clientId);  // forces consumer reconnect + decoder reset
+    throw e;
+}
+```
+
+**Verification:**
+```bash
+# Check for "decoder stuck" symptoms: consumer connected but no ACKs
+docker logs messaging-broker 2>&1 | grep "Gate 2 BLOCKED" | tail -20
+# If Gate 2 is blocked for the same consumer for > 30 min, decoder is stuck
+```
+
+---
+
+### B7-3 — `decodeZeroCopyBatch()` always emits `BatchDecodedEvent` on partial parse → missing data + offset advanced
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** Critical
+**Batch:** 7
+
+**File:**
+- `network/src/main/java/com/messaging/network/codec/ZeroCopyBatchDecoder.java:251-352`
+
+**Bug:**
+`decodeZeroCopyBatch()` parses records in a while loop that `break`s on invalid `keyLen`/`dataLen`
+or truncated data. After the loop exits (whether fully or partially parsed), line 344
+**unconditionally** emits a `BatchDecodedEvent`:
+
+```java
+// ZeroCopyBatchDecoder.java:344 — always fires regardless of parse completeness
+out.add(new BatchDecodedEvent(records, currentBatchTopic));
+```
+
+`BatchAckHandler` handles this event and sends `BATCH_ACK` to the broker. The broker's
+`handleBatchAck()` calls `pendingOffsets.remove(pendingKey)` and commits the offset past all
+records in the batch. Records that were not parsed (mid-batch corruption or sizing bug) are
+**permanently lost** — the offset is advanced past them with no error logged.
+
+**Fix:**
+Track expected vs actual record count (from the `BATCH_HEADER`). Only emit if all records parsed:
+```java
+// Option A: Discard entire batch on parse error, close channel to trigger reconnect
+if (records.size() < expectedRecordCount) {
+    log.error("Partial parse: expected {} records, got {}. Discarding batch, closing channel.",
+              expectedRecordCount, records.size());
+    ctx.close();  // forces reconnect + re-delivery from last committed offset
+    return;
+}
+out.add(new BatchDecodedEvent(records, currentBatchTopic));
+
+// Option B: Emit only successfully parsed records (accept partial, advance offset carefully)
+// Note: broker has no per-record offset tracking, so Option A is safer
+```
+
+**Verification:**
+```bash
+# Inject a batch with a corrupt record mid-batch (keyLen = -1)
+# Before fix: consumer ACKs, offset advances, records lost silently
+# After fix: error logged, channel closed, consumer reconnects, batch redelivered
+docker logs consumer-price-quote 2>&1 | grep "Partial parse\|re-delivery"
+```
+
+---
+
+## MEDIUM Bugs (Batches 6 & 7 additions)
+
+---
+
+### B6-5 — `SegmentMetadataStore` single `Connection` unsynchronized — concurrent writes cause `SQLITE_BUSY`
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** Medium
+**Batch:** 6
+
+**File:**
+- `storage/src/main/java/com/messaging/storage/metadata/SegmentMetadataStore.java:23,80`
+
+**Bug:**
+`SegmentMetadataStore` uses a single `private Connection connection` with no `synchronized`
+blocks on `saveSegment()`. Multiple broker threads calling `append()` → `saveSegmentMetadata()`
+concurrently will hit the same `Connection`. SQLite's single-writer model rejects concurrent
+writes with `SQLITE_BUSY`. The exception is silently swallowed — metadata is not saved, segment
+boundaries become stale.
+
+**Fix:**
+Add `synchronized` to `saveSegment()` (and `getMaxOffset()` if sharing the connection):
+```java
+public synchronized void saveSegment(SegmentMetadata metadata) throws SQLException {
+    // existing code
+}
+```
+Or use a `ReentrantLock` for finer control, or use a dedicated writer thread.
+
+**Verification:**
+```bash
+# Enable SQLite busy logging, run broker under load
+docker logs messaging-broker 2>&1 | grep "SQLITE_BUSY\|database is locked"
+# After fix: no SQLITE_BUSY errors under concurrent append load
+```
+
+---
+
 ## Summary
 
 | Severity | Total | Fixed | Open |
 |----------|-------|-------|------|
-| Critical | 4     | 0     | 4    |
-| High     | 7     | 0     | 7    |
-| Medium   | 9     | 0     | 9    |
+| Critical | 6     | 0     | 6    |
+| High     | 10    | 0     | 10   |
+| Medium   | 10    | 0     | 10   |
 | Low      | 3     | 0     | 3    |
-| **Total**| **23**| **0** | **23**|
+| **Total**| **29**| **0** | **29**|
 
 ### Fix Order
 ```
@@ -775,8 +1068,13 @@ Round 1 — Critical:
   [ ] B1-1   Adaptive delivery loop dies
   [ ] B3-3   allConsumersCaughtUp() wrong consumer lookup
   [ ] B5-1   READY broadcast to non-reset consumers
+  [ ] B6-3   Header+FileRegion split → decoder stuck (close channel on FileRegion fail)
+  [ ] B7-3   Partial parse always emits ACK → offset advanced past lost records
 
 Round 2 — High:
+  [ ] B6-1   Segment boundary stall (check active segment as fallback)
+  [ ] B6-2   Offset below earliest segment → silent freeze
+  [ ] B7-2   Crash window log→index → permanent record loss (WAL pattern)
   [ ] B1-6   pendingOffsets not cleared on unregister
   [ ] B4-3   Late ACK leaves inFlight stuck true
   [ ] B3-1+B3-2  config ignored + getConsumerGroupTopic() wrong return (fix together)
@@ -794,6 +1092,7 @@ Round 3 — Medium:
   [ ] B4-6   refresh_id cardinality explosion
   [ ] B5-2   completeRefresh() uses wrong refresh_id
   [ ] B5-3   readySentTimes memory leak
+  [ ] B6-5   SegmentMetadataStore unsynchronized Connection
 
 Round 4 — Low:
   [ ] B2-3   activeConsumers gauge drift
@@ -804,4 +1103,4 @@ Round 4 — Low:
 ---
 
 *Last updated: 2026-02-19*
-*Total bugs found: 23 | Fixed: 0 | Open: 23*
+*Total bugs found: 29 | Fixed: 0 | Open: 29*
