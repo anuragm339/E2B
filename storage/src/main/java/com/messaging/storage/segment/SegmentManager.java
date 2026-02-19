@@ -160,8 +160,11 @@ public class SegmentManager {
 
         long offset = current.append(record);
 
-        // Periodically update metadata for active segment (every METADATA_UPDATE_INTERVAL appends)
-        saveSegmentMetadata(current);
+        // B4-4 fix: gate metadata save to every METADATA_UPDATE_INTERVAL appends instead of every single append.
+        // Previously saveSegmentMetadata() was called unconditionally, causing one SQLite UPSERT per message.
+        if (appendsSinceMetadataUpdate.incrementAndGet() % METADATA_UPDATE_INTERVAL == 0) {
+            saveSegmentMetadata(current);
+        }
 
         return offset;
     }
