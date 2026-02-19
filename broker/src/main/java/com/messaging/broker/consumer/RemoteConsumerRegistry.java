@@ -343,10 +343,30 @@ public class RemoteConsumerRegistry {
 
             // Revert offset reservation on error
             consumer.setCurrentOffset(startOffset);
-            pendingOffsets.remove(pendingKey);
 
             // Record failure for exponential backoff
             consumer.recordFailure();
+
+            // ✅ CRITICAL FIX (Phase 5A): Only remove pending offset for PERMANENT failures
+            // For transient failures (disconnect, backpressure), KEEP pending offset
+            // This prevents rapid retries to disconnected consumers
+            boolean isPermanentFailure = consumer.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+
+            if (isPermanentFailure) {
+                // Permanent failure - remove pending offset and unregister
+                pendingOffsets.remove(pendingKey);
+                log.error("Permanent failure for {} (consecutiveFailures={}), removing pending offset and unregistering",
+                         deliveryKey, MAX_CONSECUTIVE_FAILURES);
+                unregisterConsumer(consumer.clientId);
+            } else {
+                // Transient failure - KEEP pending offset
+                // Gate 2 will continue blocking until:
+                // - Consumer reconnects and sends ACK, OR
+                // - ACK timeout (30 min) fires and removes pending offset
+                log.warn("Transient failure for {}, KEEPING pending offset to prevent rapid retries. " +
+                        "Will wait for ACK or timeout (30 min). consecutiveFailures={}",
+                        deliveryKey, consumer.consecutiveFailures);
+            }
 
             // Record failed transfer metrics (bytes and messages that didn't make it to consumer)
             if (batch != null) {
@@ -357,16 +377,10 @@ public class RemoteConsumerRegistry {
                     batch.recordCount,
                     batch.totalBytes
                 );
-                log.warn("Recorded failed transfer: topic={}, group={}, messages={}, bytes={}, consecutiveFailures={}, nextBackoff={}ms",
+                log.warn("Recorded failed transfer: topic={}, group={}, messages={}, bytes={}, " +
+                        "consecutiveFailures={}, nextBackoff={}ms, isPermanentFailure={}",
                         consumer.topic, consumer.group, batch.recordCount, batch.totalBytes,
-                        consumer.consecutiveFailures, consumer.getBackoffDelay());
-            }
-
-            // Check if this is a connection error (Broken pipe, Connection reset, etc.)
-            if (isConnectionError(e)) {
-                log.warn("Connection error detected for {}, unregistering consumer", deliveryKey);
-                // Unregister consumer to stop adaptive polling
-                unregisterConsumer(consumer.clientId);
+                        consumer.consecutiveFailures, consumer.getBackoffDelay(), isPermanentFailure);
             }
 
             return false;  // Delivery failed
@@ -414,8 +428,8 @@ public class RemoteConsumerRegistry {
                  consumer.clientId, consumer.topic, batchRegion.recordCount, batchRegion.totalBytes);
 
         long timeoutSeconds = 1 + (batchRegion.totalBytes / (1024 * 1024) * 10);
-        // Increased header timeout from 1s to 10s for reliability
-        server.send(consumer.clientId, headerMsg).get(timeoutSeconds, TimeUnit.MINUTES);
+        // Timeout in seconds (1s base + 10s per MB, e.g., 2MB = 21 seconds)
+        server.send(consumer.clientId, headerMsg).get(timeoutSeconds, TimeUnit.SECONDS);
 
         // Step 2: Send FileRegion for true zero-copy transfer (Kafka-style sendfile)
         // This uses OS sendfile() syscall - data goes from file → kernel → socket
@@ -424,12 +438,11 @@ public class RemoteConsumerRegistry {
                  batchRegion.fileRegion.position(), batchRegion.fileRegion.count(),
                  batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic, startOffset);
 
-        // Increased timeout for larger batches (3MB batches may take longer to transfer)
-        // Timeout = 10s base + 10s per MB (e.g., 3MB = 10 + 30 = 40 seconds)
+        // Timeout scales with batch size: 1s base + 10s per MB (e.g., 2MB = 21 seconds)
         log.debug("Sending FileRegion with timeout of {}s for {} bytes", timeoutSeconds, batchRegion.totalBytes);
 
         server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
-              .get(timeoutSeconds, TimeUnit.MINUTES);
+              .get(timeoutSeconds, TimeUnit.SECONDS);
 
         log.info("✓ Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
