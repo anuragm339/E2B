@@ -142,7 +142,7 @@ cat /data/data-refresh-state.properties | grep "topic\."
 ### B5-1 — READY broadcast to non-reset consumers
 
 **Status:** `FIXED`
-**Commit:** `3830980`
+**Commit:** `3830980`, `a7fe869`
 **Severity:** Critical
 **Batch:** 5
 
@@ -399,8 +399,8 @@ docker logs messaging-broker 2>&1 | grep "Gate 1 BLOCKED\|inFlight"
 
 ### B2-1 — Consumer lag metric always 0
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `2d6a510`
 **Severity:** Medium
 **Batch:** 2
 
@@ -428,8 +428,8 @@ curl -s http://localhost:8081/prometheus | grep "broker_consumer_lag"
 
 ### B2-2 — `recordConsumerFailure()` / `recordConsumerRetry()` never called
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `2d6a510`
 **Severity:** Medium
 **Batch:** 2
 
@@ -454,8 +454,8 @@ curl -s http://localhost:8081/prometheus | grep "broker_consumer_failures_total"
 
 ### B2-4 — ACK timeout scheduled before send — false-positive timeouts
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `9b5a54f`
 **Severity:** Medium
 **Batch:** 2
 
@@ -481,8 +481,8 @@ curl -s http://localhost:8081/prometheus | grep "broker_consumer_ack_timeouts_to
 
 ### B2-5 — `DataRefreshMetrics` non-atomic `value += delta`
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `03261a1`
 **Severity:** Medium
 **Batch:** 2 & 3
 
@@ -518,8 +518,8 @@ curl -s http://localhost:8081/prometheus | grep "data_refresh_bytes_transferred"
 
 ### B3-4 — Duplicate READY ACK guard commented out — metrics double-counted
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `3974901`
 **Severity:** Medium
 **Batch:** 3
 
@@ -549,8 +549,8 @@ docker logs messaging-broker 2>&1 | grep "Duplicate READY ACK"
 
 ### B4-4 — `saveSegmentMetadata()` called on every append — SQLite hammering
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `2993cd0`
 **Severity:** Medium
 **Batch:** 4
 
@@ -587,8 +587,8 @@ docker exec messaging-broker iostat -x 1 5
 
 ### B4-6 — `refresh_id` label causes unbounded Prometheus cardinality
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `f62230b`
 **Severity:** Medium
 **Batch:** 4
 
@@ -617,8 +617,8 @@ curl -s http://localhost:9090/api/v1/label/__name__/values | jq '.data | length'
 
 ### B5-2 — `completeRefresh()` tags metrics with wrong `refresh_id`
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `eb642e5`
 **Severity:** Medium
 **Batch:** 5
 
@@ -647,8 +647,8 @@ curl -s http://localhost:8081/prometheus | grep "data_refresh_completed_total"
 
 ### B5-3 — `readySentTimes` map never cleared — memory leak
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `eb642e5`
 **Severity:** Medium
 **Batch:** 5
 
@@ -679,8 +679,8 @@ docker stats messaging-broker --no-stream
 
 ### B9-1 — `resumeRefresh()` re-records ACK duration metrics on every restart — inflates Timers
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `b7cafb2`
 **Severity:** Medium
 **Batch:** 9
 
@@ -744,8 +744,8 @@ curl -s http://localhost:8081/prometheus | grep "data_refresh_reset_ack_duration
 
 ### B8-1 — `SegmentMetadataStoreFactory.closeAll()` not wired to `@PreDestroy` — SQLite connections not closed on shutdown
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `ba86ebf`
 **Severity:** Low
 **Batch:** 8
 
@@ -781,8 +781,8 @@ ls -la /data/*/segment_metadata.db-wal 2>/dev/null
 
 ### B2-3 — `activeConsumers` gauge drifts on duplicate SUBSCRIBE
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `ba86ebf`
 **Severity:** Low
 **Batch:** 2
 
@@ -807,8 +807,8 @@ curl -s http://localhost:8081/prometheus | grep "broker_consumer_active"
 
 ### B2-7 — `recordAckTimeout()` missing `group` label
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `ba86ebf`
 **Severity:** Low
 **Batch:** 2
 
@@ -832,8 +832,8 @@ curl -s http://localhost:8081/prometheus | grep "broker_consumer_ack_timeouts_to
 
 ### B3-7 — `startReplayForConsumer()` called for non-ACKed consumers
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `ba86ebf`
 **Severity:** Low
 **Batch:** 3
 
@@ -1116,8 +1116,8 @@ docker logs consumer-price-quote 2>&1 | grep "Partial parse\|re-delivery"
 
 ### B6-5 — `SegmentMetadataStore` single `Connection` unsynchronized — concurrent writes cause `SQLITE_BUSY`
 
-**Status:** `OPEN`
-**Commit:** —
+**Status:** `FIXED`
+**Commit:** `fbcda46`
 **Severity:** Medium
 **Batch:** 6
 
@@ -1154,10 +1154,10 @@ docker logs messaging-broker 2>&1 | grep "SQLITE_BUSY\|database is locked"
 | Severity | Total | Fixed | Open |
 |----------|-------|-------|------|
 | Critical | 6     | 6     | 0    |
-| High     | 10    | 0     | 10   |
-| Medium   | 11    | 0     | 11   |
-| Low      | 4     | 0     | 4    |
-| **Total**| **31**| **15** | **16**|
+| High     | 10    | 10    | 0    |
+| Medium   | 11    | 11    | 0    |
+| Low      | 4     | 4     | 0    |
+| **Total**| **31**| **31** | **0**|
 
 ### Fix Order
 ```
@@ -1165,7 +1165,7 @@ Round 1 — Critical: ✅ ALL DONE
   [x] B3-5   clearState() wrong overload (1-line fix)             9bd9993
   [x] B1-1   Adaptive delivery loop dies                          84a393a
   [x] B3-3   allConsumersCaughtUp() wrong consumer lookup         921fa05
-  [x] B5-1   READY broadcast to non-reset consumers               3830980
+  [x] B5-1   READY broadcast to non-reset consumers               3830980, a7fe869
   [x] B6-3   Header+FileRegion split → decoder stuck              c6d49ed
   [x] B7-3   Partial parse always emits ACK                       e06412f
 
@@ -1182,27 +1182,27 @@ Round 2 — High: ✅ ALL DONE
   [x] B1-2   deliveryTask never assigned                          d843a41
   [x] B1-3   ClassCastException sealed segment (instanceof fix)   442e4f4
 
-Round 3 — Medium:
-  [ ] B2-1   Consumer lag never updated
-  [ ] B2-4   ACK timeout before send
-  [ ] B2-5   Non-atomic DataRefreshMetrics
-  [ ] B3-4   Uncomment duplicate READY ACK guard (4-line uncomment)
-  [ ] B2-2   Wire recordConsumerFailure/Retry
-  [ ] B4-4   SQLite write throttle
-  [ ] B4-6   refresh_id cardinality explosion
-  [ ] B5-2   completeRefresh() uses wrong refresh_id
-  [ ] B5-3   readySentTimes memory leak
-  [ ] B6-5   SegmentMetadataStore unsynchronized Connection
-  [ ] B9-1   resumeRefresh() inflates ACK duration Timers on repeated restart
+Round 3 — Medium: ✅ ALL DONE
+  [x] B2-1   Consumer lag never updated                           2d6a510
+  [x] B2-2   Wire recordConsumerFailure/Retry                     2d6a510
+  [x] B2-4   ACK timeout before send                              9b5a54f
+  [x] B2-5   Non-atomic DataRefreshMetrics                        03261a1
+  [x] B3-4   Uncomment duplicate READY ACK guard (4-line uncomment) 3974901
+  [x] B4-4   SQLite write throttle                                2993cd0
+  [x] B4-6   refresh_id cardinality explosion                     f62230b
+  [x] B5-2   completeRefresh() uses wrong refresh_id              eb642e5
+  [x] B5-3   readySentTimes memory leak                           eb642e5
+  [x] B6-5   SegmentMetadataStore unsynchronized Connection       fbcda46
+  [x] B9-1   resumeRefresh() inflates ACK duration Timers         b7cafb2
 
-Round 4 — Low:
-  [ ] B8-1   SegmentMetadataStoreFactory.closeAll() not wired to @PreDestroy
-  [ ] B2-3   activeConsumers gauge drift
-  [ ] B2-7   Add group tag to recordAckTimeout
-  [ ] B3-7   Gate startReplayForConsumer by ackedConsumers
+Round 4 — Low: ✅ ALL DONE
+  [x] B8-1   SegmentMetadataStoreFactory.closeAll() @PreDestroy   ba86ebf
+  [x] B2-3   activeConsumers gauge drift on duplicate SUBSCRIBE   ba86ebf
+  [x] B2-7   Add group tag to recordAckTimeout                    ba86ebf
+  [x] B3-7   Gate startReplayForConsumer by ackedConsumers        ba86ebf
 ```
 
 ---
 
 *Last updated: 2026-02-19*
-*Total bugs found: 31 | Fixed: 6 | Open: 25*
+*Total bugs found: 31 | Fixed: 31 | Open: 0 — ALL BUGS RESOLVED*
