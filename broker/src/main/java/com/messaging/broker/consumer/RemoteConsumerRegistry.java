@@ -59,6 +59,11 @@ public class RemoteConsumerRegistry {
     // Map: "clientId:topic:pending" -> next offset to commit on ACK
     private final Map<String, Long> pendingOffsets;
 
+    // B2-6 fix: retain group mapping even after consumer unregisters so that a late ACK
+    // (arriving after unregistration) can still persist the offset to the offset tracker.
+    // Key: "clientId:topic", Value: group name
+    private final Map<String, String> deliveryKeyToGroup;
+
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
@@ -89,6 +94,7 @@ public class RemoteConsumerRegistry {
         this.consumers = new ConcurrentHashMap<>();
         this.inFlightDeliveries = new ConcurrentHashMap<>();
         this.pendingOffsets = new ConcurrentHashMap<>();
+        this.deliveryKeyToGroup = new ConcurrentHashMap<>();
         log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer (size-only batching)",
                  maxMessageSizePerConsumer);
     }
@@ -123,6 +129,7 @@ public class RemoteConsumerRegistry {
         // Use composite key to support multiple topic subscriptions per client
         String consumerKey = clientId + ":" + topic;
         consumers.put(consumerKey, consumer);
+        deliveryKeyToGroup.put(consumerKey, group); // B2-6: persist group for late-ACK offset commit
 
         // Notify adaptive delivery manager to start polling for this consumer
         if (adaptiveDeliveryManager != null) {
@@ -512,6 +519,19 @@ public class RemoteConsumerRegistry {
 
             // Record consumer ACK metric
             metrics.recordConsumerAck(clientId, topic, consumer.group);
+        } else {
+            // B2-6 fix: consumer was unregistered before ACK arrived (race between permanent failure
+            // and the in-flight ACK). Still persist the offset using the group stored in
+            // deliveryKeyToGroup — this prevents offset regression and message re-delivery on reconnect.
+            String group = deliveryKeyToGroup.get(deliveryKey);
+            if (group != null) {
+                log.warn("ACK for unregistered consumer {}, persisting offset {} via retained group mapping",
+                         deliveryKey, committedOffset);
+                offsetTracker.updateOffset(group + ":" + topic, committedOffset);
+            } else {
+                log.warn("ACK for unregistered consumer {} with no retained group mapping — offset {} lost",
+                         deliveryKey, committedOffset);
+            }
         }
 
         AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
