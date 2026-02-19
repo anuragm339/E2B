@@ -673,7 +673,7 @@ public class DataRefreshManager {
                 // Already done, cleanup
                 log.info("Resuming from COMPLETED - cleaning up");
                 activeRefreshes.remove(topic);
-                stateStore.clearState();
+                stateStore.clearState(topic);
                 break;
 
             case ABORTED:
