@@ -378,9 +378,12 @@ public class DataRefreshMetrics {
             timer.record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
 
-        // Cleanup
+        // Cleanup — B5-3 fix: also remove readySentTimes entry to prevent memory leak.
+        // Previously only resetSentTimes and resetAckTimes were cleaned up here;
+        // readySentTimes accumulated one entry per refresh run indefinitely.
         resetSentTimes.remove(stateKey);
         resetAckTimes.remove(stateKey);
+        readySentTimes.remove(stateKey);
     }
 
     /**
@@ -580,9 +583,10 @@ public class DataRefreshMetrics {
     public void clearTopicState(String topic) {
         refreshStartTimes.remove(topic);
 
-        // Clear consumer-specific state
+        // Clear consumer-specific state — B5-3 fix: include readySentTimes
         resetSentTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
         resetAckTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
+        readySentTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
         replayStartTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
     }
 }

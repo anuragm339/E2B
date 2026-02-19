@@ -496,8 +496,11 @@ public class DataRefreshManager {
         context.setState(DataRefreshState.COMPLETED);
         stateStore.saveState(context);
 
-        // Record metrics: refresh completed successfully (with refresh_id AND context for downtime)
-        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", currentRefreshId, context);
+        // B5-2 fix: use context.getRefreshId() instead of currentRefreshId field.
+        // currentRefreshId may already be null if another topic in the same batch completed first
+        // (line below sets currentRefreshId=null after all topics in batch complete).
+        // context.getRefreshId() always holds the correct refresh_id for this specific refresh.
+        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", context.getRefreshId(), context);
 
         // Resume pipe calls only if NO other refreshes IN THE SAME BATCH are in progress
         // Check only topics with the same refresh_id (same batch)
