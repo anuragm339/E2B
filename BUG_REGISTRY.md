@@ -677,7 +677,105 @@ docker stats messaging-broker --no-stream
 
 ---
 
+### B9-1 — `resumeRefresh()` re-records ACK duration metrics on every restart — inflates Timers
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** Medium
+**Batch:** 9
+
+**File:**
+- `broker/src/main/java/com/messaging/broker/refresh/DataRefreshManager.java:564-670`
+- `broker/src/main/java/com/messaging/broker/metrics/DataRefreshMetrics.java:287-308`
+
+**Bug:**
+`handleResetAck()` correctly guards against duplicate processing (line 254). However
+`resumeRefresh()` bypasses this guard. In the `REPLAYING` and `READY_SENT` cases it
+re-records `recordResetAckDuration()` and `recordReadyAckDuration()` for every consumer
+already in `getReceivedResetAcks()` / `getReceivedReadyAcks()` (lines 613-615, 645-647,
+657-659). `Timer.record()` accumulates — it does not overwrite. Each broker restart during
+an active refresh adds a duplicate observation to the histogram.
+
+```java
+// resumeRefresh() REPLAYING case — re-records for all already-ACKed consumers
+for (String consumer : context.getExpectedConsumers()) {
+    metrics.recordResetSent(topic, consumer, replayingRefreshId);  // re-records
+    if (context.getReceivedResetAcks().contains(consumer)) {
+        // ... durationMs = time between resetSentTime and resetAckTime (historical) ...
+        metrics.recordResetAckDuration(topic, consumer, replayingRefreshId, durationMs);
+        // ↑ Called again on every restart — timer.record() accumulates, not overwrites
+    }
+}
+```
+
+With N broker restarts during a refresh, each already-ACKed consumer's duration timer
+has N observations instead of 1. p50/p95/p99 percentiles are skewed toward repeated
+historical values. `data_refresh_reset_ack_duration_seconds` and
+`data_refresh_ready_ack_duration_seconds` become meaningless for long refresh cycles.
+
+**Fix:**
+Add a flag to `DataRefreshContext` to track whether resume metrics have already been
+re-recorded. Only record on first resume after restart:
+```java
+// In DataRefreshContext:
+private volatile boolean resumeMetricsRecorded = false;
+
+// In resumeRefresh() before recording historical durations:
+if (!context.isResumeMetricsRecorded()) {
+    metrics.recordResetAckDuration(...);
+    // ... other historical metrics ...
+    context.setResumeMetricsRecorded(true);
+}
+```
+
+**Verification:**
+```bash
+# Restart broker 3 times during active refresh, then check timer count
+curl -s http://localhost:8081/prometheus | grep "data_refresh_reset_ack_duration_seconds_count"
+# Before fix: count = 3 × (number of ACKed consumers) after 3 restarts
+# After fix: count = 1 × (number of ACKed consumers) regardless of restart count
+```
+
+---
+
 ## LOW Bugs (Observability gaps / minor drift)
+
+---
+
+### B8-1 — `SegmentMetadataStoreFactory.closeAll()` not wired to `@PreDestroy` — SQLite connections not closed on shutdown
+
+**Status:** `OPEN`
+**Commit:** —
+**Severity:** Low
+**Batch:** 8
+
+**File:**
+- `storage/src/main/java/com/messaging/storage/metadata/SegmentMetadataStoreFactory.java:55`
+
+**Bug:**
+`closeAll()` is defined at line 55 but has no `@PreDestroy` annotation. No storage engine
+(`MMapStorageEngine`, `FileChannelStorageEngine`) calls `closeAll()` in its own `@PreDestroy`.
+The 24 per-topic SQLite `Connection` objects are abandoned on JVM shutdown. Consequences:
+- SQLite WAL journal files may not be checkpointed (extra files on disk after restart)
+- Any pending dirty pages may not be flushed to the main database file
+- JVM relies on GC finalizers to close connections, which is not guaranteed to run before exit
+
+**Fix:**
+Add `@PreDestroy` to `closeAll()`:
+```java
+@jakarta.annotation.PreDestroy
+public void closeAll() {
+    // existing code
+}
+```
+
+**Verification:**
+```bash
+# After graceful broker shutdown, check for orphaned WAL files
+ls -la /data/*/segment_metadata.db-wal 2>/dev/null
+# Before fix: WAL files may exist after shutdown
+# After fix: WAL files checkpointed and removed
+```
 
 ---
 
@@ -1057,9 +1155,9 @@ docker logs messaging-broker 2>&1 | grep "SQLITE_BUSY\|database is locked"
 |----------|-------|-------|------|
 | Critical | 6     | 0     | 6    |
 | High     | 10    | 0     | 10   |
-| Medium   | 10    | 0     | 10   |
-| Low      | 3     | 0     | 3    |
-| **Total**| **29**| **0** | **29**|
+| Medium   | 11    | 0     | 11   |
+| Low      | 4     | 0     | 4    |
+| **Total**| **31**| **0** | **31**|
 
 ### Fix Order
 ```
@@ -1093,8 +1191,10 @@ Round 3 — Medium:
   [ ] B5-2   completeRefresh() uses wrong refresh_id
   [ ] B5-3   readySentTimes memory leak
   [ ] B6-5   SegmentMetadataStore unsynchronized Connection
+  [ ] B9-1   resumeRefresh() inflates ACK duration Timers on repeated restart
 
 Round 4 — Low:
+  [ ] B8-1   SegmentMetadataStoreFactory.closeAll() not wired to @PreDestroy
   [ ] B2-3   activeConsumers gauge drift
   [ ] B2-7   Add group tag to recordAckTimeout
   [ ] B3-7   Gate startReplayForConsumer by ackedConsumers
@@ -1103,4 +1203,4 @@ Round 4 — Low:
 ---
 
 *Last updated: 2026-02-19*
-*Total bugs found: 29 | Fixed: 0 | Open: 29*
+*Total bugs found: 31 | Fixed: 0 | Open: 31*
