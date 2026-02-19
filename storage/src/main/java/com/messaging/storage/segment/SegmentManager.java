@@ -353,7 +353,20 @@ public class SegmentManager {
                  currentSegment.getBaseOffset(), currentSegment.getNextOffset());
 
         // Get zero-copy batch from segment (size-only batching)
-        return currentSegment.getBatchFileRegion(fromOffset, maxBytes);
+        Segment.BatchFileRegion result = currentSegment.getBatchFileRegion(fromOffset, maxBytes);
+
+        // B6-1 fix: if sealed segment returned empty (fromOffset == sealed.nextOffset i.e. exactly
+        // at the rollover boundary), fall through to the active segment.
+        // floorEntry() returns the OLD sealed segment even when fromOffset equals the new active
+        // segment's baseOffset, so without this check delivery stalls permanently at segment rollover.
+        if ((result == null || result.recordCount == 0) && activeSegment.get() != null) {
+            Segment active = activeSegment.get();
+            log.info("DEBUG SegmentManager: Sealed segment returned empty for offset {}, checking active segment (baseOffset={}, nextOffset={})",
+                     fromOffset, active.getBaseOffset(), active.getNextOffset());
+            result = active.getBatchFileRegion(fromOffset, maxBytes);
+        }
+
+        return result;
     }
 
     /**
