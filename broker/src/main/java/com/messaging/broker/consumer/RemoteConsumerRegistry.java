@@ -490,7 +490,14 @@ public class RemoteConsumerRegistry {
 
         Long committedOffset = pendingOffsets.remove(pendingKey);
         if (committedOffset == null) {
-            log.warn("ACK with no pending offset: {}", deliveryKey);
+            log.warn("ACK with no pending offset: {} (likely a late ACK after timeout). Clearing inFlight to unblock delivery.",
+                     deliveryKey);
+            // B4-3 fix: always clear inFlight on any ACK, even a late one.
+            // Without this, Gate 1 stays permanently true and delivery stalls forever.
+            AtomicBoolean lateInFlight = inFlightDeliveries.get(deliveryKey);
+            if (lateInFlight != null) {
+                lateInFlight.set(false);
+            }
             return;
         }
 
