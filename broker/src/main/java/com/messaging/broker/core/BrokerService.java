@@ -268,9 +268,17 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             log.info("Client {} subscribed: topic={}, group={}", clientId, topic, group);
 
-            // Register consumer for message delivery
-            remoteConsumers.registerConsumer(clientId, topic, group);
-            metrics.recordConsumerConnection();
+            // Register consumer for message delivery.
+            // B2-3 fix: only record connection metric for genuinely new registrations.
+            // Duplicate SUBSCRIBE (same clientId+topic) on the same connection would otherwise
+            // increment activeConsumers without a matching decrement on unregister.
+            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group);
+            if (isNew) {
+                metrics.recordConsumerConnection();
+            } else {
+                log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} — skipping activeConsumers increment",
+                        clientId, topic, group);
+            }
 
             log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
 

@@ -2,6 +2,7 @@ package com.messaging.storage.metadata;
 
 import com.messaging.common.exception.StorageException;
 import io.micronaut.context.annotation.Value;
+import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,8 +51,12 @@ public class SegmentMetadataStoreFactory {
     }
 
     /**
-     * Close all metadata stores (called during shutdown)
+     * Close all metadata stores on graceful shutdown.
+     * B8-1 fix: @PreDestroy ensures SQLite connections are properly closed so WAL journals
+     * are checkpointed and dirty pages flushed before JVM exit. Without this, the JVM
+     * relied on GC finalizers which are not guaranteed to run before process termination.
      */
+    @PreDestroy
     public void closeAll() {
         stores.forEach((topic, store) -> {
             try {

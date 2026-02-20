@@ -47,6 +47,7 @@ public class RemoteConsumerRegistry {
     private final ScheduledExecutorService scheduler;
     private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
     private final long maxMessageSizePerConsumer;
+    private static final int MAX_CONSECUTIVE_FAILURES = 10; // Max retries before giving up
 
     // Map: "clientId:topic" -> RemoteConsumer (composite key to support multiple topic subscriptions per client)
     private final Map<String, RemoteConsumer> consumers;
@@ -57,6 +58,11 @@ public class RemoteConsumerRegistry {
 
     // Map: "clientId:topic:pending" -> next offset to commit on ACK
     private final Map<String, Long> pendingOffsets;
+
+    // B2-6 fix: retain group mapping even after consumer unregisters so that a late ACK
+    // (arriving after unregistration) can still persist the offset to the offset tracker.
+    // Key: "clientId:topic", Value: group name
+    private final Map<String, String> deliveryKeyToGroup;
 
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
@@ -88,6 +94,7 @@ public class RemoteConsumerRegistry {
         this.consumers = new ConcurrentHashMap<>();
         this.inFlightDeliveries = new ConcurrentHashMap<>();
         this.pendingOffsets = new ConcurrentHashMap<>();
+        this.deliveryKeyToGroup = new ConcurrentHashMap<>();
         log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer (size-only batching)",
                  maxMessageSizePerConsumer);
     }
@@ -106,7 +113,11 @@ public class RemoteConsumerRegistry {
     /**
      * Register a remote consumer when it subscribes
      */
-    public void registerConsumer(String clientId, String topic, String group) {
+    /**
+     * Register a consumer for message delivery.
+     * @return true if this is a new registration, false if re-registering an existing key (duplicate SUBSCRIBE)
+     */
+    public boolean registerConsumer(String clientId, String topic, String group) {
         RemoteConsumer consumer = new RemoteConsumer(clientId, topic, group);
 
         // Load persisted offset from property file - ONLY source of truth
@@ -120,8 +131,11 @@ public class RemoteConsumerRegistry {
         metrics.updateConsumerLag(clientId, topic, group, 0);
 
         // Use composite key to support multiple topic subscriptions per client
+        // B2-3 fix: detect re-registration before put() so BrokerService can avoid double-counting activeConsumers metric
         String consumerKey = clientId + ":" + topic;
+        boolean isNew = !consumers.containsKey(consumerKey);
         consumers.put(consumerKey, consumer);
+        deliveryKeyToGroup.put(consumerKey, group); // B2-6: persist group for late-ACK offset commit
 
         // Notify adaptive delivery manager to start polling for this consumer
         if (adaptiveDeliveryManager != null) {
@@ -129,8 +143,9 @@ public class RemoteConsumerRegistry {
             log.info("Triggered adaptive delivery for new consumer: {}:{}", clientId, topic);
         }
 
-        log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}",
-                 consumerKey, clientId, topic, group, startOffset);
+        log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}, isNew={}",
+                 consumerKey, clientId, topic, group, startOffset, isNew);
+        return isNew;
     }
 
     /**
@@ -154,6 +169,14 @@ public class RemoteConsumerRegistry {
             if (consumer != null) {
                 if (consumer.deliveryTask != null) {
                     consumer.deliveryTask.cancel(false);
+                }
+                // B1-6 fix: clear stale pendingOffsets entry so Gate 2 does not block
+                // the same consumer if it reconnects and re-registers before the ACK
+                // timeout fires (which could take up to 30 minutes).
+                String pendingKey = key + ":pending";
+                Long stalePending = pendingOffsets.remove(pendingKey);
+                if (stalePending != null) {
+                    log.info("Cleared stale pending offset {} for key={} on unregister", stalePending, pendingKey);
                 }
                 // Clean up metrics (though with stable identifiers, metrics are now retained)
                 metrics.removeConsumerMetrics(clientId, consumer.topic, consumer.group);
@@ -207,27 +230,62 @@ public class RemoteConsumerRegistry {
             return false;  // Waiting for ACK
         }
 
+        // Gate 3: Check maximum consecutive failures
+        if (consumer.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            log.error("Consumer {} has exceeded max consecutive failures ({}), unregistering",
+                     deliveryKey, MAX_CONSECUTIVE_FAILURES);
+            inFlight.set(false);
+            unregisterConsumer(consumer.clientId);
+            return false;  // Consumer has failed too many times
+        }
+
+        // Gate 4: Check exponential backoff after failures
+        long backoffDelay = consumer.getBackoffDelay();
+        if (backoffDelay > 0) {
+            long timeSinceLastFailure = System.currentTimeMillis() - consumer.lastFailureTime;
+            if (timeSinceLastFailure < backoffDelay) {
+                long remainingDelay = backoffDelay - timeSinceLastFailure;
+                log.debug("DEBUG deliverBatch: Gate 4 BLOCKED (backoff) for {}, consecutiveFailures={}, remainingDelay={}ms",
+                         deliveryKey, consumer.consecutiveFailures, remainingDelay);
+                inFlight.set(false);
+                return false;  // Still in backoff period
+            }
+        }
+
         log.info("DEBUG deliverBatch: Gates passed, proceeding with batch read for {}", deliveryKey);
+
+        // B2-2 fix: record retry metric when a previously-failed consumer is being retried
+        if (consumer.consecutiveFailures > 0) {
+            metrics.recordConsumerRetry(consumer.clientId, consumer.topic, consumer.group);
+        }
 
         // Gate 3 removed: Parallel topic delivery now allowed
 
         long startOffset = consumer.getCurrentOffset();
         Timer.Sample readSample = null;
         Timer.Sample deliverySample = null;
+        Segment.BatchFileRegion batch = null;
 
         try {
             /* ================= STORAGE READ METRICS ================= */
             readSample = metrics.startStorageReadTimer();
 
-            Segment.BatchFileRegion batch = storageExecutor.submit(() ->
-                    ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage)
-                            .getZeroCopyBatch(
-                                    consumer.topic,
-                                    0,
-                                    startOffset,
-                                    batchSizeBytes
-                            )
-            ).get(10, TimeUnit.MINUTES);
+            // B1-3 fix: storage is injected as StorageEngine (interface); hard-casting to
+            // FileChannelStorageEngine throws ClassCastException when MMapStorageEngine is used.
+            // Use instanceof to dispatch to the correct concrete type.
+            final long capturedOffset = startOffset;
+            batch = storageExecutor.submit(() -> {
+                if (storage instanceof com.messaging.storage.filechannel.FileChannelStorageEngine) {
+                    return ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage)
+                            .getZeroCopyBatch(consumer.topic, 0, capturedOffset, batchSizeBytes);
+                } else if (storage instanceof com.messaging.storage.mmap.MMapStorageEngine) {
+                    return ((com.messaging.storage.mmap.MMapStorageEngine) storage)
+                            .getZeroCopyBatch(consumer.topic, 0, capturedOffset, batchSizeBytes);
+                } else {
+                    throw new IllegalStateException("StorageEngine implementation does not support " +
+                            "getZeroCopyBatch(): " + storage.getClass().getName());
+                }
+            }).get(10, TimeUnit.MINUTES);
 
             metrics.stopStorageReadTimer(readSample);
             metrics.recordStorageRead();
@@ -252,7 +310,17 @@ public class RemoteConsumerRegistry {
             consumer.setCurrentOffset(nextOffset);
             pendingOffsets.put(pendingKey, nextOffset);
 
+            /* ================= DELIVERY METRICS ================= */
+            deliverySample = metrics.startConsumerDeliveryTimer();
+
+            sendBatchToConsumer(consumer, batch, startOffset);
+
             /* ================= ACK TIMEOUT SETUP ================= */
+            // B2-4 fix: schedule timeout AFTER successful send so it only fires for
+            // batches the consumer actually received (not for send failures).
+            // Previously the timeout was scheduled before sendBatchToConsumer(), so a
+            // send failure left a 30-min timer that would incorrectly revert the offset
+            // for a batch the consumer never received.
             scheduler.schedule(() -> {
                 if (pendingOffsets.remove(pendingKey) != null) {
                     log.warn("ACK timeout for {}, reverting offset from {} to {}",
@@ -262,14 +330,9 @@ public class RemoteConsumerRegistry {
                     consumer.setCurrentOffset(originalOffset);
                     inFlight.set(false);
 
-                    metrics.recordAckTimeout(consumer.topic);
+                    metrics.recordAckTimeout(consumer.topic, consumer.group);  // B2-7 fix: pass group
                 }
             }, 30, TimeUnit.MINUTES);
-
-            /* ================= DELIVERY METRICS ================= */
-            deliverySample = metrics.startConsumerDeliveryTimer();
-
-            sendBatchToConsumer(consumer, batch, startOffset);
 
             metrics.stopConsumerDeliveryTimer(
                     deliverySample,
@@ -309,21 +372,67 @@ public class RemoteConsumerRegistry {
                 log.warn("DEBUG: dataRefreshManager is NULL - cannot record data refresh metrics");
             }
 
+            // Reset failure counter on successful delivery
+            consumer.resetFailures();
+
+            // B2-1 fix: update consumer lag metric after each successful delivery.
+            // lag = storageHead - newConsumerOffset (after offset was advanced to nextOffset)
+            try {
+                long storageHead = storage.getCurrentOffset(consumer.topic, 0);
+                long lag = Math.max(0, storageHead - consumer.getCurrentOffset());
+                metrics.updateConsumerLag(consumer.clientId, consumer.topic, consumer.group, lag);
+            } catch (Exception lagEx) {
+                log.debug("Could not update consumer lag metric for {}: {}", deliveryKey, lagEx.getMessage());
+            }
+
             return true;  // Data delivered successfully
 
         } catch (Exception e) {
             log.error("Delivery failed for {}", deliveryKey, e);
+            // B2-2 fix: record failure metric so broker_consumer_failures_total is non-zero
+            metrics.recordConsumerFailure(consumer.clientId, consumer.topic, consumer.group);
             inFlight.set(false);
 
             // Revert offset reservation on error
             consumer.setCurrentOffset(startOffset);
-            pendingOffsets.remove(pendingKey);
 
-            // Check if this is a connection error (Broken pipe, Connection reset, etc.)
-            if (isConnectionError(e)) {
-                log.warn("Connection error detected for {}, unregistering consumer", deliveryKey);
-                // Unregister consumer to stop adaptive polling
+            // Record failure for exponential backoff
+            consumer.recordFailure();
+
+            // ✅ CRITICAL FIX (Phase 5A): Only remove pending offset for PERMANENT failures
+            // For transient failures (disconnect, backpressure), KEEP pending offset
+            // This prevents rapid retries to disconnected consumers
+            boolean isPermanentFailure = consumer.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+
+            if (isPermanentFailure) {
+                // Permanent failure - remove pending offset and unregister
+                pendingOffsets.remove(pendingKey);
+                log.error("Permanent failure for {} (consecutiveFailures={}), removing pending offset and unregistering",
+                         deliveryKey, MAX_CONSECUTIVE_FAILURES);
                 unregisterConsumer(consumer.clientId);
+            } else {
+                // Transient failure - KEEP pending offset
+                // Gate 2 will continue blocking until:
+                // - Consumer reconnects and sends ACK, OR
+                // - ACK timeout (30 min) fires and removes pending offset
+                log.warn("Transient failure for {}, KEEPING pending offset to prevent rapid retries. " +
+                        "Will wait for ACK or timeout (30 min). consecutiveFailures={}",
+                        deliveryKey, consumer.consecutiveFailures);
+            }
+
+            // Record failed transfer metrics (bytes and messages that didn't make it to consumer)
+            if (batch != null) {
+                metrics.recordConsumerTransferFailed(
+                    consumer.clientId,
+                    consumer.topic,
+                    consumer.group,
+                    batch.recordCount,
+                    batch.totalBytes
+                );
+                log.warn("Recorded failed transfer: topic={}, group={}, messages={}, bytes={}, " +
+                        "consecutiveFailures={}, nextBackoff={}ms, isPermanentFailure={}",
+                        consumer.topic, consumer.group, batch.recordCount, batch.totalBytes,
+                        consumer.consecutiveFailures, consumer.getBackoffDelay(), isPermanentFailure);
             }
 
             return false;  // Delivery failed
@@ -371,8 +480,8 @@ public class RemoteConsumerRegistry {
                  consumer.clientId, consumer.topic, batchRegion.recordCount, batchRegion.totalBytes);
 
         long timeoutSeconds = 1 + (batchRegion.totalBytes / (1024 * 1024) * 10);
-        // Increased header timeout from 1s to 10s for reliability
-        server.send(consumer.clientId, headerMsg).get(timeoutSeconds, TimeUnit.MINUTES);
+        // Timeout in seconds (1s base + 10s per MB, e.g., 2MB = 21 seconds)
+        server.send(consumer.clientId, headerMsg).get(timeoutSeconds, TimeUnit.SECONDS);
 
         // Step 2: Send FileRegion for true zero-copy transfer (Kafka-style sendfile)
         // This uses OS sendfile() syscall - data goes from file → kernel → socket
@@ -381,12 +490,22 @@ public class RemoteConsumerRegistry {
                  batchRegion.fileRegion.position(), batchRegion.fileRegion.count(),
                  batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic, startOffset);
 
-        // Increased timeout for larger batches (3MB batches may take longer to transfer)
-        // Timeout = 10s base + 10s per MB (e.g., 3MB = 10 + 30 = 40 seconds)
+        // Timeout scales with batch size: 1s base + 10s per MB (e.g., 2MB = 21 seconds)
         log.debug("Sending FileRegion with timeout of {}s for {} bytes", timeoutSeconds, batchRegion.totalBytes);
 
-        server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
-              .get(timeoutSeconds, TimeUnit.MINUTES);
+        try {
+            server.sendFileRegion(consumer.clientId, batchRegion.fileRegion)
+                  .get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            // CRITICAL: BATCH_HEADER was already sent — consumer decoder has transitioned to
+            // READING_ZERO_COPY_BATCH and is waiting for expectedTotalBytes that will never arrive.
+            // Close the connection so the consumer reconnects and decoder resets to initial state.
+            log.error("FileRegion send failed after BATCH_HEADER was already sent for consumer {} topic {}." +
+                      " Closing connection to reset consumer decoder state.",
+                      consumer.clientId, consumer.topic, e);
+            server.closeConnection(consumer.clientId);
+            throw e;
+        }
 
         log.info("✓ Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
@@ -397,6 +516,9 @@ public class RemoteConsumerRegistry {
         // Record per-consumer metrics (efficient batch version)
         metrics.recordConsumerBatchSent(consumer.clientId, consumer.topic, consumer.group,
                                        batchRegion.recordCount, batchRegion.totalBytes);
+
+        // Update last successful delivery timestamp for stuck detection
+        metrics.updateConsumerLastDeliveryTime(consumer.clientId, consumer.topic, consumer.group);
     }
 
     /**
@@ -412,7 +534,14 @@ public class RemoteConsumerRegistry {
 
         Long committedOffset = pendingOffsets.remove(pendingKey);
         if (committedOffset == null) {
-            log.warn("ACK with no pending offset: {}", deliveryKey);
+            log.warn("ACK with no pending offset: {} (likely a late ACK after timeout). Clearing inFlight to unblock delivery.",
+                     deliveryKey);
+            // B4-3 fix: always clear inFlight on any ACK, even a late one.
+            // Without this, Gate 1 stays permanently true and delivery stalls forever.
+            AtomicBoolean lateInFlight = inFlightDeliveries.get(deliveryKey);
+            if (lateInFlight != null) {
+                lateInFlight.set(false);
+            }
             return;
         }
 
@@ -421,6 +550,25 @@ public class RemoteConsumerRegistry {
             offsetTracker.updateOffset(consumer.group + ":" + topic, committedOffset);
             // Update Prometheus gauge metric to reflect new offset
             metrics.updateConsumerOffset(clientId, topic, consumer.group, committedOffset);
+
+            // Update last ACK timestamp for stuck detection
+            metrics.updateConsumerLastAckTime(clientId, topic, consumer.group);
+
+            // Record consumer ACK metric
+            metrics.recordConsumerAck(clientId, topic, consumer.group);
+        } else {
+            // B2-6 fix: consumer was unregistered before ACK arrived (race between permanent failure
+            // and the in-flight ACK). Still persist the offset using the group stored in
+            // deliveryKeyToGroup — this prevents offset regression and message re-delivery on reconnect.
+            String group = deliveryKeyToGroup.get(deliveryKey);
+            if (group != null) {
+                log.warn("ACK for unregistered consumer {}, persisting offset {} via retained group mapping",
+                         deliveryKey, committedOffset);
+                offsetTracker.updateOffset(group + ":" + topic, committedOffset);
+            } else {
+                log.warn("ACK for unregistered consumer {} with no retained group mapping — offset {} lost",
+                         deliveryKey, committedOffset);
+            }
         }
 
         AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
@@ -492,6 +640,39 @@ public class RemoteConsumerRegistry {
     }
 
     /**
+     * Send READY only to consumers whose group:topic identifier is in the provided set.
+     * Used by DataRefreshManager to avoid sending READY to consumers that never ACKed RESET.
+     *
+     * @param topic            Topic name
+     * @param ackedGroupTopics Set of "group:topic" identifiers that have ACKed RESET
+     */
+    public void sendReadyToAckedConsumers(String topic, java.util.Set<String> ackedGroupTopics) {
+        byte[] payload = topic.getBytes(StandardCharsets.UTF_8);
+        BrokerMessage readyMsg = new BrokerMessage(
+            BrokerMessage.MessageType.READY,
+            System.currentTimeMillis(),
+            payload
+        );
+
+        for (RemoteConsumer consumer : consumers.values()) {
+            if (!consumer.topic.equals(topic)) continue;
+            String groupTopic = consumer.group + ":" + consumer.topic;
+            if (!ackedGroupTopics.contains(groupTopic)) {
+                log.warn("Skipping READY for consumer {} — did not ACK RESET (groupTopic={})",
+                        consumer.clientId, groupTopic);
+                continue;
+            }
+            try {
+                server.send(consumer.clientId, readyMsg);
+                log.info("Sent READY to consumer: {} (groupTopic={}) for topic: {}",
+                        consumer.clientId, groupTopic, topic);
+            } catch (Exception e) {
+                log.error("Failed to send READY to consumer: {}", consumer.clientId, e);
+            }
+        }
+    }
+
+    /**
      * Reset offset for a specific consumer (for DataRefresh)
      */
     public void resetConsumerOffset(String clientId, String topic, long offset) {
@@ -526,13 +707,7 @@ public class RemoteConsumerRegistry {
 
         for (String clientId : consumerClientIds) {
             String consumerKey = clientId + ":" + topic;
-            RemoteConsumer consumer = consumers.entrySet()
-                    .stream()
-                    .filter(e -> e.getKey().contains(topic))
-                    .peek(e -> log.debug("Consumer key in registry: {}", e.getKey()))
-                    .map(Map.Entry::getValue)
-                    .findFirst()
-                    .orElse(null);
+            RemoteConsumer consumer = consumers.get(consumerKey);
 
             if (consumer == null) {
                 log.debug("Consumer not found: consumerKey={}", consumerKey);
@@ -570,7 +745,7 @@ public class RemoteConsumerRegistry {
             return null;
         }
 
-        return consumer.topic;
+        return consumer.group + ":" + consumer.topic;
     }
 
     /**
@@ -597,6 +772,24 @@ public class RemoteConsumerRegistry {
         log.info("RemoteConsumerRegistry shutdown complete");
     }
 
+
+    /**
+     * Get stable "group:topic" identifiers for all registered consumers of a topic.
+     * Used by DataRefreshManager.startRefresh() to build the expectedConsumers set,
+     * ensuring ACK matching uses the same format that handleResetAck() receives.
+     *
+     * @param topic Topic name
+     * @return Set of "group:topic" strings for currently registered consumers of this topic
+     */
+    public java.util.Set<String> getGroupTopicIdentifiers(String topic) {
+        java.util.Set<String> result = new java.util.HashSet<>();
+        for (RemoteConsumer consumer : consumers.values()) {
+            if (consumer.topic.equals(topic)) {
+                result.add(consumer.group + ":" + consumer.topic);
+            }
+        }
+        return result;
+    }
 
     /**
      * Get all consumer client IDs for a topic (for DataRefresh replay)
@@ -662,6 +855,8 @@ public class RemoteConsumerRegistry {
         volatile long currentOffset;
         volatile Future<?> deliveryTask;
         volatile long lastDeliveryAttempt; // Rate limiting: timestamp of last delivery attempt
+        volatile int consecutiveFailures; // Track consecutive failures for exponential backoff
+        volatile long lastFailureTime; // Timestamp of last failure
 
         RemoteConsumer(String clientId, String topic, String group) {
             this.clientId = clientId;
@@ -669,6 +864,8 @@ public class RemoteConsumerRegistry {
             this.group = group;
             this.currentOffset = 0;
             this.lastDeliveryAttempt = 0; // Allow immediate first delivery
+            this.consecutiveFailures = 0;
+            this.lastFailureTime = 0;
         }
 
         long getCurrentOffset() {
@@ -677,6 +874,29 @@ public class RemoteConsumerRegistry {
 
         void setCurrentOffset(long offset) {
             this.currentOffset = offset;
+        }
+
+        /**
+         * Calculate backoff delay based on consecutive failures (exponential backoff)
+         * @return delay in milliseconds before next retry
+         */
+        long getBackoffDelay() {
+            if (consecutiveFailures == 0) {
+                return 0; // No delay on first attempt
+            }
+            // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, max 5000ms
+            long delay = Math.min(100L * (1L << (consecutiveFailures - 1)), 5000L);
+            return delay;
+        }
+
+        void recordFailure() {
+            consecutiveFailures++;
+            lastFailureTime = System.currentTimeMillis();
+        }
+
+        void resetFailures() {
+            consecutiveFailures = 0;
+            lastFailureTime = 0;
         }
     }
 }

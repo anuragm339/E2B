@@ -160,8 +160,11 @@ public class SegmentManager {
 
         long offset = current.append(record);
 
-        // Periodically update metadata for active segment (every METADATA_UPDATE_INTERVAL appends)
-        saveSegmentMetadata(current);
+        // B4-4 fix: gate metadata save to every METADATA_UPDATE_INTERVAL appends instead of every single append.
+        // Previously saveSegmentMetadata() was called unconditionally, causing one SQLite UPSERT per message.
+        if (appendsSinceMetadataUpdate.incrementAndGet() % METADATA_UPDATE_INTERVAL == 0) {
+            saveSegmentMetadata(current);
+        }
 
         return offset;
     }
@@ -327,6 +330,19 @@ public class SegmentManager {
         log.info("DEBUG SegmentManager.getZeroCopyBatch(): topic={}, partition={}, fromOffset={}, maxBytes={}, segments.size={}",
                 topic, partition, fromOffset, maxBytes, segments.size());
 
+        // B6-2 fix: detect consumer offset below earliest available data.
+        // This happens when segments have been deleted (compaction/wipe) while consumer was offline.
+        // Without this check, getBatchFileRegion() returns empty silently and delivery stalls forever.
+        long earliestBase = segments.isEmpty()
+                ? (activeSegment.get() != null ? activeSegment.get().getBaseOffset() : 0L)
+                : segments.firstKey();
+        if (fromOffset < earliestBase) {
+            log.warn("Consumer offset {} is below earliest available segment baseOffset={} for topic={} — " +
+                     "data has been compacted/deleted. Resetting read position to earliest available offset.",
+                     fromOffset, earliestBase, topic);
+            fromOffset = earliestBase;
+        }
+
         // Find the segment that contains this offset
         var entry = segments.floorEntry(fromOffset);
 
@@ -353,7 +369,20 @@ public class SegmentManager {
                  currentSegment.getBaseOffset(), currentSegment.getNextOffset());
 
         // Get zero-copy batch from segment (size-only batching)
-        return currentSegment.getBatchFileRegion(fromOffset, maxBytes);
+        Segment.BatchFileRegion result = currentSegment.getBatchFileRegion(fromOffset, maxBytes);
+
+        // B6-1 fix: if sealed segment returned empty (fromOffset == sealed.nextOffset i.e. exactly
+        // at the rollover boundary), fall through to the active segment.
+        // floorEntry() returns the OLD sealed segment even when fromOffset equals the new active
+        // segment's baseOffset, so without this check delivery stalls permanently at segment rollover.
+        if ((result == null || result.recordCount == 0) && activeSegment.get() != null) {
+            Segment active = activeSegment.get();
+            log.info("DEBUG SegmentManager: Sealed segment returned empty for offset {}, checking active segment (baseOffset={}, nextOffset={})",
+                     fromOffset, active.getBaseOffset(), active.getNextOffset());
+            result = active.getBatchFileRegion(fromOffset, maxBytes);
+        }
+
+        return result;
     }
 
     /**

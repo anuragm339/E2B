@@ -5,6 +5,7 @@ import com.messaging.common.model.ConsumerRecord;
 import com.messaging.network.tcp.NettyTcpClient;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.DecoderException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,6 +73,18 @@ public class ClientMessageHandler extends SimpleChannelInboundHandler<Object> {
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
         log.error("Exception in client channel", cause);
+
+        // Only close channel on fatal errors, not on decoding errors
+        // Decoding errors are usually recoverable (corrupted batch, wrong format, etc.)
+        // Let TCP keepalive handle truly dead connections
+        if (cause instanceof DecoderException) {
+            log.warn("Decoding error detected - keeping connection alive, error: {}", cause.getMessage());
+            // Don't close - the decoder already logged the issue and moved on
+            return;
+        }
+
+        // For other exceptions (IO errors, network errors, etc.), close the connection
+        log.warn("Fatal error detected - closing connection");
         ctx.close();
     }
 }

@@ -340,6 +340,25 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
         log.debug("Decoded zero-copy batch: {} records, {} bytes", records.size(), bytesRead);
 
+        if (records.size() != expectedRecordCount) {
+            // Partial parse — some records were not decoded (corrupt data or sizing bug).
+            // Do NOT emit BatchDecodedEvent: emitting would trigger BATCH_ACK and advance the
+            // broker offset past the unparsed records, causing permanent data loss.
+            // Close the channel instead — the broker will detect the disconnect, and the consumer
+            // will reconnect and re-subscribe. Delivery resumes from the last committed offset.
+            log.error("Partial batch parse for topic {}: expected {} records, decoded {} records ({} bytes consumed of {})." +
+                      " Closing channel to trigger reconnect and redelivery from last committed offset.",
+                      currentBatchTopic, expectedRecordCount, records.size(), bytesRead, expectedTotalBytes);
+            // Reset decoder state before closing
+            state = DecoderState.READING_BROKER_MESSAGE;
+            expectedRecordCount = 0;
+            expectedTotalBytes = 0;
+            lastOffset = 0;
+            currentBatchTopic = null;
+            ctx.close();
+            return;
+        }
+
         // Emit BatchDecodedEvent to pipeline (BatchAckHandler will send BATCH_ACK)
         out.add(new BatchDecodedEvent(records, currentBatchTopic));
 

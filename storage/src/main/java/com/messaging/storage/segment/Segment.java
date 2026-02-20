@@ -292,6 +292,10 @@ public class Segment {
             ByteBuffer buffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
             long position = FILE_HEADER_SIZE;  // Skip file header
             long highestOffset = baseOffset - 1;
+            // B7-2 fix: track where valid log data ends according to the index.
+            // If the log file is larger, the extra bytes are a partial write from a crash
+            // between log-write and index-write — they must be truncated.
+            long expectedLogEnd = FILE_HEADER_SIZE;
 
             while (position < indexSize) {
                 buffer.clear();
@@ -309,12 +313,29 @@ public class Segment {
                 if (offset > highestOffset) {
                     highestOffset = offset;
                 }
+                // Track the end of the last fully-indexed record in the log file
+                long entryEnd = logPos + (long) recordSize;
+                if (entryEnd > expectedLogEnd) {
+                    expectedLogEnd = entryEnd;
+                }
 
                 position += INDEX_ENTRY_SIZE;
             }
 
             this.nextOffset = highestOffset + 1;
             this.recordCount = index.size(); // Set recordCount for dense indexing
+
+            // B7-2 fix: truncate log file if it has bytes beyond what the index knows about.
+            // This removes any partial record written before a crash that prevented the
+            // corresponding index entry from being written and fsynced.
+            long actualLogSize = logChannel.size();
+            if (actualLogSize > expectedLogEnd) {
+                log.warn("B7-2 crash recovery: log file has {} orphaned bytes beyond last indexed record " +
+                         "(logSize={}, expectedLogEnd={}). Truncating to remove partial write.",
+                         actualLogSize - expectedLogEnd, actualLogSize, expectedLogEnd);
+                logChannel.truncate(expectedLogEnd);
+                this.logPosition = expectedLogEnd;
+            }
 
             log.info("Recovered index with {} entries, nextOffset={}, recordCount={}", index.size(), nextOffset, recordCount);
         } catch ( IOException e) {
