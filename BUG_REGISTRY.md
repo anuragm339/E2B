@@ -182,7 +182,7 @@ docker logs messaging-broker 2>&1 | grep "READY sent"
 ### B1-7 — Zero-copy interleaving across topics corrupts stream on multi-topic consumers
 
 **Status:** `FIXED`
-**Commit:** `c504ebc`
+**Commit:** `c504ebc` (main fix), `1447460` (edge case fixes)
 **Severity:** Critical
 **Batch:** 9
 
@@ -265,6 +265,24 @@ docker logs consumer-price-quote 2>&1 | grep "Partial batch parse"
 docker exec messaging-broker ss -tn | grep :9092 | wc -l
 # Should show 24+ connections (one per topic + other consumers)
 ```
+
+**Edge Case Fixes (commit `1447460`):**
+
+After initial implementation, two edge cases were identified and fixed:
+
+1. **Multiple groups on same topic:**
+   - **Issue:** If two handlers subscribed to same topic with different groups, second overwrote first
+   - **Fix:** Changed `topicToHandler` → `topicToHandlers` (Map<String, List<>>)
+   - Changed `topicToGroup` → `topicToGroups` (Map<String, Set<>>)
+   - Multiple handlers now receive all messages for their topic
+   - Multiple SUBSCRIBE messages sent (one per topic:group pair) on shared connection
+   - Example: Handler A (prices-v1, group-a) + Handler B (prices-v1, group-b) → both receive messages
+
+2. **Initial connection failures not retried:**
+   - **Issue:** Topics failing in initial `connectToBroker()` were counted but not scheduled for retry
+   - **Fix:** Added `scheduleTopicReconnect(topic)` in catch block for each failed topic
+   - Each failed topic now retries independently with exponential backoff
+   - No longer requires all topics to fail before triggering retry
 
 ---
 
