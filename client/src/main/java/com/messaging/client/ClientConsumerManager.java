@@ -84,10 +84,11 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
     private final Map<String, ConsumerMetadata> consumers = new ConcurrentHashMap<>();
 
-    // Map: topic -> MessageHandler (for routing messages to correct handler)
-    private final Map<String, MessageHandler> topicToHandler = new ConcurrentHashMap<>();
-    // Map: topic -> group (for SUBSCRIBE messages)
-    private final Map<String, String> topicToGroup = new ConcurrentHashMap<>();
+    // FIX #1: Support multiple groups/handlers per topic (same connection, different groups)
+    // Map: topic -> List<MessageHandler> (for routing messages to all handlers)
+    private final Map<String, List<MessageHandler>> topicToHandlers = new ConcurrentHashMap<>();
+    // Map: topic -> Set<String> groups (for SUBSCRIBE messages - one per group)
+    private final Map<String, Set<String>> topicToGroups = new ConcurrentHashMap<>();
 
     public ClientConsumerManager() {
         this.objectMapper = new ObjectMapper();
@@ -146,11 +147,16 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         String consumerId = String.join(",", topics) + ":" + group;
         consumers.put(consumerId, metadata);
 
-        // B1-7 FIX: Build topic -> handler and topic -> group mappings
+        // FIX #1: Build topic -> handlers and topic -> groups mappings (supports multiple groups per topic)
         for (String topic : topics) {
-            topicToHandler.put(topic, handler);
-            topicToGroup.put(topic, group);
-            log.info("Registered mapping: topic={} -> handler={}, group={}", topic, handler.getClass().getSimpleName(), group);
+            // Add handler to list (may have multiple handlers for same topic)
+            topicToHandlers.computeIfAbsent(topic, k -> new java.util.ArrayList<>()).add(handler);
+
+            // Add group to set (may have multiple groups for same topic)
+            topicToGroups.computeIfAbsent(topic, k -> new java.util.HashSet<>()).add(group);
+
+            log.info("Registered mapping: topic='{}' -> handler={}, group={}",
+                    topic, handler.getClass().getSimpleName(), group);
         }
 
         log.info("Registered consumer: topics={}, group={}", String.join(",", topics), group);
@@ -205,18 +211,20 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                 connectToTopic(topic);
                 successCount++;
             } catch (Exception e) {
-                log.error("✗ Failed to connect topic {}: {}", topic, e.getMessage());
+                log.error("✗ Failed to connect topic '{}': {}", topic, e.getMessage());
                 failCount++;
+                // FIX #2: Schedule per-topic reconnect for failed initial connections
+                scheduleTopicReconnect(topic);
             }
         }
 
         if (successCount > 0) {
-            log.info("✓ Connected {} topic(s) successfully, {} failed", successCount, failCount);
+            log.info("✓ Connected {} topic(s) successfully, {} failed (retry scheduled)", successCount, failCount);
             reconnectAttempts.set(0);
             startHealthMonitoring();
         } else {
-            log.error("✗ All topic connections failed, scheduling reconnect");
-            scheduleReconnect();
+            log.error("✗ All topic connections failed, individual retries scheduled");
+            // Don't call scheduleReconnect() here - per-topic retries already scheduled above
         }
     }
 
@@ -262,34 +270,38 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
     /**
      * B1-7 FIX: Subscribe a topic on its dedicated connection
+     * FIX #1: Send SUBSCRIBE for ALL groups registered for this topic
      */
     private void subscribeTopicOnConnection(String topic, NettyTcpClient.Connection connection) {
-        String group = topicToGroup.get(topic);
-        if (group == null) {
-            log.error("No group mapping found for topic: {}", topic);
+        Set<String> groups = topicToGroups.get(topic);
+        if (groups == null || groups.isEmpty()) {
+            log.error("No group mappings found for topic '{}'", topic);
             return;
         }
 
-        try {
-            String payload = String.format("{\"topic\":\"%s\",\"group\":\"%s\"}", topic, group);
+        // Subscribe once for each group on this topic's shared connection
+        for (String group : groups) {
+            try {
+                String payload = String.format("{\"topic\":\"%s\",\"group\":\"%s\"}", topic, group);
 
-            BrokerMessage subscribeMsg = new BrokerMessage(
-                BrokerMessage.MessageType.SUBSCRIBE,
-                System.currentTimeMillis(),
-                payload.getBytes(StandardCharsets.UTF_8)
-            );
+                BrokerMessage subscribeMsg = new BrokerMessage(
+                    BrokerMessage.MessageType.SUBSCRIBE,
+                    System.currentTimeMillis(),
+                    payload.getBytes(StandardCharsets.UTF_8)
+                );
 
-            connection.send(subscribeMsg).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to SUBSCRIBE topic '{}' on dedicated connection", topic, ex);
-                    scheduleTopicReconnect(topic);
-                } else {
-                    log.info("✓ SUBSCRIBE sent for topic '{}', group '{}' on dedicated connection", topic, group);
-                }
-            });
+                connection.send(subscribeMsg).whenComplete((v, ex) -> {
+                    if (ex != null) {
+                        log.error("Failed to SUBSCRIBE topic '{}' group '{}' on dedicated connection", topic, group, ex);
+                        scheduleTopicReconnect(topic);
+                    } else {
+                        log.info("✓ SUBSCRIBE sent for topic '{}', group '{}' on dedicated connection", topic, group);
+                    }
+                });
 
-        } catch (Exception e) {
-            log.error("Error subscribing topic '{}' on dedicated connection", topic, e);
+            } catch (Exception e) {
+                log.error("Error subscribing topic '{}' group '{}' on dedicated connection", topic, group, e);
+            }
         }
     }
 
@@ -435,7 +447,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
     /**
      * B1-7 FIX: Handle DATA message for a specific topic
-     * Route to the correct handler based on topic mapping
+     * FIX #1: Route to ALL handlers registered for this topic (may have multiple groups)
      */
     private void handleDataMessage(String topic, BrokerMessage message) {
         try {
@@ -448,17 +460,21 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                 records = parseRawBatch(payload);
             }
 
-            // Route to the handler registered for this topic
-            MessageHandler handler = topicToHandler.get(topic);
-            if (handler != null) {
-                try {
-                    handler.handleBatch(records);
-                    log.debug("Delivered {} records to handler for topic '{}'", records.size(), topic);
-                } catch (Exception e) {
-                    log.error("Error in consumer handler for topic '{}'", topic, e);
+            // Route to ALL handlers registered for this topic
+            List<MessageHandler> handlers = topicToHandlers.get(topic);
+            if (handlers != null && !handlers.isEmpty()) {
+                for (MessageHandler handler : handlers) {
+                    try {
+                        handler.handleBatch(records);
+                        log.debug("Delivered {} records to handler {} for topic '{}'",
+                                records.size(), handler.getClass().getSimpleName(), topic);
+                    } catch (Exception e) {
+                        log.error("Error in consumer handler {} for topic '{}'",
+                                handler.getClass().getSimpleName(), topic, e);
+                    }
                 }
             } else {
-                log.warn("No handler found for topic '{}', dropping {} records", topic, records.size());
+                log.warn("No handlers found for topic '{}', dropping {} records", topic, records.size());
             }
 
         } catch (Exception e) {
@@ -484,6 +500,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
     /**
      * B1-7 FIX: Handle RESET message for a specific topic
+     * FIX #1: Call onReset on ALL handlers for this topic
      * Uses the topic's dedicated connection for ACK
      */
     private void handleResetMessage(String topic, BrokerMessage message) {
@@ -494,19 +511,23 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
             log.info("Received RESET for topic: '{}', preparing to receive refreshed data", messageTopic);
 
-            // Call onReset on the handler for this topic
-            MessageHandler handler = topicToHandler.get(messageTopic);
-            if (handler != null) {
-                try {
-                    handler.onReset(messageTopic);
-                    String group = topicToGroup.get(messageTopic);
-                    log.info("Called onReset for topic '{}', group '{}'", messageTopic, group);
-                } catch (Exception e) {
-                    log.error("Error in consumer onReset handler for topic '{}'", messageTopic, e);
+            // Call onReset on ALL handlers for this topic (may have multiple groups)
+            List<MessageHandler> handlers = topicToHandlers.get(messageTopic);
+            if (handlers != null && !handlers.isEmpty()) {
+                for (MessageHandler handler : handlers) {
+                    try {
+                        handler.onReset(messageTopic);
+                        log.info("Called onReset for topic '{}' on handler {}",
+                                messageTopic, handler.getClass().getSimpleName());
+                    } catch (Exception e) {
+                        log.error("Error in consumer onReset handler {} for topic '{}'",
+                                handler.getClass().getSimpleName(), messageTopic, e);
+                    }
                 }
             }
 
             // Send RESET ACK back to broker on this topic's dedicated connection
+            // Note: Only send ONE ACK per topic (not one per group)
             BrokerMessage resetAck = new BrokerMessage(
                 BrokerMessage.MessageType.RESET_ACK,
                 System.currentTimeMillis(),
@@ -533,6 +554,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
     /**
      * B1-7 FIX: Handle READY message for a specific topic
+     * FIX #1: Call onReady on ALL handlers for this topic
      * Uses the topic's dedicated connection for ACK
      */
     private void handleReadyMessage(String topic, BrokerMessage message) {
@@ -543,19 +565,23 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
             log.info("Received READY for topic '{}', refresh complete", messageTopic);
 
-            // Call onReady on the handler for this topic
-            MessageHandler handler = topicToHandler.get(messageTopic);
-            if (handler != null) {
-                try {
-                    handler.onReady(messageTopic);
-                    String group = topicToGroup.get(messageTopic);
-                    log.info("Called onReady for topic '{}', group '{}'", messageTopic, group);
-                } catch (Exception e) {
-                    log.error("Error in consumer onReady handler for topic '{}'", messageTopic, e);
+            // Call onReady on ALL handlers for this topic (may have multiple groups)
+            List<MessageHandler> handlers = topicToHandlers.get(messageTopic);
+            if (handlers != null && !handlers.isEmpty()) {
+                for (MessageHandler handler : handlers) {
+                    try {
+                        handler.onReady(messageTopic);
+                        log.info("Called onReady for topic '{}' on handler {}",
+                                messageTopic, handler.getClass().getSimpleName());
+                    } catch (Exception e) {
+                        log.error("Error in consumer onReady handler {} for topic '{}'",
+                                handler.getClass().getSimpleName(), messageTopic, e);
+                    }
                 }
             }
 
             // Send READY ACK back to broker on this topic's dedicated connection
+            // Note: Only send ONE ACK per topic (not one per group)
             BrokerMessage readyAck = new BrokerMessage(
                 BrokerMessage.MessageType.READY_ACK,
                 System.currentTimeMillis(),
