@@ -179,6 +179,95 @@ docker logs messaging-broker 2>&1 | grep "READY sent"
 
 ---
 
+### B1-7 — Zero-copy interleaving across topics corrupts stream on multi-topic consumers
+
+**Status:** `FIXED`
+**Commit:** `c504ebc`
+**Severity:** Critical
+**Batch:** 9
+
+**File:**
+- `client/src/main/java/com/messaging/client/ClientConsumerManager.java`
+- `broker/src/main/java/com/messaging/broker/consumer/RemoteConsumerRegistry.java`
+- `network/src/main/java/com/messaging/network/codec/ZeroCopyBatchDecoder.java`
+
+**Bug:**
+Multi-topic consumers share a single TCP connection. The broker delivers zero-copy batches per
+`clientId:topic`, so different topics can be sent in parallel on the same channel. This interleaves
+`BATCH_HEADER` for topic B while the consumer decoder is in `READING_ZERO_COPY_BATCH` for topic A.
+The decoder treats the header bytes as raw record data, fails the parse (`Invalid keyLen`), and then
+subsequent bytes are misread as BrokerMessage headers, causing `Invalid message type code: -100`.
+Consumers disconnect/reconnect in a loop and delivery stalls for multi-topic subscriptions.
+
+**Evidence (consumer log):**
+```
+First 32 bytes received:
+09 00 00 01 9C 77 2B 98 9E 00 00 00 27 00 00 00
+68 00 00 00 00 00 1F CE 78 00 00 00 17 6C 6F 73
+
+Record 0: keyLen=150994945 (0x9000001) at bytesRead=0
+Partial batch parse for topic loss-prevention-configuration: expected 104 records...
+DecoderException: Invalid message type code: -100
+```
+`0x09` is `BATCH_HEADER`, and `topicLen=0x17` (23) decodes to `"loss-prevention-product"`,
+which proves a new batch header arrived while the decoder was still reading raw bytes for a
+different topic.
+
+**Root Cause:**
+Zero-copy payloads are unframed raw bytes. They cannot be multiplexed across topics on a single
+connection. Broker delivery is parallelized per `clientId:topic`, but the transport is a single
+byte stream, so batches interleave.
+
+**Fix Applied:** Option 1 (Client-side - per-topic connections)
+
+**Implementation:**
+Refactored `ClientConsumerManager.java` to use one dedicated TCP connection per topic:
+- Replaced `NettyTcpClient client` with `Map<String, NettyTcpClient> clientsPerTopic`
+- Replaced `Connection connection` with `Map<String, Connection> connectionsPerTopic`
+- `connectToBroker()` now creates one connection per topic (e.g., price-quote: 6 connections)
+- Message routing: each connection's handler knows its topic, dispatches to correct `MessageHandler`
+- Disconnect/reconnect: per-topic with independent exponential backoff
+- Health monitoring: checks all topic connections independently
+- Shutdown: closes all topic connections gracefully
+
+**Impact:**
+- **price-quote:** 6 TCP connections (was 1 broken, now 6 working)
+- **loss-prevention-api:** 4 TCP connections (was 1 broken, now 4 working)
+- **tesco-location-service:** 2 TCP connections
+- **colleague-facts:** 2 TCP connections
+- **stored-value-services:** 2 TCP connections
+- **Total system:** 24 connections (was 13, increase of 11 connections - negligible overhead)
+
+**Trade-offs:**
+- ✅ Zero-copy batches never interleave (each connection carries one topic only)
+- ✅ Full parallel throughput maintained (independent connections)
+- ✅ Clean isolation, robust architecture
+- ✅ No broker changes required
+- ⚠️ Slightly higher file descriptor usage (11 extra sockets system-wide)
+- ⚠️ ~176KB extra memory (11 × 16KB socket buffers)
+
+**Verification:**
+```bash
+# After fix: verify consumer creates one connection per topic
+docker logs consumer-price-quote 2>&1 | grep "B1-7 FIX: Creating one TCP connection per topic"
+docker logs consumer-price-quote 2>&1 | grep "Connected topic"
+# Should show 6 connections for price-quote
+
+# Verify no interleaving errors under load
+docker logs consumer-price-quote 2>&1 | grep "Invalid message type code"
+# Should return no results
+
+# Verify no decoder stuck state
+docker logs consumer-price-quote 2>&1 | grep "Partial batch parse"
+# Should return no results
+
+# Monitor active connections from broker side
+docker exec messaging-broker ss -tn | grep :9092 | wc -l
+# Should show 24+ connections (one per topic + other consumers)
+```
+
+---
+
 ## HIGH Bugs (Wrong behavior / correctness broken)
 
 ---
@@ -1153,11 +1242,11 @@ docker logs messaging-broker 2>&1 | grep "SQLITE_BUSY\|database is locked"
 
 | Severity | Total | Fixed | Open |
 |----------|-------|-------|------|
-| Critical | 6     | 6     | 0    |
+| Critical | 7     | 7     | 0    |
 | High     | 10    | 10    | 0    |
 | Medium   | 11    | 11    | 0    |
 | Low      | 4     | 4     | 0    |
-| **Total**| **31**| **31** | **0**|
+| **Total**| **32**| **32** | **0**|
 
 ### Fix Order
 ```
@@ -1168,6 +1257,7 @@ Round 1 — Critical: ✅ ALL DONE
   [x] B5-1   READY broadcast to non-reset consumers               3830980, a7fe869
   [x] B6-3   Header+FileRegion split → decoder stuck              c6d49ed
   [x] B7-3   Partial parse always emits ACK                       e06412f
+  [x] B1-7   Zero-copy interleaving (per-topic connections)       c504ebc
 
 Round 1 add-on — High (prerequisite for Critical fixes to work):
   [x] B3-1   startRefresh() expectedConsumers format mismatch     8f5c741
@@ -1204,5 +1294,5 @@ Round 4 — Low: ✅ ALL DONE
 
 ---
 
-*Last updated: 2026-02-19*
-*Total bugs found: 31 | Fixed: 31 | Open: 0 — ALL BUGS RESOLVED*
+*Last updated: 2026-02-21*
+*Total bugs found: 32 | Fixed: 32 | Open: 0 — ALL BUGS RESOLVED*
