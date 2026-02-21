@@ -19,9 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -32,11 +30,16 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * Features:
  * - Auto-discovery of @Consumer annotated MessageHandler beans
- * - Auto-connect to broker on startup
+ * - Auto-connect to broker on startup (ONE CONNECTION PER TOPIC - B1-7 fix)
  * - Auto-reconnect with exponential backoff (5s → 60s max)
  * - Auto-retry when topics don't exist (disconnect and retry after 5s)
  * - Connection health monitoring (30s interval)
  * - Graceful shutdown
+ *
+ * Architecture (B1-7 FIX):
+ * - Creates one dedicated TCP connection per topic to prevent zero-copy batch interleaving
+ * - Each connection carries only one topic stream, ensuring decoder safety
+ * - For price-quote with 6 topics: 6 independent TCP connections to broker
  *
  * Consumer apps only need to:
  * 1. Add @Consumer annotation to MessageHandler implementation
@@ -66,17 +69,25 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
     private final ObjectMapper objectMapper;
     private final AtomicBoolean running = new AtomicBoolean(false);
-    private final AtomicBoolean connected = new AtomicBoolean(false);
     private final AtomicBoolean reconnectScheduled = new AtomicBoolean(false);
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
 
-    private NettyTcpClient client;
-    private NettyTcpClient.Connection connection;
+    // B1-7 FIX: One TCP connection per topic to prevent zero-copy batch interleaving
+    private final Map<String, NettyTcpClient> clientsPerTopic = new ConcurrentHashMap<>();
+    private final Map<String, NettyTcpClient.Connection> connectionsPerTopic = new ConcurrentHashMap<>();
+    private final Map<String, AtomicBoolean> connectedPerTopic = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> reconnectAttemptsPerTopic = new ConcurrentHashMap<>();
+
     private ScheduledExecutorService reconnectScheduler;
     private ScheduledExecutorService healthCheckScheduler;
     private ScheduledFuture<?> healthCheckTask;
 
     private final Map<String, ConsumerMetadata> consumers = new ConcurrentHashMap<>();
+
+    // Map: topic -> MessageHandler (for routing messages to correct handler)
+    private final Map<String, MessageHandler> topicToHandler = new ConcurrentHashMap<>();
+    // Map: topic -> group (for SUBSCRIBE messages)
+    private final Map<String, String> topicToGroup = new ConcurrentHashMap<>();
 
     public ClientConsumerManager() {
         this.objectMapper = new ObjectMapper();
@@ -135,6 +146,13 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         String consumerId = String.join(",", topics) + ":" + group;
         consumers.put(consumerId, metadata);
 
+        // B1-7 FIX: Build topic -> handler and topic -> group mappings
+        for (String topic : topics) {
+            topicToHandler.put(topic, handler);
+            topicToGroup.put(topic, group);
+            log.info("Registered mapping: topic={} -> handler={}, group={}", topic, handler.getClass().getSimpleName(), group);
+        }
+
         log.info("Registered consumer: topics={}, group={}", String.join(",", topics), group);
     }
 
@@ -159,64 +177,99 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         return value;
     }
 
+    /**
+     * B1-7 FIX: Create one dedicated TCP connection per topic
+     * This prevents zero-copy batch interleaving on multi-topic consumers
+     */
     private void connectToBroker() {
         if (!running.get()) {
             return;
         }
 
-        try {
-            log.info("Connecting to broker at {}:{}... (attempt {})",
-                    brokerHost, brokerPort, reconnectAttempts.get() + 1);
+        log.info("=== B1-7 FIX: Creating one TCP connection per topic ===");
+        log.info("Connecting to broker at {}:{}", brokerHost, brokerPort);
 
-            if (client == null) {
-                client = new NettyTcpClient();
+        // Get all unique topics across all consumers
+        Set<String> allTopics = new java.util.HashSet<>();
+        for (ConsumerMetadata metadata : consumers.values()) {
+            allTopics.addAll(java.util.Arrays.asList(metadata.topics));
+        }
+
+        log.info("Total topics to connect: {}", allTopics.size());
+
+        int successCount = 0;
+        int failCount = 0;
+
+        for (String topic : allTopics) {
+            try {
+                connectToTopic(topic);
+                successCount++;
+            } catch (Exception e) {
+                log.error("✗ Failed to connect topic {}: {}", topic, e.getMessage());
+                failCount++;
             }
+        }
 
-            CompletableFuture<NettyTcpClient.Connection> connectFuture =
-                client.connect(brokerHost, brokerPort);
-
-            connection = connectFuture.get(10, TimeUnit.SECONDS);
-            connection.onMessage(this::handleMessage);
-
-            // Set up disconnect handler for immediate reconnection
-            if (connection instanceof NettyTcpClient.TcpConnection) {
-                ((NettyTcpClient.TcpConnection) connection).onDisconnect(() -> {
-                    log.warn("⚠ Connection lost - triggering reconnection");
-                    connected.set(false);
-                    scheduleReconnect();
-                });
-            }
-
-            connected.set(true);
+        if (successCount > 0) {
+            log.info("✓ Connected {} topic(s) successfully, {} failed", successCount, failCount);
             reconnectAttempts.set(0);
-
-            log.info("✓ Connected to broker successfully");
-
-            subscribeAll();
             startHealthMonitoring();
-
-        } catch (Exception e) {
-            log.error("✗ Failed to connect to broker: {}", e.getMessage());
-            connected.set(false);
+        } else {
+            log.error("✗ All topic connections failed, scheduling reconnect");
             scheduleReconnect();
         }
     }
 
-    private void subscribeAll() {
-        if (!connected.get()) {
+    /**
+     * B1-7 FIX: Create dedicated connection for a single topic
+     */
+    private void connectToTopic(String topic) throws Exception {
+        int attempt = reconnectAttemptsPerTopic.computeIfAbsent(topic, k -> new AtomicInteger(0)).get() + 1;
+
+        log.info("Connecting topic '{}' to broker (attempt {})...", topic, attempt);
+
+        // Create new client for this topic
+        NettyTcpClient topicClient = new NettyTcpClient();
+        clientsPerTopic.put(topic, topicClient);
+
+        // Connect
+        CompletableFuture<NettyTcpClient.Connection> connectFuture =
+            topicClient.connect(brokerHost, brokerPort);
+
+        NettyTcpClient.Connection topicConnection = connectFuture.get(10, TimeUnit.SECONDS);
+        connectionsPerTopic.put(topic, topicConnection);
+
+        // Set up message handler for this topic's connection
+        topicConnection.onMessage(message -> handleMessage(topic, message));
+
+        // Set up disconnect handler for this topic
+        if (topicConnection instanceof NettyTcpClient.TcpConnection) {
+            ((NettyTcpClient.TcpConnection) topicConnection).onDisconnect(() -> {
+                log.warn("⚠ Connection lost for topic '{}' - triggering reconnection", topic);
+                connectedPerTopic.put(topic, new AtomicBoolean(false));
+                scheduleTopicReconnect(topic);
+            });
+        }
+
+        connectedPerTopic.put(topic, new AtomicBoolean(true));
+        reconnectAttemptsPerTopic.get(topic).set(0);
+
+        log.info("✓ Connected topic '{}' successfully", topic);
+
+        // Subscribe this topic on its dedicated connection
+        subscribeTopicOnConnection(topic, topicConnection);
+    }
+
+    /**
+     * B1-7 FIX: Subscribe a topic on its dedicated connection
+     */
+    private void subscribeTopicOnConnection(String topic, NettyTcpClient.Connection connection) {
+        String group = topicToGroup.get(topic);
+        if (group == null) {
+            log.error("No group mapping found for topic: {}", topic);
             return;
         }
 
-        log.info("Subscribing all consumers...");
-
-        for (ConsumerMetadata metadata : consumers.values()) {
-            for (String topic : metadata.topics) {
-                subscribe(topic, metadata.group);
-            }
-        }
-    }
-
-    private void subscribe(String topic, String group) {
         try {
             String payload = String.format("{\"topic\":\"%s\",\"group\":\"%s\"}", topic, group);
 
@@ -228,18 +281,50 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
             connection.send(subscribeMsg).whenComplete((v, ex) -> {
                 if (ex != null) {
-                    log.error("Failed to SUBSCRIBE to topic: {}", topic, ex);
-                    scheduleReconnect();
+                    log.error("Failed to SUBSCRIBE topic '{}' on dedicated connection", topic, ex);
+                    scheduleTopicReconnect(topic);
                 } else {
-                    log.info("✓ SUBSCRIBE sent for topic: {}, group: {}", topic, group);
+                    log.info("✓ SUBSCRIBE sent for topic '{}', group '{}' on dedicated connection", topic, group);
                 }
             });
 
         } catch (Exception e) {
-            log.error("Error subscribing to topic: {}", topic, e);
+            log.error("Error subscribing topic '{}' on dedicated connection", topic, e);
         }
     }
 
+    /**
+     * B1-7 FIX: Schedule reconnection for a specific topic
+     */
+    private void scheduleTopicReconnect(String topic) {
+        if (!running.get()) {
+            return;
+        }
+
+        AtomicInteger attempts = reconnectAttemptsPerTopic.computeIfAbsent(topic, k -> new AtomicInteger(0));
+        int attemptCount = attempts.incrementAndGet();
+
+        long delayMs = Math.min(
+            INITIAL_RECONNECT_DELAY_MS * (1L << Math.min(attemptCount - 1, 4)),
+            MAX_RECONNECT_DELAY_MS
+        );
+
+        log.info("⟳ Scheduling reconnect for topic '{}' in {}ms (attempt {})", topic, delayMs, attemptCount);
+
+        reconnectScheduler.schedule(() -> {
+            cleanupTopicConnection(topic);
+            try {
+                connectToTopic(topic);
+            } catch (Exception e) {
+                log.error("Reconnect failed for topic '{}': {}", topic, e.getMessage());
+                scheduleTopicReconnect(topic);
+            }
+        }, delayMs, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * B1-7 FIX: Schedule full reconnect for all topics (used on initial connection failure)
+     */
     private void scheduleReconnect() {
         if (!running.get()) {
             return;
@@ -257,15 +342,18 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
             MAX_RECONNECT_DELAY_MS
         );
 
-        log.info("⟳ Scheduling reconnect in {}ms (attempt {})", delayMs, attempts);
+        log.info("⟳ Scheduling full reconnect in {}ms (attempt {})", delayMs, attempts);
 
         reconnectScheduler.schedule(() -> {
             reconnectScheduled.set(false);
-            cleanupConnection();
+            cleanupAllConnections();
             connectToBroker();
         }, delayMs, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * B1-7 FIX: Monitor health of all per-topic connections
+     */
     private void startHealthMonitoring() {
         if (healthCheckTask != null) {
             healthCheckTask.cancel(false);
@@ -273,62 +361,83 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
         healthCheckTask = healthCheckScheduler.scheduleAtFixedRate(() -> {
             try {
-                if (!connected.get()) {
-                    log.debug("Health check: already disconnected, skip check");
-                    return;
+                int aliveCount = 0;
+                int deadCount = 0;
+
+                for (Map.Entry<String, NettyTcpClient.Connection> entry : connectionsPerTopic.entrySet()) {
+                    String topic = entry.getKey();
+                    NettyTcpClient.Connection conn = entry.getValue();
+
+                    AtomicBoolean isConnected = connectedPerTopic.get(topic);
+                    if (isConnected == null || !isConnected.get()) {
+                        log.debug("Health check: topic '{}' already disconnected, skip check", topic);
+                        continue;
+                    }
+
+                    if (conn == null || !conn.isAlive()) {
+                        log.warn("Health check failed for topic '{}': connection is " +
+                                (conn == null ? "null" : "not alive"), topic);
+                        isConnected.set(false);
+                        scheduleTopicReconnect(topic);
+                        deadCount++;
+                    } else {
+                        aliveCount++;
+                    }
                 }
 
-                if (connection == null || !connection.isAlive()) {
-                    log.warn("Health check failed: connection is " + (connection == null ? "null" : "not alive"));
-                    connected.set(false);
-                    scheduleReconnect();
-                    return;
+                if (aliveCount + deadCount > 0) {
+                    log.debug("Health check: {} alive, {} dead topic connections", aliveCount, deadCount);
                 }
-
-                log.debug("Health check: connection is alive");
 
             } catch (Exception e) {
                 log.error("Health check error", e);
-                connected.set(false);
-                scheduleReconnect();
             }
         }, HEALTH_CHECK_INTERVAL_MS, HEALTH_CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
-    private void handleMessage(BrokerMessage message) {
+    /**
+     * B1-7 FIX: Handle message for a specific topic's connection
+     * Each topic has its own connection, so we know which topic this message is for
+     */
+    private void handleMessage(String topic, BrokerMessage message) {
         try {
-            log.debug("Received message: type={}", message.getType());
+            log.debug("Received message for topic '{}': type={}", topic, message.getType());
 
             switch (message.getType()) {
                 case DATA:
-                    handleDataMessage(message);
+                case BATCH_HEADER:
+                    handleDataMessage(topic, message);
                     break;
 
                 case ACK:
-                    log.debug("Received ACK");
+                    log.debug("Received ACK for topic '{}'", topic);
                     break;
 
                 case RESET:
                 case READY:
-                    handleControlMessage(message);
+                    handleControlMessage(topic, message);
                     break;
 
                 case DISCONNECT:
-                    log.warn("Received DISCONNECT from broker");
-                    connected.set(false);
-                    scheduleReconnect();
+                    log.warn("Received DISCONNECT from broker for topic '{}'", topic);
+                    connectedPerTopic.get(topic).set(false);
+                    scheduleTopicReconnect(topic);
                     break;
 
                 default:
-                    log.debug("Received message type: {}", message.getType());
+                    log.debug("Received message type {} for topic '{}'", message.getType(), topic);
             }
 
         } catch (Exception e) {
-            log.error("Error handling message", e);
+            log.error("Error handling message for topic '{}'", topic, e);
         }
     }
 
-    private void handleDataMessage(BrokerMessage message) {
+    /**
+     * B1-7 FIX: Handle DATA message for a specific topic
+     * Route to the correct handler based on topic mapping
+     */
+    private void handleDataMessage(String topic, BrokerMessage message) {
         try {
             byte[] payload = message.getPayload();
 
@@ -339,127 +448,135 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                 records = parseRawBatch(payload);
             }
 
-            for (ConsumerMetadata metadata : consumers.values()) {
+            // Route to the handler registered for this topic
+            MessageHandler handler = topicToHandler.get(topic);
+            if (handler != null) {
                 try {
-                    metadata.handler.handleBatch(records);
+                    handler.handleBatch(records);
+                    log.debug("Delivered {} records to handler for topic '{}'", records.size(), topic);
                 } catch (Exception e) {
-                    log.error("Error in consumer handler", e);
+                    log.error("Error in consumer handler for topic '{}'", topic, e);
                 }
+            } else {
+                log.warn("No handler found for topic '{}', dropping {} records", topic, records.size());
             }
 
         } catch (Exception e) {
-            log.error("Error handling DATA message", e);
+            log.error("Error handling DATA message for topic '{}'", topic, e);
         }
     }
 
 
-    private void handleControlMessage(BrokerMessage message) {
+    /**
+     * B1-7 FIX: Handle control message for a specific topic
+     */
+    private void handleControlMessage(String topic, BrokerMessage message) {
         try {
             if (message.getType() == BrokerMessage.MessageType.RESET) {
-                handleResetMessage(message);
+                handleResetMessage(topic, message);
             } else if (message.getType() == BrokerMessage.MessageType.READY) {
-                handleReadyMessage(message);
+                handleReadyMessage(topic, message);
             }
         } catch (Exception e) {
-            log.error("Error handling control message", e);
+            log.error("Error handling control message for topic '{}'", topic, e);
         }
     }
 
-    private void handleResetMessage(BrokerMessage message) {
+    /**
+     * B1-7 FIX: Handle RESET message for a specific topic
+     * Uses the topic's dedicated connection for ACK
+     */
+    private void handleResetMessage(String topic, BrokerMessage message) {
         try {
-            // Parse RESET message to get topic
+            // Parse RESET message to get topic (should match the connection's topic)
             String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
-            String topic = extractTopicFromPayload(payload);
+            String messageTopic = extractTopicFromPayload(payload);
 
-            log.info("Received RESET for topic: {}, preparing to receive refreshed data", topic);
+            log.info("Received RESET for topic: '{}', preparing to receive refreshed data", messageTopic);
 
-            // Call onReset only on handlers subscribed to this topic
-            for (ConsumerMetadata metadata : consumers.values()) {
-                // Check if this handler is subscribed to the topic
-                boolean isSubscribed = false;
-                for (String subscribedTopic : metadata.topics) {
-                    if (subscribedTopic.equals(topic)) {
-                        isSubscribed = true;
-                        break;
-                    }
-                }
-
-                if (isSubscribed) {
-                    try {
-                        metadata.handler.onReset(topic);
-                        log.info("Called onReset for topic: {} on handler for group: {}", topic, metadata.group);
-                    } catch (Exception e) {
-                        log.error("Error in consumer onReset handler for topic: {}, group: {}", topic, metadata.group, e);
-                    }
+            // Call onReset on the handler for this topic
+            MessageHandler handler = topicToHandler.get(messageTopic);
+            if (handler != null) {
+                try {
+                    handler.onReset(messageTopic);
+                    String group = topicToGroup.get(messageTopic);
+                    log.info("Called onReset for topic '{}', group '{}'", messageTopic, group);
+                } catch (Exception e) {
+                    log.error("Error in consumer onReset handler for topic '{}'", messageTopic, e);
                 }
             }
 
-            // Send RESET ACK back to broker (topic as plain text, not JSON)
+            // Send RESET ACK back to broker on this topic's dedicated connection
             BrokerMessage resetAck = new BrokerMessage(
                 BrokerMessage.MessageType.RESET_ACK,
                 System.currentTimeMillis(),
-                topic.getBytes(StandardCharsets.UTF_8)
+                messageTopic.getBytes(StandardCharsets.UTF_8)
             );
 
-            connection.send(resetAck).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send RESET ACK for topic: {}", topic, ex);
-                } else {
-                    log.info("✓ RESET ACK sent for topic: {}", topic);
-                }
-            });
+            NettyTcpClient.Connection topicConnection = connectionsPerTopic.get(topic);
+            if (topicConnection != null) {
+                topicConnection.send(resetAck).whenComplete((v, ex) -> {
+                    if (ex != null) {
+                        log.error("Failed to send RESET ACK for topic '{}'", topic, ex);
+                    } else {
+                        log.info("✓ RESET ACK sent for topic '{}' on dedicated connection", topic);
+                    }
+                });
+            } else {
+                log.error("No connection found for topic '{}' to send RESET ACK", topic);
+            }
 
         } catch (Exception e) {
-            log.error("Error handling RESET message", e);
+            log.error("Error handling RESET message for topic '{}'", topic, e);
         }
     }
 
-    private void handleReadyMessage(BrokerMessage message) {
+    /**
+     * B1-7 FIX: Handle READY message for a specific topic
+     * Uses the topic's dedicated connection for ACK
+     */
+    private void handleReadyMessage(String topic, BrokerMessage message) {
         try {
-            // Parse READY message to get topic
+            // Parse READY message to get topic (should match the connection's topic)
             String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
-            String topic = extractTopicFromPayload(payload);
+            String messageTopic = extractTopicFromPayload(payload);
 
-            log.info("Received READY for topic: {}, refresh complete", topic);
+            log.info("Received READY for topic '{}', refresh complete", messageTopic);
 
-            // Call onReady only on handlers subscribed to this topic
-            for (ConsumerMetadata metadata : consumers.values()) {
-                // Check if this handler is subscribed to the topic
-                boolean isSubscribed = false;
-                for (String subscribedTopic : metadata.topics) {
-                    if (subscribedTopic.equals(topic)) {
-                        isSubscribed = true;
-                        break;
-                    }
-                }
-
-                if (isSubscribed) {
-                    try {
-                        metadata.handler.onReady(topic);
-                        log.info("Called onReady for topic: {} on handler for group: {}", topic, metadata.group);
-                    } catch (Exception e) {
-                        log.error("Error in consumer onReady handler for topic: {}, group: {}", topic, metadata.group, e);
-                    }
+            // Call onReady on the handler for this topic
+            MessageHandler handler = topicToHandler.get(messageTopic);
+            if (handler != null) {
+                try {
+                    handler.onReady(messageTopic);
+                    String group = topicToGroup.get(messageTopic);
+                    log.info("Called onReady for topic '{}', group '{}'", messageTopic, group);
+                } catch (Exception e) {
+                    log.error("Error in consumer onReady handler for topic '{}'", messageTopic, e);
                 }
             }
 
-            // Send READY ACK back to broker (topic as plain text, not JSON)
+            // Send READY ACK back to broker on this topic's dedicated connection
             BrokerMessage readyAck = new BrokerMessage(
                 BrokerMessage.MessageType.READY_ACK,
                 System.currentTimeMillis(),
-                topic.getBytes(StandardCharsets.UTF_8)
+                messageTopic.getBytes(StandardCharsets.UTF_8)
             );
 
-            connection.send(readyAck).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send READY ACK for topic: {}", topic, ex);
-                } else {
-                    log.info("✓ READY ACK sent for topic: {}", topic);
-                }
-            });
+            NettyTcpClient.Connection topicConnection = connectionsPerTopic.get(topic);
+            if (topicConnection != null) {
+                topicConnection.send(readyAck).whenComplete((v, ex) -> {
+                    if (ex != null) {
+                        log.error("Failed to send READY ACK for topic '{}'", topic, ex);
+                    } else {
+                        log.info("✓ READY ACK sent for topic '{}' on dedicated connection", topic);
+                    }
+                });
+            } else {
+                log.error("No connection found for topic '{}' to send READY ACK", topic);
+            }
 
         } catch (Exception e) {
-            log.error("Error handling READY message", e);
+            log.error("Error handling READY message for topic '{}'", topic, e);
         }
     }
 
@@ -536,30 +653,68 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         return records;
     }
 
-    private void cleanupConnection() {
+    /**
+     * B1-7 FIX: Cleanup a specific topic connection
+     */
+    private void cleanupTopicConnection(String topic) {
+        NettyTcpClient.Connection conn = connectionsPerTopic.remove(topic);
+        if (conn != null) {
+            try {
+                conn.disconnect();
+                log.debug("Disconnected topic '{}' connection", topic);
+            } catch (Exception e) {
+                log.debug("Error disconnecting topic '{}' connection", topic, e);
+            }
+        }
+
+        NettyTcpClient client = clientsPerTopic.remove(topic);
+        if (client != null) {
+            try {
+                client.shutdown();
+                log.debug("Shutdown client for topic '{}'", topic);
+            } catch (Exception e) {
+                log.debug("Error shutting down client for topic '{}'", topic, e);
+            }
+        }
+    }
+
+    /**
+     * B1-7 FIX: Cleanup all topic connections
+     */
+    private void cleanupAllConnections() {
         if (healthCheckTask != null) {
             healthCheckTask.cancel(false);
             healthCheckTask = null;
         }
 
-        if (connection != null) {
-            try {
-                connection.disconnect();
-            } catch (Exception e) {
-                log.debug("Error disconnecting", e);
-            }
-            connection = null;
+        log.info("Cleaning up all {} topic connections...", connectionsPerTopic.size());
+
+        for (String topic : new java.util.HashSet<>(connectionsPerTopic.keySet())) {
+            cleanupTopicConnection(topic);
         }
+
+        connectionsPerTopic.clear();
+        clientsPerTopic.clear();
+        connectedPerTopic.clear();
+
+        log.info("All topic connections cleaned up");
     }
 
+    /**
+     * B1-7 FIX: Shutdown all per-topic connections gracefully
+     */
     @PreDestroy
     public void shutdown() {
-        log.info("=== ClientConsumerManager Shutting Down ===");
+        log.info("=== ClientConsumerManager Shutting Down (B1-7 per-topic connections) ===");
 
         running.set(false);
-        connected.set(false);
 
-        cleanupConnection();
+        // Mark all topics as disconnected
+        for (AtomicBoolean connected : connectedPerTopic.values()) {
+            connected.set(false);
+        }
+
+        cleanupAllConnections();
 
         if (reconnectScheduler != null) {
             reconnectScheduler.shutdownNow();
@@ -569,23 +724,36 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
             healthCheckScheduler.shutdownNow();
         }
 
-        if (client != null) {
-            try {
-                client.shutdown();
-            } catch (Exception e) {
-                log.error("Error shutting down client", e);
-            }
-        }
-
-        log.info("ClientConsumerManager shutdown complete");
+        log.info("ClientConsumerManager shutdown complete - closed {} topic connections",
+                connectionsPerTopic.size());
     }
 
+    /**
+     * B1-7 FIX: Check if any topic connection is alive
+     */
     public boolean isConnected() {
-        return connected.get();
+        return connectedPerTopic.values().stream()
+                .anyMatch(AtomicBoolean::get);
     }
 
     public int getReconnectAttempts() {
         return reconnectAttempts.get();
+    }
+
+    /**
+     * B1-7 FIX: Get total number of active topic connections
+     */
+    public int getConnectedTopicCount() {
+        return (int) connectedPerTopic.values().stream()
+                .filter(AtomicBoolean::get)
+                .count();
+    }
+
+    /**
+     * B1-7 FIX: Get total number of topic connections (connected + disconnected)
+     */
+    public int getTotalTopicCount() {
+        return connectionsPerTopic.size();
     }
 
     private static class ConsumerMetadata {
