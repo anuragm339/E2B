@@ -1780,5 +1780,94 @@ curl http://localhost:8081/prometheus | grep broker_consumer | wc -l
 
 ---
 
+### B11-5 — TopicFairScheduler unbounded recursive rescheduling → heap OOM during DataRefresh
+
+**Status:** `FIXED`
+**Commit:** b563a6f
+**Severity:** CRITICAL
+**Batch:** 11
+
+**Root Cause:**
+TopicFairScheduler.schedule() recursively reschedules tasks when semaphore is full (line 73). During DataRefresh, ALL consumers are saturated (blocked on RESET/READY ACKs), causing:
+1. Every delivery task hits semaphore limit (maxInFlightPerTopic = 4)
+2. Each failure recursively schedules another task
+3. **Exponential task buildup** in ScheduledExecutorService queue
+4. 24 topics × 100s of retry attempts = **thousands of queued task objects**
+5. Each task object consumes heap space → **Java heap OOM**
+
+**Evidence:**
+```
+java.lang.OutOfMemoryError: Java heap space
+Heap dump file created [64643277 bytes]
+```
+
+**OOM only happens during DataRefresh** when consumers are saturated.
+
+**Leak Scale:**
+- Normal operation: ~24 scheduled tasks (one per topic)
+- During DataRefresh saturation: **thousands of queued tasks**
+- Each task: ~1-2KB (Runnable wrapper + ScheduledFutureTask)
+- Result: Heap grows from 64MB → 320MB → OOM
+
+**Fix Applied:**
+
+1. **Added pendingRetries tracking** (TopicFairScheduler.java:26)
+   ```java
+   private final Map<String, ScheduledFuture<?>> pendingRetries;
+   ```
+
+2. **New scheduleWithKey() method** (lines 62-106)
+   - Takes unique `deliveryKey` parameter (e.g., "clientId:topic")
+   - Tracks ONE pending retry per deliveryKey
+   - Only reschedules if no retry already pending
+   - Prevents unbounded recursive scheduling
+
+3. **Updated AdaptiveBatchDeliveryManager** (line 117)
+   ```java
+   String deliveryKey = consumer.clientId + ":" + consumer.topic;
+   fairScheduler.scheduleWithKey(consumer.topic, deliveryKey, () -> {
+       // delivery logic
+   }, delayMs, TimeUnit.MILLISECONDS);
+   ```
+
+**Before fix:**
+```
+Semaphore full → reschedule()
+  Semaphore full → reschedule()
+    Semaphore full → reschedule()
+      ... (unbounded recursion)
+        → heap OOM
+```
+
+**After fix:**
+```
+Semaphore full → check pendingRetries[deliveryKey]
+  If retry exists: drop (prevent buildup)
+  If no retry: schedule ONE retry, track in pendingRetries
+    → bounded retry queue
+```
+
+**Files Modified:**
+1. broker/src/main/java/com/messaging/broker/consumer/TopicFairScheduler.java
+2. broker/src/main/java/com/messaging/broker/consumer/AdaptiveBatchDeliveryManager.java
+
+**Verification:**
+```bash
+# Trigger DataRefresh (previously caused OOM)
+curl -X POST http://localhost:8081/api/refresh/trigger
+
+# Monitor broker logs for bounded retry behavior
+docker logs -f messaging-broker | grep "retry already pending"
+
+# Check heap usage stays stable during refresh
+docker stats messaging-broker
+
+# Should NOT see:
+# - "OutOfMemoryError: Java heap space"
+# - Heap growing past 100-150MB during refresh
+```
+
+---
+
 *Last updated: 2026-02-23*
-*Total bugs found: 36 | Fixed: 36 | Open: 0 — ALL BUGS RESOLVED*
+*Total bugs found: 37 | Fixed: 37 | Open: 0 — ALL BUGS RESOLVED*

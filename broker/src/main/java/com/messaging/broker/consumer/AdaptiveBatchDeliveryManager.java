@@ -114,7 +114,10 @@ public class AdaptiveBatchDeliveryManager {
         log.info("DEBUG: Scheduling adaptive delivery for {}:{} with delay={}ms", consumer.clientId, consumer.topic, delayMs);
         // B1-2 fix: capture the ScheduledFuture and assign it to consumer.deliveryTask so that
         // unregisterConsumer() can cancel the task and stop delivery after disconnect.
-        java.util.concurrent.ScheduledFuture<?> future = fairScheduler.schedule(consumer.topic, () -> {
+        // B11-5 fix: use scheduleWithKey with unique deliveryKey to prevent unbounded retry buildup during DataRefresh
+        String deliveryKey = consumer.clientId + ":" + consumer.topic;
+        java.util.concurrent.ScheduledFuture<?> future = fairScheduler.scheduleWithKey(
+            consumer.topic, deliveryKey, () -> {
             log.info("DEBUG: Executing delivery task for {}:{}", consumer.clientId, consumer.topic);
             // Try delivery and get result (true = data found, false = no data/skipped)
             boolean dataFound = tryDeliverBatch(consumer);
