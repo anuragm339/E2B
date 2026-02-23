@@ -199,6 +199,86 @@ The decoder treats the header bytes as raw record data, fails the parse (`Invali
 subsequent bytes are misread as BrokerMessage headers, causing `Invalid message type code: -100`.
 Consumers disconnect/reconnect in a loop and delivery stalls for multi-topic subscriptions.
 
+---
+
+### B1-8 — `inFlightDeliveries` map leaks entries on disconnect → OOM under reconnect churn
+
+**Status:** `FIXED`
+**Commit:** TBD
+**Severity:** Critical
+**Batch:** 10
+
+**File:**
+- `broker/src/main/java/com/messaging/broker/consumer/RemoteConsumerRegistry.java`
+
+**Bug:**
+`inFlightDeliveries` is keyed by `clientId:topic:group`. When a client disconnects and reconnects,
+its TCP port changes (clientId changes), so new keys are created. `unregisterConsumer()` removes
+consumers and `pendingOffsets`, but **never removes** the `inFlightDeliveries` entry. With frequent
+reconnects (e.g., zero-copy send failures), the map grows without bound and eventually OOMs the broker
+(`java.lang.OutOfMemoryError: Java heap space` observed during refresh).
+
+**Evidence (Heap Dump):**
+- Local copy: `data/heap-dump.hprof` (32MB)
+- Source: copied from container `messaging-broker` path `/app/data/heap-dump.hprof`
+
+**Root Cause Code:**
+```java
+// RemoteConsumerRegistry.java:217-219
+AtomicBoolean inFlight = inFlightDeliveries.computeIfAbsent(
+        deliveryKey, k -> new AtomicBoolean(false)
+);
+// No corresponding inFlightDeliveries.remove(...) in unregisterConsumer()
+```
+
+**Leak Scale:**
+- 6-topic consumer reconnecting hourly: 144 leaked entries/day
+- 13 consumer services: ~1,872 leaked entries/day
+- After 30 days: ~56,160 leaked entries → eventual OOM
+
+**Fix Applied:**
+Added cleanup in `unregisterConsumer()` method (after line 181):
+```java
+// B1-8 fix: Clean up inFlightDeliveries to prevent memory leak
+String deliveryKeyPrefix = clientId + ":";
+int removedInflight = 0;
+Iterator<String> iterator = inFlightDeliveries.keySet().iterator();
+while (iterator.hasNext()) {
+    String inflightKey = iterator.next();
+    if (inflightKey.startsWith(deliveryKeyPrefix)) {
+        iterator.remove();
+        removedInflight++;
+    }
+}
+if (removedInflight > 0) {
+    log.info("B1-8 fix: Cleared {} inFlightDeliveries entries for clientId={} on unregister",
+             removedInflight, clientId);
+}
+```
+
+**Why this approach:**
+- Matches existing `pendingOffsets` cleanup pattern
+- Uses iterator.remove() for thread-safe concurrent modification
+- Removes ALL entries for disconnected clientId (all topics/groups)
+- Immediate cleanup on disconnect (no delay)
+- Logging enables verification in production
+
+**Verification:**
+```bash
+# Reconnect a consumer repeatedly
+docker restart consumer-price-quote
+# Wait 30 seconds
+docker restart consumer-price-quote
+
+# Check broker logs for cleanup confirmation:
+grep "B1-8 fix: Cleared" docker logs messaging-broker
+# Example output: "B1-8 fix: Cleared 6 inFlightDeliveries entries for clientId=127.0.0.1:54321"
+
+# After fix: map size stabilizes instead of growing
+# Before fix: size increases by ~6 entries per restart (one per topic)
+# After fix: size remains constant (~13 active entries)
+```
+
 **Evidence (consumer log):**
 ```
 First 32 bytes received:

@@ -22,6 +22,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -179,6 +180,25 @@ public class RemoteConsumerRegistry {
                 if (stalePending != null) {
                     log.info("Cleared stale pending offset {} for key={} on unregister", stalePending, pendingKey);
                 }
+
+                // B1-8 fix: Clean up inFlightDeliveries to prevent memory leak
+                // Remove all inFlightDeliveries entries for this clientId
+                // Key format: "clientId:topic:group", so we match prefix "clientId:"
+                String deliveryKeyPrefix = clientId + ":";
+                int removedInflight = 0;
+                Iterator<String> iterator = inFlightDeliveries.keySet().iterator();
+                while (iterator.hasNext()) {
+                    String inflightKey = iterator.next();
+                    if (inflightKey.startsWith(deliveryKeyPrefix)) {
+                        iterator.remove();
+                        removedInflight++;
+                    }
+                }
+                if (removedInflight > 0) {
+                    log.info("B1-8 fix: Cleared {} inFlightDeliveries entries for clientId={} on unregister",
+                             removedInflight, clientId);
+                }
+
                 // Clean up metrics (though with stable identifiers, metrics are now retained)
                 metrics.removeConsumerMetrics(clientId, consumer.topic, consumer.group);
                 log.info("Unregistered remote consumer: consumerKey={}, clientId={}, topic={}, group={}",
