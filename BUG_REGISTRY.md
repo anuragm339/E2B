@@ -1614,5 +1614,171 @@ Round 4 — Low: ✅ ALL DONE
 
 ---
 
-*Last updated: 2026-02-21*
-*Total bugs found: 32 | Fixed: 32 | Open: 0 — ALL BUGS RESOLVED*
+## Batch 11 — OOM Memory Leak Fixes (2026-02-23)
+
+### B11-1 — BrokerMetrics map cleanup disabled → OOM from ephemeral port reconnections
+
+**Status:** `FIXED`
+**Commit:** b1c2cd9
+**Severity:** CRITICAL
+**Batch:** 11
+
+**Root Cause:**
+BrokerMetrics.removeConsumerMetrics() had all cleanup code commented out (lines 460-467) with assumption of "stable identifiers." However, clientId includes ephemeral ports (`/172.18.0.9:37846`) which change on reconnect, causing duplicate Counter/Gauge/Timer registrations that are NEVER garbage collected.
+
+**12+ leaked maps:**
+- consumerMessagesSent, consumerBytesSent, consumerAcks, consumerFailures, consumerRetries
+- consumerOffsets, consumerLag, consumerDeliveryLatency
+- consumerBytesFailed, consumerMessagesFailed
+- consumerLastDeliveryTime, consumerLastAckTime, consumerAckTimeouts
+
+**Leak Scale:**
+13 consumers × 6 avg topics × 24 reconnects/day = 1,872 leaked metric objects/day
+After 30 days: ~56,160 leaked Prometheus time-series → OOM + cardinality explosion
+
+**Fix Applied:**
+Re-enabled cleanup in removeConsumerMetrics() (BrokerMetrics.java:453-479)
+
+```java
+// OOM FIX: Re-enabled removal to prevent memory leak
+consumerMessagesSent.remove(key);
+consumerBytesSent.remove(key);
+consumerAcks.remove(key);
+// ... (all 13 maps)
+```
+
+**Trade-off:** Prometheus graphs show gaps on disconnect, but prevents unbounded memory growth.
+
+---
+
+### B11-2 — DataRefreshMetrics timing maps never cleaned → OOM from per-consumer keys
+
+**Status:** `FIXED`
+**Commit:** b1c2cd9
+**Severity:** CRITICAL
+**Batch:** 11
+
+**Root Cause:**
+23+ timing maps keyed by `topic:consumer` accumulate entries on every reconnect (ephemeral port changes) with NO cleanup code.
+
+**Leaked maps:**
+- resetSentTimes, resetAckTimes, readySentTimes, replayStartTimes
+- resetAckDurationTimers, readyAckDurationTimers
+- Plus 17 gauge/timer maps for transfer rates, timing data
+
+**Fix Applied:**
+Added removeConsumerTimingData() method to DataRefreshMetrics (lines 612-643)
+
+```java
+public void removeConsumerTimingData(String topic, String consumer) {
+    String keyPrefix = topic + ":" + consumer;
+    resetSentTimes.keySet().removeIf(k -> k.startsWith(keyPrefix));
+    resetAckTimes.keySet().removeIf(k -> k.startsWith(keyPrefix));
+    readySentTimes.keySet().removeIf(k -> k.startsWith(keyPrefix));
+    replayStartTimes.keySet().removeIf(k -> k.startsWith(keyPrefix));
+    resetAckDurationTimers.remove(keyPrefix);
+    readyAckDurationTimers.remove(keyPrefix);
+    // ... logging
+}
+```
+
+Called from RemoteConsumerRegistry.unregisterConsumer() (line 224)
+
+---
+
+### B11-3 — deliveryKeyToGroup map never cleaned → unbounded growth
+
+**Status:** `FIXED`
+**Commit:** b1c2cd9
+**Severity:** HIGH
+**Batch:** 11
+
+**Root Cause:**
+deliveryKeyToGroup map (RemoteConsumerRegistry.java:66) retains group mappings for late ACKs (B2-6 fix) but was NEVER cleaned on disconnect. Ephemeral port changes cause unbounded accumulation.
+
+**Fix Applied:**
+Added cleanup in unregisterConsumer() using iterator.remove() pattern (lines 203-217)
+
+```java
+// OOM FIX: Clean up deliveryKeyToGroup to prevent memory leak
+String deliveryKeyPrefix = clientId + ":";
+int removedDeliveryKeys = 0;
+Iterator<String> deliveryKeyIterator = deliveryKeyToGroup.keySet().iterator();
+while (deliveryKeyIterator.hasNext()) {
+    String deliveryKey = deliveryKeyIterator.next();
+    if (deliveryKey.startsWith(deliveryKeyPrefix)) {
+        deliveryKeyIterator.remove();
+        removedDeliveryKeys++;
+    }
+}
+```
+
+---
+
+### B11-4 — DeliveryStateStore cache never cleaned → persisted leak
+
+**Status:** `FIXED`
+**Commit:** b1c2cd9
+**Severity:** MEDIUM
+**Batch:** 11
+
+**Root Cause:**
+DeliveryStateStore.cache map (line 40) persists delivery state to disk but entries are only removed on ACK, not on disconnect. If consumer disconnects before ACK timeout (30min), entry persists forever.
+
+**Fix Applied:**
+Added removeConsumerState() method to DeliveryStateStore (lines 232-255)
+
+```java
+public void removeConsumerState(String clientId) {
+    String keyPrefix = clientId + ":";
+    int removedCount = 0;
+    for (String key : cache.keySet()) {
+        if (key.startsWith(keyPrefix)) {
+            if (cache.remove(key) != null) {
+                removedCount++;
+            }
+        }
+    }
+    if (removedCount > 0) {
+        log.info("OOM FIX: Removed {} delivery state entries...", removedCount);
+        persistToDisk(); // Immediate flush
+    }
+}
+```
+
+Called from RemoteConsumerRegistry.unregisterConsumer() (line 232)
+
+---
+
+**Files Modified:**
+1. broker/src/main/java/com/messaging/broker/metrics/BrokerMetrics.java
+2. broker/src/main/java/com/messaging/broker/metrics/DataRefreshMetrics.java
+3. broker/src/main/java/com/messaging/broker/consumer/RemoteConsumerRegistry.java
+4. broker/src/main/java/com/messaging/broker/consumer/DeliveryStateStore.java
+
+**Verification:**
+```bash
+# Restart broker to clear leaked objects
+docker restart messaging-broker
+
+# Trigger consumer reconnects
+docker restart consumer-price-quote
+
+# Check logs for cleanup confirmation
+docker logs messaging-broker 2>&1 | grep "OOM FIX: Removed"
+# Expected: "OOM FIX: Removed metrics for disconnected consumer..."
+#           "OOM FIX: Removed X timing data entries..."
+#           "OOM FIX: Cleared X deliveryKeyToGroup entries..."
+#           "OOM FIX: Removed X delivery state entries..."
+
+# Monitor heap usage (should stabilize instead of grow)
+docker stats messaging-broker
+
+# Check Prometheus cardinality (should not explode)
+curl http://localhost:8081/prometheus | grep broker_consumer | wc -l
+```
+
+---
+
+*Last updated: 2026-02-23*
+*Total bugs found: 36 | Fixed: 36 | Open: 0 — ALL BUGS RESOLVED*

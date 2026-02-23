@@ -447,26 +447,35 @@ public class BrokerMetrics {
 
     /**
      * Remove all metrics for a consumer group when they disconnect
-     * NOTE: With stable group+topic identifiers, metrics should persist across reconnections.
-     * This method may no longer be necessary and could be deprecated in the future.
+     *
+     * OOM FIX: Re-enabled cleanup to prevent memory leak from ephemeral port changes.
+     * Despite using "stable" group:topic keys, the underlying clientId (with ephemeral port)
+     * causes duplicate metric registrations on reconnect, leaking Counter/Gauge/Timer objects.
+     *
+     * Trade-off: Prometheus graphs may show gaps on disconnect, but this prevents unbounded
+     * memory growth and cardinality explosion.
      */
     public void removeConsumerMetrics(String consumerId, String topic, String group) {
         String key = group + ":" + topic;
 
-        // NOTE: Removing metrics on disconnect causes graph breaks.
-        // With stable identifiers, we should NOT remove metrics to preserve historical data.
-        // Commenting out removal - metrics will persist across consumer reconnections.
+        // OOM FIX: Re-enabled removal to prevent memory leak from ephemeral port reconnections
+        consumerMessagesSent.remove(key);
+        consumerBytesSent.remove(key);
+        consumerAcks.remove(key);
+        consumerFailures.remove(key);
+        consumerRetries.remove(key);
+        consumerOffsets.remove(key);
+        consumerLag.remove(key);
+        consumerDeliveryLatency.remove(key);
+        consumerBytesFailed.remove(key);
+        consumerMessagesFailed.remove(key);
+        consumerLastDeliveryTime.remove(key);
+        consumerLastAckTime.remove(key);
+        consumerAckTimeouts.remove(key);
 
-        // consumerMessagesSent.remove(key);
-        // consumerBytesSent.remove(key);
-        // consumerAcks.remove(key);
-        // consumerFailures.remove(key);
-        // consumerRetries.remove(key);
-        // consumerOffsets.remove(key);
-        // consumerLag.remove(key);
-        // consumerDeliveryLatency.remove(key);
+        // Note: offsetGapsDetected uses topic:partition key, not group:topic, so not removed here
 
-        log.debug("Consumer disconnected but metrics retained for group: {} topic: {} (stable identifier: {})",
+        log.info("OOM FIX: Removed metrics for disconnected consumer: group={}, topic={}, key={}",
                   group, topic, key);
     }
 

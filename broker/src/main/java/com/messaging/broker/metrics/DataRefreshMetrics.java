@@ -608,4 +608,37 @@ public class DataRefreshMetrics {
         readySentTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
         replayStartTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
     }
+
+    /**
+     * OOM FIX: Remove all timing data for a specific consumer on disconnect
+     *
+     * Prevents memory leak from accumulating per-consumer timing maps when
+     * consumers reconnect with different ephemeral ports.
+     *
+     * @param topic Topic name
+     * @param consumer Consumer identifier (may include ephemeral port)
+     */
+    public void removeConsumerTimingData(String topic, String consumer) {
+        String keyPrefix = topic + ":" + consumer;
+        int removedCount = 0;
+
+        // Remove timing state maps (keyed by topic:consumer or topic:consumer:refreshId)
+        removedCount += resetSentTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+        removedCount += resetAckTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+        removedCount += readySentTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+        removedCount += replayStartTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+
+        // Remove Timer objects (prevent Prometheus cardinality explosion)
+        // Keys are: topic:consumer (B4-6 fix removed refreshId from timer keys)
+        if (resetAckDurationTimers.remove(keyPrefix) != null) removedCount++;
+        if (readyAckDurationTimers.remove(keyPrefix) != null) removedCount++;
+
+        // Note: transferRateGauges, bytesTransferredGauges use group:topic keys, not consumer-specific
+        // So we don't remove them here (they're cleaned by BrokerMetrics.removeConsumerMetrics)
+
+        if (removedCount > 0) {
+            log.info("OOM FIX: Removed {} timing data entries for disconnected consumer: topic={}, consumer={}",
+                    removedCount, topic, consumer);
+        }
+    }
 }

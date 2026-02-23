@@ -42,6 +42,7 @@ public class RemoteConsumerRegistry {
     private final ConsumerOffsetTracker offsetTracker;
     private final BrokerMetrics metrics;
     private final DataRefreshMetrics dataRefreshMetrics;
+    private final DeliveryStateStore deliveryStateStore; // OOM FIX: Added to clean up state on disconnect
     private volatile DataRefreshManager dataRefreshManager; // Lazy injection to avoid circular dependency
     private volatile AdaptiveBatchDeliveryManager adaptiveDeliveryManager; // Lazy injection to avoid circular dependency
     private final ObjectMapper objectMapper;
@@ -68,13 +69,14 @@ public class RemoteConsumerRegistry {
     @Inject
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
-                                  DataRefreshMetrics dataRefreshMetrics,
+                                  DataRefreshMetrics dataRefreshMetrics, DeliveryStateStore deliveryStateStore,
                                   @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer) {
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
         this.metrics = metrics;
         this.dataRefreshMetrics = dataRefreshMetrics;
+        this.deliveryStateStore = deliveryStateStore;
         this.maxMessageSizePerConsumer = maxMessageSizePerConsumer;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
@@ -199,13 +201,37 @@ public class RemoteConsumerRegistry {
                              removedInflight, clientId);
                 }
 
-                // Clean up metrics (though with stable identifiers, metrics are now retained)
+                // OOM FIX: Clean up deliveryKeyToGroup to prevent memory leak
+                // Key format: "clientId:topic", so we match prefix "clientId:"
+                int removedDeliveryKeys = 0;
+                Iterator<String> deliveryKeyIterator = deliveryKeyToGroup.keySet().iterator();
+                while (deliveryKeyIterator.hasNext()) {
+                    String deliveryKey = deliveryKeyIterator.next();
+                    if (deliveryKey.startsWith(deliveryKeyPrefix)) {
+                        deliveryKeyIterator.remove();
+                        removedDeliveryKeys++;
+                    }
+                }
+                if (removedDeliveryKeys > 0) {
+                    log.info("OOM FIX: Cleared {} deliveryKeyToGroup entries for clientId={} on unregister",
+                             removedDeliveryKeys, clientId);
+                }
+
+                // Clean up metrics (OOM FIX: re-enabled cleanup in BrokerMetrics)
                 metrics.removeConsumerMetrics(clientId, consumer.topic, consumer.group);
+
+                // OOM FIX: Clean up data refresh timing metrics for this consumer
+                dataRefreshMetrics.removeConsumerTimingData(consumer.topic, clientId);
+
                 log.info("Unregistered remote consumer: consumerKey={}, clientId={}, topic={}, group={}",
                          key, clientId, consumer.topic, consumer.group);
                 removedCount++;
             }
         }
+
+        // OOM FIX: Clean up delivery state for this clientId (all topics)
+        // Called once after processing all topic subscriptions for this client
+        deliveryStateStore.removeConsumerState(clientId);
 
         log.info("Unregistered {} topic subscriptions for client: {}", removedCount, clientId);
         return removedCount;
