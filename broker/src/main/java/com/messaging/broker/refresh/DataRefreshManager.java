@@ -42,6 +42,8 @@ public class DataRefreshManager {
     private final Map<String, DataRefreshContext> activeRefreshes;
     private final Map<String, ScheduledFuture<?>> replayCheckTasks;
     private final Map<String, ScheduledFuture<?>> resetRetryTasks;
+    // B11-6a fix: Reference to AdaptiveBatchDeliveryManager for wiring refresh state checks
+    private final com.messaging.broker.consumer.AdaptiveBatchDeliveryManager adaptiveBatchDeliveryManager;
 
     // Track current refresh batch ID - shared by all topics in the same batch
     private volatile String currentRefreshId = null;
@@ -51,12 +53,14 @@ public class DataRefreshManager {
             PipeConnector pipeConnector,
             DataRefreshConfiguration config,
             DataRefreshStateStore stateStore,
-            DataRefreshMetrics metrics) {
+            DataRefreshMetrics metrics,
+            com.messaging.broker.consumer.AdaptiveBatchDeliveryManager adaptiveBatchDeliveryManager) {
         this.remoteConsumers = remoteConsumers;
         this.pipeConnector = pipeConnector;
         this.config = config;
         this.stateStore = stateStore;
         this.metrics = metrics;
+        this.adaptiveBatchDeliveryManager = adaptiveBatchDeliveryManager;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r);
             t.setName("DataRefreshManager");
@@ -75,6 +79,10 @@ public class DataRefreshManager {
         // Wire this manager to RemoteConsumerRegistry for metrics tracking
         remoteConsumers.setDataRefreshManager(this);
         log.info("DataRefreshManager wired to RemoteConsumerRegistry for metrics tracking");
+
+        // B11-6a fix: Wire this manager to AdaptiveBatchDeliveryManager for refresh state checks
+        adaptiveBatchDeliveryManager.setDataRefreshManager(this);
+        log.info("B11-6a: DataRefreshManager wired to AdaptiveBatchDeliveryManager for RESET_SENT state checking");
 
         Map<String, DataRefreshContext> savedRefreshes = stateStore.loadAllRefreshes();
 
@@ -155,6 +163,32 @@ public class DataRefreshManager {
      * Uses topic name as the expected consumer identifier (one consumer per topic)
      */
     public CompletableFuture<RefreshResult> startRefresh(String topic) {
+
+        // B11-6b fix: Force refresh - cancel existing refresh if in progress
+        // This allows admin to retrigger stuck refreshes without orphaning tasks
+        DataRefreshContext existingRefresh = activeRefreshes.get(topic);
+        if (existingRefresh != null) {
+            log.warn("Refresh already in progress for topic: {} (state: {}), forcing new refresh (canceling old tasks)",
+                     topic, existingRefresh.getState());
+
+            // Cancel existing RESET retry task (prevent orphaned scheduler task)
+            ScheduledFuture<?> oldResetTask = resetRetryTasks.remove(topic);
+            if (oldResetTask != null) {
+                oldResetTask.cancel(false);
+                log.info("B11-6b fix: Cancelled orphaned RESET retry task for topic: {}", topic);
+            }
+
+            // Cancel existing replay check task
+            ScheduledFuture<?> oldReplayTask = replayCheckTasks.remove(topic);
+            if (oldReplayTask != null) {
+                oldReplayTask.cancel(false);
+                log.info("B11-6b fix: Cancelled orphaned replay check task for topic: {}", topic);
+            }
+
+            // Remove old context (will be replaced below)
+            activeRefreshes.remove(topic);
+            log.info("B11-6b fix: Cleaned up old refresh context for topic: {}", topic);
+        }
 
         // Build expected consumers from currently-registered consumers for this topic.
         // Use "group:topic" identifiers — the same format that handleResetAck() receives

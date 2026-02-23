@@ -35,6 +35,8 @@ public class AdaptiveBatchDeliveryManager {
     private final TopicFairScheduler fairScheduler;
     private final BrokerMetrics metrics;
     private final long batchSizeBytes;
+    // B11-6a fix: Reference to DataRefreshManager to check if topic is in RESET_SENT state
+    private com.messaging.broker.refresh.DataRefreshManager dataRefreshManager;
 
     // Adaptive polling config
     private static final long MIN_POLL_DELAY_MS = 1;     // Immediate on data found (near-push latency)
@@ -71,6 +73,14 @@ public class AdaptiveBatchDeliveryManager {
         // Wire back-reference to enable consumer registration notifications
         consumerRegistry.setAdaptiveBatchDeliveryManager(this);
         log.info("AdaptiveBatchDeliveryManager wired to RemoteConsumerRegistry for consumer registration");
+    }
+
+    /**
+     * B11-6a fix: Set DataRefreshManager reference (called by DataRefreshManager.init())
+     */
+    public void setDataRefreshManager(com.messaging.broker.refresh.DataRefreshManager dataRefreshManager) {
+        this.dataRefreshManager = dataRefreshManager;
+        log.info("AdaptiveBatchDeliveryManager wired to DataRefreshManager for refresh state checking");
     }
 
     /**
@@ -158,6 +168,22 @@ public class AdaptiveBatchDeliveryManager {
         String deliveryKey = consumer.clientId + ":" + consumer.topic;
 
         try {
+            // B11-6a FIX: Skip delivery if topic is in DataRefresh RESET_SENT state
+            // During RESET wait, consumer should be paused and not receiving messages
+            // Continuing delivery creates polling storm with 187+ blocked attempts/minute
+            // causing OOM due to accumulated ScheduledFuture + CompletableFuture objects
+            if (dataRefreshManager != null) {
+                com.messaging.broker.refresh.DataRefreshContext refreshContext =
+                    dataRefreshManager.getRefreshStatus(consumer.topic);
+                if (refreshContext != null &&
+                    refreshContext.getState() == com.messaging.broker.refresh.DataRefreshState.RESET_SENT) {
+                    log.trace("B11-6a: Skipping delivery for {}:{} - topic in RESET_SENT state (waiting for consumer ACK)",
+                             consumer.clientId, consumer.topic);
+                    metrics.recordAdaptivePollSkipped(consumer.topic);
+                    return false;  // Return false to trigger exponential backoff to MAX_POLL_DELAY_MS (1s)
+                }
+            }
+
             // Get consumer's current offset from RemoteConsumer
             long consumerOffset = consumer.getCurrentOffset();
 
