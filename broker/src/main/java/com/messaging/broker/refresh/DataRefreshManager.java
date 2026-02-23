@@ -277,7 +277,9 @@ public class DataRefreshManager {
 
         // CRITICAL FIX: Reset offset to 0 for THIS consumer (do this for EVERY RESET_ACK)
         // Previously this was only done for the first RESET_ACK, causing incomplete replays
-        remoteConsumers.resetConsumerOffset(clientId, topic, 0);
+        // MULTI-GROUP FIX: Extract group from consumerGroupTopic (format: "group:topic")
+        String group = consumerGroupTopic.split(":")[0];
+        remoteConsumers.resetConsumerOffset(clientId, topic, group, 0);
         log.info("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}",
                  clientId, consumerGroupTopic, topic);
 
@@ -403,22 +405,24 @@ public class DataRefreshManager {
         } else {
             // Trigger replay for each consumer (InFlight check in notifyNewMessageForConsumer prevents duplicates)
             // This polling is necessary to keep driving deliveries during refresh
-            List<String> allConsumerIds = remoteConsumers.getAllConsumerIds(topic);
-            if (allConsumerIds == null || allConsumerIds.isEmpty()) {
+            // MULTI-GROUP FIX: Use getConsumerGroupTopicPairs to properly handle multiple groups per topic
+            List<RemoteConsumerRegistry.ConsumerGroupTopicPair> consumerPairs =
+                remoteConsumers.getConsumerGroupTopicPairs(topic);
+            if (consumerPairs == null || consumerPairs.isEmpty()) {
                 log.debug("No remote consumers found for topic {}, cannot trigger replay", topic);
             } else {
-                log.debug("Checking replay progress for {} consumers on topic {}", allConsumerIds.size(), topic);
-                for (String clientId : allConsumerIds) {
+                log.debug("Checking replay progress for {} consumer registrations on topic {}",
+                         consumerPairs.size(), topic);
+                for (RemoteConsumerRegistry.ConsumerGroupTopicPair pair : consumerPairs) {
                     // B3-7 fix: only trigger replay for consumers that ACKed RESET.
                     // Previously called for ALL consumers, inflating data_refresh_replay_started_total.
-                    String groupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
-                    if (groupTopic == null || !ackedConsumers.contains(groupTopic)) {
-                        log.debug("Skipping replay trigger for clientId={} (groupTopic={} not in ackedConsumers={})",
-                                clientId, groupTopic, ackedConsumers);
+                    if (!ackedConsumers.contains(pair.consumerGroupTopic)) {
+                        log.debug("Skipping replay trigger for clientId={} consumerGroupTopic={} (not in ackedConsumers={})",
+                                pair.clientId, pair.consumerGroupTopic, ackedConsumers);
                         continue;
                     }
                     // The InFlight check in notifyNewMessageForConsumer will prevent duplicate scheduling
-                    startReplayForConsumer(clientId, topic);
+                    startReplayForConsumer(pair.clientId, topic);
                 }
             }
         }

@@ -27,17 +27,38 @@ import java.util.function.Consumer;
 
 /**
  * Netty-based TCP client implementation
+ *
+ * N2 FIX: Supports external EventLoopGroup to avoid thread explosion when creating
+ * multiple client instances (one per topic or topic:group).
  */
 @Singleton
 @Requires(property = "broker.network.type", value = "tcp")
 public class NettyTcpClient implements NetworkClient {
     private static final Logger log = LoggerFactory.getLogger(NettyTcpClient.class);
 
-    private EventLoopGroup workerGroup;
+    private final EventLoopGroup workerGroup;
+    private final boolean ownEventLoopGroup; // N2 FIX: Track if we should shutdown the EventLoopGroup
 
+    /**
+     * Default constructor - creates its own EventLoopGroup (for Micronaut DI singleton)
+     */
     public NettyTcpClient() {
         this.workerGroup = new NioEventLoopGroup();
-        log.info("Initialized NettyTcpClient");
+        this.ownEventLoopGroup = true;
+        log.info("Initialized NettyTcpClient with own EventLoopGroup");
+    }
+
+    /**
+     * N2 FIX: Constructor with external EventLoopGroup (for shared thread pool)
+     * This allows multiple NettyTcpClient instances to share a single EventLoopGroup,
+     * preventing thread explosion when creating many connections.
+     *
+     * @param sharedEventLoopGroup The shared EventLoopGroup to use
+     */
+    public NettyTcpClient(EventLoopGroup sharedEventLoopGroup) {
+        this.workerGroup = sharedEventLoopGroup;
+        this.ownEventLoopGroup = false;
+        log.debug("Initialized NettyTcpClient with shared EventLoopGroup");
     }
 
     @Override
@@ -90,10 +111,13 @@ public class NettyTcpClient implements NetworkClient {
 
     @PreDestroy
     public void shutdown() {
-        if (workerGroup != null) {
+        // N2 FIX: Only shutdown EventLoopGroup if we own it
+        if (workerGroup != null && ownEventLoopGroup) {
             workerGroup.shutdownGracefully();
+            log.info("NettyTcpClient shutdown complete (EventLoopGroup shut down)");
+        } else {
+            log.debug("NettyTcpClient shutdown (shared EventLoopGroup not shut down)");
         }
-        log.info("NettyTcpClient shutdown complete");
     }
 
     /**

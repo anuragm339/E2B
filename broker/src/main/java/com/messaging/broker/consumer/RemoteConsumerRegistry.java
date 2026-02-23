@@ -130,12 +130,13 @@ public class RemoteConsumerRegistry {
         metrics.updateConsumerOffset(clientId, topic, group, startOffset);
         metrics.updateConsumerLag(clientId, topic, group, 0);
 
-        // Use composite key to support multiple topic subscriptions per client
+        // MULTI-GROUP FIX: Use composite key clientId:topic:group to support multiple groups per topic
+        // This allows multiple groups to subscribe to the same topic on one connection
         // B2-3 fix: detect re-registration before put() so BrokerService can avoid double-counting activeConsumers metric
-        String consumerKey = clientId + ":" + topic;
+        String consumerKey = clientId + ":" + topic + ":" + group;
         boolean isNew = !consumers.containsKey(consumerKey);
         consumers.put(consumerKey, consumer);
-        deliveryKeyToGroup.put(consumerKey, group); // B2-6: persist group for late-ACK offset commit
+        // Note: deliveryKeyToGroup no longer needed since group is in the key
 
         // Notify adaptive delivery manager to start polling for this consumer
         if (adaptiveDeliveryManager != null) {
@@ -209,7 +210,8 @@ public class RemoteConsumerRegistry {
      * @return true if data delivered, false if no data or delivery blocked
      */
     public boolean deliverBatch(RemoteConsumer consumer, long batchSizeBytes) {
-        String deliveryKey = consumer.clientId + ":" + consumer.topic;
+        // MULTI-GROUP FIX: Include group in delivery key
+        String deliveryKey = consumer.clientId + ":" + consumer.topic + ":" + consumer.group;
         String pendingKey = deliveryKey + ":pending";
 
         AtomicBoolean inFlight = inFlightDeliveries.computeIfAbsent(
@@ -453,20 +455,24 @@ public class RemoteConsumerRegistry {
         }
 
         // Step 1: Create and send header message with batch metadata
-        // Include topic name so consumer knows what to ACK
+        // FIX: Include both topic AND group so consumer can ACK with correct group identifier
         byte[] topicBytes = consumer.topic.getBytes(StandardCharsets.UTF_8);
         int topicLen = topicBytes.length;
+        byte[] groupBytes = consumer.group.getBytes(StandardCharsets.UTF_8);
+        int groupLen = groupBytes.length;
 
-        // UNIFIED FORMAT Header: [recordCount:4][totalBytes:8][topicLen:4][topic:var]
-        // Removed lastOffset - consumer doesn't need it (broker tracks offsets)
-        ByteBuffer headerBuffer = ByteBuffer.allocate(12 + 4 + topicLen);
+        // MULTI-GROUP FIX: Header format [recordCount:4][totalBytes:8][topicLen:4][topic:var][groupLen:4][group:var]
+        // Group is REQUIRED for ACK routing when multiple groups share one connection
+        ByteBuffer headerBuffer = ByteBuffer.allocate(12 + 4 + topicLen + 4 + groupLen);
         headerBuffer.putInt(batchRegion.recordCount);
         headerBuffer.putLong(batchRegion.totalBytes);
         headerBuffer.putInt(topicLen);
         headerBuffer.put(topicBytes);
+        headerBuffer.putInt(groupLen);
+        headerBuffer.put(groupBytes);
         headerBuffer.flip();
 
-        byte[] header = new byte[12 + 4 + topicLen];
+        byte[] header = new byte[12 + 4 + topicLen + 4 + groupLen];
         headerBuffer.get(header);
 
         // Send header using BATCH_HEADER message type
@@ -476,8 +482,8 @@ public class RemoteConsumerRegistry {
             header
         );
 
-        log.debug("Sending BATCH_HEADER to consumer {}: topic={}, recordCount={}, totalBytes={}",
-                 consumer.clientId, consumer.topic, batchRegion.recordCount, batchRegion.totalBytes);
+        log.debug("Sending BATCH_HEADER to consumer {}: topic={}, group={}, recordCount={}, totalBytes={}",
+                 consumer.clientId, consumer.topic, consumer.group, batchRegion.recordCount, batchRegion.totalBytes);
 
         long timeoutSeconds = 1 + (batchRegion.totalBytes / (1024 * 1024) * 10);
         // Timeout in seconds (1s base + 10s per MB, e.g., 2MB = 21 seconds)
@@ -525,11 +531,15 @@ public class RemoteConsumerRegistry {
      * Handle BATCH_ACK from consumer
      * This is called when the consumer successfully processes a batch and sends acknowledgment
      *
+     * MULTI-GROUP FIX: Now expects group in ACK for proper routing
+     *
      * @param clientId The client ID that sent the ACK
      * @param topic The topic that was acknowledged
+     * @param group The group that was acknowledged
      */
-    public void handleBatchAck(String clientId, String topic) {
-        String deliveryKey = clientId + ":" + topic;
+    public void handleBatchAck(String clientId, String topic, String group) {
+        // MULTI-GROUP FIX: Include group in delivery key
+        String deliveryKey = clientId + ":" + topic + ":" + group;
         String pendingKey = deliveryKey + ":pending";
 
         Long committedOffset = pendingOffsets.remove(pendingKey);
@@ -547,28 +557,21 @@ public class RemoteConsumerRegistry {
 
         RemoteConsumer consumer = consumers.get(deliveryKey);
         if (consumer != null) {
-            offsetTracker.updateOffset(consumer.group + ":" + topic, committedOffset);
+            offsetTracker.updateOffset(group + ":" + topic, committedOffset);
             // Update Prometheus gauge metric to reflect new offset
-            metrics.updateConsumerOffset(clientId, topic, consumer.group, committedOffset);
+            metrics.updateConsumerOffset(clientId, topic, group, committedOffset);
 
             // Update last ACK timestamp for stuck detection
-            metrics.updateConsumerLastAckTime(clientId, topic, consumer.group);
+            metrics.updateConsumerLastAckTime(clientId, topic, group);
 
             // Record consumer ACK metric
-            metrics.recordConsumerAck(clientId, topic, consumer.group);
+            metrics.recordConsumerAck(clientId, topic, group);
         } else {
-            // B2-6 fix: consumer was unregistered before ACK arrived (race between permanent failure
-            // and the in-flight ACK). Still persist the offset using the group stored in
-            // deliveryKeyToGroup — this prevents offset regression and message re-delivery on reconnect.
-            String group = deliveryKeyToGroup.get(deliveryKey);
-            if (group != null) {
-                log.warn("ACK for unregistered consumer {}, persisting offset {} via retained group mapping",
-                         deliveryKey, committedOffset);
-                offsetTracker.updateOffset(group + ":" + topic, committedOffset);
-            } else {
-                log.warn("ACK for unregistered consumer {} with no retained group mapping — offset {} lost",
-                         deliveryKey, committedOffset);
-            }
+            // MULTI-GROUP FIX: Group is now in the key, so we already know it
+            // If consumer was unregistered, we can still persist the offset
+            log.warn("ACK for unregistered consumer {}, persisting offset {} for group {}",
+                     deliveryKey, committedOffset, group);
+            offsetTracker.updateOffset(group + ":" + topic, committedOffset);
         }
 
         AtomicBoolean inFlight = inFlightDeliveries.get(deliveryKey);
@@ -674,9 +677,11 @@ public class RemoteConsumerRegistry {
 
     /**
      * Reset offset for a specific consumer (for DataRefresh)
+     * MULTI-GROUP FIX: Now requires group parameter for correct consumer lookup
      */
-    public void resetConsumerOffset(String clientId, String topic, long offset) {
-        String consumerKey = clientId + ":" + topic;
+    public void resetConsumerOffset(String clientId, String topic, String group, long offset) {
+        // MULTI-GROUP FIX: Include group in consumer key
+        String consumerKey = clientId + ":" + topic + ":" + group;
         RemoteConsumer consumer = consumers.get(consumerKey);
 
         if (consumer == null) {
@@ -686,7 +691,7 @@ public class RemoteConsumerRegistry {
 
         consumer.setCurrentOffset(offset);
 
-        String consumerId = consumer.group + ":" + consumer.topic;
+        String consumerId = group + ":" + topic;
         offsetTracker.resetOffset(consumerId, offset);
 
         log.info("Reset offset to {} for consumer: {} ({})", offset, clientId, consumerId);
@@ -694,8 +699,9 @@ public class RemoteConsumerRegistry {
 
     /**
      * Check if all specified consumers have caught up to latest offset (for DataRefresh)
+     * MULTI-GROUP FIX: Parameter is consumerGroupTopics (format: "group:topic"), not clientIds
      */
-    public boolean allConsumersCaughtUp(String topic, java.util.Set<String> consumerClientIds) {
+    public boolean allConsumersCaughtUp(String topic, java.util.Set<String> consumerGroupTopics) {
         // CRITICAL FIX: Use getCurrentOffset (actual storage write head) instead of getMaxOffsetFromMetadata (stale)
         // getMaxOffsetFromMetadata reads from segment metadata DB which is only updated periodically (every 1000 appends)
         // During data refresh replay, metadata can lag behind actual storage by tens of thousands of offsets
@@ -705,25 +711,14 @@ public class RemoteConsumerRegistry {
 
         log.debug("Checking if consumers caught up for topic {}: latestOffset from CURRENT storage = {}", topic, latestOffset);
 
-        for (String clientId : consumerClientIds) {
-            String consumerKey = clientId + ":" + topic;
-            RemoteConsumer consumer = consumers.get(consumerKey);
-
-            if (consumer == null) {
-                log.debug("Consumer not found: consumerKey={}", consumerKey);
-                return false;
-            }
-
-            // CRITICAL FIX: Use COMMITTED offset from offsetTracker (consumer-offsets.properties)
-            // instead of in-memory currentOffset which is RESERVED (not yet ACKed)
-            // consumer.getCurrentOffset() returns the next offset to SEND
-            // offsetTracker.getOffset() returns the last offset that was ACKNOWLEDGED
-            String consumerId = consumer.group + ":" + topic;
-            long committedOffset = offsetTracker.getOffset(consumerId);
+        for (String consumerGroupTopic : consumerGroupTopics) {
+            // MULTI-GROUP FIX: Use COMMITTED offset from offsetTracker with consumerGroupTopic key
+            // consumerGroupTopic is already in "group:topic" format which is what offsetTracker expects
+            long committedOffset = offsetTracker.getOffset(consumerGroupTopic);
 
             if (committedOffset < latestOffset) {
                 log.info("Consumer {} not caught up: committed={} < latest={} (need {} more messages)",
-                         consumerId, committedOffset, latestOffset, latestOffset - committedOffset);
+                         consumerGroupTopic, committedOffset, latestOffset, latestOffset - committedOffset);
                 return false;
             }
         }
@@ -735,17 +730,50 @@ public class RemoteConsumerRegistry {
     /**
      * Get consumer group:topic identifier for a client (for DataRefresh)
      * Maps dynamic clientId to stable "group:topic" identifier
+     *
+     * MULTI-GROUP NOTE: This method is deprecated for multi-group scenarios.
+     * Use getConsumerGroupTopicPairs() instead.
+     *
+     * @deprecated Use getConsumerGroupTopicPairs() for multi-group support
      */
+    @Deprecated
     public String getConsumerGroupTopic(String clientId, String topic) {
-        String consumerKey = clientId + ":" + topic;
-        RemoteConsumer consumer = consumers.get(consumerKey);
-
-        if (consumer == null) {
-            log.warn("Consumer not found for clientId={}, topic={}", clientId, topic);
-            return null;
+        // MULTI-GROUP FIX: Find first matching consumer (there may be multiple groups)
+        for (RemoteConsumer consumer : consumers.values()) {
+            if (consumer.clientId.equals(clientId) && consumer.topic.equals(topic)) {
+                return consumer.group + ":" + consumer.topic;
+            }
         }
 
-        return consumer.group + ":" + consumer.topic;
+        log.warn("Consumer not found for clientId={}, topic={}", clientId, topic);
+        return null;
+    }
+
+    /**
+     * Get all (clientId, consumerGroupTopic) pairs for a topic.
+     * This properly handles multi-group scenarios where one clientId may be
+     * registered for the same topic with multiple groups.
+     *
+     * MULTI-GROUP FIX: Returns pairs to support iteration over all consumer registrations.
+     */
+    public java.util.List<ConsumerGroupTopicPair> getConsumerGroupTopicPairs(String topic) {
+        return consumers.values().stream()
+                .filter(c -> c.topic.equals(topic))
+                .map(c -> new ConsumerGroupTopicPair(c.clientId, c.group + ":" + c.topic))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Pair of (clientId, consumerGroupTopic) for multi-group replay iteration
+     */
+    public static class ConsumerGroupTopicPair {
+        public final String clientId;
+        public final String consumerGroupTopic;
+
+        public ConsumerGroupTopicPair(String clientId, String consumerGroupTopic) {
+            this.clientId = clientId;
+            this.consumerGroupTopic = consumerGroupTopic;
+        }
     }
 
     /**

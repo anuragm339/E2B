@@ -284,6 +284,228 @@ After initial implementation, two edge cases were identified and fixed:
    - Each failed topic now retries independently with exponential backoff
    - No longer requires all topics to fail before triggering retry
 
+**Multi-Group Protocol Enhancement (follow-up):**
+
+After fixing the client-side edge cases, it was discovered that the broker registry still used
+`clientId:topic` as the consumer key, causing the "last SUBSCRIBE wins" problem for multiple
+groups on the same topic. A complete protocol redesign was implemented to support multi-group
+scenarios properly:
+
+**Implementation Changes:**
+
+1. **Broker Registry Key:** `clientId:topic` → `clientId:topic:group`
+   - File: `RemoteConsumerRegistry.java:136`
+   - Each (clientId, topic, group) combination is now a separate registration
+   - Prevents group subscriptions from overwriting each other
+
+2. **BATCH_HEADER Protocol:** Added group field
+   - File: `RemoteConsumerRegistry.java:559-571`
+   - Old format: `[recordCount:4][totalBytes:8][topicLen:4][topic:var]`
+   - New format: `[recordCount:4][totalBytes:8][topicLen:4][topic:var][groupLen:4][group:var]`
+   - Decoder now knows which group the batch belongs to
+
+3. **ZeroCopyBatchDecoder:** Parse group from BATCH_HEADER
+   - File: `network/codec/ZeroCopyBatchDecoder.java:112-116`
+   - Stores `currentBatchGroup` during decode
+   - Emits `BatchDecodedEvent(records, topic, group)` with group info
+
+4. **BatchDecodedEvent:** Added group field
+   - File: `network/codec/BatchDecodedEvent.java:12`
+   - Changed from `(records, topic)` to `(records, topic, group)`
+
+5. **BatchAckHandler:** Send group in BATCH_ACK
+   - File: `network/codec/BatchAckHandler.java:26-42`
+   - Old format: topic string only
+   - New format: `[topicLen:4][topic:var][groupLen:4][group:var]`
+   - Broker can now route offset commits to correct group
+
+6. **BrokerService.handleBatchAck:** Parse group from payload
+   - File: `broker/core/BrokerService.java:428-452`
+   - Extracts both topic and group from BATCH_ACK
+   - Calls `remoteConsumers.handleBatchAck(clientId, topic, group)`
+
+7. **RESET_ACK Protocol:** Send multiple ACKs (one per group)
+   - File: `client/ClientConsumerManager.java:handleResetMessage()`
+   - Client sends one RESET_ACK per group when multiple groups subscribe to same topic
+   - Format: `[topicLen:4][topic:var][groupLen:4][group:var]`
+
+8. **BrokerService.handleResetAck:** Parse group from payload
+   - File: `broker/core/BrokerService.java:346-393`
+   - Constructs `consumerGroupTopic = group + ":" + topic`
+   - Passes stable identifier to DataRefreshManager
+
+9. **READY_ACK Protocol:** Send multiple ACKs (one per group)
+   - File: `client/ClientConsumerManager.java:handleReadyMessage()`
+   - Client sends one READY_ACK per group
+   - Format: `[topicLen:4][topic:var][groupLen:4][group:var]`
+
+10. **BrokerService.handleReadyAck:** Parse group from payload
+    - File: `broker/core/BrokerService.java:398-443`
+    - Constructs `consumerGroupTopic = group + ":" + topic`
+    - Sends explicit ACK back to consumer
+
+11. **DataRefreshManager Replay Loop:** Support multi-group iteration
+    - File: `broker/refresh/DataRefreshManager.java:405-425`
+    - Old: `getAllConsumerIds(topic)` + `getConsumerGroupTopic(clientId, topic)`
+    - New: `getConsumerGroupTopicPairs(topic)` returns list of (clientId, group:topic) pairs
+    - Properly handles same clientId with multiple groups on same topic
+
+**Result:**
+- ✅ Multiple groups can subscribe to same topic on one connection
+- ✅ Each group tracks offsets independently
+- ✅ BATCH_ACK, RESET_ACK, READY_ACK all include group for proper routing
+- ✅ Data refresh workflow works correctly with multiple groups
+- ✅ No "last subscribe wins" issue
+
+**Example Scenario:**
+- Consumer process subscribes to `prices-v1` with both `group-a` and `group-b`
+- Creates 1 TCP connection to broker
+- Sends 2 SUBSCRIBE messages (one per group)
+- Broker creates 2 registrations: `clientId:prices-v1:group-a` and `clientId:prices-v1:group-b`
+- Each group receives batches independently with correct group in BATCH_HEADER
+- Each group commits offsets independently via BATCH_ACK with group field
+- Data refresh sends 2 RESET_ACKs and 2 READY_ACKs (one per group)
+
+---
+
+### N1 — Multi-group, same topic can still interleave zero-copy on one connection
+
+**Status:** `FIXED`
+**Commit:** TBD
+**Severity:** Critical
+**Batch:** 10
+
+**File:**
+- `client/src/main/java/com/messaging/client/ClientConsumerManager.java`
+- `network/src/main/java/com/messaging/network/tcp/NettyTcpClient.java`
+
+**Bug:**
+After implementing per-topic connections (B1-7), it was discovered that multiple groups on the same topic still share a single TCP connection. The broker delivery is parallelized per `clientId:topic:group`, so batches for different groups can still interleave on one socket, causing zero-copy desync.
+
+**Example:**
+- Consumer subscribes to `prices-v1` with both `group-a` and `group-b`
+- B1-7 creates ONE connection for topic `prices-v1` (shared by both groups)
+- Broker sends batch for `group-a` → `BATCH_HEADER` for group-a
+- While decoder reads raw bytes for group-a, broker sends batch for `group-b` → `BATCH_HEADER` for group-b arrives
+- Decoder treats group-b's header bytes as group-a's record data → parse failure
+
+**Root Cause:**
+Connection key was `topic` instead of `topic:group`, so multiple groups shared one connection.
+
+**Fix Applied:** Per-topic:group connections
+
+**Implementation:**
+1. Changed connection key from `topic` to `topic:group`
+2. Each (topic, group) combination now gets its own dedicated TCP connection
+3. Updated all connection maps to use `topicGroup` as key:
+   - `clientsPerTopic` → `clientsPerTopicGroup`
+   - `connectionsPerTopic` → `connectionsPerTopicGroup`
+   - `connectedPerTopic` → `connectedPerTopicGroup`
+   - `reconnectAttemptsPerTopic` → `reconnectAttemptsPerTopicGroup`
+
+4. Updated connection management:
+   - `connectToTopic()` → `connectToTopicGroup()` - accepts `"topic:group"` string
+   - `subscribeTopicOnConnection()` → `subscribeTopicGroupOnConnection()` - sends ONE SUBSCRIBE per connection
+   - `scheduleTopicReconnect()` → `scheduleTopicGroupReconnect()` - reconnects specific topic:group
+   - `cleanupTopicConnection()` → `cleanupTopicGroupConnection()`
+
+5. Updated message handlers:
+   - `handleMessage()` now receives `topicGroup` parameter
+   - Extracts topic from `topicGroup` for handler routing
+   - DISCONNECT reconnects only the affected topic:group
+   - RESET/READY ACK sent on correct topic:group connection
+
+**Result:**
+- ✅ Each topic:group combination has its own TCP connection
+- ✅ Zero-copy batches never interleave (complete isolation)
+- ✅ Supports unlimited groups per topic without risk
+
+**Example:**
+- Consumer subscribes to `prices-v1` with `group-a` and `group-b`
+- Creates 2 TCP connections: `prices-v1:group-a` and `prices-v1:group-b`
+- Each connection carries only one group's batches
+- No interleaving possible
+
+---
+
+### N2 — Thread explosion with one Netty client per topic:group
+
+**Status:** `FIXED`
+**Commit:** TBD
+**Severity:** High
+**Batch:** 10
+
+**File:**
+- `network/src/main/java/com/messaging/network/tcp/NettyTcpClient.java`
+- `client/src/main/java/com/messaging/client/ClientConsumerManager.java`
+
+**Bug:**
+With per-topic:group connections (N1 fix), each connection creates its own `NettyTcpClient` instance. Each `NettyTcpClient` creates its own `NioEventLoopGroup`, which defaults to 2×CPU cores threads. This causes thread explosion:
+
+**Example:**
+- Consumer with 6 topics and 2 groups each = 12 connections
+- Each connection = 1 NettyTcpClient = 1 EventLoopGroup = 16 threads (on 8-core machine)
+- Total: 12 × 16 = 192 threads for one consumer process!
+
+**Root Cause:**
+Each `NettyTcpClient` instance created its own `EventLoopGroup` in the constructor, with no way to share a single group across multiple clients.
+
+**Fix Applied:** Shared EventLoopGroup across all connections
+
+**Implementation:**
+1. **NettyTcpClient** - Added external EventLoopGroup support:
+   ```java
+   // New constructor for shared EventLoopGroup
+   public NettyTcpClient(EventLoopGroup sharedEventLoopGroup) {
+       this.workerGroup = sharedEventLoopGroup;
+       this.ownEventLoopGroup = false;  // Don't shutdown on destroy
+   }
+
+   // Updated shutdown to only close if we own the group
+   @PreDestroy
+   public void shutdown() {
+       if (workerGroup != null && ownEventLoopGroup) {
+           workerGroup.shutdownGracefully();
+       }
+   }
+   ```
+
+2. **ClientConsumerManager** - Create and share one EventLoopGroup:
+   ```java
+   // Single shared EventLoopGroup for all connections
+   private EventLoopGroup sharedEventLoopGroup;
+
+   // Initialize in onApplicationEvent()
+   sharedEventLoopGroup = new NioEventLoopGroup();
+
+   // Pass to each NettyTcpClient
+   NettyTcpClient client = new NettyTcpClient(sharedEventLoopGroup);
+
+   // Shutdown in @PreDestroy
+   sharedEventLoopGroup.shutdownGracefully().sync();
+   ```
+
+3. Updated `cleanupTopicGroupConnection()` to not call `client.shutdown()` (shares EventLoopGroup)
+
+**Result:**
+- ✅ All connections share ONE EventLoopGroup (16 threads total, not 192)
+- ✅ Thread count: O(CPU cores) instead of O(connections × CPU cores)
+- ✅ Memory savings: ~90% reduction (one group vs. 12 groups)
+- ✅ No functional impact - connections still isolated
+
+**Resource Comparison:**
+
+| Configuration | Connections | EventLoopGroups | Threads (8-core) | Memory |
+|---------------|-------------|-----------------|------------------|---------|
+| Before N1+N2 | 1 (shared) | 1 | 16 | Baseline |
+| After N1 only | 12 (per topic:group) | 12 | 192 | ~12x |
+| After N1+N2 | 12 (per topic:group) | 1 (shared) | 16 | Baseline |
+
+**Trade-offs:**
+- ✅ Correctness: Zero-copy never interleaves (N1)
+- ✅ Efficiency: Thread count stays constant (N2)
+- ✅ Scalability: Supports many topic:group combinations without resource explosion
+
 ---
 
 ## HIGH Bugs (Wrong behavior / correctness broken)

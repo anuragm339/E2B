@@ -345,17 +345,24 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      */
     private void handleResetAck(String clientId, BrokerMessage message) {
         try {
-            // Extract topic from payload
-            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
-            String[] split = topic.split(",");
-            log.info("Received RESET ACK from client: {} for topic: {}", clientId, topic);
+            // MULTI-GROUP FIX: Parse both topic and group from payload
+            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
-            // Map clientId to stable group:topic identifier
-            String consumerGroupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
-            if (consumerGroupTopic == null) {
-                log.warn("Cannot map consumer to group:topic: clientId={}, topic={}", clientId, topic);
-                return;
-            }
+            int topicLen = buffer.getInt();
+            byte[] topicBytes = new byte[topicLen];
+            buffer.get(topicBytes);
+            String topic = new String(topicBytes, StandardCharsets.UTF_8);
+
+            int groupLen = buffer.getInt();
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            String group = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.info("Received RESET ACK from client: {} for topic: {}, group: {}", clientId, topic, group);
+
+            // MULTI-GROUP FIX: Construct consumerGroupTopic directly from parsed group and topic
+            String consumerGroupTopic = group + ":" + topic;
 
             log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
 
@@ -390,17 +397,24 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      */
     private void handleReadyAck(String clientId, BrokerMessage message) {
         try {
-            // Extract topic from payload
-            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
+            // MULTI-GROUP FIX: Parse both topic and group from payload
+            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
-            log.info("Received READY ACK from client: {} for topic: {}", clientId, topic);
+            int topicLen = buffer.getInt();
+            byte[] topicBytes = new byte[topicLen];
+            buffer.get(topicBytes);
+            String topic = new String(topicBytes, StandardCharsets.UTF_8);
 
-            // Map clientId to stable group:topic identifier
-            String consumerGroupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
-            if (consumerGroupTopic == null) {
-                log.warn("Cannot map consumer to group:topic: clientId={}, topic={}", clientId, topic);
-                return;
-            }
+            int groupLen = buffer.getInt();
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            String group = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.info("Received READY ACK from client: {} for topic: {}, group: {}", clientId, topic, group);
+
+            // MULTI-GROUP FIX: Construct consumerGroupTopic directly from parsed group and topic
+            String consumerGroupTopic = group + ":" + topic;
 
             log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
 
@@ -408,6 +422,19 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
 
             // Send ACK back to consumer to acknowledge receipt
+            BrokerMessage ack = new BrokerMessage(
+                BrokerMessage.MessageType.ACK,
+                message.getMessageId(),
+                new byte[0]
+            );
+
+            server.send(clientId, ack).whenComplete((v, ex) -> {
+                if (ex != null) {
+                    log.error("Failed to send READY ACK to {}", clientId, ex);
+                } else {
+                    log.debug("Sent ACK to {} for READY", clientId);
+                }
+            });
 
         } catch (Exception e) {
             log.error("Error handling READY from {}", clientId, e);
@@ -416,15 +443,28 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
     /**
      * Handle BATCH_ACK message - consumer acknowledges receipt and processing of a batch
+     * MULTI-GROUP FIX: Payload now contains both topic and group
      */
     private void handleBatchAck(String clientId, BrokerMessage message) {
         try {
-            // Payload contains topic name as bytes
-            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
-            log.debug("Received BATCH_ACK from client: {}, topic: {}", clientId, topic);
+            // MULTI-GROUP FIX: Parse both topic and group from payload
+            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
+
+            int topicLen = buffer.getInt();
+            byte[] topicBytes = new byte[topicLen];
+            buffer.get(topicBytes);
+            String topic = new String(topicBytes, StandardCharsets.UTF_8);
+
+            int groupLen = buffer.getInt();
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            String group = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.debug("Received BATCH_ACK from client: {}, topic: {}, group: {}", clientId, topic, group);
 
             // Delegate to RemoteConsumerRegistry to handle ACK and commit offset
-            remoteConsumers.handleBatchAck(clientId, topic);
+            remoteConsumers.handleBatchAck(clientId, topic, group);
 
         } catch (Exception e) {
             log.error("Error handling BATCH_ACK from {}", clientId, e);

@@ -46,6 +46,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
     private long expectedTotalBytes = 0;
     private long lastOffset = 0;
     private String currentBatchTopic = null; // Track which topic this batch belongs to
+    private String currentBatchGroup = null; // MULTI-GROUP FIX: Track which group this batch belongs to
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
@@ -96,8 +97,8 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             byte[] payload = new byte[payloadLength];
             in.readBytes(payload);
 
-            // UNIFIED FORMAT: [recordCount:4][totalBytes:8][topicLen:4][topic:var]
-            // Removed lastOffset - consumer doesn't need it
+            // MULTI-GROUP FIX: Format [recordCount:4][totalBytes:8][topicLen:4][topic:var][groupLen:4][group:var]
+            // Group is required for ACK routing when multiple groups share one connection
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(payload);
             expectedRecordCount = buffer.getInt();
             expectedTotalBytes = buffer.getLong();
@@ -108,8 +109,14 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             buffer.get(topicBytes);
             currentBatchTopic = new String(topicBytes, StandardCharsets.UTF_8);
 
-            log.debug("Received BATCH_HEADER: topic={}, recordCount={}, totalBytes={}",
-                    currentBatchTopic, expectedRecordCount, expectedTotalBytes);
+            // MULTI-GROUP FIX: Parse group name from header
+            int groupLen = buffer.getInt();
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            currentBatchGroup = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.debug("Received BATCH_HEADER: topic={}, group={}, recordCount={}, totalBytes={}",
+                    currentBatchTopic, currentBatchGroup, expectedRecordCount, expectedTotalBytes);
 
             // Transition to READING_ZERO_COPY_BATCH state to expect raw bytes
             state = DecoderState.READING_ZERO_COPY_BATCH;
@@ -355,12 +362,14 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             expectedTotalBytes = 0;
             lastOffset = 0;
             currentBatchTopic = null;
+            currentBatchGroup = null;
             ctx.close();
             return;
         }
 
-        // Emit BatchDecodedEvent to pipeline (BatchAckHandler will send BATCH_ACK)
-        out.add(new BatchDecodedEvent(records, currentBatchTopic));
+        // Emit BatchDecodedEvent to pipeline (BatchAckHandler will send BATCH_ACK with group)
+        // MULTI-GROUP FIX: Include group so ACK can identify which group to advance offset for
+        out.add(new BatchDecodedEvent(records, currentBatchTopic, currentBatchGroup));
 
         // Reset state for next message
         state = DecoderState.READING_BROKER_MESSAGE;
@@ -368,5 +377,6 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
         expectedTotalBytes = 0;
         lastOffset = 0;
         currentBatchTopic = null;
+        currentBatchGroup = null;
     }
 }
