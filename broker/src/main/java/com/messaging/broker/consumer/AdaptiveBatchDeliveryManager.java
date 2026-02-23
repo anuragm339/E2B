@@ -1,7 +1,7 @@
 package com.messaging.broker.consumer;
 
 import com.messaging.broker.metrics.BrokerMetrics;
-import com.messaging.storage.metadata.SegmentMetadataStoreFactory;
+import com.messaging.common.api.StorageEngine;
 import io.micronaut.context.annotation.Value;
 import jakarta.annotation.PostConstruct;
 import jakarta.inject.Inject;
@@ -15,7 +15,7 @@ import java.util.concurrent.TimeUnit;
  * Adaptive polling-based batch delivery manager
  *
  * Replaces push-based delivery with watermark-based adaptive polling:
- * - Checks storage watermarks before reading (cheap metadata check)
+ * - Checks storage watermarks before reading (cheap in-memory offset check)
  * - Adaptive delay: 1ms when active, exponential backoff to 1s when idle
  * - Per-topic fairness via TopicFairScheduler
  * - Persistent delivery state for safe restarts
@@ -30,7 +30,7 @@ public class AdaptiveBatchDeliveryManager {
     private static final Logger log = LoggerFactory.getLogger(AdaptiveBatchDeliveryManager.class);
 
     private final RemoteConsumerRegistry consumerRegistry;
-    private final com.messaging.storage.metadata.SegmentMetadataStoreFactory metadataStoreFactory;
+    private final StorageEngine storage;
     private final DeliveryStateStore deliveryStateStore;
     private final TopicFairScheduler fairScheduler;
     private final BrokerMetrics metrics;
@@ -47,21 +47,21 @@ public class AdaptiveBatchDeliveryManager {
     @Inject
     public AdaptiveBatchDeliveryManager(
             RemoteConsumerRegistry consumerRegistry,
-            SegmentMetadataStoreFactory metadataStoreFactory,
+            StorageEngine storage,
             DeliveryStateStore deliveryStateStore,
             TopicFairScheduler fairScheduler,
             BrokerMetrics metrics,
             @Value("${broker.consumer.max-message-size-per-consumer:1048576}") long batchSizeBytes) {
 
         this.consumerRegistry = consumerRegistry;
-        this.metadataStoreFactory = metadataStoreFactory;
+        this.storage = storage;
         this.deliveryStateStore = deliveryStateStore;
         this.fairScheduler = fairScheduler;
         this.metrics = metrics;
         this.batchSizeBytes = batchSizeBytes;
 
         log.info("AdaptiveBatchDeliveryManager initialized: batchSize={}bytes, " +
-                 "minDelay={}ms, maxDelay={}ms, per-topic metadata-based watermark enabled",
+                 "minDelay={}ms, maxDelay={}ms, per-topic current-offset watermark enabled",
                 batchSizeBytes, MIN_POLL_DELAY_MS, MAX_POLL_DELAY_MS);
     }
 
@@ -157,7 +157,7 @@ public class AdaptiveBatchDeliveryManager {
      *
      * Flow:
      * 1. Get consumer's current offset
-     * 2. Query segment_metadata for latest offset (direct DB query - no cache)
+     * 2. Query storage for latest offset (in-memory write head)
      * 3. If latest > consumer offset → call consumerRegistry.deliverBatch()
      * 4. Return true if data delivered, false if skipped
      *
@@ -187,12 +187,8 @@ public class AdaptiveBatchDeliveryManager {
             // Get consumer's current offset from RemoteConsumer
             long consumerOffset = consumer.getCurrentOffset();
 
-            // Get topic-specific metadata store from factory
-            com.messaging.storage.metadata.SegmentMetadataStore metadataStore =
-                metadataStoreFactory.getStoreForTopic(consumer.topic);
-
-            // Query segment_metadata for latest offset (DIRECT QUERY - no cache!)
-            long latestOffset = metadataStore.getMaxOffset(consumer.topic, 0);
+            // Query storage for latest offset (in-memory write head)
+            long latestOffset = storage.getCurrentOffset(consumer.topic, 0);
 
             log.info("DEBUG: tryDeliverBatch offset check: topic={}, latestOffset={}, consumerOffset={}",
                     consumer.topic, latestOffset, consumerOffset);
