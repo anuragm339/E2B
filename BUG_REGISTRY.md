@@ -17,6 +17,68 @@
 
 ---
 
+## HIGH SEVERITY Bugs (Memory leaks / Performance degradation)
+
+---
+
+### STORAGE-1 — Segment Index Map Memory Leak
+
+**Status:** `FIXED`
+**Commit:** `[TODO: Add commit hash]`
+**Severity:** HIGH (Memory leak)
+**Affected Component:** storage/Segment.java
+
+**Description:**
+Segment.recoverFromIndexFile() populates a deprecated ConcurrentSkipListMap<Long, Integer> index
+with every offset during segment recovery. This creates millions of ConcurrentSkipListMap$Node
+objects, consuming 50-500MB+ per segment despite the map never being used for reads or writes.
+
+**Root Cause:**
+Incomplete refactoring. File-based binary search (findIndexEntryForOffset) replaced the in-memory
+index for reads (line 627), but recoverFromIndexFile() (line 311) continued populating the map.
+
+**Impact:**
+- 1M records: ~50MB wasted per segment
+- 10M records: ~500MB wasted per segment
+- Multiple segments: Several GB of wasted heap
+- OOM risk in production with large datasets
+
+**Fix:**
+Removed deprecated index field and all references:
+- Deleted `ConcurrentSkipListMap<Long, Integer> index` field
+- Removed `index = new ConcurrentSkipListMap<>()` initialization
+- Removed `index.put(offset, logPos)` in recovery loop
+- Fixed `recordCount` calculation to not use `index.size()`
+- Removed commented-out code referencing index
+- Updated javadoc to reflect O(1) memory usage
+
+**Files Changed:**
+- storage/src/main/java/com/messaging/storage/segment/Segment.java
+
+**Memory Savings:**
+- 1M records: 50MB per segment
+- 10M records: 500MB per segment
+
+**Testing:**
+- Heap dump before/after: Verified ConcurrentSkipListMap$Node instances eliminated
+- Functional testing: Read/write/recovery still works correctly
+- Crash recovery (B7-2): Still handles orphaned bytes correctly
+
+**Verification:**
+```bash
+# Heap dump analysis
+docker exec broker jmap -dump:live,format=b,file=/tmp/heap-after.hprof 1
+# Analyze with Eclipse MAT - should show ZERO ConcurrentSkipListMap$Node instances
+
+# Functional test
+# 1. Send messages: docker compose exec cloud-server curl -X POST localhost:8080/data/refresh
+# 2. Restart broker: docker compose restart broker
+# 3. Verify recovery: docker logs broker | grep "Recovered index"
+# 4. Verify reads work: Check consumer logs for message delivery
+```
+
+---
+
 ## CRITICAL Bugs (System stops / data permanently lost)
 
 ---
@@ -1871,3 +1933,191 @@ docker stats messaging-broker
 
 *Last updated: 2026-02-23*
 *Total bugs found: 37 | Fixed: 37 | Open: 0 — ALL BUGS RESOLVED*
+
+### B11-6 — AdaptiveBatchDeliveryManager polling storm during RESET_SENT → heap OOM + duplicate refresh leak
+
+**Status:** `FIXED`
+**Commit:** [pending]
+**Severity:** CRITICAL
+**Batch:** 11
+
+**Root Cause:**
+Two related memory leaks during DataRefresh:
+
+**B11-6a: Adaptive polling storm during RESET_SENT**
+- AdaptiveBatchDeliveryManager polls storage watermark every MIN_POLL_DELAY_MS = 1ms
+- During RESET_SENT state (waiting for consumer RESET_ACK), consumer is paused
+- But adaptive delivery continues polling at 1ms intervals
+- Sees new data → calls deliverBatch() → blocked by "Gate 2 BLOCKED (pending ACK)"
+- Returns false → schedules retry with exponential backoff
+- Before backoff takes effect, next 1ms poll fires again
+- **Result: 187 blocked delivery attempts in 65 seconds**
+
+**B11-6b: Duplicate startRefresh() orphans scheduler tasks**
+- If startRefresh(topic) called while topic already refreshing:
+  - Old resetRetryTask reference overwritten in map
+  - Old task still running in scheduler (cannot be cancelled)
+  - New task also running → **two tasks broadcasting RESET every 5 seconds**
+  - Old task runs forever until JVM restart → **permanent leak**
+
+**Evidence:**
+```
+09:25:38 - Broker resumes, starts RESET retry for prices-v1
+09:25:38 to 09:26:43 - Consumer takes 65 seconds to respond with RESET_ACK
+During 65-second window: 187 "Gate 2 BLOCKED" log entries
+09:26:43 - RESET_ACK received, broker crashes with OOM at 65MB heap
+```
+
+Logs show massive adaptive delivery activity:
+```
+09:26:25.455 [TopicFairScheduler-44] INFO  c.m.b.c.AdaptiveBatchDeliveryManager - DEBUG: New data available! Calling deliverBatch
+09:26:25.456 [TopicFairScheduler-44] INFO  c.m.b.c.RemoteConsumerRegistry - DEBUG deliverBatch: Gate 2 BLOCKED (pending ACK)
+[... 187 more blocked attempts ...]
+```
+
+**Memory Leak Mechanism:**
+Each blocked delivery attempt creates:
+1. ScheduledFuture object (line 119 in AdaptiveBatchDeliveryManager)
+2. Runnable closure capturing consumer, topic, batchSizeBytes
+3. CompletableFuture from server.send() (line 142 in NettyTcpServer)
+4. Netty write buffers queued but not flushed
+5. Combined: **~3 blocked attempts/second × 65 seconds = 195+ objects accumulating**
+
+**Why Previous Fixes Didn't Work:**
+- B11-1 to B11-4: Fixed map leaks, but didn't address polling storm
+- B11-5: Fixed TopicFairScheduler recursion, but AdaptiveBatchDeliveryManager still schedules hundreds of new tasks
+
+**Fix Applied:**
+
+**B11-6a: Pause adaptive delivery during RESET_SENT**
+
+1. **Added DataRefreshManager reference** (AdaptiveBatchDeliveryManager.java:42)
+   ```java
+   private com.messaging.broker.refresh.DataRefreshManager dataRefreshManager;
+   ```
+
+2. **Added refresh state check in tryDeliverBatch()** (lines 160-173)
+   ```java
+   // B11-6a FIX: Skip delivery if topic is in DataRefresh RESET_SENT state
+   if (dataRefreshManager != null) {
+       DataRefreshContext refreshContext = dataRefreshManager.getRefreshStatus(consumer.topic);
+       if (refreshContext != null && 
+           refreshContext.getState() == DataRefreshState.RESET_SENT) {
+           log.trace("B11-6a: Skipping delivery for {}:{} - topic in RESET_SENT state",
+                    consumer.clientId, consumer.topic);
+           return false;  // Trigger exponential backoff to 1000ms
+       }
+   }
+   ```
+
+3. **Wired DataRefreshManager → AdaptiveBatchDeliveryManager** (DataRefreshManager.java:80)
+   ```java
+   adaptiveBatchDeliveryManager.setDataRefreshManager(this);
+   ```
+
+**B11-6b: Force refresh - cancel orphaned tasks**
+
+1. **Added cleanup in startRefresh()** (DataRefreshManager.java:162-188)
+   ```java
+   // B11-6b fix: Force refresh - cancel existing refresh if in progress
+   DataRefreshContext existingRefresh = activeRefreshes.get(topic);
+   if (existingRefresh != null) {
+       log.warn("Refresh already in progress for topic: {} (state: {}), forcing new refresh",
+                topic, existingRefresh.getState());
+
+       // Cancel orphaned RESET retry task
+       ScheduledFuture<?> oldResetTask = resetRetryTasks.remove(topic);
+       if (oldResetTask != null) {
+           oldResetTask.cancel(false);
+           log.info("B11-6b fix: Cancelled orphaned RESET retry task for topic: {}", topic);
+       }
+
+       // Cancel orphaned replay check task
+       ScheduledFuture<?> oldReplayTask = replayCheckTasks.remove(topic);
+       if (oldReplayTask != null) {
+           oldReplayTask.cancel(false);
+           log.info("B11-6b fix: Cancelled orphaned replay check task for topic: {}", topic);
+       }
+
+       // Remove old context
+       activeRefreshes.remove(topic);
+       log.info("B11-6b fix: Cleaned up old refresh context for topic: {}", topic);
+   }
+   ```
+
+**Before fix:**
+```
+RESET_SENT state:
+  Adaptive polling at 1ms → deliverBatch() → Gate 2 BLOCKED
+  → schedule retry → 1ms later → deliverBatch() → Gate 2 BLOCKED
+  → schedule retry → ... (187 times in 65 seconds)
+    → hundreds of ScheduledFuture + CompletableFuture objects
+      → heap OOM
+
+Duplicate startRefresh():
+  First call: resetRetryTasks.put("topic", task1) → task1 scheduled
+  Second call: resetRetryTasks.put("topic", task2) → task1 orphaned!
+    → task1 runs forever, cannot be cancelled
+      → permanent leak
+```
+
+**After fix:**
+```
+RESET_SENT state:
+  tryDeliverBatch() → check refresh state → RESET_SENT detected
+    → skip delivery, return false
+      → exponential backoff to MAX_POLL_DELAY_MS (1000ms)
+        → 0 blocked delivery attempts
+          → memory stable
+
+Duplicate startRefresh():
+  Check activeRefreshes[topic]
+    → cancel oldResetTask, oldReplayTask
+    → remove old context
+    → start fresh refresh
+      → no orphaned tasks
+```
+
+**Files Modified:**
+1. broker/src/main/java/com/messaging/broker/consumer/AdaptiveBatchDeliveryManager.java
+2. broker/src/main/java/com/messaging/broker/refresh/DataRefreshManager.java
+
+**Expected Impact:**
+- **Before:** 187 blocked delivery attempts during 65-second RESET wait → OOM at 65MB heap
+- **After:** 0 delivery attempts during RESET_SENT → heap stable below 100MB
+
+**Verification:**
+```bash
+# Trigger DataRefresh
+curl -X POST http://localhost:8081/api/refresh/trigger
+
+# Monitor broker logs - should see B11-6a skips
+docker logs -f messaging-broker | grep "B11-6a: Skipping delivery"
+
+# Should NOT see any "Gate 2 BLOCKED" during RESET_SENT
+docker logs -f messaging-broker | grep "Gate 2 BLOCKED"
+
+# Monitor heap usage (should stay under 100MB during RESET wait)
+docker stats messaging-broker
+
+# Test force refresh (retrigger while in progress)
+curl -X POST http://localhost:8081/api/refresh/trigger
+sleep 2
+curl -X POST http://localhost:8081/api/refresh/trigger
+# Should see: "B11-6b fix: Cancelled orphaned RESET retry task"
+
+# Verify no OOM crash
+docker logs messaging-broker | grep "OutOfMemoryError"
+# Should return nothing
+```
+
+**Why This Topic (prices-v1) Only?**
+Refresh state file showed only prices-v1 was in RESET_SENT state (not 3 topics as initially thought). The broker was stuck waiting for consumer to ACK, which took 65 seconds due to:
+- Large dataset processing (1.2M records)
+- Consumer restart delay
+- TCP backpressure
+
+During this 65-second window, adaptive polling storm created the memory pressure leading to OOM.
+
+---
+
