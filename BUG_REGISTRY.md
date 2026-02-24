@@ -24,7 +24,7 @@
 ### STORAGE-1 — Segment Index Map Memory Leak
 
 **Status:** `FIXED`
-**Commit:** `[TODO: Add commit hash]`
+**Commit:** `59dd688`
 **Severity:** HIGH (Memory leak)
 **Affected Component:** storage/Segment.java
 
