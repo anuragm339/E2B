@@ -5,6 +5,9 @@ dependencies {
     // Netty for NIO
     implementation 'io.netty:netty-all:4.1.100.Final'
 
+    // Metrics (optional, used by consumer-side decode error counter)
+    implementation 'io.micrometer:micrometer-core'
+
     // For serialization
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'
 }

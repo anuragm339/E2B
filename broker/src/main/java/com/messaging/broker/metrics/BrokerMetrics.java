@@ -37,6 +37,10 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, AtomicLong> consumerLastDeliveryTime = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicLong> consumerLastAckTime = new ConcurrentHashMap<>();
 
+    // Topic freshness - track last message time per topic (seconds since epoch)
+    private final ConcurrentHashMap<String, AtomicLong> topicLastMessageTimeSeconds = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> topicLastMessageTimeGauges = new ConcurrentHashMap<>();
+
     // Counters
     private final Counter messagesReceived;
     private final Counter messagesSent;
@@ -191,6 +195,29 @@ public class BrokerMetrics {
 
     public void recordMessageStored() {
         messagesStored.increment();
+    }
+
+    /**
+     * Update last message time for a topic (seconds since epoch).
+     * Used for data freshness SLA dashboards.
+     */
+    public void recordTopicLastMessageTime(String topic) {
+        if (topic == null || topic.isBlank()) {
+            topic = "unknown";
+        }
+        final String topicLabel = topic;
+        String key = topicLabel;
+        AtomicLong value = topicLastMessageTimeSeconds.computeIfAbsent(key, k -> {
+            AtomicLong atomic = new AtomicLong(0);
+            topicLastMessageTimeGauges.computeIfAbsent(key, gk ->
+                    Gauge.builder("broker_topic_last_message_time_seconds", atomic, AtomicLong::get)
+                            .description("Last message time per topic (seconds since epoch)")
+                            .tag("topic", topicLabel)
+                            .register(registry)
+            );
+            return atomic;
+        });
+        value.set(System.currentTimeMillis() / 1000);
     }
 
     public void recordStorageRead() {

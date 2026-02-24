@@ -5,8 +5,11 @@ import com.messaging.common.api.MessageHandler;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.common.model.ConsumerRecord;
 import com.messaging.network.tcp.NettyTcpClient;
+import com.messaging.network.metrics.ConsumerDecodeMetrics;
+import com.messaging.network.metrics.DecodeErrorRecorder;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.micronaut.context.ApplicationContext;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.annotation.Value;
@@ -74,6 +77,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
     // N2 FIX: Shared EventLoopGroup for all connections to prevent thread explosion
     private io.netty.channel.EventLoopGroup sharedEventLoopGroup;
+    private DecodeErrorRecorder decodeErrorRecorder = DecodeErrorRecorder.noop();
 
     // N1 + N2 FIX: One TCP connection per topic:group to prevent zero-copy batch interleaving
     // AND avoid thread explosion by sharing EventLoopGroup
@@ -101,6 +105,16 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
     @Override
     public void onApplicationEvent(ServerStartupEvent event) {
         log.info("=== ClientConsumerManager Starting ===");
+
+        // Initialize decode error metrics if Micrometer is available
+        try {
+            this.decodeErrorRecorder = applicationContext.findBean(MeterRegistry.class)
+                    .<DecodeErrorRecorder>map(ConsumerDecodeMetrics::new)
+                    .orElse(DecodeErrorRecorder.noop());
+        } catch (Exception e) {
+            log.debug("Micrometer MeterRegistry not available for decode metrics; using no-op recorder");
+            this.decodeErrorRecorder = DecodeErrorRecorder.noop();
+        }
 
         discoverConsumers();
 
@@ -256,7 +270,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         String group = parts[1];
 
         // N2 FIX: Create new client with shared EventLoopGroup
-        NettyTcpClient topicGroupClient = new NettyTcpClient(sharedEventLoopGroup);
+        NettyTcpClient topicGroupClient = new NettyTcpClient(sharedEventLoopGroup, decodeErrorRecorder);
         clientsPerTopicGroup.put(topicGroup, topicGroupClient);
 
         // Connect

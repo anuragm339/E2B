@@ -8,6 +8,7 @@ import com.messaging.network.codec.BinaryMessageEncoder;
 import com.messaging.network.codec.JsonMessageDecoder;
 import com.messaging.network.codec.JsonMessageEncoder;
 import com.messaging.network.codec.ZeroCopyBatchDecoder;
+import com.messaging.network.metrics.DecodeErrorRecorder;
 import com.messaging.network.handler.ClientMessageHandler;
 import io.micronaut.context.annotation.Requires;
 import io.netty.bootstrap.Bootstrap;
@@ -38,14 +39,13 @@ public class NettyTcpClient implements NetworkClient {
 
     private final EventLoopGroup workerGroup;
     private final boolean ownEventLoopGroup; // N2 FIX: Track if we should shutdown the EventLoopGroup
+    private final DecodeErrorRecorder decodeErrorRecorder;
 
     /**
      * Default constructor - creates its own EventLoopGroup (for Micronaut DI singleton)
      */
     public NettyTcpClient() {
-        this.workerGroup = new NioEventLoopGroup();
-        this.ownEventLoopGroup = true;
-        log.info("Initialized NettyTcpClient with own EventLoopGroup");
+        this(new NioEventLoopGroup(), true, DecodeErrorRecorder.noop());
     }
 
     /**
@@ -56,9 +56,28 @@ public class NettyTcpClient implements NetworkClient {
      * @param sharedEventLoopGroup The shared EventLoopGroup to use
      */
     public NettyTcpClient(EventLoopGroup sharedEventLoopGroup) {
-        this.workerGroup = sharedEventLoopGroup;
-        this.ownEventLoopGroup = false;
-        log.debug("Initialized NettyTcpClient with shared EventLoopGroup");
+        this(sharedEventLoopGroup, false, DecodeErrorRecorder.noop());
+    }
+
+    /**
+     * Constructor with external EventLoopGroup and decode error recorder.
+     */
+    public NettyTcpClient(EventLoopGroup sharedEventLoopGroup, DecodeErrorRecorder decodeErrorRecorder) {
+        this(sharedEventLoopGroup, false, decodeErrorRecorder);
+    }
+
+    /**
+     * Private constructor to centralize initialization.
+     */
+    private NettyTcpClient(EventLoopGroup eventLoopGroup, boolean ownEventLoopGroup, DecodeErrorRecorder decodeErrorRecorder) {
+        this.workerGroup = eventLoopGroup;
+        this.ownEventLoopGroup = ownEventLoopGroup;
+        this.decodeErrorRecorder = decodeErrorRecorder != null ? decodeErrorRecorder : DecodeErrorRecorder.noop();
+        if (ownEventLoopGroup) {
+            log.info("Initialized NettyTcpClient with own EventLoopGroup");
+        } else {
+            log.debug("Initialized NettyTcpClient with shared EventLoopGroup");
+        }
     }
 
     @Override
@@ -79,7 +98,7 @@ public class NettyTcpClient implements NetworkClient {
                             ChannelPipeline pipeline = ch.pipeline();
 
                             // Codecs (Zero-copy batch decoder for efficient file-to-network transfer)
-                            pipeline.addLast("decoder", new ZeroCopyBatchDecoder());
+                            pipeline.addLast("decoder", new ZeroCopyBatchDecoder(decodeErrorRecorder));
                             pipeline.addLast("batchAckHandler", new BatchAckHandler());
                             pipeline.addLast("encoder", new BinaryMessageEncoder());
 

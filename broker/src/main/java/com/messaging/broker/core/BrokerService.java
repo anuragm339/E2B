@@ -137,6 +137,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             metrics.stopStorageWriteTimer(storageSample);
 
             metrics.recordMessageStored();
+            metrics.recordTopicLastMessageTime(topic);
 
             log.debug("Stored message from parent: topic={}, offset={}, key={}",
                     topic, offset, record.getMsgKey());
@@ -226,6 +227,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             metrics.stopStorageWriteTimer(storageSample);
 
             metrics.recordMessageStored();
+            metrics.recordTopicLastMessageTime(topic);
 
             log.info("Stored message: topic={}, offset={}, key={}, type={}",
                      topic, offset, msgKey, eventType);
