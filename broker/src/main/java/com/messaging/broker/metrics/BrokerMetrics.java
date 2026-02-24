@@ -37,6 +37,10 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, AtomicLong> consumerLastDeliveryTime = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicLong> consumerLastAckTime = new ConcurrentHashMap<>();
 
+    // Pending ACK age tracking - how long current ACK has been pending (milliseconds since epoch)
+    private final ConcurrentHashMap<String, AtomicLong> pendingAckStartTime = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> pendingAckAgeGauges = new ConcurrentHashMap<>();
+
     // Topic freshness - track last message time per topic (seconds since epoch)
     private final ConcurrentHashMap<String, AtomicLong> topicLastMessageTimeSeconds = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Gauge> topicLastMessageTimeGauges = new ConcurrentHashMap<>();
@@ -537,6 +541,51 @@ public class BrokerMetrics {
         );
         counter.increment();
         log.debug("Recorded ACK timeout for topic={} group={}", topic, group);
+    }
+
+    /**
+     * Start tracking pending ACK age for a consumer group/topic.
+     * Called when a batch is sent to the consumer (before ACK is received).
+     * Exposes a gauge: broker.consumer.pending_ack_age_seconds
+     */
+    public void startPendingAck(String topic, String group) {
+        String key = group + ":" + topic;
+
+        // Store the start time
+        pendingAckStartTime.computeIfAbsent(key, k -> new AtomicLong(0)).set(System.currentTimeMillis());
+
+        // Register gauge if not already registered
+        pendingAckAgeGauges.computeIfAbsent(key, k ->
+            Gauge.builder("broker.consumer.pending_ack_age_seconds", () -> {
+                AtomicLong startTime = pendingAckStartTime.get(k);
+                if (startTime == null || startTime.get() == 0) {
+                    return 0.0; // No pending ACK
+                }
+                return (System.currentTimeMillis() - startTime.get()) / 1000.0;
+            })
+            .description("Age of pending ACK in seconds (0 if no pending ACK)")
+            .tag("topic", topic)
+            .tag("group", group)
+            .register(registry)
+        );
+
+        log.trace("Started pending ACK tracking for topic={} group={}", topic, group);
+    }
+
+    /**
+     * Complete pending ACK tracking for a consumer group/topic.
+     * Called when ACK is received or timeout occurs.
+     * Resets the pending age gauge to 0.
+     */
+    public void completePendingAck(String topic, String group) {
+        String key = group + ":" + topic;
+
+        // Clear the start time (gauge will return 0)
+        AtomicLong startTime = pendingAckStartTime.get(key);
+        if (startTime != null) {
+            startTime.set(0);
+            log.trace("Completed pending ACK tracking for topic={} group={}", topic, group);
+        }
     }
 
     /**

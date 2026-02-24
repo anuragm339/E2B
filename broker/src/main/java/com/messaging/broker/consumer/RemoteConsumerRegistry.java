@@ -49,6 +49,7 @@ public class RemoteConsumerRegistry {
     private final ScheduledExecutorService scheduler;
     private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
     private final long maxMessageSizePerConsumer;
+    private final long ackTimeoutMs; // Configurable ACK timeout
     private static final int MAX_CONSECUTIVE_FAILURES = 10; // Max retries before giving up
 
     // Map: "clientId:topic" -> RemoteConsumer (composite key to support multiple topic subscriptions per client)
@@ -70,7 +71,8 @@ public class RemoteConsumerRegistry {
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
                                   DataRefreshMetrics dataRefreshMetrics, DeliveryStateStore deliveryStateStore,
-                                  @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer) {
+                                  @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer,
+                                  @Value("${broker.consumer.ack-timeout}") long ackTimeoutMs) {
         this.storage = storage;
         this.server = server;
         this.offsetTracker = offsetTracker;
@@ -78,6 +80,7 @@ public class RemoteConsumerRegistry {
         this.dataRefreshMetrics = dataRefreshMetrics;
         this.deliveryStateStore = deliveryStateStore;
         this.maxMessageSizePerConsumer = maxMessageSizePerConsumer;
+        this.ackTimeoutMs = ackTimeoutMs;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
         // Reduced thread pool: use half of available cores (min 2) to lower CPU usage
@@ -363,24 +366,33 @@ public class RemoteConsumerRegistry {
 
             sendBatchToConsumer(consumer, batch, startOffset);
 
+            // Start tracking pending ACK age for monitoring
+            metrics.startPendingAck(consumer.topic, consumer.group);
+
             /* ================= ACK TIMEOUT SETUP ================= */
             // B2-4 fix: schedule timeout AFTER successful send so it only fires for
             // batches the consumer actually received (not for send failures).
             // Previously the timeout was scheduled before sendBatchToConsumer(), so a
             // send failure left a 30-min timer that would incorrectly revert the offset
             // for a batch the consumer never received.
+            //
+            // Now uses configurable timeout from application.yml (broker.consumer.ack-timeout)
+            // instead of hardcoded 30 minutes. Recommended: 30-60s baseline, scale by batch size.
+            long pendingStartTime = System.currentTimeMillis();
             scheduler.schedule(() -> {
                 if (pendingOffsets.remove(pendingKey) != null) {
-                    log.warn("ACK timeout for {}, reverting offset from {} to {}",
-                             deliveryKey, nextOffset, originalOffset);
+                    long pendingDuration = System.currentTimeMillis() - pendingStartTime;
+                    log.warn("ACK timeout for {} after {}ms, reverting offset from {} to {}",
+                             deliveryKey, pendingDuration, nextOffset, originalOffset);
 
                     // REVERT consumer offset to prevent delivery gap
                     consumer.setCurrentOffset(originalOffset);
                     inFlight.set(false);
 
                     metrics.recordAckTimeout(consumer.topic, consumer.group);  // B2-7 fix: pass group
+                    metrics.completePendingAck(consumer.topic, consumer.group);  // Clear pending ACK age metric
                 }
-            }, 30, TimeUnit.MINUTES);
+            }, ackTimeoutMs, TimeUnit.MILLISECONDS);
 
             metrics.stopConsumerDeliveryTimer(
                     deliverySample,
@@ -612,6 +624,9 @@ public class RemoteConsumerRegistry {
 
             // Record consumer ACK metric
             metrics.recordConsumerAck(clientId, topic, group);
+
+            // Complete pending ACK tracking (resets age gauge to 0)
+            metrics.completePendingAck(topic, group);
         } else {
             // MULTI-GROUP FIX: Group is now in the key, so we already know it
             // If consumer was unregistered, we can still persist the offset

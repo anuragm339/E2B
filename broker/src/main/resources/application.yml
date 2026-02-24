@@ -63,7 +63,10 @@ broker:
     default-initial-retry-delay: 1000
     default-max-retry-delay: 30000
     default-fixed-retry-interval: 30000
-    ack-timeout: 5000
+    # ACK timeout in milliseconds - how long to wait for consumer to ACK a batch before reverting offset
+    # Baseline: 60s works for most 1-2MB batches. Increase for larger batches or slower consumers.
+    # If timeout fires frequently, increase this value or reduce batch size.
+    ack-timeout: ${ACK_TIMEOUT_MS:60000}  # 60 seconds (was 5s, then hardcoded 30 min)
     max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:1048576}  # 1MB max data per consumer per delivery cycle
     # DEPRECATED: max-batch-size-per-consumer no longer used (size-only batching now)
     # max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}
