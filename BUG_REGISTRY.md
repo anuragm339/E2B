@@ -86,7 +86,7 @@ docker exec broker jmap -dump:live,format=b,file=/tmp/heap-after.hprof 1
 ### BROKER-2 — ACK Handler OOM Vulnerability (Unbounded Array Allocation)
 
 **Status:** `FIXED`
-**Commit:** `[TODO: Add commit hash]`
+**Commit:** `6ae9733`
 **Severity:** CRITICAL (Security vulnerability - Remote OOM attack)
 **Affected Component:** broker/BrokerService.java
 
