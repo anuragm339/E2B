@@ -351,12 +351,56 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // Format: [topicLen:4][topic:var][groupLen:4][group:var]
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
+            // SECURITY FIX (BROKER-2): Validate payload size before reading
+            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
+                log.error("RESET_ACK payload too small from {}: {} bytes (expected >= 8)",
+                         clientId, buffer.remaining());
+                server.closeConnection(clientId);
+                return;
+            }
+
             int topicLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
+            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
+                log.error("Invalid topicLen in RESET_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, topicLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
+                log.error("Not enough data in RESET_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), topicLen + 4);
+                server.closeConnection(clientId);
+                return;
+            }
+
             byte[] topicBytes = new byte[topicLen];
             buffer.get(topicBytes);
             String topic = new String(topicBytes, StandardCharsets.UTF_8);
 
             int groupLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
+            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
+                log.error("Invalid groupLen in RESET_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < groupLen) {
+                log.error("Not enough data for group in RESET_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
             byte[] groupBytes = new byte[groupLen];
             buffer.get(groupBytes);
             String group = new String(groupBytes, StandardCharsets.UTF_8);
@@ -403,12 +447,56 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // Format: [topicLen:4][topic:var][groupLen:4][group:var]
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
+            // SECURITY FIX (BROKER-2): Validate payload size before reading
+            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
+                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8)",
+                         clientId, buffer.remaining());
+                server.closeConnection(clientId);
+                return;
+            }
+
             int topicLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
+            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
+                log.error("Invalid topicLen in READY_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, topicLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
+                log.error("Not enough data in READY_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), topicLen + 4);
+                server.closeConnection(clientId);
+                return;
+            }
+
             byte[] topicBytes = new byte[topicLen];
             buffer.get(topicBytes);
             String topic = new String(topicBytes, StandardCharsets.UTF_8);
 
             int groupLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
+            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
+                log.error("Invalid groupLen in READY_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < groupLen) {
+                log.error("Not enough data for group in READY_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
             byte[] groupBytes = new byte[groupLen];
             buffer.get(groupBytes);
             String group = new String(groupBytes, StandardCharsets.UTF_8);
@@ -453,12 +541,56 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // Format: [topicLen:4][topic:var][groupLen:4][group:var]
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
+            // SECURITY FIX (BROKER-2): Validate payload size before reading
+            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
+                log.error("BATCH_ACK payload too small from {}: {} bytes (expected >= 8)",
+                         clientId, buffer.remaining());
+                server.closeConnection(clientId);
+                return;
+            }
+
             int topicLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
+            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
+                log.error("Invalid topicLen in BATCH_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, topicLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
+                log.error("Not enough data in BATCH_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), topicLen + 4);
+                server.closeConnection(clientId);
+                return;
+            }
+
             byte[] topicBytes = new byte[topicLen];
             buffer.get(topicBytes);
             String topic = new String(topicBytes, StandardCharsets.UTF_8);
 
             int groupLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
+            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
+                log.error("Invalid groupLen in BATCH_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < groupLen) {
+                log.error("Not enough data for group in BATCH_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
             byte[] groupBytes = new byte[groupLen];
             buffer.get(groupBytes);
             String group = new String(groupBytes, StandardCharsets.UTF_8);
