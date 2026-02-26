@@ -46,7 +46,7 @@ public class RemoteConsumerRegistry {
     private volatile DataRefreshManager dataRefreshManager; // Lazy injection to avoid circular dependency
     private volatile AdaptiveBatchDeliveryManager adaptiveDeliveryManager; // Lazy injection to avoid circular dependency
     private final ObjectMapper objectMapper;
-    private final ScheduledExecutorService scheduler;
+    private final ScheduledThreadPoolExecutor scheduler;
     private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
     private final long maxMessageSizePerConsumer;
     private final long ackTimeoutMs; // Configurable ACK timeout
@@ -61,6 +61,11 @@ public class RemoteConsumerRegistry {
 
     // Map: "clientId:topic:pending" -> next offset to commit on ACK
     private final Map<String, Long> pendingOffsets;
+
+    // Map: "clientId:topic:group:pending" -> timestamp when batch was sent (for ACK latency tracking)
+    private final Map<String, Long> batchSendTimestamps;
+    // Map: "clientId:topic:group:pending" -> timeout task (canceled on ACK)
+    private final Map<String, ScheduledFuture<?>> pendingTimeouts;
 
     // B2-6 fix: retain group mapping even after consumer unregisters so that a late ACK
     // (arriving after unregistration) can still persist the offset to the offset tracker.
@@ -85,11 +90,13 @@ public class RemoteConsumerRegistry {
         this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
         // Reduced thread pool: use half of available cores (min 2) to lower CPU usage
         int schedulerThreads = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
-        this.scheduler = Executors.newScheduledThreadPool(schedulerThreads, runnable -> {
+        this.scheduler = new ScheduledThreadPoolExecutor(schedulerThreads, runnable -> {
             Thread t = new Thread(runnable);
             t.setName("RemoteConsumerRegistry-" + t.getId());
             return t;
         });
+        // Remove canceled timeout tasks from queue to prevent buildup.
+        this.scheduler.setRemoveOnCancelPolicy(true);
         // Separate thread pool for storage operations to prevent deadlock
         // Reduced to 1x CPU cores to minimize memory usage (was 2x)
         this.storageExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors(), runnable -> {
@@ -100,9 +107,13 @@ public class RemoteConsumerRegistry {
         this.consumers = new ConcurrentHashMap<>();
         this.inFlightDeliveries = new ConcurrentHashMap<>();
         this.pendingOffsets = new ConcurrentHashMap<>();
+        this.batchSendTimestamps = new ConcurrentHashMap<>();
+        this.pendingTimeouts = new ConcurrentHashMap<>();
         this.deliveryKeyToGroup = new ConcurrentHashMap<>();
-        log.info("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer (size-only batching)",
+        log.warn("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer (size-only batching)",
                  maxMessageSizePerConsumer);
+        log.warn("⚙️ ACK_TIMEOUT configured: {}ms ({}s, {}min)",
+                 ackTimeoutMs, ackTimeoutMs/1000, ackTimeoutMs/60000);
     }
 
     /**
@@ -184,6 +195,10 @@ public class RemoteConsumerRegistry {
                 Long stalePending = pendingOffsets.remove(pendingKey);
                 if (stalePending != null) {
                     log.info("Cleared stale pending offset {} for key={} on unregister", stalePending, pendingKey);
+                }
+                ScheduledFuture<?> staleTimeout = pendingTimeouts.remove(pendingKey);
+                if (staleTimeout != null) {
+                    staleTimeout.cancel(false);
                 }
 
                 // B1-8 fix: Clean up inFlightDeliveries to prevent memory leak
@@ -269,13 +284,13 @@ public class RemoteConsumerRegistry {
 
         // Gate 1: Check in-flight (per topic:consumer)
         if (!inFlight.compareAndSet(false, true)) {
-            log.info("DEBUG deliverBatch: Gate 1 BLOCKED (in-flight) for {}", deliveryKey);
+            log.debug("deliverBatch: Gate 1 BLOCKED (in-flight) for {}", deliveryKey);
             return false;  // Already delivering to this consumer:topic
         }
 
         // Gate 2: Check pending ACK
         if (pendingOffsets.containsKey(pendingKey)) {
-            log.info("DEBUG deliverBatch: Gate 2 BLOCKED (pending ACK) for {}, pendingOffset={}",
+            log.debug("deliverBatch: Gate 2 BLOCKED (pending ACK) for {}, pendingOffset={}",
                      deliveryKey, pendingOffsets.get(pendingKey));
             inFlight.set(false);
             return false;  // Waiting for ACK
@@ -303,7 +318,7 @@ public class RemoteConsumerRegistry {
             }
         }
 
-        log.info("DEBUG deliverBatch: Gates passed, proceeding with batch read for {}", deliveryKey);
+        log.debug("deliverBatch: Gates passed, proceeding with batch read for {}", deliveryKey);
 
         // B2-2 fix: record retry metric when a previously-failed consumer is being retried
         if (consumer.consecutiveFailures > 0) {
@@ -341,11 +356,11 @@ public class RemoteConsumerRegistry {
             metrics.stopStorageReadTimer(readSample);
             metrics.recordStorageRead();
 
-            log.info("DEBUG deliverBatch: Batch read complete for {}, recordCount={}, fileRegion={}",
+            log.debug("deliverBatch: Batch read complete for {}, recordCount={}, fileRegion={}",
                      deliveryKey, batch.recordCount, (batch.fileRegion != null ? "present" : "NULL"));
 
             if (batch.recordCount == 0 || batch.fileRegion == null) {
-                log.info("DEBUG deliverBatch: EMPTY BATCH (recordCount={}, fileRegion={}) for {}, startOffset={}",
+                log.debug("deliverBatch: EMPTY BATCH (recordCount={}, fileRegion={}) for {}, startOffset={}",
                          batch.recordCount, (batch.fileRegion != null ? "present" : "NULL"), deliveryKey, startOffset);
                 inFlight.set(false);
                 return false;  // No data available
@@ -379,11 +394,17 @@ public class RemoteConsumerRegistry {
             // Now uses configurable timeout from application.yml (broker.consumer.ack-timeout)
             // instead of hardcoded 30 minutes. Recommended: 30-60s baseline, scale by batch size.
             long pendingStartTime = System.currentTimeMillis();
-            scheduler.schedule(() -> {
+            batchSendTimestamps.put(pendingKey, pendingStartTime); // Track send time for ACK latency calculation
+            log.warn("⏱️ BATCH_SENT to {} at T=0ms, startOffset={}, recordCount={}, bytes={}, ackTimeoutConfigured={}ms, pendingOffsetsSize={}, batchTimestampsSize={}",
+                     deliveryKey, startOffset, batch.recordCount, batch.totalBytes, ackTimeoutMs,
+                     pendingOffsets.size(), batchSendTimestamps.size());
+            ScheduledFuture<?> timeoutFuture = scheduler.schedule(() -> {
                 if (pendingOffsets.remove(pendingKey) != null) {
+                    batchSendTimestamps.remove(pendingKey); // Clean up timestamp on timeout
                     long pendingDuration = System.currentTimeMillis() - pendingStartTime;
-                    log.warn("ACK timeout for {} after {}ms, reverting offset from {} to {}",
-                             deliveryKey, pendingDuration, nextOffset, originalOffset);
+                    log.warn("⏰ ACK_TIMEOUT for {} after {}ms, reverting offset from {} to {}, pendingOffsetsSize={}, batchTimestampsSize={}",
+                             deliveryKey, pendingDuration, nextOffset, originalOffset,
+                             pendingOffsets.size(), batchSendTimestamps.size());
 
                     // REVERT consumer offset to prevent delivery gap
                     consumer.setCurrentOffset(originalOffset);
@@ -392,7 +413,12 @@ public class RemoteConsumerRegistry {
                     metrics.recordAckTimeout(consumer.topic, consumer.group);  // B2-7 fix: pass group
                     metrics.completePendingAck(consumer.topic, consumer.group);  // Clear pending ACK age metric
                 }
+                pendingTimeouts.remove(pendingKey);
             }, ackTimeoutMs, TimeUnit.MILLISECONDS);
+            ScheduledFuture<?> oldTimeout = pendingTimeouts.put(pendingKey, timeoutFuture);
+            if (oldTimeout != null) {
+                oldTimeout.cancel(false);
+            }
 
             metrics.stopConsumerDeliveryTimer(
                     deliverySample,
@@ -408,10 +434,10 @@ public class RemoteConsumerRegistry {
             if (dataRefreshManager != null) {
                 String refreshId = dataRefreshManager.getRefreshIdForTopic(consumer.topic);
                 String refreshType = dataRefreshManager.getRefreshTypeForTopic(consumer.topic);
-                log.info("DEBUG: refreshId for topic {} = {}, refreshType = {}", consumer.topic, refreshId, refreshType);
+                log.debug("refreshId for topic {} = {}, refreshType = {}", consumer.topic, refreshId, refreshType);
 
                 if (refreshId != null && refreshType != null) {
-                    log.info("DEBUG: Recording data refresh metrics - topic={}, group={}, bytes={}, messages={}, refreshId={}, refreshType={}",
+                    log.debug("Recording data refresh metrics - topic={}, group={}, bytes={}, messages={}, refreshId={}, refreshType={}",
                              consumer.topic, consumer.group, batch.totalBytes, batch.recordCount, refreshId, refreshType);
 
                     // Record data transferred during refresh
@@ -424,12 +450,12 @@ public class RemoteConsumerRegistry {
                             refreshType
                     );
 
-                    log.info("DEBUG: Data refresh metrics recorded successfully");
+                    log.debug("Data refresh metrics recorded successfully");
                 } else {
-                    log.debug("DEBUG: refreshId or refreshType is NULL for topic {} - not in refresh mode", consumer.topic);
+                    log.debug("refreshId or refreshType is NULL for topic {} - not in refresh mode", consumer.topic);
                 }
             } else {
-                log.warn("DEBUG: dataRefreshManager is NULL - cannot record data refresh metrics");
+                log.debug("dataRefreshManager is NULL - cannot record data refresh metrics");
             }
 
             // Reset failure counter on successful delivery
@@ -550,7 +576,7 @@ public class RemoteConsumerRegistry {
         // Step 2: Send FileRegion for true zero-copy transfer (Kafka-style sendfile)
         // This uses OS sendfile() syscall - data goes from file → kernel → socket
         // NO user-space copies, NO heap allocations!
-        log.info("Sending zero-copy FileRegion: position={}, count={}, records={}, bytes={}, consumer={}, topic={}, startOffset={}",
+        log.debug("Sending zero-copy FileRegion: position={}, count={}, records={}, bytes={}, consumer={}, topic={}, startOffset={}",
                  batchRegion.fileRegion.position(), batchRegion.fileRegion.count(),
                  batchRegion.recordCount, batchRegion.totalBytes, consumer.clientId, consumer.topic, startOffset);
 
@@ -571,7 +597,7 @@ public class RemoteConsumerRegistry {
             throw e;
         }
 
-        log.info("✓ Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
+        log.debug("Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
                  consumer.clientId, batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
 
         // Record metrics for messages and bytes sent (global counters)
@@ -600,10 +626,19 @@ public class RemoteConsumerRegistry {
         String deliveryKey = clientId + ":" + topic + ":" + group;
         String pendingKey = deliveryKey + ":pending";
 
+        // Calculate ACK latency
+        long ackReceiveTime = System.currentTimeMillis();
+        Long sendTime = batchSendTimestamps.remove(pendingKey);
+        long ackLatencyMs = sendTime != null ? (ackReceiveTime - sendTime) : -1;
+
         Long committedOffset = pendingOffsets.remove(pendingKey);
+        ScheduledFuture<?> timeoutFuture = pendingTimeouts.remove(pendingKey);
+        if (timeoutFuture != null) {
+            timeoutFuture.cancel(false);
+        }
         if (committedOffset == null) {
-            log.warn("ACK with no pending offset: {} (likely a late ACK after timeout). Clearing inFlight to unblock delivery.",
-                     deliveryKey);
+            log.warn("⚠️ ACK with no pending offset: {} (likely a late ACK after timeout). ACK_LATENCY={}ms. Clearing inFlight to unblock delivery.",
+                     deliveryKey, ackLatencyMs);
             // B4-3 fix: always clear inFlight on any ACK, even a late one.
             // Without this, Gate 1 stays permanently true and delivery stalls forever.
             AtomicBoolean lateInFlight = inFlightDeliveries.get(deliveryKey);
@@ -611,6 +646,20 @@ public class RemoteConsumerRegistry {
                 lateInFlight.set(false);
             }
             return;
+        }
+
+        // Log ACK latency with severity based on threshold
+        if (ackLatencyMs > 10000) {
+            log.error("🔴 ACK_RECEIVED for {} at T={}ms (CRITICAL SLOW!), offset={}, pendingOffsetsSize={}, batchTimestampsSize={}",
+                      deliveryKey, ackLatencyMs, committedOffset, pendingOffsets.size(), batchSendTimestamps.size());
+        } else if (ackLatencyMs > 5000) {
+            log.warn("🟡 ACK_RECEIVED for {} at T={}ms (SLOW), offset={}, pendingOffsetsSize={}, batchTimestampsSize={}",
+                     deliveryKey, ackLatencyMs, committedOffset, pendingOffsets.size(), batchSendTimestamps.size());
+        } else if (ackLatencyMs > 1000) {
+            log.warn("🟢 ACK_RECEIVED for {} at T={}ms, offset={}, pendingOffsetsSize={}, batchTimestampsSize={}",
+                     deliveryKey, ackLatencyMs, committedOffset, pendingOffsets.size(), batchSendTimestamps.size());
+        } else {
+            log.warn("✅ ACK_RECEIVED for {} at T={}ms (FAST), offset={}", deliveryKey, ackLatencyMs, committedOffset);
         }
 
         RemoteConsumer consumer = consumers.get(deliveryKey);
@@ -640,7 +689,7 @@ public class RemoteConsumerRegistry {
             inFlight.set(false);
         }
 
-        log.info("ACK committed for {} at offset {}", deliveryKey, committedOffset);
+        log.debug("ACK committed for {} at offset {}", deliveryKey, committedOffset);
     }
 
     /**
@@ -778,7 +827,7 @@ public class RemoteConsumerRegistry {
             long committedOffset = offsetTracker.getOffset(consumerGroupTopic);
 
             if (committedOffset < latestOffset) {
-                log.info("Consumer {} not caught up: committed={} < latest={} (need {} more messages)",
+                log.debug("Consumer {} not caught up: committed={} < latest={} (need {} more messages)",
                          consumerGroupTopic, committedOffset, latestOffset, latestOffset - committedOffset);
                 return false;
             }
@@ -848,6 +897,11 @@ public class RemoteConsumerRegistry {
                 consumer.deliveryTask.cancel(false);
             }
         }
+
+        for (ScheduledFuture<?> future : pendingTimeouts.values()) {
+            future.cancel(false);
+        }
+        pendingTimeouts.clear();
 
         scheduler.shutdown();
         storageExecutor.shutdown();

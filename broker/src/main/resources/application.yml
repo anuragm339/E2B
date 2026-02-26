@@ -120,5 +120,8 @@ data-refresh:
 
 logger:
   levels:
-    com.messaging: INFO
-    io.netty: WARN
+    com.messaging: WARN  # Only show warnings and errors (was INFO)
+    com.messaging.broker.core: INFO  # Keep broker lifecycle events
+    com.messaging.broker.refresh: INFO  # Keep data refresh events
+    com.messaging.broker.consumer: WARN  # Keep timing instrumentation logs
+    io.netty: ERROR  # Only show Netty errors (was WARN)

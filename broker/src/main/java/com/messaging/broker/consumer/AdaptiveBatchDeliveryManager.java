@@ -121,14 +121,14 @@ public class AdaptiveBatchDeliveryManager {
             return;
         }
 
-        log.info("DEBUG: Scheduling adaptive delivery for {}:{} with delay={}ms", consumer.clientId, consumer.topic, delayMs);
+        log.debug("Scheduling adaptive delivery for {}:{} with delay={}ms", consumer.clientId, consumer.topic, delayMs);
         // B1-2 fix: capture the ScheduledFuture and assign it to consumer.deliveryTask so that
         // unregisterConsumer() can cancel the task and stop delivery after disconnect.
         // B11-5 fix: use scheduleWithKey with unique deliveryKey to prevent unbounded retry buildup during DataRefresh
         String deliveryKey = consumer.clientId + ":" + consumer.topic;
         java.util.concurrent.ScheduledFuture<?> future = fairScheduler.scheduleWithKey(
             consumer.topic, deliveryKey, () -> {
-            log.info("DEBUG: Executing delivery task for {}:{}", consumer.clientId, consumer.topic);
+            log.debug("Executing delivery task for {}:{}", consumer.clientId, consumer.topic);
             // Try delivery and get result (true = data found, false = no data/skipped)
             boolean dataFound = tryDeliverBatch(consumer);
 
@@ -190,18 +190,18 @@ public class AdaptiveBatchDeliveryManager {
             // Query storage for latest offset (in-memory write head)
             long latestOffset = storage.getCurrentOffset(consumer.topic, 0);
 
-            log.info("DEBUG: tryDeliverBatch offset check: topic={}, latestOffset={}, consumerOffset={}",
+            log.debug("tryDeliverBatch offset check: topic={}, latestOffset={}, consumerOffset={}",
                     consumer.topic, latestOffset, consumerOffset);
 
             // Check if new data available
             if (latestOffset <= consumerOffset) {
-                log.info("DEBUG: No new data available (latestOffset={} <= consumerOffset={})", latestOffset, consumerOffset);
+                log.debug("No new data available (latestOffset={} <= consumerOffset={})", latestOffset, consumerOffset);
                 metrics.recordAdaptivePollSkipped(consumer.topic);
                 return false;  // No data → trigger backoff
             }
 
             // New data available → proceed with delivery
-            log.info("DEBUG: New data available! Calling deliverBatch: topic={}, latest={}, consumer={}",
+            log.debug("New data available! Calling deliverBatch: topic={}, latest={}, consumer={}",
                      consumer.topic, latestOffset, consumerOffset);
 
             boolean success = consumerRegistry.deliverBatch(consumer, batchSizeBytes);

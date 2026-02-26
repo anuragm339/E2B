@@ -26,6 +26,9 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Main broker service that wires storage and network together
@@ -45,6 +48,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final DataRefreshManager dataRefreshManager;
     private final int serverPort;
     private final ObjectMapper objectMapper;
+
+    // Dedicated executor for ACK processing to prevent event loop blocking
+    private final ExecutorService ackExecutor;
 
     @Inject
     public BrokerService(
@@ -71,7 +77,17 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.serverPort = serverPort;
         this.objectMapper = new ObjectMapper();
 
-        log.info("BrokerService initialized");
+        // Create dedicated thread pool for ACK processing (CPU cores * 2)
+        // This prevents ACKs from being blocked by heavy delivery operations on Netty event loop
+        int ackThreads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
+        this.ackExecutor = Executors.newFixedThreadPool(ackThreads, runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("ACK-Processor-" + t.getId());
+            t.setDaemon(true);
+            return t;
+        });
+
+        log.info("BrokerService initialized with {} ACK processing threads", ackThreads);
     }
 
     @Override
@@ -156,7 +172,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      * Handle incoming messages from clients
      */
     private void handleMessage(String clientId, BrokerMessage message) {
-        log.info("Handling message from {}: type={}, id={}",
+        log.debug("Handling message from {}: type={}, id={}",
                   clientId, message.getType(), message.getMessageId());
 
         switch (message.getType()) {
@@ -229,7 +245,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             metrics.recordMessageStored();
             metrics.recordTopicLastMessageTime(topic);
 
-            log.info("Stored message: topic={}, offset={}, key={}, type={}",
+            log.debug("Stored message: topic={}, offset={}, key={}, type={}",
                      topic, offset, msgKey, eventType);
 
             // Broker will discover new messages via adaptive polling (watermark-based)
@@ -319,7 +335,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             String group = json.get("group").asText();
             long offset = json.get("offset").asLong();
 
-            log.info("Client {} committed offset: topic={}, group={}, offset={}",
+            log.debug("Client {} committed offset: topic={}, group={}, offset={}",
                      clientId, topic, group, offset);
 
             // CRITICAL: Persist offset to property file - property file is ONLY source of truth
@@ -597,8 +613,17 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             log.debug("Received BATCH_ACK from client: {}, topic: {}, group: {}", clientId, topic, group);
 
-            // Delegate to RemoteConsumerRegistry to handle ACK and commit offset
-            remoteConsumers.handleBatchAck(clientId, topic, group);
+            // Offload ACK processing to dedicated executor to prevent Netty event loop blocking
+            // This ensures ACKs are processed quickly even when delivery operations are heavy
+            final String finalTopic = topic;
+            final String finalGroup = group;
+            ackExecutor.execute(() -> {
+                try {
+                    remoteConsumers.handleBatchAck(clientId, finalTopic, finalGroup);
+                } catch (Exception e) {
+                    log.error("Error processing BATCH_ACK from {}", clientId, e);
+                }
+            });
 
         } catch (Exception e) {
             log.error("Error handling BATCH_ACK from {}", clientId, e);
@@ -623,6 +648,20 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down broker...");
+
+        // Shutdown ACK executor first to stop accepting new ACKs
+        log.info("Shutting down ACK executor...");
+        ackExecutor.shutdown();
+        try {
+            if (!ackExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                log.warn("ACK executor did not terminate in time, forcing shutdown");
+                ackExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            log.warn("Interrupted while waiting for ACK executor shutdown", e);
+            ackExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
 
         // Stop adaptive delivery manager
         adaptiveDeliveryManager.stop();

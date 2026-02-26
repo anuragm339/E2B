@@ -301,7 +301,7 @@ public class DataRefreshManager {
         }
 
         context.recordResetAck(consumerGroupTopic);
-        log.info("RESET ACK received from {} (client: {}) for topic {} ({}/{})",
+        log.debug("RESET ACK received from {} (client: {}) for topic {} ({}/{})",
                 consumerGroupTopic, clientId, topic,
                 context.getReceivedResetAcks().size(),
                 context.getExpectedConsumers().size());
@@ -314,7 +314,7 @@ public class DataRefreshManager {
         // MULTI-GROUP FIX: Extract group from consumerGroupTopic (format: "group:topic")
         String group = consumerGroupTopic.split(":")[0];
         remoteConsumers.resetConsumerOffset(clientId, topic, group, 0);
-        log.info("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}",
+        log.debug("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}",
                  clientId, consumerGroupTopic, topic);
 
         // Persist state after each ACK
@@ -348,7 +348,7 @@ public class DataRefreshManager {
      * Start immediate replay for individual consumer
      */
     private void startReplayForConsumer(String clientId, String topic) {
-        log.info("Starting IMMEDIATE replay for consumer: {} on topic: {}", clientId, topic);
+        log.debug("Starting IMMEDIATE replay for consumer: {} on topic: {}", clientId, topic);
 
         try {
             DataRefreshContext context = activeRefreshes.get(topic);
@@ -360,7 +360,7 @@ public class DataRefreshManager {
             // Note: Adaptive delivery manager will automatically discover and deliver messages
             // No explicit trigger needed - watermark-based polling handles replay
 
-            log.info("Replay ready for consumer: {} starting from offset 0 (adaptive delivery will poll)", clientId);
+            log.debug("Replay ready for consumer: {} starting from offset 0 (adaptive delivery will poll)", clientId);
 
         } catch (Exception e) {
             DataRefreshException ex = new DataRefreshException(ErrorCode.DATA_REFRESH_REPLAY_FAILED,
@@ -399,7 +399,7 @@ public class DataRefreshManager {
         }
 
         // Re-broadcast RESET to all consumers (safe to send multiple times)
-        log.info("Retrying RESET broadcast for topic {} - still waiting for {} consumer(s): {}",
+        log.debug("Retrying RESET broadcast for topic {} - still waiting for {} consumer(s): {}",
                 topic, missingAcks.size(), missingAcks);
         remoteConsumers.broadcastResetToTopic(topic);
     }
@@ -424,11 +424,11 @@ public class DataRefreshManager {
         boolean allResetAcksReceived = context.allResetAcksReceived();
         if (!allResetAcksReceived) {
             Set<String> missing = getMissingResetAcks(context);
-            log.info("Waiting for RESET ACKs from: {}", missing);
+            log.debug("Waiting for RESET ACKs from: {}", missing);
         }
 
         if (allCaughtUp && allResetAcksReceived) {
-            log.info("All consumers caught up for topic {}, sending READY", topic);
+            log.debug("All consumers caught up for topic {}, sending READY", topic);
             sendReady(topic, context);
 
             // Cancel replay check task
@@ -518,7 +518,7 @@ public class DataRefreshManager {
         }
 
         context.recordReadyAck(consumerGroupTopic);
-        log.info("READY ACK received from {} for topic {} ({}/{})",
+        log.debug("READY ACK received from {} for topic {} ({}/{})",
                 consumerGroupTopic, topic,
                 context.getReceivedReadyAcks().size(),
                 context.getExpectedConsumers().size());
@@ -534,7 +534,7 @@ public class DataRefreshManager {
             completeRefresh(topic, context);
         } else {
             Set<String> missing = getMissingReadyAcks(context);
-            log.info("Waiting for READY ACKs from: {}", missing);
+            log.debug("Waiting for READY ACKs from: {}", missing);
         }
     }
 
@@ -813,7 +813,7 @@ public class DataRefreshManager {
     public String getRefreshIdForTopic(String topic) {
         DataRefreshContext context = activeRefreshes.get(topic);
         String refreshId = context != null ? context.getRefreshId() : null;
-        log.info("getRefreshIdForTopic({}): context={}, refreshId={}", topic, (context != null), refreshId);
+        log.trace("getRefreshIdForTopic({}): context={}, refreshId={}", topic, (context != null), refreshId);
         return refreshId;
     }
 

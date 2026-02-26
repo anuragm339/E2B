@@ -1,5 +1,12 @@
 plugins {
     id 'io.micronaut.application' version '4.2.1'
+    id 'groovy'
+}
+
+// Configure custom configurations for unit tests
+configurations {
+    unitTestImplementation.extendsFrom implementation
+    unitTestRuntimeOnly.extendsFrom runtimeOnly
 }
 
 dependencies {
@@ -34,7 +41,44 @@ dependencies {
 
     // Management endpoints
     implementation 'io.micronaut:micronaut-management'
+
+    // Unit test dependencies
+    unitTestImplementation 'org.apache.groovy:groovy:4.0.15'
+    unitTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    unitTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
+    unitTestImplementation 'org.objenesis:objenesis:3.3'
+    unitTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // Integration test dependencies
+    integrationTestImplementation 'org.apache.groovy:groovy:4.0.15'
+    integrationTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    integrationTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
+    integrationTestImplementation 'org.objenesis:objenesis:3.3'
+    integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
+
+// Configure source sets for unit tests
+sourceSets {
+    unitTest {
+        groovy.srcDir 'src/unitTest/groovy'
+        resources.srcDir 'src/unitTest/resources'
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+    // Add Groovy support to integrationTest source set (defined in root build.gradle)
+    integrationTest {
+        groovy.srcDir 'src/integrationTest/groovy'
+    }
+}
+
+// Map test task to run unitTest source set
+test {
+    useJUnitPlatform()
+    testClassesDirs = sourceSets.unitTest.output.classesDirs
+    classpath = sourceSets.unitTest.runtimeClasspath
+}
+
+// integrationTest task already defined in root build.gradle
 
 application {
     mainClass = 'com.messaging.broker.Application'
