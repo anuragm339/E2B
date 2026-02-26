@@ -76,8 +76,11 @@ public class SegmentMetadataStore {
 
     /**
      * Save or update segment metadata
+     * B6-5 fix: synchronized to prevent concurrent access to the shared SQLite Connection.
+     * SQLite JDBC connections are not thread-safe; concurrent PreparedStatement creation
+     * on the same Connection causes "database is locked" or data corruption.
      */
-    public void saveSegment(SegmentMetadata metadata) throws StorageException {
+    public synchronized void saveSegment(SegmentMetadata metadata) throws StorageException {
         String sql = """
             INSERT OR REPLACE INTO segment_metadata 
             (topic, partition, base_offset, max_offset, log_file_path, index_file_path, 
@@ -113,8 +116,9 @@ public class SegmentMetadataStore {
 
     /**
      * Get all segments for a topic-partition
+     * B6-5 fix: synchronized to guard shared Connection
      */
-    public List<SegmentMetadata> getSegments(String topic, int partition) throws StorageException {
+    public synchronized List<SegmentMetadata> getSegments(String topic, int partition) throws StorageException {
         String sql = """
             SELECT topic, partition, base_offset, max_offset, log_file_path, index_file_path,
                    size_bytes, record_count, created_at, updated_at
@@ -163,7 +167,8 @@ public class SegmentMetadataStore {
      * @param partition The partition number
      * @return The maximum offset, or -1 if no data exists
      */
-    public long getMaxOffset(String topic, int partition) {
+    // B6-5 fix: synchronized to guard shared Connection
+    public synchronized long getMaxOffset(String topic, int partition) {
         String sql = "SELECT MAX(max_offset) FROM segment_metadata WHERE topic = ? AND partition = ?";
 
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
@@ -191,8 +196,9 @@ public class SegmentMetadataStore {
 
     /**
      * Delete segment metadata
+     * B6-5 fix: synchronized to guard shared Connection
      */
-    public void deleteSegment(String topic, int partition, long baseOffset) throws StorageException {
+    public synchronized void deleteSegment(String topic, int partition, long baseOffset) throws StorageException {
         String sql = "DELETE FROM segment_metadata WHERE topic = ? AND partition = ? AND base_offset = ?";
 
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {

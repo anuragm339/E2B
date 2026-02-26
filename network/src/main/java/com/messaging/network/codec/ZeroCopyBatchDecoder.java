@@ -5,6 +5,7 @@ import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.common.model.ConsumerRecord;
 import com.messaging.common.model.EventType;
+import com.messaging.network.metrics.DecodeErrorRecorder;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.ByteToMessageDecoder;
@@ -46,6 +47,16 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
     private long expectedTotalBytes = 0;
     private long lastOffset = 0;
     private String currentBatchTopic = null; // Track which topic this batch belongs to
+    private String currentBatchGroup = null; // MULTI-GROUP FIX: Track which group this batch belongs to
+    private final DecodeErrorRecorder decodeErrorRecorder;
+
+    public ZeroCopyBatchDecoder() {
+        this(DecodeErrorRecorder.noop());
+    }
+
+    public ZeroCopyBatchDecoder(DecodeErrorRecorder decodeErrorRecorder) {
+        this.decodeErrorRecorder = decodeErrorRecorder != null ? decodeErrorRecorder : DecodeErrorRecorder.noop();
+    }
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
@@ -77,6 +88,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
         // Validate payload length
         if (payloadLength < 0 || payloadLength > 10 * 1024 * 1024) {
             log.error("Invalid payload length: {}", payloadLength);
+            decodeErrorRecorder.record("unknown", "invalid_payload_length");
             in.resetReaderIndex();
             throw new NetworkException(ErrorCode.NETWORK_DECODING_ERROR, "Invalid payload length: " + payloadLength)
                 .withContext("payloadLength", payloadLength);
@@ -88,7 +100,13 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             return; // Wait for more data
         }
 
-        BrokerMessage.MessageType messageType = BrokerMessage.MessageType.fromCode(typeCode);
+        BrokerMessage.MessageType messageType;
+        try {
+            messageType = BrokerMessage.MessageType.fromCode(typeCode);
+        } catch (RuntimeException ex) {
+            decodeErrorRecorder.record("unknown", "invalid_message_type");
+            throw ex;
+        }
 
         // Handle BATCH_HEADER message - this signals that raw FileRegion bytes will follow
         if (messageType == BrokerMessage.MessageType.BATCH_HEADER) {
@@ -96,8 +114,8 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             byte[] payload = new byte[payloadLength];
             in.readBytes(payload);
 
-            // UNIFIED FORMAT: [recordCount:4][totalBytes:8][topicLen:4][topic:var]
-            // Removed lastOffset - consumer doesn't need it
+            // MULTI-GROUP FIX: Format [recordCount:4][totalBytes:8][topicLen:4][topic:var][groupLen:4][group:var]
+            // Group is required for ACK routing when multiple groups share one connection
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(payload);
             expectedRecordCount = buffer.getInt();
             expectedTotalBytes = buffer.getLong();
@@ -108,8 +126,14 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
             buffer.get(topicBytes);
             currentBatchTopic = new String(topicBytes, StandardCharsets.UTF_8);
 
-            log.debug("Received BATCH_HEADER: topic={}, recordCount={}, totalBytes={}",
-                    currentBatchTopic, expectedRecordCount, expectedTotalBytes);
+            // MULTI-GROUP FIX: Parse group name from header
+            int groupLen = buffer.getInt();
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            currentBatchGroup = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.debug("Received BATCH_HEADER: topic={}, group={}, recordCount={}, totalBytes={}",
+                    currentBatchTopic, currentBatchGroup, expectedRecordCount, expectedTotalBytes);
 
             // Transition to READING_ZERO_COPY_BATCH state to expect raw bytes
             state = DecoderState.READING_ZERO_COPY_BATCH;
@@ -189,6 +213,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
             if (keyLen < 0 || keyLen > 1024 * 1024) {
                 log.error("Invalid keyLen: {}", keyLen);
+                decodeErrorRecorder.record("unknown", "invalid_key_length");
                 break;
             }
 
@@ -210,6 +235,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
             if (dataLen < 0 || dataLen > 10 * 1024 * 1024) {
                 log.error("Invalid dataLen: {}", dataLen);
+                decodeErrorRecorder.record("unknown", "invalid_data_length");
                 break;
             }
 
@@ -291,6 +317,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
             if (keyLen < 0 || keyLen > 1024 * 1024) {
                 log.error("Invalid keyLen: {} (0x{})", keyLen, Integer.toHexString(keyLen));
+                decodeErrorRecorder.record(currentBatchTopic, "invalid_key_length");
                 break;
             }
 
@@ -312,6 +339,7 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
             if (dataLen < 0 || dataLen > 10 * 1024 * 1024) {
                 log.error("Invalid dataLen: {}", dataLen);
+                decodeErrorRecorder.record(currentBatchTopic, "invalid_data_length");
                 break;
             }
 
@@ -340,8 +368,30 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
 
         log.debug("Decoded zero-copy batch: {} records, {} bytes", records.size(), bytesRead);
 
-        // Emit BatchDecodedEvent to pipeline (BatchAckHandler will send BATCH_ACK)
-        out.add(new BatchDecodedEvent(records, currentBatchTopic));
+        if (records.size() != expectedRecordCount) {
+            // Partial parse — some records were not decoded (corrupt data or sizing bug).
+            // Do NOT emit BatchDecodedEvent: emitting would trigger BATCH_ACK and advance the
+            // broker offset past the unparsed records, causing permanent data loss.
+            // Close the channel instead — the broker will detect the disconnect, and the consumer
+            // will reconnect and re-subscribe. Delivery resumes from the last committed offset.
+            log.error("Partial batch parse for topic {}: expected {} records, decoded {} records ({} bytes consumed of {})." +
+                      " Closing channel to trigger reconnect and redelivery from last committed offset.",
+                      currentBatchTopic, expectedRecordCount, records.size(), bytesRead, expectedTotalBytes);
+            decodeErrorRecorder.record(currentBatchTopic, "partial_batch_parse");
+            // Reset decoder state before closing
+            state = DecoderState.READING_BROKER_MESSAGE;
+            expectedRecordCount = 0;
+            expectedTotalBytes = 0;
+            lastOffset = 0;
+            currentBatchTopic = null;
+            currentBatchGroup = null;
+            ctx.close();
+            return;
+        }
+
+        // Emit BatchDecodedEvent to pipeline (BatchAckHandler will send BATCH_ACK with group)
+        // MULTI-GROUP FIX: Include group so ACK can identify which group to advance offset for
+        out.add(new BatchDecodedEvent(records, currentBatchTopic, currentBatchGroup));
 
         // Reset state for next message
         state = DecoderState.READING_BROKER_MESSAGE;
@@ -349,5 +399,6 @@ public class ZeroCopyBatchDecoder extends ByteToMessageDecoder {
         expectedTotalBytes = 0;
         lastOffset = 0;
         currentBatchTopic = null;
+        currentBatchGroup = null;
     }
 }

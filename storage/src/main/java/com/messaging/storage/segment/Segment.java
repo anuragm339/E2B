@@ -18,7 +18,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.zip.CRC32;
 
 /**
@@ -47,23 +46,6 @@ public class Segment {
     private final String topic;
     private final int partition;
 
-    /**
-     * In-memory index: offset -> file position
-     *
-     * @deprecated This in-memory index is kept only for backward compatibility during segment recovery.
-     * New reads use file-based binary search via findIndexEntryForOffset(), which provides:
-     * - O(log n) lookup time (similar to this ConcurrentSkipListMap)
-     * - O(1) memory usage (vs O(n) for this map)
-     * - Thread-safe positioned reads without synchronization
-     *
-     * Memory savings: ~50MB per 1M records (8 bytes key + 4 bytes value + ~40 bytes overhead per entry).
-     * With binary search: ~400 bytes per lookup (20 iterations × 20 bytes per index entry).
-     *
-     * Will be completely removed in next major version after successful rollout.
-     */
-    @Deprecated
-    private final ConcurrentSkipListMap<Long, Integer> index;
-
     // Thread-local buffers for reads (to avoid allocation)
     private final ThreadLocal<ByteBuffer> readBuffer = ThreadLocal.withInitial(() -> ByteBuffer.allocate(WRITE_BUFFER_SIZE));
 
@@ -83,7 +65,6 @@ public class Segment {
         this.maxSize = maxSize;
         this.topic = topic;
         this.partition = partition;
-        this.index = new ConcurrentSkipListMap<>();
 
         try {
             // Open log file channel
@@ -279,19 +260,26 @@ public class Segment {
     }
 
     /**
-     * Recover index from index file (unified format).
+     * Recover segment metadata from index file (unified format).
      * Index entry: [offset:8][logPosition:4][recordSize:4][crc32:4]
      *
-     * NOTE: This method still populates the deprecated in-memory index for backward compatibility.
-     * However, new reads no longer use this index - they use file-based binary search instead.
-     * This ensures segment recovery works during transition period.
-     * Will be simplified in future version to only recover metadata (nextOffset, recordCount).
+     * Recovers:
+     * - Sets nextOffset to highest offset + 1
+     * - Sets recordCount based on index entries
+     * - Validates log file integrity (B7-2 crash recovery)
+     * - Truncates orphaned bytes if present
+     *
+     * All reads use file-based binary search (findIndexEntryForOffset) - O(1) memory.
      */
     private void recoverFromIndexFile(long indexSize) throws MessagingException {
         try {
             ByteBuffer buffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
             long position = FILE_HEADER_SIZE;  // Skip file header
             long highestOffset = baseOffset - 1;
+            // B7-2 fix: track where valid log data ends according to the index.
+            // If the log file is larger, the extra bytes are a partial write from a crash
+            // between log-write and index-write — they must be truncated.
+            long expectedLogEnd = FILE_HEADER_SIZE;
 
             while (position < indexSize) {
                 buffer.clear();
@@ -304,19 +292,35 @@ public class Segment {
                 int recordSize = buffer.getInt();
                 int crc = buffer.getInt();
 
-                index.put(offset, logPos);
-
                 if (offset > highestOffset) {
                     highestOffset = offset;
+                }
+                // Track the end of the last fully-indexed record in the log file
+                long entryEnd = logPos + (long) recordSize;
+                if (entryEnd > expectedLogEnd) {
+                    expectedLogEnd = entryEnd;
                 }
 
                 position += INDEX_ENTRY_SIZE;
             }
 
             this.nextOffset = highestOffset + 1;
-            this.recordCount = index.size(); // Set recordCount for dense indexing
+            // Calculate recordCount from number of index entries read
+            this.recordCount = (int) ((position - FILE_HEADER_SIZE) / INDEX_ENTRY_SIZE);
 
-            log.info("Recovered index with {} entries, nextOffset={}, recordCount={}", index.size(), nextOffset, recordCount);
+            // B7-2 fix: truncate log file if it has bytes beyond what the index knows about.
+            // This removes any partial record written before a crash that prevented the
+            // corresponding index entry from being written and fsynced.
+            long actualLogSize = logChannel.size();
+            if (actualLogSize > expectedLogEnd) {
+                log.warn("B7-2 crash recovery: log file has {} orphaned bytes beyond last indexed record " +
+                         "(logSize={}, expectedLogEnd={}). Truncating to remove partial write.",
+                         actualLogSize - expectedLogEnd, actualLogSize, expectedLogEnd);
+                logChannel.truncate(expectedLogEnd);
+                this.logPosition = expectedLogEnd;
+            }
+
+            log.info("Recovered index with {} entries, nextOffset={}, recordCount={}", recordCount, nextOffset, recordCount);
         } catch ( IOException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.ioError("Failed to recover index from index file", e)
@@ -447,10 +451,6 @@ public class Segment {
 
             // Increment record count for next write
             recordCount++;
-
-            // Update in-memory index (offset -> log position)
-            // DEPRECATED: Commented out - new reads use file-based binary search
-            // index.put(offset, (int) recordLogPosition);
 
             // Force to disk for durability
             logChannel.force(false);

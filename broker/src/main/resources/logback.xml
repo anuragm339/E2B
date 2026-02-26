@@ -18,11 +18,17 @@
         </encoder>
     </appender>
 
-    <logger name="com.messaging" level="INFO"/>
-    <logger name="io.netty" level="WARN"/>
+    <!-- Targeted INFO logs -->
+    <logger name="com.messaging.broker.core" level="INFO"/>
+    <logger name="com.messaging.broker.refresh" level="INFO"/>
     <logger name="io.micronaut" level="INFO"/>
 
-    <root level="INFO">
+    <!-- Default WARN+ -->
+    <logger name="com.messaging" level="WARN"/>
+    <logger name="com.messaging.broker.consumer" level="WARN"/>
+    <logger name="io.netty" level="ERROR"/>
+
+    <root level="WARN">
         <appender-ref ref="STDOUT"/>
         <appender-ref ref="FILE"/>
     </root>

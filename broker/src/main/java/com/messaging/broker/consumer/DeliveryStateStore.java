@@ -229,6 +229,35 @@ public class DeliveryStateStore {
     }
 
     /**
+     * OOM FIX: Remove all delivery state entries for a disconnected consumer
+     *
+     * Prevents memory leak from accumulating state entries when consumers
+     * reconnect with different ephemeral ports.
+     *
+     * @param clientId Client identifier (includes ephemeral port)
+     */
+    public void removeConsumerState(String clientId) {
+        String keyPrefix = clientId + ":";
+        int removedCount = 0;
+
+        // Remove all entries matching clientId prefix (all topics for this client)
+        for (String key : cache.keySet()) {
+            if (key.startsWith(keyPrefix)) {
+                if (cache.remove(key) != null) {
+                    removedCount++;
+                }
+            }
+        }
+
+        if (removedCount > 0) {
+            log.info("OOM FIX: Removed {} delivery state entries for disconnected clientId={}",
+                    removedCount, clientId);
+            // Trigger immediate flush to persist cleanup
+            persistToDisk();
+        }
+    }
+
+    /**
      * Shutdown - stop flusher and perform final flush
      */
     @PreDestroy

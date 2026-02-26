@@ -42,6 +42,8 @@ public class DataRefreshManager {
     private final Map<String, DataRefreshContext> activeRefreshes;
     private final Map<String, ScheduledFuture<?>> replayCheckTasks;
     private final Map<String, ScheduledFuture<?>> resetRetryTasks;
+    // B11-6a fix: Reference to AdaptiveBatchDeliveryManager for wiring refresh state checks
+    private final com.messaging.broker.consumer.AdaptiveBatchDeliveryManager adaptiveBatchDeliveryManager;
 
     // Track current refresh batch ID - shared by all topics in the same batch
     private volatile String currentRefreshId = null;
@@ -51,12 +53,14 @@ public class DataRefreshManager {
             PipeConnector pipeConnector,
             DataRefreshConfiguration config,
             DataRefreshStateStore stateStore,
-            DataRefreshMetrics metrics) {
+            DataRefreshMetrics metrics,
+            com.messaging.broker.consumer.AdaptiveBatchDeliveryManager adaptiveBatchDeliveryManager) {
         this.remoteConsumers = remoteConsumers;
         this.pipeConnector = pipeConnector;
         this.config = config;
         this.stateStore = stateStore;
         this.metrics = metrics;
+        this.adaptiveBatchDeliveryManager = adaptiveBatchDeliveryManager;
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r);
             t.setName("DataRefreshManager");
@@ -75,6 +79,10 @@ public class DataRefreshManager {
         // Wire this manager to RemoteConsumerRegistry for metrics tracking
         remoteConsumers.setDataRefreshManager(this);
         log.info("DataRefreshManager wired to RemoteConsumerRegistry for metrics tracking");
+
+        // B11-6a fix: Wire this manager to AdaptiveBatchDeliveryManager for refresh state checks
+        adaptiveBatchDeliveryManager.setDataRefreshManager(this);
+        log.info("B11-6a: DataRefreshManager wired to AdaptiveBatchDeliveryManager for RESET_SENT state checking");
 
         Map<String, DataRefreshContext> savedRefreshes = stateStore.loadAllRefreshes();
 
@@ -156,13 +164,49 @@ public class DataRefreshManager {
      */
     public CompletableFuture<RefreshResult> startRefresh(String topic) {
 
-        // For per-topic refresh, we expect ONE consumer per topic
-        // The expected consumer identifier is the topic name itself
-        // This matches how consumers are registered in application.yml
-        Set<String> expectedConsumers = Set.of(topic);
+        // B11-6b fix: Force refresh - cancel existing refresh if in progress
+        // This allows admin to retrigger stuck refreshes without orphaning tasks
+        DataRefreshContext existingRefresh = activeRefreshes.get(topic);
+        if (existingRefresh != null) {
+            log.warn("Refresh already in progress for topic: {} (state: {}), forcing new refresh (canceling old tasks)",
+                     topic, existingRefresh.getState());
 
-        log.info("Starting refresh for topic: {} with {} expected consumer(s)",
-                topic, expectedConsumers.size());
+            // Cancel existing RESET retry task (prevent orphaned scheduler task)
+            ScheduledFuture<?> oldResetTask = resetRetryTasks.remove(topic);
+            if (oldResetTask != null) {
+                oldResetTask.cancel(false);
+                log.info("B11-6b fix: Cancelled orphaned RESET retry task for topic: {}", topic);
+            }
+
+            // Cancel existing replay check task
+            ScheduledFuture<?> oldReplayTask = replayCheckTasks.remove(topic);
+            if (oldReplayTask != null) {
+                oldReplayTask.cancel(false);
+                log.info("B11-6b fix: Cancelled orphaned replay check task for topic: {}", topic);
+            }
+
+            // Remove old context (will be replaced below)
+            activeRefreshes.remove(topic);
+            log.info("B11-6b fix: Cleaned up old refresh context for topic: {}", topic);
+        }
+
+        // Build expected consumers from currently-registered consumers for this topic.
+        // Use "group:topic" identifiers — the same format that handleResetAck() receives
+        // from getConsumerGroupTopic(). This ensures ACK matching works correctly.
+        Set<String> expectedConsumers = new java.util.HashSet<>(
+                remoteConsumers.getGroupTopicIdentifiers(topic)
+        );
+
+        if (expectedConsumers.isEmpty()) {
+            // No consumers registered for this topic — nothing to refresh
+            log.warn("No consumers registered for topic: {} — skipping refresh", topic);
+            return CompletableFuture.completedFuture(
+                RefreshResult.success(topic, DataRefreshState.COMPLETED, 0)
+            );
+        }
+
+        log.info("Starting refresh for topic: {} with {} expected consumer(s): {}",
+                topic, expectedConsumers.size(), expectedConsumers);
 
         // Thread-safe initialization of currentRefreshId and metrics reset
         // Reset all metrics ONLY if this is the first refresh (no active refreshes)
@@ -257,7 +301,7 @@ public class DataRefreshManager {
         }
 
         context.recordResetAck(consumerGroupTopic);
-        log.info("RESET ACK received from {} (client: {}) for topic {} ({}/{})",
+        log.debug("RESET ACK received from {} (client: {}) for topic {} ({}/{})",
                 consumerGroupTopic, clientId, topic,
                 context.getReceivedResetAcks().size(),
                 context.getExpectedConsumers().size());
@@ -267,8 +311,10 @@ public class DataRefreshManager {
 
         // CRITICAL FIX: Reset offset to 0 for THIS consumer (do this for EVERY RESET_ACK)
         // Previously this was only done for the first RESET_ACK, causing incomplete replays
-        remoteConsumers.resetConsumerOffset(clientId, topic, 0);
-        log.info("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}",
+        // MULTI-GROUP FIX: Extract group from consumerGroupTopic (format: "group:topic")
+        String group = consumerGroupTopic.split(":")[0];
+        remoteConsumers.resetConsumerOffset(clientId, topic, group, 0);
+        log.debug("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}",
                  clientId, consumerGroupTopic, topic);
 
         // Persist state after each ACK
@@ -302,7 +348,7 @@ public class DataRefreshManager {
      * Start immediate replay for individual consumer
      */
     private void startReplayForConsumer(String clientId, String topic) {
-        log.info("Starting IMMEDIATE replay for consumer: {} on topic: {}", clientId, topic);
+        log.debug("Starting IMMEDIATE replay for consumer: {} on topic: {}", clientId, topic);
 
         try {
             DataRefreshContext context = activeRefreshes.get(topic);
@@ -314,7 +360,7 @@ public class DataRefreshManager {
             // Note: Adaptive delivery manager will automatically discover and deliver messages
             // No explicit trigger needed - watermark-based polling handles replay
 
-            log.info("Replay ready for consumer: {} starting from offset 0 (adaptive delivery will poll)", clientId);
+            log.debug("Replay ready for consumer: {} starting from offset 0 (adaptive delivery will poll)", clientId);
 
         } catch (Exception e) {
             DataRefreshException ex = new DataRefreshException(ErrorCode.DATA_REFRESH_REPLAY_FAILED,
@@ -353,7 +399,7 @@ public class DataRefreshManager {
         }
 
         // Re-broadcast RESET to all consumers (safe to send multiple times)
-        log.info("Retrying RESET broadcast for topic {} - still waiting for {} consumer(s): {}",
+        log.debug("Retrying RESET broadcast for topic {} - still waiting for {} consumer(s): {}",
                 topic, missingAcks.size(), missingAcks);
         remoteConsumers.broadcastResetToTopic(topic);
     }
@@ -375,9 +421,14 @@ public class DataRefreshManager {
         }
 
         boolean allCaughtUp = remoteConsumers.allConsumersCaughtUp(topic, ackedConsumers);
+        boolean allResetAcksReceived = context.allResetAcksReceived();
+        if (!allResetAcksReceived) {
+            Set<String> missing = getMissingResetAcks(context);
+            log.debug("Waiting for RESET ACKs from: {}", missing);
+        }
 
-        if (allCaughtUp) {
-            log.info("All consumers caught up for topic {}, sending READY", topic);
+        if (allCaughtUp && allResetAcksReceived) {
+            log.debug("All consumers caught up for topic {}, sending READY", topic);
             sendReady(topic, context);
 
             // Cancel replay check task
@@ -388,14 +439,24 @@ public class DataRefreshManager {
         } else {
             // Trigger replay for each consumer (InFlight check in notifyNewMessageForConsumer prevents duplicates)
             // This polling is necessary to keep driving deliveries during refresh
-            List<String> allConsumerIds = remoteConsumers.getAllConsumerIds(topic);
-            if (allConsumerIds == null || allConsumerIds.isEmpty()) {
+            // MULTI-GROUP FIX: Use getConsumerGroupTopicPairs to properly handle multiple groups per topic
+            List<RemoteConsumerRegistry.ConsumerGroupTopicPair> consumerPairs =
+                remoteConsumers.getConsumerGroupTopicPairs(topic);
+            if (consumerPairs == null || consumerPairs.isEmpty()) {
                 log.debug("No remote consumers found for topic {}, cannot trigger replay", topic);
             } else {
-                log.debug("Checking replay progress for {} consumers on topic {}", allConsumerIds.size(), topic);
-                for (String clientId : allConsumerIds) {
+                log.debug("Checking replay progress for {} consumer registrations on topic {}",
+                         consumerPairs.size(), topic);
+                for (RemoteConsumerRegistry.ConsumerGroupTopicPair pair : consumerPairs) {
+                    // B3-7 fix: only trigger replay for consumers that ACKed RESET.
+                    // Previously called for ALL consumers, inflating data_refresh_replay_started_total.
+                    if (!ackedConsumers.contains(pair.consumerGroupTopic)) {
+                        log.debug("Skipping replay trigger for clientId={} consumerGroupTopic={} (not in ackedConsumers={})",
+                                pair.clientId, pair.consumerGroupTopic, ackedConsumers);
+                        continue;
+                    }
                     // The InFlight check in notifyNewMessageForConsumer will prevent duplicate scheduling
-                    startReplayForConsumer(clientId, topic);
+                    startReplayForConsumer(pair.clientId, topic);
                 }
             }
         }
@@ -415,8 +476,9 @@ public class DataRefreshManager {
             metrics.recordReadySent(topic, consumer, context.getRefreshId());
         }
 
-        remoteConsumers.broadcastReadyToTopic(topic);
-        log.info("READY sent to all consumers for topic: {}", topic);
+        // Only send READY to consumers that have ACKed RESET — not all connected consumers
+        remoteConsumers.sendReadyToAckedConsumers(topic, context.getReceivedResetAcks());
+        log.info("READY sent to {} ACKed consumers for topic: {}", context.getReceivedResetAcks().size(), topic);
 
         // Persist state
         stateStore.saveState(context);
@@ -449,13 +511,14 @@ public class DataRefreshManager {
             return;
         }
 
-//        if (context.getReceivedReadyAcks().contains(consumerGroupTopic)) {
-//            log.debug("Duplicate READY ACK from {} for topic {}, ignoring", consumerGroupTopic, topic);
-//            return;
-//        }
+        // B3-4 fix: guard was commented out, allowing duplicate READY ACKs to double-record metrics.
+        if (context.getReceivedReadyAcks().contains(consumerGroupTopic)) {
+            log.debug("Duplicate READY ACK from {} for topic {}, ignoring", consumerGroupTopic, topic);
+            return;
+        }
 
         context.recordReadyAck(consumerGroupTopic);
-        log.info("READY ACK received from {} for topic {} ({}/{})",
+        log.debug("READY ACK received from {} for topic {} ({}/{})",
                 consumerGroupTopic, topic,
                 context.getReceivedReadyAcks().size(),
                 context.getExpectedConsumers().size());
@@ -471,7 +534,7 @@ public class DataRefreshManager {
             completeRefresh(topic, context);
         } else {
             Set<String> missing = getMissingReadyAcks(context);
-            log.info("Waiting for READY ACKs from: {}", missing);
+            log.debug("Waiting for READY ACKs from: {}", missing);
         }
     }
 
@@ -484,8 +547,11 @@ public class DataRefreshManager {
         context.setState(DataRefreshState.COMPLETED);
         stateStore.saveState(context);
 
-        // Record metrics: refresh completed successfully (with refresh_id AND context for downtime)
-        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", currentRefreshId, context);
+        // B5-2 fix: use context.getRefreshId() instead of currentRefreshId field.
+        // currentRefreshId may already be null if another topic in the same batch completed first
+        // (line below sets currentRefreshId=null after all topics in batch complete).
+        // context.getRefreshId() always holds the correct refresh_id for this specific refresh.
+        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", context.getRefreshId(), context);
 
         // Resume pipe calls only if NO other refreshes IN THE SAME BATCH are in progress
         // Check only topics with the same refresh_id (same batch)
@@ -574,12 +640,18 @@ public class DataRefreshManager {
                 log.info("Resuming from RESET_SENT - starting periodic RESET retry for {} consumer(s): {}",
                         missingResetAcks.size(), missingResetAcks);
 
-                // Re-record RESET sent metrics with current refresh_id (in-memory map was cleared on restart)
+                // B9-1 fix: populate resetSentTimes with original RESET sent time from context,
+                // not System.currentTimeMillis(). When ACK arrives after resume, the measured
+                // duration = (ackTime - originalResetSentTime) instead of (ackTime - resumeTime).
                 String resumeRefreshId = context.getRefreshId();
+                Instant originalResetSentTime = context.getResetSentTime();
                 for (String consumer : context.getExpectedConsumers()) {
-                    metrics.recordResetSent(topic, consumer, resumeRefreshId);
+                    long resetSentMs = originalResetSentTime != null
+                            ? originalResetSentTime.toEpochMilli()
+                            : System.currentTimeMillis();
+                    metrics.recordResetSentAt(topic, consumer, resumeRefreshId, resetSentMs);
                 }
-                log.info("Re-recorded RESET sent metrics for topic {} with refresh_id: {}", topic, resumeRefreshId);
+                log.info("Re-populated RESET timing map for topic {} with refresh_id: {}", topic, resumeRefreshId);
 
                 // Immediately send RESET once
                 remoteConsumers.broadcastResetToTopic(topic);
@@ -601,23 +673,30 @@ public class DataRefreshManager {
                 log.info("Resuming from REPLAYING - {} consumers ACKed, checking progress",
                         context.getReceivedResetAcks().size());
 
-                // Re-record RESET sent metrics with current refresh_id (Timer was cleared on restart)
+                // B9-1 fix: Re-populate timing maps with original sent times from context, not System.currentTimeMillis().
+                // Using "now" would make the subsequent ACK duration measurement include broker downtime,
+                // inflating the Timer by hours or days if the broker was restarted mid-refresh.
                 String replayingRefreshId = context.getRefreshId();
+                Instant resetSentInstant = context.getResetSentTime();
                 for (String consumer : context.getExpectedConsumers()) {
-                    metrics.recordResetSent(topic, consumer, replayingRefreshId);
-
-                    // If RESET ACK was already received before restart, record the historical duration
                     if (context.getReceivedResetAcks().contains(consumer)) {
-                        Instant resetSentTime = context.getResetSentTime();
+                        // Already ACKed before restart — record the historical duration directly
                         Instant resetAckTime = context.getResetAckTimes().get(consumer);
-                        if (resetSentTime != null && resetAckTime != null) {
-                            long durationMs = java.time.Duration.between(resetSentTime, resetAckTime).toMillis();
+                        if (resetSentInstant != null && resetAckTime != null) {
+                            long durationMs = java.time.Duration.between(resetSentInstant, resetAckTime).toMillis();
                             metrics.recordResetAckDuration(topic, consumer, replayingRefreshId, durationMs);
                             log.info("Recorded historical RESET ACK duration for consumer {}: {}ms", consumer, durationMs);
                         }
+                    } else {
+                        // Still waiting for ACK — populate timing map with original sent time so that
+                        // when ACK arrives the measured duration = (ackTime - originalResetSentTime)
+                        long sentTimeMs = resetSentInstant != null
+                                ? resetSentInstant.toEpochMilli()
+                                : System.currentTimeMillis();
+                        metrics.recordResetSentAt(topic, consumer, replayingRefreshId, sentTimeMs);
                     }
                 }
-                log.info("Re-recorded RESET sent metrics for topic {} with refresh_id: {}", topic, replayingRefreshId);
+                log.info("Re-populated RESET timing maps for topic {} with refresh_id: {}", topic, replayingRefreshId);
 
                 ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
                         () -> checkReplayProgress(topic),
@@ -632,35 +711,40 @@ public class DataRefreshManager {
                 // Continue waiting for READY ACKs
                 log.info("Resuming from READY_SENT - waiting for ACKs from: {}", getMissingReadyAcks(context));
 
-                // Re-record both RESET and READY sent metrics (Timers were cleared on restart)
+                // B9-1 fix: populate timing maps with ORIGINAL sent times from context.
+                // recordResetSent()/recordReadySent() would store System.currentTimeMillis() which
+                // inflates the subsequent ACK duration Timer by including broker downtime.
                 String readySentRefreshId = context.getRefreshId();
+                Instant resumeResetSentInstant = context.getResetSentTime();
+                Instant resumeReadySentInstant = context.getReadySentTime();
                 for (String consumer : context.getExpectedConsumers()) {
-                    metrics.recordResetSent(topic, consumer, readySentRefreshId);
-                    metrics.recordReadySent(topic, consumer, readySentRefreshId);
-
-                    // Record historical RESET ACK duration if available
+                    // Record historical RESET ACK duration (all consumers in READY_SENT already ACKed RESET)
                     if (context.getReceivedResetAcks().contains(consumer)) {
-                        Instant resetSentTime = context.getResetSentTime();
                         Instant resetAckTime = context.getResetAckTimes().get(consumer);
-                        if (resetSentTime != null && resetAckTime != null) {
-                            long durationMs = java.time.Duration.between(resetSentTime, resetAckTime).toMillis();
+                        if (resumeResetSentInstant != null && resetAckTime != null) {
+                            long durationMs = java.time.Duration.between(resumeResetSentInstant, resetAckTime).toMillis();
                             metrics.recordResetAckDuration(topic, consumer, readySentRefreshId, durationMs);
                             log.info("Recorded historical RESET ACK duration for consumer {}: {}ms", consumer, durationMs);
                         }
                     }
 
-                    // Record historical READY ACK duration if already received before restart
                     if (context.getReceivedReadyAcks().contains(consumer)) {
-                        Instant readySentTime = context.getReadySentTime();
+                        // Already received READY ACK before restart — record historical duration directly
                         Instant readyAckTime = context.getReadyAckTimes().get(consumer);
-                        if (readySentTime != null && readyAckTime != null) {
-                            long durationMs = java.time.Duration.between(readySentTime, readyAckTime).toMillis();
+                        if (resumeReadySentInstant != null && readyAckTime != null) {
+                            long durationMs = java.time.Duration.between(resumeReadySentInstant, readyAckTime).toMillis();
                             metrics.recordReadyAckDuration(topic, consumer, readySentRefreshId, durationMs);
                             log.info("Recorded historical READY ACK duration for consumer {}: {}ms", consumer, durationMs);
                         }
+                    } else {
+                        // Still waiting for READY ACK — populate readySentTimes with original READY sent time
+                        long readySentMs = resumeReadySentInstant != null
+                                ? resumeReadySentInstant.toEpochMilli()
+                                : System.currentTimeMillis();
+                        metrics.recordReadySentAt(topic, consumer, readySentRefreshId, readySentMs);
                     }
                 }
-                log.info("Re-recorded RESET and READY sent metrics for topic {} with refresh_id: {}", topic, readySentRefreshId);
+                log.info("Re-populated RESET/READY timing maps for topic {} with refresh_id: {}", topic, readySentRefreshId);
 
                 scheduler.schedule(
                         () -> checkReadyAckTimeout(topic),
@@ -673,7 +757,7 @@ public class DataRefreshManager {
                 // Already done, cleanup
                 log.info("Resuming from COMPLETED - cleaning up");
                 activeRefreshes.remove(topic);
-                stateStore.clearState();
+                stateStore.clearState(topic);
                 break;
 
             case ABORTED:
@@ -729,7 +813,7 @@ public class DataRefreshManager {
     public String getRefreshIdForTopic(String topic) {
         DataRefreshContext context = activeRefreshes.get(topic);
         String refreshId = context != null ? context.getRefreshId() : null;
-        log.info("getRefreshIdForTopic({}): context={}, refreshId={}", topic, (context != null), refreshId);
+        log.trace("getRefreshIdForTopic({}): context={}, refreshId={}", topic, (context != null), refreshId);
         return refreshId;
     }
 

@@ -26,6 +26,9 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Main broker service that wires storage and network together
@@ -45,6 +48,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final DataRefreshManager dataRefreshManager;
     private final int serverPort;
     private final ObjectMapper objectMapper;
+
+    // Dedicated executor for ACK processing to prevent event loop blocking
+    private final ExecutorService ackExecutor;
 
     @Inject
     public BrokerService(
@@ -71,7 +77,17 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.serverPort = serverPort;
         this.objectMapper = new ObjectMapper();
 
-        log.info("BrokerService initialized");
+        // Create dedicated thread pool for ACK processing (CPU cores * 2)
+        // This prevents ACKs from being blocked by heavy delivery operations on Netty event loop
+        int ackThreads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
+        this.ackExecutor = Executors.newFixedThreadPool(ackThreads, runnable -> {
+            Thread t = new Thread(runnable);
+            t.setName("ACK-Processor-" + t.getId());
+            t.setDaemon(true);
+            return t;
+        });
+
+        log.info("BrokerService initialized with {} ACK processing threads", ackThreads);
     }
 
     @Override
@@ -137,6 +153,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             metrics.stopStorageWriteTimer(storageSample);
 
             metrics.recordMessageStored();
+            metrics.recordTopicLastMessageTime(topic);
 
             log.debug("Stored message from parent: topic={}, offset={}, key={}",
                     topic, offset, record.getMsgKey());
@@ -155,7 +172,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      * Handle incoming messages from clients
      */
     private void handleMessage(String clientId, BrokerMessage message) {
-        log.info("Handling message from {}: type={}, id={}",
+        log.debug("Handling message from {}: type={}, id={}",
                   clientId, message.getType(), message.getMessageId());
 
         switch (message.getType()) {
@@ -226,8 +243,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             metrics.stopStorageWriteTimer(storageSample);
 
             metrics.recordMessageStored();
+            metrics.recordTopicLastMessageTime(topic);
 
-            log.info("Stored message: topic={}, offset={}, key={}, type={}",
+            log.debug("Stored message: topic={}, offset={}, key={}, type={}",
                      topic, offset, msgKey, eventType);
 
             // Broker will discover new messages via adaptive polling (watermark-based)
@@ -268,9 +286,17 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             log.info("Client {} subscribed: topic={}, group={}", clientId, topic, group);
 
-            // Register consumer for message delivery
-            remoteConsumers.registerConsumer(clientId, topic, group);
-            metrics.recordConsumerConnection();
+            // Register consumer for message delivery.
+            // B2-3 fix: only record connection metric for genuinely new registrations.
+            // Duplicate SUBSCRIBE (same clientId+topic) on the same connection would otherwise
+            // increment activeConsumers without a matching decrement on unregister.
+            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group);
+            if (isNew) {
+                metrics.recordConsumerConnection();
+            } else {
+                log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} — skipping activeConsumers increment",
+                        clientId, topic, group);
+            }
 
             log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
 
@@ -309,7 +335,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             String group = json.get("group").asText();
             long offset = json.get("offset").asLong();
 
-            log.info("Client {} committed offset: topic={}, group={}, offset={}",
+            log.debug("Client {} committed offset: topic={}, group={}, offset={}",
                      clientId, topic, group, offset);
 
             // CRITICAL: Persist offset to property file - property file is ONLY source of truth
@@ -337,17 +363,68 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      */
     private void handleResetAck(String clientId, BrokerMessage message) {
         try {
-            // Extract topic from payload
-            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
-            String[] split = topic.split(",");
-            log.info("Received RESET ACK from client: {} for topic: {}", clientId, topic);
+            // MULTI-GROUP FIX: Parse both topic and group from payload
+            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
-            // Map clientId to stable group:topic identifier
-            String consumerGroupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
-            if (consumerGroupTopic == null) {
-                log.warn("Cannot map consumer to group:topic: clientId={}, topic={}", clientId, topic);
+            // SECURITY FIX (BROKER-2): Validate payload size before reading
+            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
+                log.error("RESET_ACK payload too small from {}: {} bytes (expected >= 8)",
+                         clientId, buffer.remaining());
+                server.closeConnection(clientId);
                 return;
             }
+
+            int topicLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
+            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
+                log.error("Invalid topicLen in RESET_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, topicLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
+                log.error("Not enough data in RESET_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), topicLen + 4);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            byte[] topicBytes = new byte[topicLen];
+            buffer.get(topicBytes);
+            String topic = new String(topicBytes, StandardCharsets.UTF_8);
+
+            int groupLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
+            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
+                log.error("Invalid groupLen in RESET_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < groupLen) {
+                log.error("Not enough data for group in RESET_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            String group = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.info("Received RESET ACK from client: {} for topic: {}, group: {}", clientId, topic, group);
+
+            // MULTI-GROUP FIX: Construct consumerGroupTopic directly from parsed group and topic
+            String consumerGroupTopic = group + ":" + topic;
 
             log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
 
@@ -382,17 +459,68 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      */
     private void handleReadyAck(String clientId, BrokerMessage message) {
         try {
-            // Extract topic from payload
-            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
+            // MULTI-GROUP FIX: Parse both topic and group from payload
+            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
-            log.info("Received READY ACK from client: {} for topic: {}", clientId, topic);
-
-            // Map clientId to stable group:topic identifier
-            String consumerGroupTopic = remoteConsumers.getConsumerGroupTopic(clientId, topic);
-            if (consumerGroupTopic == null) {
-                log.warn("Cannot map consumer to group:topic: clientId={}, topic={}", clientId, topic);
+            // SECURITY FIX (BROKER-2): Validate payload size before reading
+            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
+                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8)",
+                         clientId, buffer.remaining());
+                server.closeConnection(clientId);
                 return;
             }
+
+            int topicLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
+            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
+                log.error("Invalid topicLen in READY_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, topicLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
+                log.error("Not enough data in READY_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), topicLen + 4);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            byte[] topicBytes = new byte[topicLen];
+            buffer.get(topicBytes);
+            String topic = new String(topicBytes, StandardCharsets.UTF_8);
+
+            int groupLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
+            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
+                log.error("Invalid groupLen in READY_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < groupLen) {
+                log.error("Not enough data for group in READY_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            String group = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.info("Received READY ACK from client: {} for topic: {}, group: {}", clientId, topic, group);
+
+            // MULTI-GROUP FIX: Construct consumerGroupTopic directly from parsed group and topic
+            String consumerGroupTopic = group + ":" + topic;
 
             log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
 
@@ -400,6 +528,19 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
 
             // Send ACK back to consumer to acknowledge receipt
+            BrokerMessage ack = new BrokerMessage(
+                BrokerMessage.MessageType.ACK,
+                message.getMessageId(),
+                new byte[0]
+            );
+
+            server.send(clientId, ack).whenComplete((v, ex) -> {
+                if (ex != null) {
+                    log.error("Failed to send READY ACK to {}", clientId, ex);
+                } else {
+                    log.debug("Sent ACK to {} for READY", clientId);
+                }
+            });
 
         } catch (Exception e) {
             log.error("Error handling READY from {}", clientId, e);
@@ -408,15 +549,81 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
     /**
      * Handle BATCH_ACK message - consumer acknowledges receipt and processing of a batch
+     * MULTI-GROUP FIX: Payload now contains both topic and group
      */
     private void handleBatchAck(String clientId, BrokerMessage message) {
         try {
-            // Payload contains topic name as bytes
-            String topic = new String(message.getPayload(), StandardCharsets.UTF_8);
-            log.debug("Received BATCH_ACK from client: {}, topic: {}", clientId, topic);
+            // MULTI-GROUP FIX: Parse both topic and group from payload
+            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
 
-            // Delegate to RemoteConsumerRegistry to handle ACK and commit offset
-            remoteConsumers.handleBatchAck(clientId, topic);
+            // SECURITY FIX (BROKER-2): Validate payload size before reading
+            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
+                log.error("BATCH_ACK payload too small from {}: {} bytes (expected >= 8)",
+                         clientId, buffer.remaining());
+                server.closeConnection(clientId);
+                return;
+            }
+
+            int topicLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
+            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
+                log.error("Invalid topicLen in BATCH_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, topicLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
+                log.error("Not enough data in BATCH_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), topicLen + 4);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            byte[] topicBytes = new byte[topicLen];
+            buffer.get(topicBytes);
+            String topic = new String(topicBytes, StandardCharsets.UTF_8);
+
+            int groupLen = buffer.getInt();
+
+            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
+            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
+                log.error("Invalid groupLen in BATCH_ACK from {}: {} (expected 0-65535). " +
+                         "Possible corrupted payload or protocol mismatch. Closing connection.",
+                         clientId, groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
+            if (buffer.remaining() < groupLen) {
+                log.error("Not enough data for group in BATCH_ACK from {}: remaining={}, needed={}",
+                         clientId, buffer.remaining(), groupLen);
+                server.closeConnection(clientId);
+                return;
+            }
+
+            byte[] groupBytes = new byte[groupLen];
+            buffer.get(groupBytes);
+            String group = new String(groupBytes, StandardCharsets.UTF_8);
+
+            log.debug("Received BATCH_ACK from client: {}, topic: {}, group: {}", clientId, topic, group);
+
+            // Offload ACK processing to dedicated executor to prevent Netty event loop blocking
+            // This ensures ACKs are processed quickly even when delivery operations are heavy
+            final String finalTopic = topic;
+            final String finalGroup = group;
+            ackExecutor.execute(() -> {
+                try {
+                    remoteConsumers.handleBatchAck(clientId, finalTopic, finalGroup);
+                } catch (Exception e) {
+                    log.error("Error processing BATCH_ACK from {}", clientId, e);
+                }
+            });
 
         } catch (Exception e) {
             log.error("Error handling BATCH_ACK from {}", clientId, e);
@@ -441,6 +648,20 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down broker...");
+
+        // Shutdown ACK executor first to stop accepting new ACKs
+        log.info("Shutting down ACK executor...");
+        ackExecutor.shutdown();
+        try {
+            if (!ackExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                log.warn("ACK executor did not terminate in time, forcing shutdown");
+                ackExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            log.warn("Interrupted while waiting for ACK executor shutdown", e);
+            ackExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
 
         // Stop adaptive delivery manager
         adaptiveDeliveryManager.stop();

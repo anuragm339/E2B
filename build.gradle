@@ -38,8 +38,65 @@ subprojects {
         testImplementation("org.mockito:mockito-core")
     }
 
+    configurations {
+        integrationTestImplementation.extendsFrom testImplementation
+        integrationTestRuntimeOnly.extendsFrom testRuntimeOnly
+        systemTestImplementation.extendsFrom testImplementation
+        systemTestRuntimeOnly.extendsFrom testRuntimeOnly
+        performanceTestImplementation.extendsFrom testImplementation
+        performanceTestRuntimeOnly.extendsFrom testRuntimeOnly
+    }
+
+    sourceSets {
+        integrationTest {
+            java.srcDir file('src/integrationTest/java')
+            resources.srcDir file('src/integrationTest/resources')
+            compileClasspath += sourceSets.main.output + configurations.testRuntimeClasspath
+            runtimeClasspath += output + compileClasspath
+        }
+        systemTest {
+            java.srcDir file('src/systemTest/java')
+            resources.srcDir file('src/systemTest/resources')
+            compileClasspath += sourceSets.main.output + configurations.testRuntimeClasspath
+            runtimeClasspath += output + compileClasspath
+        }
+        performanceTest {
+            java.srcDir file('src/performanceTest/java')
+            resources.srcDir file('src/performanceTest/resources')
+            compileClasspath += sourceSets.main.output + configurations.testRuntimeClasspath
+            runtimeClasspath += output + compileClasspath
+        }
+    }
+
     test {
         useJUnitPlatform()
+    }
+
+    tasks.register('integrationTest', Test) {
+        description = 'Runs integration tests.'
+        group = 'verification'
+        testClassesDirs = sourceSets.integrationTest.output.classesDirs
+        classpath = sourceSets.integrationTest.runtimeClasspath
+        useJUnitPlatform()
+        shouldRunAfter test
+    }
+
+    tasks.register('systemTest', Test) {
+        description = 'Runs system tests (journeys).'
+        group = 'verification'
+        testClassesDirs = sourceSets.systemTest.output.classesDirs
+        classpath = sourceSets.systemTest.runtimeClasspath
+        useJUnitPlatform()
+        shouldRunAfter test
+    }
+
+    tasks.register('performanceTest', Test) {
+        description = 'Runs performance tests.'
+        group = 'verification'
+        testClassesDirs = sourceSets.performanceTest.output.classesDirs
+        classpath = sourceSets.performanceTest.runtimeClasspath
+        useJUnitPlatform()
+        shouldRunAfter test
     }
     tasks.withType(Jar).configureEach {
         manifest {

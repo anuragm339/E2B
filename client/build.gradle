@@ -9,6 +9,9 @@ dependencies {
     api 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
     api 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.15.2'
 
+    // Metrics (optional, only used if consumer enables Micrometer)
+    api 'io.micrometer:micrometer-core'
+
     // Micronaut for dependency injection (provided by consumer apps)
     compileOnly 'io.micronaut:micronaut-inject'
     compileOnly 'io.micronaut:micronaut-runtime'

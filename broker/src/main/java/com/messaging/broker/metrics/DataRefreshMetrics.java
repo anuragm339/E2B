@@ -101,9 +101,10 @@ public class DataRefreshMetrics {
     public void recordRefreshStarted(String topic, String refreshType, String refreshId) {
         refreshStartedTotal.increment();
         long startTimeMs = System.currentTimeMillis();
-        refreshStartTimes.put(topic, startTimeMs);
+        String stateKey = topic + ":" + refreshId;
+        refreshStartTimes.put(stateKey, startTimeMs);
 
-        // Record start timestamp as gauge (in seconds since epoch)
+        // Use refresh_id to preserve per-refresh history in Prometheus.
         String key = topic + ":" + refreshType + ":" + refreshId;
         AtomicDouble startTimeValue = refreshStartTimeValues.computeIfAbsent(key, k -> {
             AtomicDouble atomicTime = new AtomicDouble(0.0);
@@ -124,6 +125,7 @@ public class DataRefreshMetrics {
      * Record refresh workflow completed
      */
     public void recordRefreshCompleted(String topic, String refreshType, String status, String refreshId, DataRefreshContext context) {
+        // Use refresh_id to preserve per-refresh history in Prometheus.
         String key = topic + ":" + refreshType + ":" + status + ":" + refreshId;
 
         Counter counter = refreshCompletedCounters.computeIfAbsent(key, k ->
@@ -139,6 +141,7 @@ public class DataRefreshMetrics {
 
         // Record end timestamp as gauge (in seconds since epoch)
         long endTimeMs = System.currentTimeMillis();
+        // Include refresh_id to preserve per-refresh history
         String gaugeKey = topic + ":" + refreshType + ":" + refreshId;
         AtomicDouble endTimeValue = refreshEndTimeValues.computeIfAbsent(gaugeKey, k -> {
             AtomicDouble atomicTime = new AtomicDouble(0.0);
@@ -197,7 +200,8 @@ public class DataRefreshMetrics {
                  topic, totalDurationSeconds, totalDowntimeSeconds, activeProcessingSeconds);
 
         // Record total duration
-        Long startTime = refreshStartTimes.remove(topic);
+        String stateKey = topic + ":" + refreshId;
+        Long startTime = refreshStartTimes.remove(stateKey);
         if (startTime != null) {
             long durationMs = endTimeMs - startTime;
             recordRefreshDuration(topic, refreshType, refreshId, durationMs);
@@ -240,6 +244,16 @@ public class DataRefreshMetrics {
     }
 
     /**
+     * Record RESET message sent at a specific time (for resume-after-restart).
+     * B9-1 fix: resumeRefresh() must record the original RESET sent time, not System.currentTimeMillis(),
+     * so that ACK duration measured after resume reflects actual consumer response time.
+     */
+    public void recordResetSentAt(String topic, String consumer, String refreshId, long sentTimeMs) {
+        String key = topic + ":" + consumer + ":" + refreshId;
+        resetSentTimes.put(key, sentTimeMs);
+    }
+
+    /**
      * Record READY message sent to consumer
      */
     public void recordReadySent(String topic, String consumer, String refreshId) {
@@ -248,16 +262,27 @@ public class DataRefreshMetrics {
     }
 
     /**
+     * Record READY message sent at a specific time (for resume-after-restart).
+     * B9-1 fix: analogous to recordResetSentAt — preserves original READY sent time.
+     */
+    public void recordReadySentAt(String topic, String consumer, String refreshId, long sentTimeMs) {
+        String key = topic + ":" + consumer + ":" + refreshId;
+        readySentTimes.put(key, sentTimeMs);
+    }
+
+    /**
      * Record RESET ACK received from consumer
      */
     public void recordResetAckReceived(String topic, String consumer, String refreshId) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // Internal state key still uses refreshId to distinguish concurrent refreshes
+        String stateKey = topic + ":" + consumer + ":" + refreshId;
+        String timerKey = topic + ":" + consumer + ":" + refreshId;
 
-        Long resetSentTime = resetSentTimes.get(key);
+        Long resetSentTime = resetSentTimes.get(stateKey);
         if (resetSentTime != null) {
             long durationMs = System.currentTimeMillis() - resetSentTime;
 
-            Timer timer = resetAckDurationTimers.computeIfAbsent(key, k ->
+            Timer timer = resetAckDurationTimers.computeIfAbsent(timerKey, k ->
                     Timer.builder("data_refresh_reset_ack_duration_seconds")
                             .description("Time taken for consumer to ACK RESET message")
                             .tag("topic", topic)
@@ -277,7 +302,7 @@ public class DataRefreshMetrics {
             timer.record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
 
             // Track when RESET ACK was received for replay duration
-            resetAckTimes.put(key, System.currentTimeMillis());
+            resetAckTimes.put(stateKey, System.currentTimeMillis());
         }
     }
 
@@ -285,9 +310,9 @@ public class DataRefreshMetrics {
      * Record RESET ACK duration from persisted timestamps (for resume after restart)
      */
     public void recordResetAckDuration(String topic, String consumer, String refreshId, long durationMs) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        String timerKey = topic + ":" + consumer + ":" + refreshId;
 
-        Timer timer = resetAckDurationTimers.computeIfAbsent(key, k ->
+        Timer timer = resetAckDurationTimers.computeIfAbsent(timerKey, k ->
                 Timer.builder("data_refresh_reset_ack_duration_seconds")
                         .description("Time taken for consumer to ACK RESET message")
                         .tag("topic", topic)
@@ -319,14 +344,16 @@ public class DataRefreshMetrics {
      * Record READY ACK received from consumer
      */
     public void recordReadyAckReceived(String topic, String consumer, String refreshId) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        // Internal state key still uses refreshId to distinguish concurrent refreshes
+        String stateKey = topic + ":" + consumer + ":" + refreshId;
+        String timerKey = topic + ":" + consumer + ":" + refreshId;
 
         // Measure time from READY sent to READY ACK received
-        Long readySentTime = readySentTimes.get(key);
+        Long readySentTime = readySentTimes.get(stateKey);
         if (readySentTime != null) {
             long durationMs = System.currentTimeMillis() - readySentTime;
 
-            Timer timer = readyAckDurationTimers.computeIfAbsent(key, k ->
+            Timer timer = readyAckDurationTimers.computeIfAbsent(timerKey, k ->
                     Timer.builder("data_refresh_ready_ack_duration_seconds")
                             .description("Time taken from READY sent to READY ACK received")
                             .tag("topic", topic)
@@ -349,11 +376,11 @@ public class DataRefreshMetrics {
         }
 
         // Measure pure replay duration (from replay start to READY ACK)
-        Long replayStartTime = replayStartTimes.remove(key);
+        Long replayStartTime = replayStartTimes.remove(stateKey);
         if (replayStartTime != null) {
             long durationMs = System.currentTimeMillis() - replayStartTime;
 
-            Timer timer = replayDurationTimers.computeIfAbsent(key, k ->
+            Timer timer = replayDurationTimers.computeIfAbsent(timerKey, k ->
                     Timer.builder("data_refresh_replay_duration_seconds")
                             .description("Pure replay duration (from replay start to READY ACK)")
                             .tag("topic", topic)
@@ -375,18 +402,21 @@ public class DataRefreshMetrics {
             timer.record(durationMs, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
 
-        // Cleanup
-        resetSentTimes.remove(key);
-        resetAckTimes.remove(key);
+        // Cleanup — B5-3 fix: also remove readySentTimes entry to prevent memory leak.
+        // Previously only resetSentTimes and resetAckTimes were cleaned up here;
+        // readySentTimes accumulated one entry per refresh run indefinitely.
+        resetSentTimes.remove(stateKey);
+        resetAckTimes.remove(stateKey);
+        readySentTimes.remove(stateKey);
     }
 
     /**
      * Record READY ACK duration from persisted timestamps (for resume after restart)
      */
     public void recordReadyAckDuration(String topic, String consumer, String refreshId, long durationMs) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        String timerKey = topic + ":" + consumer + ":" + refreshId;
 
-        Timer timer = readyAckDurationTimers.computeIfAbsent(key, k ->
+        Timer timer = readyAckDurationTimers.computeIfAbsent(timerKey, k ->
                 Timer.builder("data_refresh_ready_ack_duration_seconds")
                         .description("Time taken from READY sent to READY ACK received")
                         .tag("topic", topic)
@@ -412,7 +442,7 @@ public class DataRefreshMetrics {
      * Record data transferred during replay
      */
     public void recordDataTransferred(String topic, String consumer, long bytes, long messages, String refreshId, String refreshType) {
-        String key = topic + ":" + consumer + ":" + refreshId;
+        String key = topic + ":" + consumer + ":" + refreshType + ":" + refreshId;
 
         // Bytes gauge (resettable)
         AtomicLong bytesValue = bytesTransferredValues.computeIfAbsent(key, k -> {
@@ -422,8 +452,8 @@ public class DataRefreshMetrics {
                             .description("Total bytes transferred during current data refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
                             .baseUnit("bytes")
                             .register(registry)
             );
@@ -439,8 +469,8 @@ public class DataRefreshMetrics {
                             .description("Total messages transferred during current data refresh")
                             .tag("topic", topic)
                             .tag("consumer", consumer)
-                            .tag("refresh_id", refreshId)
                             .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicMessages;
@@ -494,26 +524,27 @@ public class DataRefreshMetrics {
     }
 
     /**
-     * Helper class for atomic long gauge
+     * Helper class for atomic long gauge.
+     * B2-5 fix: was using volatile long + non-atomic compound += which loses concurrent increments.
+     * Now backed by java.util.concurrent.atomic.AtomicLong for correct CAS-based addAndGet().
      */
     private static class AtomicLong {
-        private volatile long value;
+        private final java.util.concurrent.atomic.AtomicLong value;
 
         AtomicLong(long initialValue) {
-            this.value = initialValue;
+            this.value = new java.util.concurrent.atomic.AtomicLong(initialValue);
         }
 
         void set(long newValue) {
-            this.value = newValue;
+            this.value.set(newValue);
         }
 
         long addAndGet(long delta) {
-            this.value += delta;
-            return this.value;
+            return this.value.addAndGet(delta);
         }
 
         double get() {
-            return value;
+            return value.get();
         }
     }
 
@@ -575,11 +606,44 @@ public class DataRefreshMetrics {
      * Clear all state for a topic (called when refresh completes)
      */
     public void clearTopicState(String topic) {
-        refreshStartTimes.remove(topic);
+        refreshStartTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
 
-        // Clear consumer-specific state
+        // Clear consumer-specific state — B5-3 fix: include readySentTimes
         resetSentTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
         resetAckTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
+        readySentTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
         replayStartTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
+    }
+
+    /**
+     * OOM FIX: Remove all timing data for a specific consumer on disconnect
+     *
+     * Prevents memory leak from accumulating per-consumer timing maps when
+     * consumers reconnect with different ephemeral ports.
+     *
+     * @param topic Topic name
+     * @param consumer Consumer identifier (may include ephemeral port)
+     */
+    public void removeConsumerTimingData(String topic, String consumer) {
+        String keyPrefix = topic + ":" + consumer;
+        int removedCount = 0;
+
+        // Remove timing state maps (keyed by topic:consumer or topic:consumer:refreshId)
+        removedCount += resetSentTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+        removedCount += resetAckTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+        removedCount += readySentTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+        removedCount += replayStartTimes.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+
+        // Remove Timer objects (keys are topic:consumer:refreshId)
+        removedCount += resetAckDurationTimers.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+        removedCount += readyAckDurationTimers.keySet().removeIf(k -> k.startsWith(keyPrefix)) ? 1 : 0;
+
+        // Note: transferRateGauges, bytesTransferredGauges use group:topic keys, not consumer-specific
+        // So we don't remove them here (they're cleaned by BrokerMetrics.removeConsumerMetrics)
+
+        if (removedCount > 0) {
+            log.info("OOM FIX: Removed {} timing data entries for disconnected consumer: topic={}, consumer={}",
+                    removedCount, topic, consumer);
+        }
     }
 }
