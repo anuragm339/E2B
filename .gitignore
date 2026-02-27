@@ -11,3 +11,7 @@ storage/build/
 .idea/
 .gradle/
 data/
+readme
+data-local/
+data/
+.claude

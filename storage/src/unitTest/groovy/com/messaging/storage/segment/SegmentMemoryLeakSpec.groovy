@@ -2,11 +2,18 @@ package com.messaging.storage.segment
 
 import com.messaging.common.model.EventType
 import com.messaging.common.model.MessageRecord
+import com.messaging.common.exception.StorageException
+import com.messaging.storage.metadata.SegmentMetadataStore
 import spock.lang.Specification
 import spock.lang.TempDir
 
+import java.io.RandomAccessFile
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
 import java.time.Instant
+import java.util.regex.Pattern
 
 /**
  * Unit tests for STORAGE-1: Segment Index Map Memory Leak Fix
@@ -206,6 +213,233 @@ class SegmentMemoryLeakSpec extends Specification {
         segment?.close()
     }
 
+    def "reading offset gaps returns null for missing and reads existing"() {
+        given: "a segment with offset gaps"
+        def logPath = tempDir.resolve("00000000000000000500.log")
+        def indexPath = tempDir.resolve("00000000000000000500.index")
+        def baseOffset = 500L
+        def maxSize = 10 * 1024 * 1024L
+        def topic = "test-topic"
+        def partition = 0
+
+        and: "append records with gaps"
+        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        [500L, 700L, 1200L].each { offset ->
+            segment.append(createTestRecord(offset, "key-${offset}", "data-${offset}"))
+        }
+
+        when: "reading existing offsets"
+        def record500 = segment.read(500L)
+        def record700 = segment.read(700L)
+
+        then: "records are found"
+        record500 != null
+        record500.getMsgKey() == "key-500"
+        record700 != null
+        record700.getMsgKey() == "key-700"
+
+        when: "reading a missing offset in the gap"
+        def missing = segment.read(900L)
+
+        then: "null is returned"
+        missing == null
+
+        cleanup:
+        segment?.close()
+    }
+
+    def "segment manager reads from active segment at boundary"() {
+        given: "a segment manager that rolls segments"
+        def topic = "boundary-topic"
+        def partition = 0
+        def topicDir = tempDir.resolve(topic)
+        def partitionDir = topicDir.resolve("partition-0")
+        def metadataStore = new SegmentMetadataStore(topicDir)
+        def recordSize = calculateRecordSize("k", "d")
+        def maxSize = (LOG_HEADER_SIZE + (recordSize * 5)) as long
+        def manager = new SegmentManager(topic, partition, partitionDir, maxSize, metadataStore)
+
+        and: "append enough records to roll segments"
+        20.times { i ->
+            manager.append(createTestRecord(i, "k", "d"))
+        }
+
+        and: "determine active segment base offset"
+        def logFiles = listLogFiles(partitionDir)
+        def activeBase = logFiles.collect { extractBaseOffset(it) }.max()
+
+        when: "reading from the active segment base offset"
+        def records = manager.read(activeBase, 1)
+
+        then: "record from active segment is returned"
+        records.size() == 1
+        records[0].getOffset() == activeBase
+
+        cleanup:
+        manager?.close()
+    }
+
+    def "empty key and data are preserved"() {
+        given: "a segment and an empty payload record"
+        def logPath = tempDir.resolve("00000000000000000600.log")
+        def indexPath = tempDir.resolve("00000000000000000600.index")
+        def baseOffset = 600L
+        def maxSize = 10 * 1024 * 1024L
+        def topic = "test-topic"
+        def partition = 0
+        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+
+        and: "append record with empty key and data"
+        segment.append(createTestRecord(baseOffset, "", ""))
+
+        when: "reading the record back"
+        def read = segment.read(baseOffset)
+
+        then: "empty fields are preserved"
+        read != null
+        read.getMsgKey() == ""
+        read.getData() == null
+
+        cleanup:
+        segment?.close()
+    }
+
+    def "corrupted log header is detected on recovery"() {
+        given: "a segment with data"
+        def logPath = tempDir.resolve("00000000000000000700.log")
+        def indexPath = tempDir.resolve("00000000000000000700.index")
+        def baseOffset = 700L
+        def maxSize = 10 * 1024 * 1024L
+        def topic = "test-topic"
+        def partition = 0
+        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        segment.append(createTestRecord(baseOffset, "key", "data"))
+        segment.close()
+
+        and: "corrupt the log file header"
+        overwriteBytes(logPath, 0, "XXXX".getBytes(StandardCharsets.UTF_8))
+
+        when: "recovering the segment"
+        new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+
+        then: "a storage exception is thrown"
+        thrown(StorageException)
+    }
+
+    def "crc mismatch is detected during read"() {
+        given: "a segment with one record"
+        def logPath = tempDir.resolve("00000000000000000800.log")
+        def indexPath = tempDir.resolve("00000000000000000800.index")
+        def baseOffset = 800L
+        def maxSize = 10 * 1024 * 1024L
+        def topic = "test-topic"
+        def partition = 0
+        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        segment.append(createTestRecord(baseOffset, "key", "data"))
+        segment.close()
+
+        and: "corrupt the index CRC field"
+        corruptIndexCrc(indexPath)
+
+        when: "reading the record after recovery"
+        def recovered = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        recovered.read(baseOffset)
+
+        then: "a CRC mismatch is reported"
+        thrown(StorageException)
+
+        cleanup:
+        recovered?.close()
+    }
+
+    def "crash recovery truncates orphaned log bytes"() {
+        given: "a segment with one record"
+        def logPath = tempDir.resolve("00000000000000000900.log")
+        def indexPath = tempDir.resolve("00000000000000000900.index")
+        def baseOffset = 900L
+        def maxSize = 10 * 1024 * 1024L
+        def topic = "test-topic"
+        def partition = 0
+        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        segment.append(createTestRecord(baseOffset, "key", "data"))
+        segment.close()
+
+        and: "append orphaned bytes to the log file"
+        Files.write(logPath, new byte[32], StandardOpenOption.APPEND)
+        def expectedSize = LOG_HEADER_SIZE + calculateRecordSize("key", "data")
+        assert Files.size(logPath) > expectedSize
+
+        when: "recovering the segment"
+        def recovered = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+
+        then: "log file is truncated to the last indexed record"
+        Files.size(logPath) == expectedSize
+
+        cleanup:
+        recovered?.close()
+    }
+
+    def "index truncation drops last record on recovery"() {
+        given: "a segment with two records"
+        def logPath = tempDir.resolve("00000000000000000950.log")
+        def indexPath = tempDir.resolve("00000000000000000950.index")
+        def baseOffset = 950L
+        def maxSize = 10 * 1024 * 1024L
+        def topic = "test-topic"
+        def partition = 0
+        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        segment.append(createTestRecord(baseOffset, "key-0", "data-0"))
+        segment.append(createTestRecord(baseOffset + 1, "key-1", "data-1"))
+        segment.close()
+
+        and: "truncate the index file to remove the last entry"
+        def indexSize = Files.size(indexPath)
+        def truncatedSize = indexSize - INDEX_ENTRY_SIZE
+        def raf = new RandomAccessFile(indexPath.toFile(), "rw")
+        try {
+            raf.setLength(truncatedSize)
+        } finally {
+            raf.close()
+        }
+
+        when: "recovering the segment"
+        def recovered = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+
+        then: "nextOffset reflects only the first record"
+        recovered.getNextOffset() == baseOffset + 1
+        recovered.read(baseOffset + 1) == null
+
+        and: "log file is truncated to the last indexed record"
+        def expectedSize = LOG_HEADER_SIZE + calculateRecordSize("key-0", "data-0")
+        Files.size(logPath) == expectedSize
+
+        cleanup:
+        recovered?.close()
+    }
+
+    def "large offset values are handled correctly"() {
+        given: "a segment with a large base offset"
+        def baseOffset = 1_000_000_000L
+        def logPath = tempDir.resolve(String.format("%020d.log", baseOffset))
+        def indexPath = tempDir.resolve(String.format("%020d.index", baseOffset))
+        def maxSize = 10 * 1024 * 1024L
+        def topic = "test-topic"
+        def partition = 0
+
+        when: "writing and reading a large offset record"
+        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        segment.append(createTestRecord(baseOffset, "key", "data"))
+        def read = segment.read(baseOffset)
+
+        then: "record is readable and nextOffset is correct"
+        read != null
+        read.getOffset() == baseOffset
+        segment.getNextOffset() == baseOffset + 1
+
+        cleanup:
+        segment?.close()
+    }
+
     // Helper method to create test records
     private MessageRecord createTestRecord(long offset, String key, String data) {
         def record = new MessageRecord()
@@ -215,5 +449,57 @@ class SegmentMemoryLeakSpec extends Specification {
         record.setEventType(EventType.MESSAGE)  // Use MESSAGE not INSERT
         record.setCreatedAt(Instant.now())
         return record
+    }
+
+    private static final int LOG_HEADER_SIZE = 6
+    private static final int INDEX_ENTRY_SIZE = 20
+    private static final Pattern LOG_FILE_PATTERN = Pattern.compile("(\\d{20})\\.log")
+
+    private static long extractBaseOffset(Path logPath) {
+        def matcher = LOG_FILE_PATTERN.matcher(logPath.fileName.toString())
+        if (!matcher.matches()) {
+            throw new IllegalArgumentException("Invalid log filename: ${logPath}")
+        }
+        return Long.parseLong(matcher.group(1))
+    }
+
+    private static java.util.List<Path> listLogFiles(Path dir) {
+        def results = []
+        Files.list(dir).withCloseable { stream ->
+            stream.filter { p -> p.toString().endsWith(".log") }
+                  .forEach { p -> results.add(p) }
+        }
+        return results
+    }
+
+    private static int calculateRecordSize(String key, String data) {
+        int size = 4 + key.getBytes(StandardCharsets.UTF_8).length + 1 + 4 + 8
+        if (data != null) {
+            size += data.getBytes(StandardCharsets.UTF_8).length
+        }
+        return size
+    }
+
+    private static void overwriteBytes(Path path, long position, byte[] bytes) {
+        def raf = new RandomAccessFile(path.toFile(), "rw")
+        try {
+            raf.seek(position)
+            raf.write(bytes)
+        } finally {
+            raf.close()
+        }
+    }
+
+    private static void corruptIndexCrc(Path indexPath) {
+        def raf = new RandomAccessFile(indexPath.toFile(), "rw")
+        try {
+            long crcOffset = LOG_HEADER_SIZE + 8 + 4 + 4
+            raf.seek(crcOffset)
+            int original = raf.readInt()
+            raf.seek(crcOffset)
+            raf.writeInt(original + 1)
+        } finally {
+            raf.close()
+        }
     }
 }
