@@ -130,9 +130,12 @@ public class LegacyEventDecoder extends ByteToMessageDecoder {
                 RegisterEvent registerEvent = (RegisterEvent) event;
                 message.setType(BrokerMessage.MessageType.SUBSCRIBE);
 
-                // Payload: serviceName (will be used as consumer group)
+                // Payload: JSON with legacy flag and serviceName
+                // Format: {"isLegacy": true, "serviceName": "price-quote-service"}
+                // BrokerService will look up topics from LegacyClientConfig
                 String serviceName = registerEvent.getClientId();
-                message.setPayload(serviceName.getBytes(StandardCharsets.UTF_8));
+                String legacyPayload = String.format("{\"isLegacy\":true,\"serviceName\":\"%s\"}", serviceName);
+                message.setPayload(legacyPayload.getBytes(StandardCharsets.UTF_8));
                 break;
 
             case MESSAGE:

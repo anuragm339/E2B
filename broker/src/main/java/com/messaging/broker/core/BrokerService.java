@@ -4,6 +4,7 @@ import com.messaging.broker.consumer.AdaptiveBatchDeliveryManager;
 import com.messaging.broker.consumer.ConsumerDeliveryManager;
 import com.messaging.broker.consumer.ConsumerOffsetTracker;
 import com.messaging.broker.consumer.RemoteConsumerRegistry;
+import com.messaging.broker.legacy.LegacyClientConfig;
 import com.messaging.broker.metrics.BrokerMetrics;
 import com.messaging.broker.refresh.DataRefreshManager;
 import com.messaging.broker.registry.TopologyManager;
@@ -46,6 +47,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final BrokerMetrics metrics;
     private final ConsumerOffsetTracker offsetTracker;
     private final DataRefreshManager dataRefreshManager;
+    private final LegacyClientConfig legacyClientConfig;
     private final int serverPort;
     private final ObjectMapper objectMapper;
 
@@ -63,6 +65,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             BrokerMetrics metrics,
             ConsumerOffsetTracker offsetTracker,
             DataRefreshManager dataRefreshManager,
+            LegacyClientConfig legacyClientConfig,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
@@ -74,6 +77,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.metrics = metrics;
         this.offsetTracker = offsetTracker;
         this.dataRefreshManager = dataRefreshManager;
+        this.legacyClientConfig = legacyClientConfig;
         this.serverPort = serverPort;
         this.objectMapper = new ObjectMapper();
 
@@ -276,51 +280,123 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     /**
      * Handle SUBSCRIBE message
      */
+    /**
+     * Handle SUBSCRIBE message.
+     * Supports both modern and legacy formats:
+     * - Modern: {"topic": "prices-v1", "group": "price-quote-group"}
+     * - Legacy: {"isLegacy": true, "serviceName": "price-quote-service"}
+     */
     private void handleSubscribe(String clientId, BrokerMessage message) {
         try {
             String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
             JsonNode json = objectMapper.readTree(payload);
 
-            String topic = json.get("topic").asText();
-            String group = json.get("group").asText();
+            // Check if this is a legacy client
+            boolean isLegacy = json.has("isLegacy") && json.get("isLegacy").asBoolean();
 
-            log.info("Client {} subscribed: topic={}, group={}", clientId, topic, group);
-
-            // Register consumer for message delivery.
-            // B2-3 fix: only record connection metric for genuinely new registrations.
-            // Duplicate SUBSCRIBE (same clientId+topic) on the same connection would otherwise
-            // increment activeConsumers without a matching decrement on unregister.
-            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group);
-            if (isNew) {
-                metrics.recordConsumerConnection();
+            if (isLegacy) {
+                // Legacy client - multi-topic subscription
+                handleLegacySubscribe(clientId, message, json);
             } else {
-                log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} — skipping activeConsumers increment",
-                        clientId, topic, group);
+                // Modern client - single topic subscription
+                handleModernSubscribe(clientId, message, json);
             }
-
-            log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
-
-            // Send ACK
-            BrokerMessage ack = new BrokerMessage(
-                BrokerMessage.MessageType.ACK,
-                message.getMessageId(),
-                new byte[0]
-            );
-
-            log.debug("Sending ACK to {}: type={}, messageId={}",
-                     clientId, ack.getType(), ack.getMessageId());
-
-            server.send(clientId, ack).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send ACK to {}", clientId, ex);
-                } else {
-                    log.info("Sent ACK to {} for SUBSCRIBE", clientId);
-                }
-            });
 
         } catch (Exception e) {
             log.error("Error handling SUBSCRIBE from {}", clientId, e);
         }
+    }
+
+    /**
+     * Handle modern SUBSCRIBE: single topic, explicit group
+     */
+    private void handleModernSubscribe(String clientId, BrokerMessage message, JsonNode json) {
+        String topic = json.get("topic").asText();
+        String group = json.get("group").asText();
+
+        log.info("Modern client {} subscribed: topic={}, group={}", clientId, topic, group);
+
+        // Register consumer for message delivery.
+        // B2-3 fix: only record connection metric for genuinely new registrations.
+        // Duplicate SUBSCRIBE (same clientId+topic) on the same connection would otherwise
+        // increment activeConsumers without a matching decrement on unregister.
+        boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group);
+        if (isNew) {
+            metrics.recordConsumerConnection();
+        } else {
+            log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} — skipping activeConsumers increment",
+                    clientId, topic, group);
+        }
+
+        log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
+
+        // Send ACK
+        sendSubscribeAck(clientId, message);
+    }
+
+    /**
+     * Handle legacy SUBSCRIBE: multiple topics based on serviceName
+     */
+    private void handleLegacySubscribe(String clientId, BrokerMessage message, JsonNode json) {
+        String serviceName = json.get("serviceName").asText();
+
+        if (!legacyClientConfig.isEnabled()) {
+            log.warn("Legacy client support disabled, rejecting registration from service: {}", serviceName);
+            return;
+        }
+
+        java.util.List<String> topics = legacyClientConfig.getTopicsForService(serviceName);
+        if (topics.isEmpty()) {
+            log.error("Unknown legacy service: {}. No topics configured.", serviceName);
+            return;
+        }
+
+        log.info("Legacy client {} (service={}) subscribing to {} topics: {}",
+                clientId, serviceName, topics.size(), topics);
+
+        // Register consumer for ALL topics (serviceName is used as the consumer group)
+        int newRegistrations = 0;
+        for (String topic : topics) {
+            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, serviceName);
+            if (isNew) {
+                newRegistrations++;
+            }
+            log.info("Registered legacy consumer {} for topic={}, group={}",
+                    clientId, topic, serviceName);
+        }
+
+        // Record metrics only for new registrations
+        for (int i = 0; i < newRegistrations; i++) {
+            metrics.recordConsumerConnection();
+        }
+
+        log.info("Legacy client {} registered for {} topics (service={})",
+                clientId, topics.size(), serviceName);
+
+        // Send ACK
+        sendSubscribeAck(clientId, message);
+    }
+
+    /**
+     * Send SUBSCRIBE acknowledgment
+     */
+    private void sendSubscribeAck(String clientId, BrokerMessage message) {
+        BrokerMessage ack = new BrokerMessage(
+            BrokerMessage.MessageType.ACK,
+            message.getMessageId(),
+            new byte[0]
+        );
+
+        log.debug("Sending ACK to {}: type={}, messageId={}",
+                 clientId, ack.getType(), ack.getMessageId());
+
+        server.send(clientId, ack).whenComplete((v, ex) -> {
+            if (ex != null) {
+                log.error("Failed to send ACK to {}", clientId, ex);
+            } else {
+                log.info("Sent ACK to {} for SUBSCRIBE", clientId);
+            }
+        });
     }
 
     /**
