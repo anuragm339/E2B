@@ -143,7 +143,7 @@ public class LegacyConsumerDeliveryManager {
                         batch.add(cursor.getTopic(), msg);
 
                         log.trace("Merged message: topic={}, offset={}, key={}",
-                                cursor.getTopic(), msg.getOffset(), msg.getKey());
+                                cursor.getTopic(), msg.getOffset(), msg.getMsgKey());
                     } else {
                         log.warn("No message found at offset {} for topic {}", entry.offset, cursor.getTopic());
                     }

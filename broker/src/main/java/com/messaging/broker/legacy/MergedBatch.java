@@ -51,7 +51,7 @@ public class MergedBatch {
      */
     private long estimateMessageSize(MessageRecord msg) {
         // Rough estimate: key length + data length + overhead
-        return msg.getKey().length() +
+        return msg.getMsgKey().length() +
                (msg.getData() != null ? msg.getData().length() : 0) +
                50; // Overhead (offset, eventType, etc.)
     }
