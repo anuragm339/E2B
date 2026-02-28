@@ -325,10 +325,10 @@ docker compose up -d
 
 ## Related Documentation
 
-- [Custom Exception Framework Summary](./CUSTOM_EXCEPTION_FRAMEWORK_SUMMARY.md)
-- [Exception Usage Guide](./EXCEPTION_USAGE_GUIDE.md)
-- [Exception Integration Plan](./EXCEPTION_INTEGRATION_PLAN.md)
-- [Next Steps Implementation](./EXCEPTION_FRAMEWORK_NEXT_STEPS.md)
+- [Custom Exception Framework Summary](CUSTOM_EXCEPTION_FRAMEWORK_SUMMARY.md)
+- [Exception Usage Guide](EXCEPTION_USAGE_GUIDE.md)
+- [Exception Integration Plan](EXCEPTION_INTEGRATION_PLAN.md)
+- [Next Steps Implementation](EXCEPTION_FRAMEWORK_NEXT_STEPS.md)
 
 ## How to Resume Work
 

@@ -185,6 +185,163 @@ docker logs -f broker | grep -E "(RESET_ACK|READY_ACK|BATCH_ACK)"
 
 ---
 
+### BROKER-3 — ACK Timeout Hardcoded to 30 Minutes (Config Ignored)
+
+**Status:** `FIXED`
+**Commit:** `b9f2b29`
+**Severity:** HIGH (Performance degradation / operational issue)
+**Affected Component:** broker/RemoteConsumerRegistry.java, broker/BrokerMetrics.java
+
+**Description:**
+ACK timeout was hardcoded to 30 minutes in RemoteConsumerRegistry.java despite having a config value
+in application.yml (`broker.consumer.ack-timeout: 5000`) that was never read. The hardcoded 30-minute
+timeout turns any transient ACK loss into a multi-minute stall that blocks all delivery for that
+topic/group through Gate 2 (in-flight delivery flag).
+
+**Root Cause:**
+The config value was defined in application.yml but never injected into RemoteConsumerRegistry. The
+scheduler.schedule() call at line 383 hardcoded `30, TimeUnit.MINUTES` instead of reading the config.
+
+**Impact:**
+- 30 minutes is far too long for typical 1-2MB batches (healthy consumer should ACK in seconds)
+- During data refresh, Gate 2 blocks all further delivery until timeout expires
+- Consumer crashes go undetected for 30 minutes
+- Lag accumulates during the wait period
+- No visibility into how long ACKs have been pending
+
+**Evidence from Code:**
+```java
+// application.yml (line 66)
+ack-timeout: 5000  // ❌ IGNORED - never read by Java code
+
+// RemoteConsumerRegistry.java (line 383)
+scheduler.schedule(() -> {
+    // ... timeout logic ...
+}, 30, TimeUnit.MINUTES);  // ❌ HARDCODED - ignores config
+```
+
+**Fix:**
+
+1. **Made timeout configurable:**
+   - Added `ackTimeoutMs` field to RemoteConsumerRegistry
+   - Injected from `broker.consumer.ack-timeout` config via @Value annotation
+   - Changed hardcoded value to use `ackTimeoutMs, TimeUnit.MILLISECONDS`
+
+2. **Added pending ACK age metrics:**
+   - Added `pendingAckStartTime` map in BrokerMetrics to track when batches are sent
+   - Added `startPendingAck(topic, group)` - called after sendBatchToConsumer succeeds
+   - Added `completePendingAck(topic, group)` - called when ACK received or timeout fires
+   - Exposes gauge: `broker.consumer.pending_ack_age_seconds{topic, group}`
+
+3. **Updated default timeout:**
+   - Changed from 5s (too low) to 60s (reasonable for 1-2MB batches)
+   - Made env-var configurable: `ACK_TIMEOUT_MS`
+   - Added documentation explaining when to adjust
+
+**Files Changed:**
+- broker/src/main/java/com/messaging/broker/consumer/RemoteConsumerRegistry.java
+  - Added `ackTimeoutMs` field (line 52)
+  - Injected config in constructor (line 76)
+  - Replaced hardcoded timeout (line 391)
+  - Added `metrics.startPendingAck()` after batch send (line 370)
+  - Added `metrics.completePendingAck()` in timeout handler (line 392)
+  - Added `metrics.completePendingAck()` in handleBatchAck (line 626)
+
+- broker/src/main/java/com/messaging/broker/metrics/BrokerMetrics.java
+  - Added `pendingAckStartTime` map (line 41)
+  - Added `pendingAckAgeGauges` map (line 42)
+  - Added `startPendingAck(topic, group)` method (line 547)
+  - Added `completePendingAck(topic, group)` method (line 571)
+
+- broker/src/main/resources/application.yml
+  - Updated default: `ack-timeout: ${ACK_TIMEOUT_MS:60000}` (60 seconds)
+  - Added documentation comments
+
+**New Metrics:**
+
+**broker.consumer.pending_ack_age_seconds**
+- **Type:** Gauge
+- **Labels:** topic, group
+- **Value:** Seconds since batch was sent (0 if no pending ACK)
+- **Use case:** Dashboard alert for "pending ACK age > 30s" = stuck consumer
+
+**Configuration:**
+
+```yaml
+broker:
+  consumer:
+    ack-timeout: ${ACK_TIMEOUT_MS:60000}  # 60 seconds (baseline for 1-2MB batches)
+```
+
+**Environment variable override:**
+```bash
+# For slower consumers or larger batches
+ACK_TIMEOUT_MS=120000  # 2 minutes
+
+# For faster consumers or smaller batches
+ACK_TIMEOUT_MS=30000   # 30 seconds
+```
+
+**Recommended Values:**
+- **1-2MB batches:** 60s (default)
+- **5-10MB batches:** 120s (2 minutes)
+- **Slow consumers:** 180s (3 minutes)
+- **Fast consumers:** 30s
+
+**Testing:**
+```bash
+# 1. Build and restart broker
+./gradlew :broker:build -x test
+docker compose restart broker
+
+# 2. Check timeout is configurable
+docker exec broker env | grep ACK_TIMEOUT
+
+# 3. Monitor pending ACK age metric
+curl http://localhost:8081/prometheus | grep pending_ack_age_seconds
+
+# 4. Verify timeout fires after configured duration (not 30 minutes)
+# Send batch → wait ACK_TIMEOUT_MS → check logs for timeout warning
+
+# 5. Dashboard: Add panel showing consumers with pending_ack_age > 30
+```
+
+**Verification:**
+```bash
+# Confirm config is read (not hardcoded)
+grep -n "ackTimeoutMs" broker/src/main/java/com/messaging/broker/consumer/RemoteConsumerRegistry.java
+# Should show: field declaration, injection, and usage
+
+# Confirm metrics are exposed
+curl http://localhost:8081/prometheus | grep broker_consumer_pending_ack_age_seconds
+# Should show gauge for each topic/group with pending ACK
+
+# Confirm timeout uses config value
+docker logs broker 2>&1 | grep "ACK timeout"
+# Should show timeout firing after ~60s (not 30 minutes)
+```
+
+**Dashboard Integration:**
+
+Add panel to Grafana:
+```promql
+# Consumers with pending ACK > 30 seconds
+broker_consumer_pending_ack_age_seconds > 30
+
+# Max pending ACK age across all consumers
+max(broker_consumer_pending_ack_age_seconds)
+
+# Consumers stuck (pending > 60s)
+count(broker_consumer_pending_ack_age_seconds > 60)
+```
+
+**Related Issues:**
+- Complements BROKER-2 (OOM vulnerability fix)
+- Relates to B2-4 (timeout scheduled after send)
+- Improves B11-6 OOM investigation (visibility into delivery stalls)
+
+---
+
 ### B1-1 — Adaptive delivery loop dies permanently on semaphore miss
 
 **Status:** `FIXED`
