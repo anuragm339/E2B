@@ -742,6 +742,15 @@ public class RemoteConsumerRegistry {
                 metrics.updateConsumerLastAckTime(clientId, topic, group);
                 metrics.recordConsumerAck(clientId, topic, group);
                 metrics.completePendingAck(topic, group);
+
+                // Calculate and update consumer lag
+                try {
+                    long storageHead = storage.getCurrentOffset(topic, 0);
+                    long lag = Math.max(0, storageHead - offset);
+                    metrics.updateConsumerLag(clientId, topic, group, lag);
+                } catch (Exception lagEx) {
+                    log.debug("Could not update consumer lag metric for topic {}: {}", topic, lagEx.getMessage());
+                }
             }
 
         } catch (Exception e) {
@@ -1178,6 +1187,9 @@ public class RemoteConsumerRegistry {
             // Convert MergedBatch to BrokerMessage BATCH_HEADER
             BrokerMessage batchMessage = convertMergedBatchToBrokerMessage(mergedBatch);
 
+            // Start delivery latency timer
+            Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
+
             // Send batch to client
             long sendStart = System.currentTimeMillis();
             server.send(clientId, batchMessage).get(10, TimeUnit.SECONDS);
@@ -1202,6 +1214,9 @@ public class RemoteConsumerRegistry {
                 metrics.recordConsumerBatchSent(clientId, topic, consumerGroup,
                         messagesPerTopic, bytesPerTopic);
 
+                // Record delivery latency for this topic
+                metrics.stopConsumerDeliveryTimer(deliverySample, clientId, topic, consumerGroup);
+
                 // Update last successful delivery timestamp for stuck detection
                 metrics.updateConsumerLastDeliveryTime(clientId, topic, consumerGroup);
             }
@@ -1220,6 +1235,12 @@ public class RemoteConsumerRegistry {
 
         } catch (Exception e) {
             log.error("Failed to deliver merged batch to legacy client: {}", clientId, e);
+
+            // Record failure metrics for each topic
+            for (String topic : topics) {
+                metrics.recordConsumerFailure(clientId, topic, consumerGroup);
+            }
+
             return false;
         }
     }
@@ -1251,12 +1272,16 @@ public class RemoteConsumerRegistry {
                 log.warn("ACK timeout for legacy batch: clientId={}, elapsed={}ms",
                         clientId, System.currentTimeMillis() - sendTime);
 
-                metrics.recordAckTimeout(topic, group);
-
-                // Revert offsets for all topics in the batch
-                // This allows retry on next delivery cycle
+                // Record timeout metrics for ALL topics in the batch
                 for (Map.Entry<String, Long> entry : batch.getMaxOffsetPerTopic().entrySet()) {
                     String topicName = entry.getKey();
+
+                    // Record ACK timeout metric
+                    metrics.recordAckTimeout(topicName, group);
+
+                    // Clear pending ACK tracking (reset age gauge to 0)
+                    metrics.completePendingAck(topicName, group);
+
                     // Offset NOT committed, will retry from current position
                     log.info("Legacy batch ACK timeout - offset NOT advanced for topic: {}", topicName);
                 }
