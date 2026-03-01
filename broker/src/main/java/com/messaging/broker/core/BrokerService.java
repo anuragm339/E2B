@@ -330,8 +330,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
         log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
 
-        // Send ACK
-        sendSubscribeAck(clientId, message);
+        // Send ACK (modern client)
+        sendSubscribeAck(clientId, message, false);  // false = not legacy
     }
 
     /**
@@ -374,14 +374,23 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         log.info("Legacy client {} registered for {} topics (service={})",
                 clientId, topics.size(), serviceName);
 
-        // Send ACK
-        sendSubscribeAck(clientId, message);
+        // Send ACK (will be handled by sendSubscribeAck based on client type)
+        sendSubscribeAck(clientId, message, true);  // true = isLegacy
     }
 
     /**
      * Send SUBSCRIBE acknowledgment
+     * @param isLegacy true if client is using legacy Event protocol
      */
-    private void sendSubscribeAck(String clientId, BrokerMessage message) {
+    private void sendSubscribeAck(String clientId, BrokerMessage message, boolean isLegacy) {
+        // Legacy clients don't expect SUBSCRIBE ACK in their protocol
+        // They will start receiving BATCH events via scheduled delivery
+        if (isLegacy) {
+            log.debug("Legacy client registered, no SUBSCRIBE ACK sent (legacy protocol doesn't expect it)");
+            return;
+        }
+
+        // Modern client: send BrokerMessage ACK
         BrokerMessage ack = new BrokerMessage(
             BrokerMessage.MessageType.ACK,
             message.getMessageId(),

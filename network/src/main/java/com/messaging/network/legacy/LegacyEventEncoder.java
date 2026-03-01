@@ -1,7 +1,12 @@
 package com.messaging.network.legacy;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.messaging.network.legacy.events.*;
 import com.messaging.common.model.BrokerMessage;
+import com.messaging.common.model.EventType;
+import com.messaging.common.model.MessageRecord;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufOutputStream;
 import io.netty.channel.ChannelHandlerContext;
@@ -11,7 +16,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.DataOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 
 /**
  * Encodes internal BrokerMessage to legacy Event wire protocol.
@@ -30,6 +37,8 @@ import java.util.Collections;
  */
 public class LegacyEventEncoder extends MessageToByteEncoder<BrokerMessage> {
     private static final Logger log = LoggerFactory.getLogger(LegacyEventEncoder.class);
+    private static final ObjectMapper objectMapper = new ObjectMapper()
+            .registerModule(new JavaTimeModule());
 
     @Override
     protected void encode(ChannelHandlerContext ctx, BrokerMessage msg, ByteBuf out) throws Exception {
@@ -87,9 +96,37 @@ public class LegacyEventEncoder extends MessageToByteEncoder<BrokerMessage> {
                 return null;
 
             case BATCH_HEADER:
-                // For now, send empty BatchEvent
-                // Full batch reconstruction would require storing batch contents
-                return new BatchEvent(Collections.emptyList());
+                // Parse JSON payload to reconstruct batch
+                String json = new String(payload, StandardCharsets.UTF_8);
+                List<MessageRecord> messages = objectMapper.readValue(json,
+                    new TypeReference<List<MessageRecord>>() {});
+
+                // Convert MessageRecords to Events
+                List<Event> events = new ArrayList<>();
+                for (MessageRecord record : messages) {
+                    // Use topic as message type, msgKey as key
+                    String messageType = record.getTopic() != null ? record.getTopic() : "default";
+                    String messageKey = record.getMsgKey();
+
+                    if (record.getEventType() == EventType.MESSAGE) {
+                        DataMessage dataMsg = new DataMessage(
+                            messageType,
+                            messageKey,
+                            "application/json",
+                            record.getData()
+                        );
+                        events.add(new DataMessageEvent(dataMsg));
+                    } else if (record.getEventType() == EventType.DELETE) {
+                        DeleteMessage delMsg = new DeleteMessage(
+                            messageType,
+                            messageKey
+                        );
+                        events.add(new DeleteMessageEvent(delMsg));
+                    }
+                }
+
+                log.debug("Reconstructed BatchEvent with {} messages from JSON", events.size());
+                return new BatchEvent(events);
 
             case RESET:
                 return ResetEvent.INSTANCE;

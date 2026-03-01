@@ -57,8 +57,7 @@ public class ProtocolDetectionDecoder extends ByteToMessageDecoder {
             log.info("Switched to modern BrokerMessage protocol for client: {}", ctx.channel().remoteAddress());
         }
 
-        // Remove this handler from pipeline (job done)
-        pipeline.remove(this);
+        // Note: pipeline.replace() already removed this handler, no need to call remove(this)
 
         // Trigger pipeline re-processing with the new decoder
         // This ensures the current ByteBuf is processed by the new decoder

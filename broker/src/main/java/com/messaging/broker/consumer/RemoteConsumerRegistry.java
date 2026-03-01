@@ -13,6 +13,7 @@ import com.messaging.common.model.MessageRecord;
 import com.messaging.storage.mmap.MMapStorageEngine;
 import com.messaging.storage.segment.Segment;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import io.netty.channel.FileRegion;
@@ -92,7 +93,7 @@ public class RemoteConsumerRegistry {
         this.maxMessageSizePerConsumer = maxMessageSizePerConsumer;
         this.ackTimeoutMs = ackTimeoutMs;
         this.objectMapper = new ObjectMapper();
-        this.objectMapper.findAndRegisterModules(); // Register JSR310 module for Java 8 date/time
+        this.objectMapper.registerModule(new JavaTimeModule()); // Register JSR310 module for Java 8 date/time
         // Reduced thread pool: use half of available cores (min 2) to lower CPU usage
         int schedulerThreads = Math.max(2, Runtime.getRuntime().availableProcessors() / 2);
         this.scheduler = new ScheduledThreadPoolExecutor(schedulerThreads, runnable -> {
@@ -161,6 +162,11 @@ public class RemoteConsumerRegistry {
         Map<String, List<RemoteConsumer>> legacyClientGroups = consumers.values().stream()
                 .filter(c -> c.isLegacy)
                 .collect(Collectors.groupingBy(c -> c.clientId));
+
+        if (!legacyClientGroups.isEmpty()) {
+            log.warn("🔵 SCHEDULER: deliverToLegacyClients running - found {} legacy clients",
+                    legacyClientGroups.size());
+        }
 
         // Deliver to each legacy client
         for (Map.Entry<String, List<RemoteConsumer>> entry : legacyClientGroups.entrySet()) {
@@ -1140,7 +1146,7 @@ public class RemoteConsumerRegistry {
      * @return true if delivery succeeded, false otherwise
      */
     public boolean deliverMergedBatchToLegacy(String clientId, String consumerGroup, long maxBytes) {
-        log.debug("deliverMergedBatchToLegacy: clientId={}, group={}, maxBytes={}",
+        log.warn("🔵 DELIVERY: deliverMergedBatchToLegacy called - clientId={}, group={}, maxBytes={}",
                 clientId, consumerGroup, maxBytes);
 
         // Get all legacy consumers for this client
@@ -1162,7 +1168,7 @@ public class RemoteConsumerRegistry {
             );
 
             if (mergedBatch.isEmpty()) {
-                log.debug("No messages to deliver for legacy client: {}", clientId);
+                log.warn("🔵 DELIVERY: No messages to deliver for legacy client: {}", clientId);
                 return false;
             }
 
@@ -1176,7 +1182,29 @@ public class RemoteConsumerRegistry {
             long sendStart = System.currentTimeMillis();
             server.send(clientId, batchMessage).get(10, TimeUnit.SECONDS);
             long sendDuration = System.currentTimeMillis() - sendStart;
-            log.debug("Sent merged batch to {} in {}ms", clientId, sendDuration);
+            log.warn("🔵 DELIVERY: Sent merged batch to {} in {}ms", clientId, sendDuration);
+
+            // Record metrics for messages and bytes sent (global counters)
+            log.warn("🔵 METRICS: About to record metrics for {} messages, {} bytes",
+                    mergedBatch.getMessageCount(), mergedBatch.getTotalBytes());
+            metrics.recordBatchMessagesSent(mergedBatch.getMessageCount(), mergedBatch.getTotalBytes());
+
+            // Record per-consumer metrics for EACH topic in the merged batch
+            // NOTE: Messages in merged batch don't have topic field set, so we distribute
+            // the total count/bytes evenly across all topics for metrics purposes
+            int topicCount = mergedBatch.getMaxOffsetPerTopic().size();
+            int messagesPerTopic = topicCount > 0 ? mergedBatch.getMessageCount() / topicCount : 0;
+            long bytesPerTopic = topicCount > 0 ? mergedBatch.getTotalBytes() / topicCount : 0;
+
+            for (Map.Entry<String, Long> topicEntry : mergedBatch.getMaxOffsetPerTopic().entrySet()) {
+                String topic = topicEntry.getKey();
+
+                metrics.recordConsumerBatchSent(clientId, topic, consumerGroup,
+                        messagesPerTopic, bytesPerTopic);
+
+                // Update last successful delivery timestamp for stuck detection
+                metrics.updateConsumerLastDeliveryTime(clientId, topic, consumerGroup);
+            }
 
             // Track pending ACK (will be resolved to BATCH_ACK by LegacyConnectionState)
             String pendingKey = clientId + ":legacy-batch:pending";
@@ -1186,7 +1214,8 @@ public class RemoteConsumerRegistry {
             // Schedule ACK timeout
             scheduleAckTimeout(clientId, "legacy-batch", consumerGroup, mergedBatch);
 
-            log.info("Sent merged batch to legacy client {}: {} messages", clientId, mergedBatch.getMessageCount());
+            log.warn("🔵 SUCCESS: Sent merged batch to legacy client {}: {} messages, {} bytes",
+                    clientId, mergedBatch.getMessageCount(), mergedBatch.getTotalBytes());
             return true;
 
         } catch (Exception e) {
