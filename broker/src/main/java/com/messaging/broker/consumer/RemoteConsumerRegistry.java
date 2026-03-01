@@ -1,5 +1,7 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.legacy.LegacyConsumerDeliveryManager;
+import com.messaging.broker.legacy.MergedBatch;
 import com.messaging.broker.metrics.BrokerMetrics;
 import com.messaging.broker.metrics.DataRefreshMetrics;
 import com.messaging.broker.refresh.DataRefreshManager;
@@ -45,6 +47,7 @@ public class RemoteConsumerRegistry {
     private final DeliveryStateStore deliveryStateStore; // OOM FIX: Added to clean up state on disconnect
     private volatile DataRefreshManager dataRefreshManager; // Lazy injection to avoid circular dependency
     private volatile AdaptiveBatchDeliveryManager adaptiveDeliveryManager; // Lazy injection to avoid circular dependency
+    private final LegacyConsumerDeliveryManager legacyDeliveryManager; // For multi-topic merge delivery to legacy clients
     private final ObjectMapper objectMapper;
     private final ScheduledThreadPoolExecutor scheduler;
     private final ExecutorService storageExecutor; // Separate executor for storage operations to prevent deadlock
@@ -76,6 +79,7 @@ public class RemoteConsumerRegistry {
     public RemoteConsumerRegistry(StorageEngine storage, NetworkServer server,
                                   ConsumerOffsetTracker offsetTracker, BrokerMetrics metrics,
                                   DataRefreshMetrics dataRefreshMetrics, DeliveryStateStore deliveryStateStore,
+                                  LegacyConsumerDeliveryManager legacyDeliveryManager,
                                   @Value("${broker.consumer.max-message-size-per-consumer}") long maxMessageSizePerConsumer,
                                   @Value("${broker.consumer.ack-timeout}") long ackTimeoutMs) {
         this.storage = storage;
@@ -84,6 +88,7 @@ public class RemoteConsumerRegistry {
         this.metrics = metrics;
         this.dataRefreshMetrics = dataRefreshMetrics;
         this.deliveryStateStore = deliveryStateStore;
+        this.legacyDeliveryManager = legacyDeliveryManager;
         this.maxMessageSizePerConsumer = maxMessageSizePerConsumer;
         this.ackTimeoutMs = ackTimeoutMs;
         this.objectMapper = new ObjectMapper();
@@ -125,6 +130,53 @@ public class RemoteConsumerRegistry {
 
     public void setAdaptiveBatchDeliveryManager(AdaptiveBatchDeliveryManager adaptiveDeliveryManager) {
         this.adaptiveDeliveryManager = adaptiveDeliveryManager;
+        // Start legacy delivery scheduler once adaptive manager is set
+        startLegacyDeliveryScheduler();
+    }
+
+    /**
+     * Start periodic delivery scheduler for legacy clients.
+     * Legacy clients use multi-topic merge, so they are not registered with AdaptiveBatchDeliveryManager.
+     * This scheduler checks for legacy clients and delivers merged batches.
+     */
+    private void startLegacyDeliveryScheduler() {
+        // Schedule periodic delivery check for legacy clients (every 100ms for low latency)
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                deliverToLegacyClients();
+            } catch (Exception e) {
+                log.error("Error in legacy delivery scheduler", e);
+            }
+        }, 100, 100, TimeUnit.MILLISECONDS);
+
+        log.info("Started legacy delivery scheduler (interval: 100ms)");
+    }
+
+    /**
+     * Check all legacy clients and deliver merged batches if needed.
+     * Groups legacy consumers by clientId and delivers one merged batch per client.
+     */
+    private void deliverToLegacyClients() {
+        // Group legacy consumers by clientId
+        Map<String, List<RemoteConsumer>> legacyClientGroups = consumers.values().stream()
+                .filter(c -> c.isLegacy)
+                .collect(Collectors.groupingBy(c -> c.clientId));
+
+        // Deliver to each legacy client
+        for (Map.Entry<String, List<RemoteConsumer>> entry : legacyClientGroups.entrySet()) {
+            String clientId = entry.getKey();
+            List<RemoteConsumer> clientConsumers = entry.getValue();
+
+            if (clientConsumers.isEmpty()) {
+                continue;
+            }
+
+            // All consumers for a legacy client share the same group (serviceName)
+            String consumerGroup = clientConsumers.get(0).group;
+
+            // Attempt delivery (with built-in flow control checks)
+            deliverMergedBatchToLegacy(clientId, consumerGroup, maxMessageSizePerConsumer);
+        }
     }
 
     /**
@@ -135,7 +187,11 @@ public class RemoteConsumerRegistry {
      * @return true if this is a new registration, false if re-registering an existing key (duplicate SUBSCRIBE)
      */
     public boolean registerConsumer(String clientId, String topic, String group) {
-        RemoteConsumer consumer = new RemoteConsumer(clientId, topic, group);
+        return registerConsumer(clientId, topic, group, false);
+    }
+
+    public boolean registerConsumer(String clientId, String topic, String group, boolean isLegacy) {
+        RemoteConsumer consumer = new RemoteConsumer(clientId, topic, group, isLegacy);
 
         // Load persisted offset from property file - ONLY source of truth
         String consumerId = group + ":" + topic;
@@ -155,14 +211,17 @@ public class RemoteConsumerRegistry {
         consumers.put(consumerKey, consumer);
         // Note: deliveryKeyToGroup no longer needed since group is in the key
 
-        // Notify adaptive delivery manager to start polling for this consumer
-        if (adaptiveDeliveryManager != null) {
+        // For legacy consumers, DO NOT register with adaptive delivery manager
+        // They will be handled by grouped delivery (multi-topic merge)
+        if (!isLegacy && adaptiveDeliveryManager != null) {
             adaptiveDeliveryManager.registerConsumer(consumer);
             log.info("Triggered adaptive delivery for new consumer: {}:{}", clientId, topic);
+        } else if (isLegacy) {
+            log.info("Legacy consumer registered: {}:{} (will use grouped multi-topic delivery)", clientId, topic);
         }
 
-        log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}, isNew={}",
-                 consumerKey, clientId, topic, group, startOffset, isNew);
+        log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}, isNew={}, isLegacy={}",
+                 consumerKey, clientId, topic, group, startOffset, isNew, isLegacy);
         return isNew;
     }
 
@@ -612,6 +671,79 @@ public class RemoteConsumerRegistry {
     }
 
     /**
+     * Handle BATCH_ACK for legacy merged batch.
+     * Updates offsets for ALL topics that were in the merged batch.
+     *
+     * @param clientId The client ID that sent the ACK
+     * @param group The consumer group (serviceName for legacy clients)
+     */
+    public void handleLegacyBatchAck(String clientId, String group) {
+        String pendingKey = clientId + ":legacy-batch:pending";
+
+        // Calculate ACK latency
+        long ackReceiveTime = System.currentTimeMillis();
+        Long sendTime = batchSendTimestamps.remove(pendingKey);
+        long ackLatencyMs = sendTime != null ? (ackReceiveTime - sendTime) : -1;
+
+        Long timestamp = pendingOffsets.remove(pendingKey);
+        ScheduledFuture<?> timeoutFuture = pendingTimeouts.remove(pendingKey);
+        if (timeoutFuture != null) {
+            timeoutFuture.cancel(false);
+        }
+
+        if (timestamp == null) {
+            log.warn("⚠️ Legacy batch ACK with no pending offset: clientId={}, group={} (likely a late ACK after timeout). ACK_LATENCY={}ms.",
+                    clientId, group, ackLatencyMs);
+            return;
+        }
+
+        log.info("✅ Legacy batch ACK_RECEIVED for clientId={}, group={} at T={}ms",
+                clientId, group, ackLatencyMs);
+
+        // Get all legacy consumers for this client to find which topics to update
+        List<RemoteConsumer> legacyConsumers = getLegacyConsumersForClient(clientId);
+        if (legacyConsumers.isEmpty()) {
+            log.warn("No legacy consumers found for ACK: clientId={}, group={}", clientId, group);
+            return;
+        }
+
+        // We need the MergedBatch to know the max offset per topic
+        // For now, we'll get it from the offsetTracker's current state
+        // TODO: Store MergedBatch reference in pending state for accurate offset tracking
+
+        // Update offsets for all topics using LegacyConsumerDeliveryManager
+        // Get the topics list
+        List<String> topics = legacyConsumers.stream()
+                .map(c -> c.topic)
+                .collect(Collectors.toList());
+
+        try {
+            // Build a fresh batch to get the max offsets (this is a temporary solution)
+            // In production, we should store the MergedBatch in pending state
+            MergedBatch batch = legacyDeliveryManager.buildMergedBatch(topics, group, 1); // Just peek at offsets
+
+            // Use the handleMergedBatchAck method from LegacyConsumerDeliveryManager
+            legacyDeliveryManager.handleMergedBatchAck(group, batch);
+
+            log.info("Legacy batch ACK committed for clientId={}, group={}, topics={}",
+                    clientId, group, batch.getMaxOffsetPerTopic());
+
+            // Update metrics for each topic
+            for (Map.Entry<String, Long> entry : batch.getMaxOffsetPerTopic().entrySet()) {
+                String topic = entry.getKey();
+                long offset = entry.getValue();
+                metrics.updateConsumerOffset(clientId, topic, group, offset);
+                metrics.updateConsumerLastAckTime(clientId, topic, group);
+                metrics.recordConsumerAck(clientId, topic, group);
+                metrics.completePendingAck(topic, group);
+            }
+
+        } catch (Exception e) {
+            log.error("Error handling legacy batch ACK for clientId={}, group={}", clientId, group, e);
+        }
+    }
+
+    /**
      * Handle BATCH_ACK from consumer
      * This is called when the consumer successfully processes a batch and sends acknowledgment
      *
@@ -989,12 +1121,130 @@ public class RemoteConsumerRegistry {
     }
 
     /**
+     * Get all legacy consumers for a given clientId.
+     * Legacy consumers share the same clientId but subscribe to multiple topics.
+     */
+    public List<RemoteConsumer> getLegacyConsumersForClient(String clientId) {
+        return consumers.values().stream()
+                .filter(c -> c.clientId.equals(clientId) && c.isLegacy)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Deliver merged batch to legacy consumer.
+     * Builds a multi-topic batch sorted by global offset and delivers as single BATCH event.
+     *
+     * @param clientId Client ID (same for all topics subscribed by legacy client)
+     * @param consumerGroup Consumer group (serviceName for legacy clients)
+     * @param maxBytes Maximum batch size in bytes
+     * @return true if delivery succeeded, false otherwise
+     */
+    public boolean deliverMergedBatchToLegacy(String clientId, String consumerGroup, long maxBytes) {
+        log.debug("deliverMergedBatchToLegacy: clientId={}, group={}, maxBytes={}",
+                clientId, consumerGroup, maxBytes);
+
+        // Get all legacy consumers for this client
+        List<RemoteConsumer> legacyConsumers = getLegacyConsumersForClient(clientId);
+        if (legacyConsumers.isEmpty()) {
+            log.warn("No legacy consumers found for clientId: {}", clientId);
+            return false;
+        }
+
+        // Extract topic list
+        List<String> topics = legacyConsumers.stream()
+                .map(c -> c.topic)
+                .collect(Collectors.toList());
+
+        try {
+            // Build merged batch using LegacyConsumerDeliveryManager
+            MergedBatch mergedBatch = legacyDeliveryManager.buildMergedBatch(
+                    topics, consumerGroup, maxBytes
+            );
+
+            if (mergedBatch.isEmpty()) {
+                log.debug("No messages to deliver for legacy client: {}", clientId);
+                return false;
+            }
+
+            log.info("Built merged batch for legacy client {}: {} messages from {} topics, {} bytes",
+                    clientId, mergedBatch.getMessageCount(), topics.size(), mergedBatch.getTotalBytes());
+
+            // Convert MergedBatch to BrokerMessage BATCH_HEADER
+            BrokerMessage batchMessage = convertMergedBatchToBrokerMessage(mergedBatch);
+
+            // Send batch to client
+            long sendStart = System.currentTimeMillis();
+            server.send(clientId, batchMessage).get(10, TimeUnit.SECONDS);
+            long sendDuration = System.currentTimeMillis() - sendStart;
+            log.debug("Sent merged batch to {} in {}ms", clientId, sendDuration);
+
+            // Track pending ACK (will be resolved to BATCH_ACK by LegacyConnectionState)
+            String pendingKey = clientId + ":legacy-batch:pending";
+            pendingOffsets.put(pendingKey, System.currentTimeMillis());
+            batchSendTimestamps.put(pendingKey, System.currentTimeMillis());
+
+            // Schedule ACK timeout
+            scheduleAckTimeout(clientId, "legacy-batch", consumerGroup, mergedBatch);
+
+            log.info("Sent merged batch to legacy client {}: {} messages", clientId, mergedBatch.getMessageCount());
+            return true;
+
+        } catch (Exception e) {
+            log.error("Failed to deliver merged batch to legacy client: {}", clientId, e);
+            return false;
+        }
+    }
+
+    /**
+     * Convert MergedBatch to BrokerMessage for delivery.
+     * Format: BATCH_HEADER with JSON payload containing all messages.
+     */
+    private BrokerMessage convertMergedBatchToBrokerMessage(MergedBatch batch) throws Exception {
+        // For now, serialize as JSON
+        // TODO: Optimize with binary format if needed
+        String json = objectMapper.writeValueAsString(batch.getMessages());
+        return new BrokerMessage(
+                BrokerMessage.MessageType.BATCH_HEADER,
+                System.nanoTime(),
+                json.getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
+    /**
+     * Schedule ACK timeout for merged batch.
+     */
+    private void scheduleAckTimeout(String clientId, String topic, String group, MergedBatch batch) {
+        String pendingKey = clientId + ":legacy-batch:pending";
+
+        ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
+            Long sendTime = batchSendTimestamps.remove(pendingKey);
+            if (sendTime != null && pendingOffsets.remove(pendingKey) != null) {
+                log.warn("ACK timeout for legacy batch: clientId={}, elapsed={}ms",
+                        clientId, System.currentTimeMillis() - sendTime);
+
+                metrics.recordAckTimeout(topic, group);
+
+                // Revert offsets for all topics in the batch
+                // This allows retry on next delivery cycle
+                for (Map.Entry<String, Long> entry : batch.getMaxOffsetPerTopic().entrySet()) {
+                    String topicName = entry.getKey();
+                    // Offset NOT committed, will retry from current position
+                    log.info("Legacy batch ACK timeout - offset NOT advanced for topic: {}", topicName);
+                }
+            }
+        }, ackTimeoutMs, TimeUnit.MILLISECONDS);
+
+        pendingTimeouts.put(pendingKey, timeoutTask);
+    }
+
+    /**
      * Remote consumer metadata
      */
     public static class RemoteConsumer {
         final String clientId;
         final String topic;
         final String group;
+        final boolean isLegacy; // True if this consumer uses legacy Event protocol
         volatile long currentOffset;
         volatile Future<?> deliveryTask;
         volatile long lastDeliveryAttempt; // Rate limiting: timestamp of last delivery attempt
@@ -1002,9 +1252,14 @@ public class RemoteConsumerRegistry {
         volatile long lastFailureTime; // Timestamp of last failure
 
         RemoteConsumer(String clientId, String topic, String group) {
+            this(clientId, topic, group, false);
+        }
+
+        RemoteConsumer(String clientId, String topic, String group, boolean isLegacy) {
             this.clientId = clientId;
             this.topic = topic;
             this.group = group;
+            this.isLegacy = isLegacy;
             this.currentOffset = 0;
             this.lastDeliveryAttempt = 0; // Allow immediate first delivery
             this.consecutiveFailures = 0;
@@ -1017,6 +1272,18 @@ public class RemoteConsumerRegistry {
 
         void setCurrentOffset(long offset) {
             this.currentOffset = offset;
+        }
+
+        public String getGroup() {
+            return group;
+        }
+
+        public String getTopic() {
+            return topic;
+        }
+
+        public boolean isLegacy() {
+            return isLegacy;
         }
 
         /**

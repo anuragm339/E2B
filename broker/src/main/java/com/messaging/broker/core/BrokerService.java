@@ -355,9 +355,10 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 clientId, serviceName, topics.size(), topics);
 
         // Register consumer for ALL topics (serviceName is used as the consumer group)
+        // Mark as legacy (isLegacy=true) so delivery pipeline uses multi-topic merge
         int newRegistrations = 0;
         for (String topic : topics) {
-            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, serviceName);
+            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, serviceName, true);
             if (isNew) {
                 newRegistrations++;
             }
@@ -629,6 +630,12 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      */
     private void handleBatchAck(String clientId, BrokerMessage message) {
         try {
+            // Legacy client detection: Empty payload indicates legacy merged batch ACK
+            if (message.getPayload().length == 0) {
+                handleLegacyBatchAck(clientId);
+                return;
+            }
+
             // MULTI-GROUP FIX: Parse both topic and group from payload
             // Format: [topicLen:4][topic:var][groupLen:4][group:var]
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
@@ -704,6 +711,39 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         } catch (Exception e) {
             log.error("Error handling BATCH_ACK from {}", clientId, e);
         }
+    }
+
+    /**
+     * Handle BATCH_ACK from legacy client (merged batch from multiple topics).
+     * Legacy clients send empty-payload ACK which gets resolved to BATCH_ACK by LegacyConnectionState.
+     *
+     * @param clientId The client ID that sent the ACK
+     */
+    private void handleLegacyBatchAck(String clientId) {
+        log.debug("Received legacy BATCH_ACK from client: {}", clientId);
+
+        // Look up legacy consumers to find the group
+        java.util.List<RemoteConsumerRegistry.RemoteConsumer> legacyConsumers =
+                remoteConsumers.getLegacyConsumersForClient(clientId);
+
+        if (legacyConsumers.isEmpty()) {
+            log.warn("Received legacy BATCH_ACK from unknown client: {}", clientId);
+            return;
+        }
+
+        // All legacy consumers for a client share the same group (serviceName)
+        String group = legacyConsumers.get(0).getGroup();
+
+        log.debug("Routing legacy BATCH_ACK to group: {}", group);
+
+        // Offload ACK processing to dedicated executor
+        ackExecutor.execute(() -> {
+            try {
+                remoteConsumers.handleLegacyBatchAck(clientId, group);
+            } catch (Exception e) {
+                log.error("Error processing legacy BATCH_ACK from {}", clientId, e);
+            }
+        });
     }
 
     /**
