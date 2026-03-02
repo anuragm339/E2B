@@ -70,6 +70,10 @@ public class RemoteConsumerRegistry {
     private final Map<String, Long> batchSendTimestamps;
     // Map: "clientId:topic:group:pending" -> timeout task (canceled on ACK)
     private final Map<String, ScheduledFuture<?>> pendingTimeouts;
+    // Map: "clientId:legacy-batch:pending" -> MergedBatch (for metrics recording on ACK)
+    private final Map<String, MergedBatch> pendingLegacyBatches;
+    // Map: "clientId:legacy-batch:pending" -> Timer.Sample (for delivery latency on ACK)
+    private final Map<String, Timer.Sample> pendingLegacyTimers;
 
     // B2-6 fix: retain group mapping even after consumer unregisters so that a late ACK
     // (arriving after unregistration) can still persist the offset to the offset tracker.
@@ -115,6 +119,8 @@ public class RemoteConsumerRegistry {
         this.pendingOffsets = new ConcurrentHashMap<>();
         this.batchSendTimestamps = new ConcurrentHashMap<>();
         this.pendingTimeouts = new ConcurrentHashMap<>();
+        this.pendingLegacyBatches = new ConcurrentHashMap<>();
+        this.pendingLegacyTimers = new ConcurrentHashMap<>();
         this.deliveryKeyToGroup = new ConcurrentHashMap<>();
         log.warn("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer (size-only batching)",
                  maxMessageSizePerConsumer);
@@ -693,12 +699,15 @@ public class RemoteConsumerRegistry {
 
         Long timestamp = pendingOffsets.remove(pendingKey);
         ScheduledFuture<?> timeoutFuture = pendingTimeouts.remove(pendingKey);
+        MergedBatch batch = pendingLegacyBatches.remove(pendingKey);
+        Timer.Sample deliverySample = pendingLegacyTimers.remove(pendingKey);
+
         if (timeoutFuture != null) {
             timeoutFuture.cancel(false);
         }
 
-        if (timestamp == null) {
-            log.warn("⚠️ Legacy batch ACK with no pending offset: clientId={}, group={} (likely a late ACK after timeout). ACK_LATENCY={}ms.",
+        if (timestamp == null || batch == null) {
+            log.warn("⚠️ Legacy batch ACK with no pending data: clientId={}, group={} (likely a late ACK after timeout). ACK_LATENCY={}ms.",
                     clientId, group, ackLatencyMs);
             return;
         }
@@ -706,38 +715,41 @@ public class RemoteConsumerRegistry {
         log.info("✅ Legacy batch ACK_RECEIVED for clientId={}, group={} at T={}ms",
                 clientId, group, ackLatencyMs);
 
-        // Get all legacy consumers for this client to find which topics to update
-        List<RemoteConsumer> legacyConsumers = getLegacyConsumersForClient(clientId);
-        if (legacyConsumers.isEmpty()) {
-            log.warn("No legacy consumers found for ACK: clientId={}, group={}", clientId, group);
-            return;
-        }
-
-        // We need the MergedBatch to know the max offset per topic
-        // For now, we'll get it from the offsetTracker's current state
-        // TODO: Store MergedBatch reference in pending state for accurate offset tracking
-
-        // Update offsets for all topics using LegacyConsumerDeliveryManager
-        // Get the topics list
-        List<String> topics = legacyConsumers.stream()
-                .map(c -> c.topic)
-                .collect(Collectors.toList());
-
         try {
-            // Build a fresh batch to get the max offsets (this is a temporary solution)
-            // In production, we should store the MergedBatch in pending state
-            MergedBatch batch = legacyDeliveryManager.buildMergedBatch(topics, group, 1); // Just peek at offsets
-
             // Use the handleMergedBatchAck method from LegacyConsumerDeliveryManager
             legacyDeliveryManager.handleMergedBatchAck(group, batch);
 
             log.info("Legacy batch ACK committed for clientId={}, group={}, topics={}",
                     clientId, group, batch.getMaxOffsetPerTopic());
 
+            // Record metrics for messages and bytes sent (NOW that ACK is received)
+            metrics.recordBatchMessagesSent(batch.getMessageCount(), batch.getTotalBytes());
+
+            // Record per-consumer metrics for EACH topic in the merged batch
+            // NOTE: Messages in merged batch don't have topic field set, so we distribute
+            // the total count/bytes evenly across all topics for metrics purposes
+            int topicCount = batch.getMaxOffsetPerTopic().size();
+            int messagesPerTopic = topicCount > 0 ? batch.getMessageCount() / topicCount : 0;
+            long bytesPerTopic = topicCount > 0 ? batch.getTotalBytes() / topicCount : 0;
+
             // Update metrics for each topic
             for (Map.Entry<String, Long> entry : batch.getMaxOffsetPerTopic().entrySet()) {
                 String topic = entry.getKey();
                 long offset = entry.getValue();
+
+                // Record per-consumer batch sent metrics (messages and bytes)
+                metrics.recordConsumerBatchSent(clientId, topic, group,
+                        messagesPerTopic, bytesPerTopic);
+
+                // Record delivery latency for this topic
+                if (deliverySample != null) {
+                    metrics.stopConsumerDeliveryTimer(deliverySample, clientId, topic, group);
+                }
+
+                // Update last successful delivery timestamp for stuck detection
+                metrics.updateConsumerLastDeliveryTime(clientId, topic, group);
+
+                // Update offset, ACK time, and ACK count
                 metrics.updateConsumerOffset(clientId, topic, group, offset);
                 metrics.updateConsumerLastAckTime(clientId, topic, group);
                 metrics.recordConsumerAck(clientId, topic, group);
@@ -1158,6 +1170,14 @@ public class RemoteConsumerRegistry {
         log.warn("🔵 DELIVERY: deliverMergedBatchToLegacy called - clientId={}, group={}, maxBytes={}",
                 clientId, consumerGroup, maxBytes);
 
+        // Check if a batch is already pending ACK for this client
+        // This prevents duplicate sends and metric inflation
+        String pendingKey = clientId + ":legacy-batch:pending";
+        if (pendingOffsets.containsKey(pendingKey)) {
+            log.debug("Batch already pending ACK for clientId={}, skipping duplicate send", clientId);
+            return false;
+        }
+
         // Get all legacy consumers for this client
         List<RemoteConsumer> legacyConsumers = getLegacyConsumersForClient(clientId);
         if (legacyConsumers.isEmpty()) {
@@ -1196,35 +1216,15 @@ public class RemoteConsumerRegistry {
             long sendDuration = System.currentTimeMillis() - sendStart;
             log.warn("🔵 DELIVERY: Sent merged batch to {} in {}ms", clientId, sendDuration);
 
-            // Record metrics for messages and bytes sent (global counters)
-            log.warn("🔵 METRICS: About to record metrics for {} messages, {} bytes",
-                    mergedBatch.getMessageCount(), mergedBatch.getTotalBytes());
-            metrics.recordBatchMessagesSent(mergedBatch.getMessageCount(), mergedBatch.getTotalBytes());
-
-            // Record per-consumer metrics for EACH topic in the merged batch
-            // NOTE: Messages in merged batch don't have topic field set, so we distribute
-            // the total count/bytes evenly across all topics for metrics purposes
-            int topicCount = mergedBatch.getMaxOffsetPerTopic().size();
-            int messagesPerTopic = topicCount > 0 ? mergedBatch.getMessageCount() / topicCount : 0;
-            long bytesPerTopic = topicCount > 0 ? mergedBatch.getTotalBytes() / topicCount : 0;
-
-            for (Map.Entry<String, Long> topicEntry : mergedBatch.getMaxOffsetPerTopic().entrySet()) {
-                String topic = topicEntry.getKey();
-
-                metrics.recordConsumerBatchSent(clientId, topic, consumerGroup,
-                        messagesPerTopic, bytesPerTopic);
-
-                // Record delivery latency for this topic
-                metrics.stopConsumerDeliveryTimer(deliverySample, clientId, topic, consumerGroup);
-
-                // Update last successful delivery timestamp for stuck detection
-                metrics.updateConsumerLastDeliveryTime(clientId, topic, consumerGroup);
-            }
+            // NOTE: Metrics recording moved to handleLegacyBatchAck() to prevent retry inflation
+            // Metrics are now counted only when batch is ACKed, not when sent
 
             // Track pending ACK (will be resolved to BATCH_ACK by LegacyConnectionState)
-            String pendingKey = clientId + ":legacy-batch:pending";
+            // Store batch info and timer for metrics recording on ACK
             pendingOffsets.put(pendingKey, System.currentTimeMillis());
             batchSendTimestamps.put(pendingKey, System.currentTimeMillis());
+            pendingLegacyBatches.put(pendingKey, mergedBatch);
+            pendingLegacyTimers.put(pendingKey, deliverySample);
 
             // Schedule ACK timeout
             scheduleAckTimeout(clientId, "legacy-batch", consumerGroup, mergedBatch);
@@ -1271,6 +1271,10 @@ public class RemoteConsumerRegistry {
             if (sendTime != null && pendingOffsets.remove(pendingKey) != null) {
                 log.warn("ACK timeout for legacy batch: clientId={}, elapsed={}ms",
                         clientId, System.currentTimeMillis() - sendTime);
+
+                // Clean up pending batch and timer (prevent memory leak)
+                pendingLegacyBatches.remove(pendingKey);
+                pendingLegacyTimers.remove(pendingKey);
 
                 // Record timeout metrics for ALL topics in the batch
                 for (Map.Entry<String, Long> entry : batch.getMaxOffsetPerTopic().entrySet()) {
