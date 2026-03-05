@@ -89,6 +89,18 @@ public class ThreadMonitor {
                 .tag("category", "HTTP Server")
                 .register(meterRegistry);
 
+        Gauge.builder("broker.threads.category.cpu_time_ms", this,
+                monitor -> getTopCategoryCpuTime("Data Refresh"))
+                .description("CPU time in ms for Data Refresh threads")
+                .tag("category", "Data Refresh")
+                .register(meterRegistry);
+
+        Gauge.builder("broker.threads.category.cpu_time_ms", this,
+                monitor -> getTopCategoryCpuTime("Broker Management"))
+                .description("CPU time in ms for Broker Management threads")
+                .tag("category", "Broker Management")
+                .register(meterRegistry);
+
         Gauge.builder("broker.threads.category.memory_mb", this,
                 monitor -> getTopCategoryMemory("Network I/O"))
                 .description("Allocated memory in MB for Network I/O threads")
@@ -117,6 +129,18 @@ public class ThreadMonitor {
                 monitor -> getTopCategoryMemory("HTTP Server"))
                 .description("Allocated memory in MB for HTTP Server threads")
                 .tag("category", "HTTP Server")
+                .register(meterRegistry);
+
+        Gauge.builder("broker.threads.category.memory_mb", this,
+                monitor -> getTopCategoryMemory("Data Refresh"))
+                .description("Allocated memory in MB for Data Refresh threads")
+                .tag("category", "Data Refresh")
+                .register(meterRegistry);
+
+        Gauge.builder("broker.threads.category.memory_mb", this,
+                monitor -> getTopCategoryMemory("Broker Management"))
+                .description("Allocated memory in MB for Broker Management threads")
+                .tag("category", "Broker Management")
                 .register(meterRegistry);
 
         // Register per-category thread counts
@@ -148,6 +172,18 @@ public class ThreadMonitor {
                 monitor -> getCategoryThreadCount("HTTP Server"))
                 .description("Thread count for HTTP Server")
                 .tag("category", "HTTP Server")
+                .register(meterRegistry);
+
+        Gauge.builder("broker.threads.category.count", this,
+                monitor -> getCategoryThreadCount("Data Refresh"))
+                .description("Thread count for Data Refresh")
+                .tag("category", "Data Refresh")
+                .register(meterRegistry);
+
+        Gauge.builder("broker.threads.category.count", this,
+                monitor -> getCategoryThreadCount("Broker Management"))
+                .description("Thread count for Broker Management")
+                .tag("category", "Broker Management")
                 .register(meterRegistry);
 
         // Enable thread memory allocation tracking if supported
@@ -261,12 +297,19 @@ public class ThreadMonitor {
     private String categorizeThread(String threadName) {
         if (threadName.contains("nioEventLoopGroup") || threadName.contains("netty")) {
             return "Network I/O";
-        } else if (threadName.contains("RemoteConsumerRegistry") || threadName.contains("consumer-delivery") || threadName.contains("delivery") || threadName.contains("ConsumerOffsetFlusher")) {
+        } else if (threadName.contains("RemoteConsumerRegistry") || threadName.contains("consumer-delivery")
+                || threadName.contains("ConsumerDeliveryScheduler") || threadName.contains("ConsumerOffsetFlusher")
+                || threadName.contains("DeliveryStateStore") || threadName.contains("ACK-Processor")
+                || threadName.contains("TopicFairScheduler")) {
             return "Consumer Delivery";
         } else if (threadName.contains("StorageReader") || threadName.contains("storage") || threadName.contains("segment")) {
             return "Storage";
         } else if (threadName.contains("HttpPipeConnector") || threadName.contains("pipe")) {
             return "Pipe/Replication";
+        } else if (threadName.contains("DataRefreshManager")) {
+            return "Data Refresh";
+        } else if (threadName.contains("TopologyManager")) {
+            return "Broker Management";
         } else if (threadName.contains("scheduled") || threadName.contains("executor")) {
             return "Scheduled Tasks";
         } else if (threadName.startsWith("G1 ") || threadName.contains("GC")) {

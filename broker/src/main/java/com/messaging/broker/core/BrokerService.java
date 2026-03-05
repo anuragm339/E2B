@@ -547,11 +547,28 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         try {
             // MULTI-GROUP FIX: Parse both topic and group from payload
             // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            // Special case: Empty payload = legacy startup READY_ACK
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
+
+            // Handle empty payload for legacy startup READY_ACK
+            if (buffer.remaining() == 0) {
+                log.info("📥 READY_ACK for STARTUP from legacy client: {} (empty payload)", clientId);
+                remoteConsumers.markLegacyConsumerReady(clientId);
+                log.info("✅ Legacy consumer {} marked as READY (can now receive data)", clientId);
+
+                // Send ACK back to consumer
+                BrokerMessage ack = new BrokerMessage(
+                    BrokerMessage.MessageType.ACK,
+                    message.getMessageId(),
+                    new byte[0]
+                );
+                server.send(clientId, ack);
+                return;
+            }
 
             // SECURITY FIX (BROKER-2): Validate payload size before reading
             if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
-                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8)",
+                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8 or 0)",
                          clientId, buffer.remaining());
                 server.closeConnection(clientId);
                 return;
@@ -610,8 +627,35 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
 
-            // Delegate to DataRefreshManager with stable identifier
-            dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
+            // Check if this is startup READY_ACK or refresh READY_ACK
+            boolean isRefreshActive = topic != null && !topic.isEmpty() &&
+                    dataRefreshManager.isRefreshActive(topic);
+
+            if (isRefreshActive) {
+                // Refresh READY_ACK - delegate to DataRefreshManager
+                log.info("📥 READY_ACK for REFRESH from client: {} topic: {} group: {}",
+                        clientId, topic, group);
+                dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
+            } else {
+                // Startup READY_ACK - mark consumer as ready
+                log.info("📥 READY_ACK for STARTUP from client: {} topic: {} group: {}",
+                        clientId, topic, group);
+
+                // Determine if this is a legacy or modern consumer
+                String consumerKey = clientId + ":" + topic + ":" + group;
+                boolean isLegacy = remoteConsumers.isLegacyConsumer(consumerKey);
+
+                if (isLegacy || topic.isEmpty()) {
+                    // Legacy consumer - mark entire client as ready
+                    remoteConsumers.markLegacyConsumerReady(clientId);
+                    log.info("✅ Legacy consumer {} marked as READY (can now receive data)", clientId);
+                } else {
+                    // Modern consumer - mark specific topic as ready
+                    remoteConsumers.markModernConsumerTopicReady(clientId, topic);
+                    log.info("✅ Modern consumer {} marked as READY for topic {} (can now receive data)",
+                            clientId, topic);
+                }
+            }
 
             // Send ACK back to consumer to acknowledge receipt
             BrokerMessage ack = new BrokerMessage(

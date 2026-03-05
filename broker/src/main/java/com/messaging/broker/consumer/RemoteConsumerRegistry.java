@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -75,6 +76,14 @@ public class RemoteConsumerRegistry {
     // Map: "clientId:legacy-batch:pending" -> Timer.Sample (for delivery latency on ACK)
     private final Map<String, Timer.Sample> pendingLegacyTimers;
 
+    // READY_ACK tracking for startup health signal
+    // Map: clientId -> READY_ACK received (legacy consumers)
+    private final Map<String, Boolean> legacyConsumerReady;
+    // Map: clientId -> Set of topics that have received READY_ACK (modern consumers)
+    private final Map<String, Set<String>> modernConsumerTopicsReady;
+    // Map: "clientId" or "clientId:topic" -> READY retry task
+    private final Map<String, ScheduledFuture<?>> pendingReadyRetries;
+
     // B2-6 fix: retain group mapping even after consumer unregisters so that a late ACK
     // (arriving after unregistration) can still persist the offset to the offset tracker.
     // Key: "clientId:topic", Value: group name
@@ -121,6 +130,9 @@ public class RemoteConsumerRegistry {
         this.pendingTimeouts = new ConcurrentHashMap<>();
         this.pendingLegacyBatches = new ConcurrentHashMap<>();
         this.pendingLegacyTimers = new ConcurrentHashMap<>();
+        this.legacyConsumerReady = new ConcurrentHashMap<>();
+        this.modernConsumerTopicsReady = new ConcurrentHashMap<>();
+        this.pendingReadyRetries = new ConcurrentHashMap<>();
         this.deliveryKeyToGroup = new ConcurrentHashMap<>();
         log.warn("RemoteConsumerRegistry initialized with maxMessageSize={}bytes per consumer (size-only batching)",
                  maxMessageSizePerConsumer);
@@ -234,6 +246,24 @@ public class RemoteConsumerRegistry {
 
         log.debug("Registered remote consumer: consumerKey={}, clientId={}, topic={}, group={}, startOffset={}, isNew={}, isLegacy={}",
                  consumerKey, clientId, topic, group, startOffset, isNew, isLegacy);
+
+        // Send startup READY to new consumer (unless refresh is active)
+        if (isNew) {
+            if (isLegacy) {
+                // For legacy, only send READY once for the client (not per topic)
+                // Check if this is the first topic registration for this client
+                long legacyTopicCount = consumers.values().stream()
+                        .filter(c -> c.clientId.equals(clientId) && c.isLegacy())
+                        .count();
+                if (legacyTopicCount == 1) {  // This is the first topic
+                    sendStartupReadyToLegacyConsumer(clientId);
+                }
+            } else {
+                // For modern, send READY per topic
+                sendStartupReadyToModernConsumer(clientId, topic);
+            }
+        }
+
         return isNew;
     }
 
@@ -609,6 +639,13 @@ public class RemoteConsumerRegistry {
             return;
         }
 
+        // Check if consumer is ready for this topic (has sent READY_ACK)
+        if (!isModernConsumerTopicReady(consumer.clientId, consumer.topic)) {
+            log.debug("⏸️  Modern consumer {} not ready for topic {} yet (waiting for READY_ACK), blocking delivery",
+                    consumer.clientId, consumer.topic);
+            return;
+        }
+
         // Step 1: Create and send header message with batch metadata
         // FIX: Include both topic AND group so consumer can ACK with correct group identifier
         byte[] topicBytes = consumer.topic.getBytes(StandardCharsets.UTF_8);
@@ -945,6 +982,248 @@ public class RemoteConsumerRegistry {
     }
 
     /**
+     * Send startup READY to all currently registered consumers.
+     * Called during broker initialization or after broker restart.
+     * Skips consumers whose topics are in active refresh mode.
+     */
+    public void sendStartupReadyToAllConsumers() {
+        log.info("🚀 Sending startup READY to all registered consumers...");
+
+        // Group consumers by clientId to identify legacy vs modern
+        Map<String, List<RemoteConsumer>> consumersByClient = new java.util.HashMap<>();
+        for (RemoteConsumer consumer : consumers.values()) {
+            consumersByClient.computeIfAbsent(consumer.clientId, k -> new ArrayList<>())
+                    .add(consumer);
+        }
+
+        for (Map.Entry<String, List<RemoteConsumer>> entry : consumersByClient.entrySet()) {
+            String clientId = entry.getKey();
+            List<RemoteConsumer> clientConsumers = entry.getValue();
+
+            if (clientConsumers.isEmpty()) continue;
+
+            // Check if any consumer for this client is legacy
+            boolean isLegacy = clientConsumers.get(0).isLegacy();
+
+            if (isLegacy) {
+                // Legacy consumer - send one READY for all topics
+                sendStartupReadyToLegacyConsumer(clientId);
+            } else {
+                // Modern consumer - send READY per topic
+                for (RemoteConsumer consumer : clientConsumers) {
+                    sendStartupReadyToModernConsumer(clientId, consumer.topic);
+                }
+            }
+        }
+
+        log.info("✅ Startup READY sent to all registered consumers");
+    }
+
+    /**
+     * Send startup READY to a legacy consumer (all topics).
+     * Legacy consumer must ACK before any data is delivered.
+     * Will retry if no ACK received within timeout.
+     *
+     * @param clientId Client ID of the legacy consumer
+     */
+    public void sendStartupReadyToLegacyConsumer(String clientId) {
+        // Skip if already ready
+        if (Boolean.TRUE.equals(legacyConsumerReady.get(clientId))) {
+            log.debug("Legacy consumer {} already ready, skipping READY send", clientId);
+            return;
+        }
+
+        // Check if refresh is active for any of this consumer's topics
+        List<RemoteConsumer> consumerEntries = getLegacyConsumersForClient(clientId);
+        if (consumerEntries.isEmpty()) {
+            log.warn("No legacy consumer entries found for clientId={}", clientId);
+            return;
+        }
+
+        // If any topic is in refresh mode, skip startup READY (refresh workflow will handle it)
+        for (RemoteConsumer consumer : consumerEntries) {
+            if (dataRefreshManager != null && dataRefreshManager.isRefreshActive(consumer.topic)) {
+                log.info("Skipping startup READY for legacy consumer {} - refresh active for topic {}",
+                        clientId, consumer.topic);
+                return;
+            }
+        }
+
+        // Send READY message (empty payload for legacy - just a signal)
+        BrokerMessage readyMsg = new BrokerMessage(
+            BrokerMessage.MessageType.READY,
+            System.currentTimeMillis(),
+            new byte[0]  // Empty payload
+        );
+
+        try {
+            server.send(clientId, readyMsg);
+            log.info("📤 Sent startup READY to legacy consumer: {}", clientId);
+
+            // Schedule retry if no ACK within timeout
+            scheduleReadyRetry(clientId, null, ackTimeoutMs);
+        } catch (Exception e) {
+            log.error("Failed to send startup READY to legacy consumer: {}", clientId, e);
+        }
+    }
+
+    /**
+     * Send startup READY to a modern consumer for a specific topic.
+     * Consumer must ACK before data for this topic is delivered.
+     * Will retry if no ACK received within timeout.
+     *
+     * @param clientId Client ID of the modern consumer
+     * @param topic    Topic name
+     */
+    public void sendStartupReadyToModernConsumer(String clientId, String topic) {
+        // Check if topic already ready for this consumer
+        Set<String> readyTopics = modernConsumerTopicsReady.computeIfAbsent(clientId, k -> ConcurrentHashMap.newKeySet());
+        if (readyTopics.contains(topic)) {
+            log.debug("Modern consumer {} already ready for topic {}, skipping READY send", clientId, topic);
+            return;
+        }
+
+        // Skip if refresh is active for this topic
+        if (dataRefreshManager != null && dataRefreshManager.isRefreshActive(topic)) {
+            log.info("Skipping startup READY for modern consumer {} topic {} - refresh active",
+                    clientId, topic);
+            return;
+        }
+
+        // Send READY message with topic as payload
+        byte[] payload = topic.getBytes(StandardCharsets.UTF_8);
+        BrokerMessage readyMsg = new BrokerMessage(
+            BrokerMessage.MessageType.READY,
+            System.currentTimeMillis(),
+            payload
+        );
+
+        try {
+            server.send(clientId, readyMsg);
+            log.info("📤 Sent startup READY to modern consumer: {} for topic: {}", clientId, topic);
+
+            // Schedule retry if no ACK within timeout
+            scheduleReadyRetry(clientId, topic, ackTimeoutMs);
+        } catch (Exception e) {
+            log.error("Failed to send startup READY to modern consumer: {} topic: {}", clientId, topic, e);
+        }
+    }
+
+    /**
+     * Check if a consumer is a legacy consumer.
+     *
+     * @param consumerKey Consumer key (clientId:topic:group)
+     * @return true if legacy, false otherwise
+     */
+    public boolean isLegacyConsumer(String consumerKey) {
+        RemoteConsumer consumer = consumers.get(consumerKey);
+        return consumer != null && consumer.isLegacy();
+    }
+
+    /**
+     * Mark a legacy consumer as ready (has sent READY_ACK).
+     * Cancels any pending READY retry task.
+     *
+     * @param clientId Client ID of the legacy consumer
+     */
+    public void markLegacyConsumerReady(String clientId) {
+        legacyConsumerReady.put(clientId, true);
+
+        // Cancel pending retry task
+        String retryKey = clientId;
+        ScheduledFuture<?> retryTask = pendingReadyRetries.remove(retryKey);
+        if (retryTask != null && !retryTask.isDone()) {
+            retryTask.cancel(false);
+            log.debug("Cancelled READY retry task for legacy consumer {}", clientId);
+        }
+    }
+
+    /**
+     * Mark a modern consumer as ready for a specific topic (has sent READY_ACK).
+     * Cancels any pending READY retry task for this topic.
+     *
+     * @param clientId Client ID of the modern consumer
+     * @param topic    Topic name
+     */
+    public void markModernConsumerTopicReady(String clientId, String topic) {
+        Set<String> readyTopics = modernConsumerTopicsReady.computeIfAbsent(
+                clientId, k -> ConcurrentHashMap.newKeySet());
+        readyTopics.add(topic);
+
+        // Cancel pending retry task
+        String retryKey = clientId + ":" + topic;
+        ScheduledFuture<?> retryTask = pendingReadyRetries.remove(retryKey);
+        if (retryTask != null && !retryTask.isDone()) {
+            retryTask.cancel(false);
+            log.debug("Cancelled READY retry task for modern consumer {} topic {}", clientId, topic);
+        }
+    }
+
+    /**
+     * Check if a legacy consumer is ready to receive data.
+     *
+     * @param clientId Client ID
+     * @return true if ready, false otherwise
+     */
+    public boolean isLegacyConsumerReady(String clientId) {
+        return Boolean.TRUE.equals(legacyConsumerReady.get(clientId));
+    }
+
+    /**
+     * Check if a modern consumer is ready to receive data for a specific topic.
+     *
+     * @param clientId Client ID
+     * @param topic    Topic name
+     * @return true if ready, false otherwise
+     */
+    public boolean isModernConsumerTopicReady(String clientId, String topic) {
+        Set<String> readyTopics = modernConsumerTopicsReady.get(clientId);
+        return readyTopics != null && readyTopics.contains(topic);
+    }
+
+    /**
+     * Schedule retry for READY message if no ACK received.
+     *
+     * @param clientId Client ID
+     * @param topic    Topic (null for legacy consumers)
+     * @param delayMs  Delay before retry
+     */
+    private void scheduleReadyRetry(String clientId, String topic, long delayMs) {
+        String retryKey = topic != null ? clientId + ":" + topic : clientId;
+
+        // Cancel any existing retry task
+        ScheduledFuture<?> existingTask = pendingReadyRetries.remove(retryKey);
+        if (existingTask != null && !existingTask.isDone()) {
+            existingTask.cancel(false);
+        }
+
+        // Schedule new retry
+        ScheduledFuture<?> retryTask = scheduler.schedule(() -> {
+            try {
+                if (topic == null) {
+                    // Legacy consumer retry
+                    if (!Boolean.TRUE.equals(legacyConsumerReady.get(clientId))) {
+                        log.warn("⏰ READY_ACK timeout for legacy consumer {}, retrying...", clientId);
+                        sendStartupReadyToLegacyConsumer(clientId);
+                    }
+                } else {
+                    // Modern consumer retry
+                    Set<String> readyTopics = modernConsumerTopicsReady.get(clientId);
+                    if (readyTopics == null || !readyTopics.contains(topic)) {
+                        log.warn("⏰ READY_ACK timeout for modern consumer {} topic {}, retrying...",
+                                clientId, topic);
+                        sendStartupReadyToModernConsumer(clientId, topic);
+                    }
+                }
+            } finally {
+                pendingReadyRetries.remove(retryKey);
+            }
+        }, delayMs, TimeUnit.MILLISECONDS);
+
+        pendingReadyRetries.put(retryKey, retryTask);
+    }
+
+    /**
      * Reset offset for a specific consumer (for DataRefresh)
      * MULTI-GROUP FIX: Now requires group parameter for correct consumer lookup
      */
@@ -1175,6 +1454,12 @@ public class RemoteConsumerRegistry {
         String pendingKey = clientId + ":legacy-batch:pending";
         if (pendingOffsets.containsKey(pendingKey)) {
             log.debug("Batch already pending ACK for clientId={}, skipping duplicate send", clientId);
+            return false;
+        }
+
+        // Check if consumer is ready (has sent READY_ACK)
+        if (!isLegacyConsumerReady(clientId)) {
+            log.debug("⏸️  Legacy consumer {} not ready yet (waiting for READY_ACK), blocking delivery", clientId);
             return false;
         }
 

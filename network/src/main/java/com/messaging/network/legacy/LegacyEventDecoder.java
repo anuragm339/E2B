@@ -78,21 +78,43 @@ public class LegacyEventDecoder extends ByteToMessageDecoder {
      * Decode Event from ByteBuf based on EventType
      */
     private Event decodeEvent(EventType eventType, ByteBuf in) throws Exception {
-        // Wrap ByteBuf in DataInputStream for Event deserialization
-        DataInputStream dis = new DataInputStream(new ByteBufInputStream(in));
-
         switch (eventType) {
             case REGISTER:
-                return RegisterEvent.from(dis);
+                // RegisterEvent: [version:4B][clientId:UTF]
+                // Need at least 4 bytes for version + 2 bytes for UTF length
+                if (in.readableBytes() < 6) {
+                    return null; // Wait for more data
+                }
+                // Mark position to check UTF string length
+                in.markReaderIndex();
+                in.skipBytes(4); // Skip version
+                short utfLen = in.readShort(); // Read UTF length
+                in.resetReaderIndex();
 
-            case MESSAGE:
+                // Check if we have complete UTF string
+                if (in.readableBytes() < 4 + 2 + utfLen) {
+                    return null; // Wait for more data
+                }
+
+                // Now we have complete frame
+                DataInputStream regDis = new DataInputStream(new ByteBufInputStream(in));
+                return RegisterEvent.from(regDis);
+
+            case MESSAGE: {
+                // For other event types, wrap in DataInputStream
+                DataInputStream dis = new DataInputStream(new ByteBufInputStream(in));
                 return DataMessageEvent.from(dis);
+            }
 
-            case RESET:
+            case RESET: {
+                DataInputStream dis = new DataInputStream(new ByteBufInputStream(in));
                 return ResetEvent.from(dis);
+            }
 
-            case READY:
+            case READY: {
+                DataInputStream dis = new DataInputStream(new ByteBufInputStream(in));
                 return ReadyEvent.from(dis);
+            }
 
             case ACK:
                 // AckEvent has no payload
@@ -102,11 +124,15 @@ public class LegacyEventDecoder extends ByteToMessageDecoder {
                 // EOF has no payload
                 return EOFEvent.INSTANCE;
 
-            case DELETE:
+            case DELETE: {
+                DataInputStream dis = new DataInputStream(new ByteBufInputStream(in));
                 return DeleteMessageEvent.from(dis);
+            }
 
-            case BATCH:
+            case BATCH: {
+                DataInputStream dis = new DataInputStream(new ByteBufInputStream(in));
                 return BatchEvent.from(dis);
+            }
 
             default:
                 log.error("Unknown EventType: {}", eventType);

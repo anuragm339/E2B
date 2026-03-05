@@ -42,6 +42,8 @@ broker:
 
   registry:
     url: ${REGISTRY_URL:http://localhost:8080}
+    auth:
+      bearer-token: ${AUTH_BEARER_TOKEN:}  # Optional bearer token for registry and pipe HTTP calls
 
   storage:
     type: filechannel  # FileChannel-based (no mmap) for true zero-copy via sendfile()
