@@ -4,4 +4,7 @@ dependencies {
 
     // Netty for FileRegion (zero-copy)
     api 'io.netty:netty-transport:4.1.100.Final'
+
+    // Micronaut HTTP client (for shared client filters)
+    implementation 'io.micronaut:micronaut-http-client'
 }

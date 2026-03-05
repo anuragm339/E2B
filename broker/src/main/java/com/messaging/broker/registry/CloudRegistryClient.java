@@ -4,15 +4,15 @@ import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.TopologyResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micronaut.http.HttpRequest;
+import io.micronaut.http.HttpResponse;
+import io.micronaut.http.client.HttpClient;
+import io.micronaut.http.client.annotation.Client;
+import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -25,10 +25,9 @@ public class CloudRegistryClient {
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
 
-    public CloudRegistryClient() {
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+    @Inject
+    public CloudRegistryClient(@Client("/") HttpClient httpClient) {
+        this.httpClient = httpClient;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
         log.info("CloudRegistryClient initialized");
@@ -47,24 +46,27 @@ public class CloudRegistryClient {
                 String url = registryUrl + "/registry/topology?nodeId=" + nodeId;
                 log.debug("Querying Cloud Registry: {}", url);
 
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .GET()
-                        .timeout(Duration.ofSeconds(5))
-                        .build();
+                HttpRequest<?> request = HttpRequest.GET(url);
 
-                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> response = httpClient.toBlocking().exchange(request, String.class);
 
-                if (response.statusCode() != 200) {
-                    log.error("Failed to query Cloud Registry: status={}", response.statusCode());
+                if (response.getStatus().getCode() != 200) {
+                    log.error("Failed to query Cloud Registry: status={}", response.getStatus().getCode());
                     throw new MessagingException(ErrorCode.REGISTRY_TOPOLOGY_FETCH_FAILED,
-                        "Cloud Registry query failed: " + response.statusCode())
+                        "Cloud Registry query failed: " + response.getStatus().getCode())
                         .withContext("registryUrl", registryUrl)
                         .withContext("nodeId", nodeId)
-                        .withContext("statusCode", response.statusCode());
+                        .withContext("statusCode", response.getStatus().getCode());
                 }
 
-                TopologyResponse topology = objectMapper.readValue(response.body(), TopologyResponse.class);
+                String body = response.body();
+                if (body == null) {
+                    throw new MessagingException(ErrorCode.REGISTRY_TOPOLOGY_FETCH_FAILED,
+                            "Cloud Registry response body was empty")
+                            .withContext("registryUrl", registryUrl)
+                            .withContext("nodeId", nodeId);
+                }
+                TopologyResponse topology = objectMapper.readValue(body, TopologyResponse.class);
                 log.info("Received topology from Cloud: nodeId={}, role={}, parents={}",
                         topology.getNodeId(), topology.getRole(), topology.getRequestToFollow());
 
