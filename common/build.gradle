@@ -5,6 +5,11 @@ dependencies {
     // Netty for FileRegion (zero-copy)
     api 'io.netty:netty-transport:4.1.100.Final'
 
+    // Jackson for JSON serialization/deserialization
+    api 'com.fasterxml.jackson.core:jackson-annotations:2.15.2'
+    api 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
+    api 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.15.2'
+
     // Micronaut HTTP client (for shared client filters)
     implementation 'io.micronaut:micronaut-http-client'
 }
