@@ -16,3 +16,5 @@ data-local/
 data/
 .claude
 oldClient
+broker/data
+broker/logs

@@ -8,6 +8,10 @@ import com.messaging.pipe.metrics.PipeMetrics;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micronaut.http.HttpRequest;
+import io.micronaut.http.HttpResponse;
+import io.micronaut.http.client.HttpClient;
+import io.micronaut.http.client.annotation.Client;
 import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Singleton;
@@ -15,12 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.*;
-import java.time.Duration;
 import java.util.Properties;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
@@ -55,12 +54,10 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile long adaptiveDelay = MIN_POLL_INTERVAL_MS;
 
     public HttpPipeConnector(
+            @Client("/") HttpClient httpClient,
             @Value("${broker.storage.data-dir:./data}") String dataDir,
             PipeMetrics metrics) {
-
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+        this.httpClient = httpClient;
 
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
@@ -202,7 +199,7 @@ public class HttpPipeConnector implements PipeConnector {
     /**
      * Poll parent broker using streaming InputStream
      */
-    private int pollParent() throws IOException, InterruptedException {
+    private int pollParent() throws IOException {
         if (!running || connection == null) return 0;
 
         // Start timing the pipe fetch operation
@@ -212,20 +209,21 @@ public class HttpPipeConnector implements PipeConnector {
             String parentUrl = normalizeUrl(connection.parentUrl);
             String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=5";  // Reduced from 10 to 5
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(pollUrl))
-                    .timeout(Duration.ofSeconds(10))
-                    .GET()
-                    .build();
+            HttpRequest<?> request = HttpRequest.GET(pollUrl);
 
-            HttpResponse<InputStream> response =
-                    httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+            HttpResponse<byte[]> response =
+                    httpClient.toBlocking().exchange(request, byte[].class);
 
             // Record latency after HTTP request completes
             metrics.recordFetchLatency(sample);
 
-            if (response.statusCode() == 200) {
-                try (InputStream is = response.body()) {
+            if (response.getStatus().getCode() == 200) {
+                byte[] body = response.body();
+                if (body == null || body.length == 0) {
+                    metrics.recordEmptyFetch();
+                    return 0;
+                }
+                try (InputStream is = new java.io.ByteArrayInputStream(body)) {
                     int count = streamAndHandle(is);
                     if (count == 0) {
                         metrics.recordEmptyFetch();
@@ -234,17 +232,17 @@ public class HttpPipeConnector implements PipeConnector {
                 }
             }
 
-            if (response.statusCode() == 204) {
+            if (response.getStatus().getCode() == 204) {
                 // No content available - this is normal
                 metrics.recordEmptyFetch();
-            } else if (response.statusCode() != 204) {
-                log.warn("Poll failed: {}", response.statusCode());
+            } else if (response.getStatus().getCode() != 204) {
+                log.warn("Poll failed: {}", response.getStatus().getCode());
                 metrics.recordFetchError();
             }
 
             return 0;
 
-        } catch (IOException | InterruptedException e) {
+        } catch (IOException e) {
             // Record error metric before rethrowing
             metrics.recordFetchError();
             throw e;

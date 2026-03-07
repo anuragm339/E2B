@@ -5,6 +5,7 @@ import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.network.codec.BinaryMessageDecoder;
+import com.messaging.network.legacy.ProtocolDetectionDecoder;
 import com.messaging.network.codec.BinaryMessageEncoder;
 import com.messaging.network.codec.JsonMessageDecoder;
 import com.messaging.network.codec.JsonMessageEncoder;
@@ -75,8 +76,9 @@ public class NettyTcpServer implements NetworkServer {
 
                             ChannelPipeline pipeline = ch.pipeline();
 
-                            // Codecs (Binary format for efficiency - zero-copy optimization)
-                            pipeline.addLast("decoder", new BinaryMessageDecoder());
+                            // Protocol detection layer - auto-detects legacy vs modern protocol
+                            // Will replace itself with appropriate decoder/encoder once detected
+                            pipeline.addLast("decoder", new ProtocolDetectionDecoder());
                             pipeline.addLast("encoder", new BinaryMessageEncoder());
 
                             // Business logic handler

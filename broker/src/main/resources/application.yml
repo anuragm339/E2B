@@ -42,6 +42,8 @@ broker:
 
   registry:
     url: ${REGISTRY_URL:http://localhost:8080}
+    auth:
+      bearer-token: ${AUTH_BEARER_TOKEN:}  # Optional bearer token for registry and pipe HTTP calls
 
   storage:
     type: filechannel  # FileChannel-based (no mmap) for true zero-copy via sendfile()
@@ -117,6 +119,66 @@ data-refresh:
   #     - prices-v4
   #     - minimum-price
   #     - reference-data-v5
+
+# Legacy Client Configuration
+# Maps legacy serviceName (from RegisterEvent) to list of topics
+# Used by protocol adapter to auto-subscribe legacy clients
+legacy-clients:
+  enabled: ${LEGACY_CLIENTS_ENABLED:true}
+
+  # Service to topics mapping
+  # Key: serviceName (sent in RegisterEvent.clientId)
+  # Value: list of topics to subscribe
+  service-topics:
+    price-quote-service:
+      - prices-v1
+      - reference-data-v5
+      - non-promotable-products
+      - prices-v4
+      - minimum-price
+      - deposit
+
+    product-svc-lite:
+      - product-base-document
+
+    search-enterprise:
+      - search-product
+
+    tesco-location-service:
+      - location
+      - location-clusters
+
+    customer-order-on-till:
+      - selling-restrictions
+
+    colleague-facts:
+      - colleague-facts-jobs
+      - colleague-facts-legacy
+
+    loss-prevention-api:
+      - loss-prevention-configuration
+      - loss-prevention-store-configuration
+      - loss-prevention-product
+      - loss-prevention-rule-config
+
+    stored-value-services:
+      - stored-value-services-banned-promotion
+      - stored-value-services-active-promotion
+
+    colleague-identity:
+      - colleague-card-pin
+
+    distributed-identity:
+      - colleague-card-pin-v2
+
+    dcxp-content:
+      - dcxp-content
+
+    restriction-service-on-tills:
+      - restriction-rules
+
+    dcxp-ugc:
+      - dcxp-ugc
 
 logger:
   levels:

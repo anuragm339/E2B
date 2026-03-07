@@ -4,6 +4,7 @@ import com.messaging.broker.consumer.AdaptiveBatchDeliveryManager;
 import com.messaging.broker.consumer.ConsumerDeliveryManager;
 import com.messaging.broker.consumer.ConsumerOffsetTracker;
 import com.messaging.broker.consumer.RemoteConsumerRegistry;
+import com.messaging.broker.legacy.LegacyClientConfig;
 import com.messaging.broker.metrics.BrokerMetrics;
 import com.messaging.broker.refresh.DataRefreshManager;
 import com.messaging.broker.registry.TopologyManager;
@@ -46,6 +47,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final BrokerMetrics metrics;
     private final ConsumerOffsetTracker offsetTracker;
     private final DataRefreshManager dataRefreshManager;
+    private final LegacyClientConfig legacyClientConfig;
     private final int serverPort;
     private final ObjectMapper objectMapper;
 
@@ -63,6 +65,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             BrokerMetrics metrics,
             ConsumerOffsetTracker offsetTracker,
             DataRefreshManager dataRefreshManager,
+            LegacyClientConfig legacyClientConfig,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
@@ -74,6 +77,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.metrics = metrics;
         this.offsetTracker = offsetTracker;
         this.dataRefreshManager = dataRefreshManager;
+        this.legacyClientConfig = legacyClientConfig;
         this.serverPort = serverPort;
         this.objectMapper = new ObjectMapper();
 
@@ -276,51 +280,133 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     /**
      * Handle SUBSCRIBE message
      */
+    /**
+     * Handle SUBSCRIBE message.
+     * Supports both modern and legacy formats:
+     * - Modern: {"topic": "prices-v1", "group": "price-quote-group"}
+     * - Legacy: {"isLegacy": true, "serviceName": "price-quote-service"}
+     */
     private void handleSubscribe(String clientId, BrokerMessage message) {
         try {
             String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
             JsonNode json = objectMapper.readTree(payload);
 
-            String topic = json.get("topic").asText();
-            String group = json.get("group").asText();
+            // Check if this is a legacy client
+            boolean isLegacy = json.has("isLegacy") && json.get("isLegacy").asBoolean();
 
-            log.info("Client {} subscribed: topic={}, group={}", clientId, topic, group);
-
-            // Register consumer for message delivery.
-            // B2-3 fix: only record connection metric for genuinely new registrations.
-            // Duplicate SUBSCRIBE (same clientId+topic) on the same connection would otherwise
-            // increment activeConsumers without a matching decrement on unregister.
-            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group);
-            if (isNew) {
-                metrics.recordConsumerConnection();
+            if (isLegacy) {
+                // Legacy client - multi-topic subscription
+                handleLegacySubscribe(clientId, message, json);
             } else {
-                log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} — skipping activeConsumers increment",
-                        clientId, topic, group);
+                // Modern client - single topic subscription
+                handleModernSubscribe(clientId, message, json);
             }
-
-            log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
-
-            // Send ACK
-            BrokerMessage ack = new BrokerMessage(
-                BrokerMessage.MessageType.ACK,
-                message.getMessageId(),
-                new byte[0]
-            );
-
-            log.debug("Sending ACK to {}: type={}, messageId={}",
-                     clientId, ack.getType(), ack.getMessageId());
-
-            server.send(clientId, ack).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send ACK to {}", clientId, ex);
-                } else {
-                    log.info("Sent ACK to {} for SUBSCRIBE", clientId);
-                }
-            });
 
         } catch (Exception e) {
             log.error("Error handling SUBSCRIBE from {}", clientId, e);
         }
+    }
+
+    /**
+     * Handle modern SUBSCRIBE: single topic, explicit group
+     */
+    private void handleModernSubscribe(String clientId, BrokerMessage message, JsonNode json) {
+        String topic = json.get("topic").asText();
+        String group = json.get("group").asText();
+
+        log.info("Modern client {} subscribed: topic={}, group={}", clientId, topic, group);
+
+        // Register consumer for message delivery.
+        // B2-3 fix: only record connection metric for genuinely new registrations.
+        // Duplicate SUBSCRIBE (same clientId+topic) on the same connection would otherwise
+        // increment activeConsumers without a matching decrement on unregister.
+        boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group);
+        if (isNew) {
+            metrics.recordConsumerConnection();
+        } else {
+            log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} — skipping activeConsumers increment",
+                    clientId, topic, group);
+        }
+
+        log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
+
+        // Send ACK (modern client)
+        sendSubscribeAck(clientId, message, false);  // false = not legacy
+    }
+
+    /**
+     * Handle legacy SUBSCRIBE: multiple topics based on serviceName
+     */
+    private void handleLegacySubscribe(String clientId, BrokerMessage message, JsonNode json) {
+        String serviceName = json.get("serviceName").asText();
+
+        if (!legacyClientConfig.isEnabled()) {
+            log.warn("Legacy client support disabled, rejecting registration from service: {}", serviceName);
+            return;
+        }
+
+        java.util.List<String> topics = legacyClientConfig.getTopicsForService(serviceName);
+        if (topics.isEmpty()) {
+            log.error("Unknown legacy service: {}. No topics configured.", serviceName);
+            return;
+        }
+
+        log.info("Legacy client {} (service={}) subscribing to {} topics: {}",
+                clientId, serviceName, topics.size(), topics);
+
+        // Register consumer for ALL topics (serviceName is used as the consumer group)
+        // Mark as legacy (isLegacy=true) so delivery pipeline uses multi-topic merge
+        int newRegistrations = 0;
+        for (String topic : topics) {
+            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, serviceName, true);
+            if (isNew) {
+                newRegistrations++;
+            }
+            log.info("Registered legacy consumer {} for topic={}, group={}",
+                    clientId, topic, serviceName);
+        }
+
+        // Record metrics only for new registrations
+        for (int i = 0; i < newRegistrations; i++) {
+            metrics.recordConsumerConnection();
+        }
+
+        log.info("Legacy client {} registered for {} topics (service={})",
+                clientId, topics.size(), serviceName);
+
+        // Send ACK (will be handled by sendSubscribeAck based on client type)
+        sendSubscribeAck(clientId, message, true);  // true = isLegacy
+    }
+
+    /**
+     * Send SUBSCRIBE acknowledgment
+     * @param isLegacy true if client is using legacy Event protocol
+     */
+    private void sendSubscribeAck(String clientId, BrokerMessage message, boolean isLegacy) {
+        // Legacy clients don't expect SUBSCRIBE ACK in their protocol
+        // They will start receiving BATCH events via scheduled delivery
+        if (isLegacy) {
+            log.debug("Legacy client registered, no SUBSCRIBE ACK sent (legacy protocol doesn't expect it)");
+            return;
+        }
+
+        // Modern client: send BrokerMessage ACK
+        BrokerMessage ack = new BrokerMessage(
+            BrokerMessage.MessageType.ACK,
+            message.getMessageId(),
+            new byte[0]
+        );
+
+        log.debug("Sending ACK to {}: type={}, messageId={}",
+                 clientId, ack.getType(), ack.getMessageId());
+
+        server.send(clientId, ack).whenComplete((v, ex) -> {
+            if (ex != null) {
+                log.error("Failed to send ACK to {}", clientId, ex);
+            } else {
+                log.info("Sent ACK to {} for SUBSCRIBE", clientId);
+            }
+        });
     }
 
     /**
@@ -461,11 +547,28 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         try {
             // MULTI-GROUP FIX: Parse both topic and group from payload
             // Format: [topicLen:4][topic:var][groupLen:4][group:var]
+            // Special case: Empty payload = legacy startup READY_ACK
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
+
+            // Handle empty payload for legacy startup READY_ACK
+            if (buffer.remaining() == 0) {
+                log.info("📥 READY_ACK for STARTUP from legacy client: {} (empty payload)", clientId);
+                remoteConsumers.markLegacyConsumerReady(clientId);
+                log.info("✅ Legacy consumer {} marked as READY (can now receive data)", clientId);
+
+                // Send ACK back to consumer
+                BrokerMessage ack = new BrokerMessage(
+                    BrokerMessage.MessageType.ACK,
+                    message.getMessageId(),
+                    new byte[0]
+                );
+                server.send(clientId, ack);
+                return;
+            }
 
             // SECURITY FIX (BROKER-2): Validate payload size before reading
             if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
-                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8)",
+                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8 or 0)",
                          clientId, buffer.remaining());
                 server.closeConnection(clientId);
                 return;
@@ -524,8 +627,35 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
 
-            // Delegate to DataRefreshManager with stable identifier
-            dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
+            // Check if this is startup READY_ACK or refresh READY_ACK
+            boolean isRefreshActive = topic != null && !topic.isEmpty() &&
+                    dataRefreshManager.isRefreshActive(topic);
+
+            if (isRefreshActive) {
+                // Refresh READY_ACK - delegate to DataRefreshManager
+                log.info("📥 READY_ACK for REFRESH from client: {} topic: {} group: {}",
+                        clientId, topic, group);
+                dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
+            } else {
+                // Startup READY_ACK - mark consumer as ready
+                log.info("📥 READY_ACK for STARTUP from client: {} topic: {} group: {}",
+                        clientId, topic, group);
+
+                // Determine if this is a legacy or modern consumer
+                String consumerKey = clientId + ":" + topic + ":" + group;
+                boolean isLegacy = remoteConsumers.isLegacyConsumer(consumerKey);
+
+                if (isLegacy || topic.isEmpty()) {
+                    // Legacy consumer - mark entire client as ready
+                    remoteConsumers.markLegacyConsumerReady(clientId);
+                    log.info("✅ Legacy consumer {} marked as READY (can now receive data)", clientId);
+                } else {
+                    // Modern consumer - mark specific topic as ready
+                    remoteConsumers.markModernConsumerTopicReady(clientId, topic);
+                    log.info("✅ Modern consumer {} marked as READY for topic {} (can now receive data)",
+                            clientId, topic);
+                }
+            }
 
             // Send ACK back to consumer to acknowledge receipt
             BrokerMessage ack = new BrokerMessage(
@@ -553,6 +683,12 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
      */
     private void handleBatchAck(String clientId, BrokerMessage message) {
         try {
+            // Legacy client detection: Empty payload indicates legacy merged batch ACK
+            if (message.getPayload().length == 0) {
+                handleLegacyBatchAck(clientId);
+                return;
+            }
+
             // MULTI-GROUP FIX: Parse both topic and group from payload
             // Format: [topicLen:4][topic:var][groupLen:4][group:var]
             java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
@@ -628,6 +764,39 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         } catch (Exception e) {
             log.error("Error handling BATCH_ACK from {}", clientId, e);
         }
+    }
+
+    /**
+     * Handle BATCH_ACK from legacy client (merged batch from multiple topics).
+     * Legacy clients send empty-payload ACK which gets resolved to BATCH_ACK by LegacyConnectionState.
+     *
+     * @param clientId The client ID that sent the ACK
+     */
+    private void handleLegacyBatchAck(String clientId) {
+        log.debug("Received legacy BATCH_ACK from client: {}", clientId);
+
+        // Look up legacy consumers to find the group
+        java.util.List<RemoteConsumerRegistry.RemoteConsumer> legacyConsumers =
+                remoteConsumers.getLegacyConsumersForClient(clientId);
+
+        if (legacyConsumers.isEmpty()) {
+            log.warn("Received legacy BATCH_ACK from unknown client: {}", clientId);
+            return;
+        }
+
+        // All legacy consumers for a client share the same group (serviceName)
+        String group = legacyConsumers.get(0).getGroup();
+
+        log.debug("Routing legacy BATCH_ACK to group: {}", group);
+
+        // Offload ACK processing to dedicated executor
+        ackExecutor.execute(() -> {
+            try {
+                remoteConsumers.handleLegacyBatchAck(clientId, group);
+            } catch (Exception e) {
+                log.error("Error processing legacy BATCH_ACK from {}", clientId, e);
+            }
+        });
     }
 
     /**

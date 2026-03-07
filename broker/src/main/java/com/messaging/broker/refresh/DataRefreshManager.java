@@ -800,6 +800,13 @@ public class DataRefreshManager {
     }
 
     /**
+     * Check if a refresh is active for a specific topic
+     */
+    public boolean isRefreshActive(String topic) {
+        return activeRefreshes.containsKey(topic);
+    }
+
+    /**
      * Get current refresh ID for metrics tracking
      */
     public String getCurrentRefreshId() {
