@@ -525,21 +525,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // - clientId for triggering replay
             dataRefreshManager.handleResetAck(consumerGroupTopic, clientId, topic);
 
-            // Send ACK back to consumer to acknowledge receipt
-            BrokerMessage ack = new BrokerMessage(
-                BrokerMessage.MessageType.ACK,
-                message.getMessageId(),
-                new byte[0]
-            );
-
-            server.send(clientId, ack).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send RESET ACK to {}", clientId, ex);
-                } else {
-                    log.debug("Sent ACK to {} for RESET", clientId);
-                }
-            });
-
+            // LEGACY FIX: Do NOT send ACK back to consumer
+            // Legacy clients disconnect when receiving unexpected ACK after RESET_ACK
+            log.debug("RESET_ACK processed for {} - no ACK sent (legacy protocol compatibility)", clientId);
 
         } catch (Exception e) {
             log.error("Error handling RESET from {}", clientId, e);
@@ -562,13 +550,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 remoteConsumers.markLegacyConsumerReady(clientId);
                 log.info("✅ Legacy consumer {} marked as READY (can now receive data)", clientId);
 
-                // Send ACK back to consumer
-                BrokerMessage ack = new BrokerMessage(
-                    BrokerMessage.MessageType.ACK,
-                    message.getMessageId(),
-                    new byte[0]
-                );
-                server.send(clientId, ack);
+                // LEGACY FIX: Do NOT send ACK back - legacy clients disconnect when receiving unexpected ACK
+                // They are now ready and will receive data when available
+                log.debug("Legacy client {} ready - no ACK sent (legacy protocol)", clientId);
                 return;
             }
 
@@ -663,20 +647,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 }
             }
 
-            // Send ACK back to consumer to acknowledge receipt
-            BrokerMessage ack = new BrokerMessage(
-                BrokerMessage.MessageType.ACK,
-                message.getMessageId(),
-                new byte[0]
-            );
-
-            server.send(clientId, ack).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send READY ACK to {}", clientId, ex);
-                } else {
-                    log.debug("Sent ACK to {} for READY", clientId);
-                }
-            });
+            // LEGACY FIX: Do NOT send ACK back to consumer
+            // Legacy clients disconnect when receiving unexpected ACK after READY
+            log.debug("Consumer {} marked as READY - no ACK sent (legacy protocol compatibility)", clientId);
 
         } catch (Exception e) {
             log.error("Error handling READY from {}", clientId, e);
