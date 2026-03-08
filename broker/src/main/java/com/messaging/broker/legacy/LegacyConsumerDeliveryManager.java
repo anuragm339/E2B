@@ -297,9 +297,12 @@ public class LegacyConsumerDeliveryManager {
             try {
                 java.io.File[] files = topicDir.toFile().listFiles();
                 if (files != null && files.length > 0) {
-                    log.info("📂 [PRICE-QUOTE] Files in {}: {}", topicDir,
-                             java.util.Arrays.stream(files).map(java.io.File::getName)
-                                    .collect(java.util.stream.Collectors.joining(", ")));
+                    String fileDetails = java.util.Arrays.stream(files)
+                            .map(f -> String.format("%s (%s)",
+                                    f.getName(),
+                                    formatFileSize(f.length())))
+                            .collect(java.util.stream.Collectors.joining(", "));
+                    log.info("📂 [PRICE-QUOTE] Files in {}: {}", topicDir, fileDetails);
                 } else {
                     log.warn("⚠️ [PRICE-QUOTE] Topic directory is empty: {}", topicDir);
                 }
@@ -321,6 +324,21 @@ public class LegacyConsumerDeliveryManager {
             log.debug("✅ [PRICE-QUOTE] Found index file: {}", indexPath);
         }
         return indexPath;
+    }
+
+    /**
+     * Format file size in human-readable format
+     */
+    private String formatFileSize(long bytes) {
+        if (bytes < 1024) {
+            return bytes + "B";
+        } else if (bytes < 1024 * 1024) {
+            return String.format("%.1fKB", bytes / 1024.0);
+        } else if (bytes < 1024 * 1024 * 1024) {
+            return String.format("%.1fMB", bytes / (1024.0 * 1024));
+        } else {
+            return String.format("%.1fGB", bytes / (1024.0 * 1024 * 1024));
+        }
     }
 
     /**
