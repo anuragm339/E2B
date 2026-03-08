@@ -66,8 +66,16 @@ public class LegacyConsumerDeliveryManager {
     public MergedBatch buildMergedBatch(List<String> topics,
                                         String consumerGroup,
                                         long maxBytes) throws MessagingException {
-        log.debug("Building merged batch: topics={}, group={}, maxBytes={}",
-                topics, consumerGroup, maxBytes);
+        // Enable detailed logging only for price-quote consumer group
+        boolean debugPriceQuote = consumerGroup != null && consumerGroup.contains("price-quote");
+
+        if (debugPriceQuote) {
+            log.info("🔍 [PRICE-QUOTE] Building merged batch: topics={}, group={}, maxBytes={}",
+                    topics, consumerGroup, maxBytes);
+        } else {
+            log.debug("Building merged batch: topics={}, group={}, maxBytes={}",
+                    topics, consumerGroup, maxBytes);
+        }
 
         if (topics == null || topics.isEmpty()) {
             log.warn("No topics provided for merge");
@@ -102,45 +110,63 @@ public class LegacyConsumerDeliveryManager {
                     long startOffset;
                     if (committedOffset < 0) {
                         startOffset = earliestOffset;
-                        log.info("📍 Topic {} - No committed offset, starting from earliest: {} (current: {})",
-                                topic, startOffset, currentOffset);
+                        if (debugPriceQuote) {
+                            log.info("📍 [PRICE-QUOTE] Topic {} - No committed offset, starting from earliest: {} (current: {})",
+                                    topic, startOffset, currentOffset);
+                        }
                     } else {
                         startOffset = committedOffset + 1; // Next offset after last committed
-                        log.info("📍 Topic {} - Committed offset: {}, starting from: {} (earliest: {}, current: {})",
-                                topic, committedOffset, startOffset, earliestOffset, currentOffset);
+                        if (debugPriceQuote) {
+                            log.info("📍 [PRICE-QUOTE] Topic {} - Committed offset: {}, starting from: {} (earliest: {}, current: {})",
+                                    topic, committedOffset, startOffset, earliestOffset, currentOffset);
+                        }
                     }
 
                     // Validate offset range
                     if (currentOffset < 0) {
-                        log.warn("⚠️ Topic {} - No data available (currentOffset: -1)", topic);
+                        if (debugPriceQuote) {
+                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - No data available (currentOffset: -1)", topic);
+                        }
                         continue;
                     }
 
                     if (startOffset > currentOffset) {
-                        log.warn("⚠️ Topic {} - startOffset ({}) beyond currentOffset ({}) - no new data",
-                                topic, startOffset, currentOffset);
+                        if (debugPriceQuote) {
+                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - startOffset ({}) beyond currentOffset ({}) - no new data",
+                                    topic, startOffset, currentOffset);
+                        }
                         continue;
                     }
 
                     // Create cursor for this topic
-                    log.debug("Creating cursor for topic {} from offset {}", topic, startOffset);
-                    TopicCursor cursor = createCursor(topic, startOffset);
+                    if (debugPriceQuote) {
+                        log.debug("Creating cursor for topic {} from offset {}", topic, startOffset);
+                    }
+                    TopicCursor cursor = createCursor(topic, startOffset, debugPriceQuote);
 
                     if (cursor == null) {
-                        log.warn("⚠️ Topic {} - createCursor returned NULL (startOffset: {})", topic, startOffset);
+                        if (debugPriceQuote) {
+                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - createCursor returned NULL (startOffset: {})", topic, startOffset);
+                        }
                         continue;
                     }
 
                     boolean hasMore = cursor.hasMore();
-                    log.debug("Topic {} - cursor.hasMore() = {}", topic, hasMore);
+                    if (debugPriceQuote) {
+                        log.debug("Topic {} - cursor.hasMore() = {}", topic, hasMore);
+                    }
 
                     if (hasMore) {
                         cursors.add(cursor);
                         heap.add(cursor);
-                        log.info("✅ Added cursor: topic={}, startOffset={}", topic, startOffset);
+                        if (debugPriceQuote) {
+                            log.info("✅ [PRICE-QUOTE] Added cursor: topic={}, startOffset={}", topic, startOffset);
+                        }
                     } else {
-                        log.warn("⚠️ Topic {} - cursor.hasMore() returned false (startOffset: {}, current: {})",
-                                topic, startOffset, currentOffset);
+                        if (debugPriceQuote) {
+                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - cursor.hasMore() returned false (startOffset: {}, current: {})",
+                                    topic, startOffset, currentOffset);
+                        }
                         cursor.close();
                     }
                 } catch (IOException e) {
@@ -150,14 +176,20 @@ public class LegacyConsumerDeliveryManager {
             }
 
             if (heap.isEmpty()) {
-                log.warn("⚠️ EMPTY HEAP - No cursors available after processing {} topics (group: {}). " +
-                         "Check if: (1) startOffset > latestOffset, (2) createCursor() failed, " +
-                         "(3) cursor.hasMore() returned false",
-                         topics.size(), consumerGroup);
+                if (debugPriceQuote) {
+                    log.warn("⚠️ [PRICE-QUOTE] EMPTY HEAP - No cursors available after processing {} topics (group: {}). " +
+                             "Check if: (1) startOffset > currentOffset, (2) createCursor() failed, " +
+                             "(3) cursor.hasMore() returned false",
+                             topics.size(), consumerGroup);
+                } else {
+                    log.debug("No cursors available - all topics exhausted");
+                }
                 return batch;
             }
 
-            log.info("✅ K-way merge starting with {} cursors from {} topics", heap.size(), topics.size());
+            if (debugPriceQuote) {
+                log.info("✅ [PRICE-QUOTE] K-way merge starting with {} cursors from {} topics", heap.size(), topics.size());
+            }
 
             // 2. K-way merge using min-heap
             while (!heap.isEmpty() && batch.getTotalBytes() < maxBytes) {
@@ -213,21 +245,29 @@ public class LegacyConsumerDeliveryManager {
     /**
      * Create a TopicCursor for reading index entries from a topic.
      */
-    private TopicCursor createCursor(String topic, long startOffset) throws IOException {
+    private TopicCursor createCursor(String topic, long startOffset, boolean debugPriceQuote) throws IOException {
         // Find the segment containing startOffset
         // For simplicity, we'll use the active segment (partition 0)
         // In production, we'd query SegmentManager for the correct segment
 
-        log.debug("createCursor: topic={}, startOffset={}", topic, startOffset);
-        Path indexPath = findIndexPath(topic, startOffset);
+        if (debugPriceQuote) {
+            log.debug("[PRICE-QUOTE] createCursor: topic={}, startOffset={}", topic, startOffset);
+        }
+        Path indexPath = findIndexPath(topic, startOffset, debugPriceQuote);
         if (indexPath == null) {
-            log.warn("❌ No index file found for topic: {}, startOffset={}", topic, startOffset);
+            if (debugPriceQuote) {
+                log.warn("❌ [PRICE-QUOTE] No index file found for topic: {}, startOffset={}", topic, startOffset);
+            }
             return null;
         }
 
-        log.debug("✅ Found index path: {}", indexPath);
+        if (debugPriceQuote) {
+            log.debug("✅ [PRICE-QUOTE] Found index path: {}", indexPath);
+        }
         TopicCursor cursor = new TopicCursor(topic, indexPath, startOffset);
-        log.debug("TopicCursor created for topic: {}", topic);
+        if (debugPriceQuote) {
+            log.debug("[PRICE-QUOTE] TopicCursor created for topic: {}", topic);
+        }
         return cursor;
     }
 
@@ -235,41 +275,51 @@ public class LegacyConsumerDeliveryManager {
      * Find the index file path for a topic at the given offset.
      * This is a simplified version - in production, we'd use SegmentManager.
      */
-    private Path findIndexPath(String topic, long startOffset) {
+    private Path findIndexPath(String topic, long startOffset, boolean debugPriceQuote) {
         // Format: {dataDir}/{topic}/partition-0/00000000000000000000.index
         // For now, assume there's only one segment (baseOffset=0)
         // TODO: Query SegmentManager to find correct segment
 
         Path topicDir = Paths.get(dataDir, topic, "partition-0");
-        log.debug("Looking for index in directory: {}", topicDir);
+        if (debugPriceQuote) {
+            log.debug("[PRICE-QUOTE] Looking for index in directory: {}", topicDir);
+        }
 
         if (!topicDir.toFile().exists()) {
-            log.warn("❌ Topic directory does not exist: {}", topicDir);
+            if (debugPriceQuote) {
+                log.warn("❌ [PRICE-QUOTE] Topic directory does not exist: {}", topicDir);
+            }
             return null;
         }
 
         // List all files in the directory for debugging
-        try {
-            java.io.File[] files = topicDir.toFile().listFiles();
-            if (files != null && files.length > 0) {
-                log.debug("Files in {}: {}", topicDir,
-                         java.util.Arrays.stream(files).map(java.io.File::getName)
-                                .collect(java.util.stream.Collectors.joining(", ")));
-            } else {
-                log.warn("⚠️ Topic directory is empty: {}", topicDir);
+        if (debugPriceQuote) {
+            try {
+                java.io.File[] files = topicDir.toFile().listFiles();
+                if (files != null && files.length > 0) {
+                    log.info("📂 [PRICE-QUOTE] Files in {}: {}", topicDir,
+                             java.util.Arrays.stream(files).map(java.io.File::getName)
+                                    .collect(java.util.stream.Collectors.joining(", ")));
+                } else {
+                    log.warn("⚠️ [PRICE-QUOTE] Topic directory is empty: {}", topicDir);
+                }
+            } catch (Exception e) {
+                log.error("[PRICE-QUOTE] Error listing files in {}", topicDir, e);
             }
-        } catch (Exception e) {
-            log.error("Error listing files in {}", topicDir, e);
         }
 
         Path indexPath = topicDir.resolve("00000000000000000000.index");
 
         if (!indexPath.toFile().exists()) {
-            log.warn("❌ Index file not found: {} (expected hardcoded baseOffset=0)", indexPath);
+            if (debugPriceQuote) {
+                log.warn("❌ [PRICE-QUOTE] Index file not found: {} (expected hardcoded baseOffset=0)", indexPath);
+            }
             return null;
         }
 
-        log.debug("✅ Found index file: {}", indexPath);
+        if (debugPriceQuote) {
+            log.debug("✅ [PRICE-QUOTE] Found index file: {}", indexPath);
+        }
         return indexPath;
     }
 
