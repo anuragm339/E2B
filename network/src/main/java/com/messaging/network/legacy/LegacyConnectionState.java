@@ -55,6 +55,14 @@ public class LegacyConnectionState extends ChannelDuplexHandler {
                 super.channelRead(ctx, resolvedMsg);
                 return;
             }
+
+            // Legacy client backwards compatibility: Some clients send READY instead of ACK
+            // Treat READY from client as acknowledgment of broker's READY message
+            if (brokerMsg.getType() == BrokerMessage.MessageType.READY) {
+                BrokerMessage resolvedMsg = resolveReadyAsAck(brokerMsg);
+                super.channelRead(ctx, resolvedMsg);
+                return;
+            }
         }
 
         // Continue with read
@@ -111,6 +119,36 @@ public class LegacyConnectionState extends ChannelDuplexHandler {
         resolvedMsg.setType(expectation.expectedType);
         resolvedMsg.setMessageId(genericAck.getMessageId());
         resolvedMsg.setPayload(genericAck.getPayload());
+
+        return resolvedMsg;
+    }
+
+    /**
+     * Legacy backwards compatibility: Treat READY from client as READY_ACK
+     * Some old clients send READY instead of ACK when acknowledging broker's READY message
+     */
+    private BrokerMessage resolveReadyAsAck(BrokerMessage readyMsg) {
+        if (pendingAcks.isEmpty()) {
+            log.debug("Received READY from client but no pending expectations - treating as READY_ACK");
+            // Still convert to READY_ACK even if no pending expectations
+            BrokerMessage resolvedMsg = new BrokerMessage();
+            resolvedMsg.setType(BrokerMessage.MessageType.READY_ACK);
+            resolvedMsg.setMessageId(readyMsg.getMessageId());
+            resolvedMsg.setPayload(readyMsg.getPayload());
+            return resolvedMsg;
+        }
+
+        // Pop the oldest expectation (FIFO)
+        AckExpectation expectation = pendingAcks.removeFirst();
+
+        log.debug("Legacy client sent READY (expected {}), converting to READY_ACK, remaining pending: {}",
+                expectation.expectedType, pendingAcks.size());
+
+        // Always convert READY to READY_ACK for backwards compatibility
+        BrokerMessage resolvedMsg = new BrokerMessage();
+        resolvedMsg.setType(BrokerMessage.MessageType.READY_ACK);
+        resolvedMsg.setMessageId(readyMsg.getMessageId());
+        resolvedMsg.setPayload(readyMsg.getPayload());
 
         return resolvedMsg;
     }

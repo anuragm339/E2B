@@ -196,6 +196,12 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 handleResetAck(clientId, message);
                 break;
 
+            case READY:
+                // Legacy clients send READY instead of READY_ACK - treat as READY_ACK for backwards compatibility
+                log.debug("Legacy client {} sent READY (expected READY_ACK) - treating as READY_ACK", clientId);
+                handleReadyAck(clientId, message);
+                break;
+
             case READY_ACK:
                 handleReadyAck(clientId, message);
                 break;
