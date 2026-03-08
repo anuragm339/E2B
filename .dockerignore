@@ -1,50 +1,38 @@
-# Build artifacts
-**/build/
-**/target/
-**/.gradle/
-**/bin/
-**/out/
+# Gradle
+.gradle/
+gradle/
+gradlew
+gradlew.bat
 
-# Data directories
-data/
-data-local/
-**/data/
-**/data-*/
+# Build output (except the final JAR)
+build/classes/
+build/generated/
+build/reports/
+build/test-results/
+build/tmp/
 
-# IDE files
+# IDE
 .idea/
-.vscode/
 *.iml
-*.ipr
-*.iws
-.classpath
+.vscode/
 .project
+.classpath
 .settings/
-
-# OS files
-.DS_Store
-Thumbs.db
-*.swp
-*.swo
-*~
-
-# Logs
-*.log
-logs/
 
 # Git
 .git/
 .gitignore
+.gitattributes
 
 # Documentation
 *.md
-docs/
+!README.md
 
 # Test files
-**/test/
-**/*Test.java
+**/src/test/
 
-# Docker files
-Dockerfile*
-docker-compose*.yml
-.dockerignore
+# Misc
+*.log
+.DS_Store
+MESSAGE_RECORD_API_MAPPING.md
+qodana.yaml
