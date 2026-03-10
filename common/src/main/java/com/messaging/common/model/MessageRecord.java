@@ -40,8 +40,6 @@ public class MessageRecord {
     @JsonProperty("contentType")
     private String contentType;    // e.g., "application/json"
 
-    private int crc32;             // Checksum
-
     public MessageRecord() {
     }
 
@@ -146,14 +144,6 @@ public class MessageRecord {
 
     public void setCreatedAt(Instant createdAt) {
         this.createdAt = createdAt;
-    }
-
-    public int getCrc32() {
-        return crc32;
-    }
-
-    public void setCrc32(int crc32) {
-        this.crc32 = crc32;
     }
 
     @Override
