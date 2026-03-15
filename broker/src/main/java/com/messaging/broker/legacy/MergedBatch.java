@@ -27,11 +27,15 @@ import java.util.Map;
 public class MergedBatch {
     private final List<MessageRecord> messages;
     private final Map<String, Long> maxOffsetPerTopic;
+    private final Map<String, Long> bytesPerTopic;
+    private final Map<String, Integer> messageCountPerTopic;
     private long totalBytes;
 
     public MergedBatch() {
         this.messages = new ArrayList<>();
         this.maxOffsetPerTopic = new HashMap<>();
+        this.bytesPerTopic = new HashMap<>();
+        this.messageCountPerTopic = new HashMap<>();
         this.totalBytes = 0;
     }
 
@@ -40,7 +44,10 @@ public class MergedBatch {
      */
     public void add(String topic, MessageRecord msg) {
         messages.add(msg);
-        totalBytes += estimateMessageSize(msg);
+        long msgBytes = estimateMessageSize(msg);
+        totalBytes += msgBytes;
+        bytesPerTopic.merge(topic, msgBytes, Long::sum);
+        messageCountPerTopic.merge(topic, 1, Integer::sum);
 
         // Track highest offset per topic for ACK
         maxOffsetPerTopic.merge(topic, msg.getOffset(), Math::max);
@@ -63,6 +70,14 @@ public class MergedBatch {
 
     public Map<String, Long> getMaxOffsetPerTopic() {
         return maxOffsetPerTopic;
+    }
+
+    public Map<String, Long> getBytesPerTopic() {
+        return bytesPerTopic;
+    }
+
+    public Map<String, Integer> getMessageCountPerTopic() {
+        return messageCountPerTopic;
     }
 
     public long getTotalBytes() {

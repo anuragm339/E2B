@@ -19,13 +19,16 @@ import java.nio.file.StandardOpenOption;
 public class TopicCursor implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(TopicCursor.class);
 
-    private static final int FILE_HEADER_SIZE = 6;  // magic:4 + version:2
-    private static final int INDEX_ENTRY_SIZE = 20; // offset:8 + logPos:4 + size:4 + crc32:4
+    private static final int FILE_HEADER_SIZE = 6;         // magic:4 + version:2
+    private static final int INDEX_ENTRY_SIZE_V1 = 20;     // v1 (legacy): offset:8 + logPos:4 + size:4 + crc32:4
+    private static final int INDEX_ENTRY_SIZE_V2 = 16;     // v2 (current): offset:8 + logPos:4 + size:4
+    private static final short INDEX_FORMAT_VERSION_V2 = 2;
 
     private final String topic;
     private final FileChannel indexChannel;
     private final long indexFileSize;
     private final long startOffset;
+    private final int indexEntrySize;    // 16 (v2) or 20 (v1), detected from file header
 
     private long indexPosition;          // Current position in index file
     private IndexEntry peeked;           // Next entry (cached)
@@ -40,6 +43,9 @@ public class TopicCursor implements AutoCloseable {
         this.indexChannel = FileChannel.open(indexPath, StandardOpenOption.READ);
         this.indexFileSize = indexChannel.size();
 
+        // Detect index version from header to use correct entry size
+        this.indexEntrySize = detectIndexEntrySize();
+
         // Skip header
         this.indexPosition = FILE_HEADER_SIZE;
 
@@ -48,6 +54,25 @@ public class TopicCursor implements AutoCloseable {
 
         // Position to the first entry >= startOffset
         seekToOffset(startOffset);
+    }
+
+    /**
+     * Read the 2-byte version field from the file header and return the correct entry size.
+     * Header format: magic:4 + version:2 (matches Segment.java FILE_HEADER_SIZE=6)
+     */
+    private int detectIndexEntrySize() throws IOException {
+        if (indexFileSize < FILE_HEADER_SIZE) {
+            log.warn("TopicCursor: index file too small to read header for topic={}, defaulting to v2 (16-byte)", topic);
+            return INDEX_ENTRY_SIZE_V2;
+        }
+        ByteBuffer header = ByteBuffer.allocate(FILE_HEADER_SIZE);
+        indexChannel.read(header, 0);
+        header.flip();
+        header.getInt(); // skip magic bytes
+        short version = header.getShort();
+        int size = (version >= INDEX_FORMAT_VERSION_V2) ? INDEX_ENTRY_SIZE_V2 : INDEX_ENTRY_SIZE_V1;
+        log.debug("TopicCursor: topic={}, index version={}, entry size={}", topic, version, size);
+        return size;
     }
 
     /**
@@ -109,17 +134,17 @@ public class TopicCursor implements AutoCloseable {
      * Check if there are more entries in the index file
      */
     private boolean hasMoreEntries() {
-        return indexPosition + INDEX_ENTRY_SIZE <= indexFileSize;
+        return indexPosition + indexEntrySize <= indexFileSize;
     }
 
     /**
      * Read the next index entry from the file
      */
     private IndexEntry readNextEntry() throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+        ByteBuffer buffer = ByteBuffer.allocate(indexEntrySize);
         int bytesRead = indexChannel.read(buffer, indexPosition);
 
-        if (bytesRead < INDEX_ENTRY_SIZE) {
+        if (bytesRead < indexEntrySize) {
             return null;
         }
 
@@ -127,9 +152,9 @@ public class TopicCursor implements AutoCloseable {
         long offset = buffer.getLong();
         int logPosition = buffer.getInt();
         int recordSize = buffer.getInt();
-        int crc32 = buffer.getInt();
+        int crc32 = (indexEntrySize == INDEX_ENTRY_SIZE_V1) ? buffer.getInt() : 0; // only v1 has crc32
 
-        indexPosition += INDEX_ENTRY_SIZE;
+        indexPosition += indexEntrySize;
 
         return new IndexEntry(offset, logPosition, recordSize, crc32);
     }

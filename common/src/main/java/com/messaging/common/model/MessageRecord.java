@@ -3,6 +3,8 @@ package com.messaging.common.model;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonSetter;
 import com.fasterxml.jackson.annotation.Nulls;
+import com.fasterxml.jackson.annotation.JsonAlias;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import java.time.Instant;
 import java.util.Objects;
 
@@ -18,15 +20,16 @@ import java.util.Objects;
  * - API "data" → data (if null, eventType = DELETE)
  * - API "contentType" → contentType
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class MessageRecord {
     private long offset;           // Internal, auto-assigned by broker
 
-    @JsonProperty("type")
+    @JsonProperty("topic")
     private String topic;
 
     private int partition;
 
-    @JsonProperty("key")
+    @JsonProperty("msgKey")
     private String msgKey;         // Business key for compaction
 
     private EventType eventType;   // MESSAGE or DELETE (auto-detected from data field)
@@ -35,6 +38,7 @@ public class MessageRecord {
     private String data;           // JSON payload (null for DELETE events)
 
     @JsonProperty("created")
+    @JsonAlias("createdAt")
     private Instant createdAt;
 
     @JsonProperty("contentType")

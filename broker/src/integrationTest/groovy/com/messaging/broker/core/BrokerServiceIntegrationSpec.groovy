@@ -3,9 +3,9 @@ package com.messaging.broker.core
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.messaging.broker.Application
 import com.messaging.broker.consumer.ConsumerOffsetTracker
-import com.messaging.broker.consumer.RemoteConsumerRegistry
-import com.messaging.broker.refresh.DataRefreshManager
-import com.messaging.broker.refresh.DataRefreshState
+import com.messaging.broker.consumer.ConsumerRegistry
+import com.messaging.broker.consumer.RefreshCoordinator
+import com.messaging.broker.consumer.RefreshState
 import com.messaging.common.api.StorageEngine
 import com.messaging.common.model.BrokerMessage
 import com.messaging.common.model.EventType
@@ -132,14 +132,14 @@ class BrokerServiceIntegrationSpec extends Specification {
         }
 
         when:
-        harness.dataRefreshManager.startRefresh("topic-3").get(3, TimeUnit.SECONDS)
+        harness.dataRefreshCoordinator.startRefresh("topic-3").get(3, TimeUnit.SECONDS)
 
         then:
         conditions.eventually {
             assert harness.received.any { it.type == BrokerMessage.MessageType.RESET }
         }
         conditions.eventually {
-            assert harness.dataRefreshManager.getRefreshStatus("topic-3").state == DataRefreshState.RESET_SENT
+            assert harness.dataRefreshCoordinator.getRefreshStatus("topic-3").state == RefreshState.RESET_SENT
         }
 
         when:
@@ -149,7 +149,7 @@ class BrokerServiceIntegrationSpec extends Specification {
 
         then:
         conditions.eventually {
-            assert harness.dataRefreshManager.getRefreshStatus("topic-3").state == DataRefreshState.REPLAYING
+            assert harness.dataRefreshCoordinator.getRefreshStatus("topic-3").state == RefreshState.REPLAYING
         }
 
         and:
@@ -164,8 +164,8 @@ class BrokerServiceIntegrationSpec extends Specification {
 
         then:
         conditions.eventually {
-            assert harness.dataRefreshManager.getRefreshStatus("topic-3") == null ||
-                harness.dataRefreshManager.getRefreshStatus("topic-3").state == DataRefreshState.COMPLETED
+            assert harness.dataRefreshCoordinator.getRefreshStatus("topic-3") == null ||
+                harness.dataRefreshCoordinator.getRefreshStatus("topic-3").state == RefreshState.COMPLETED
         }
 
         cleanup:
@@ -299,9 +299,9 @@ class BrokerServiceIntegrationSpec extends Specification {
         final int port
         final int httpPort
         final StorageEngine storage
-        final RemoteConsumerRegistry remoteConsumers
+        final ConsumerRegistry remoteConsumers
         final ConsumerOffsetTracker offsetTracker
-        final DataRefreshManager dataRefreshManager
+        final RefreshCoordinator dataRefreshCoordinator
         final HttpClient httpClient
 
         static AppHarness start(Path dataDir, Map<String, Object> extraProps = [:]) {
@@ -328,9 +328,9 @@ class BrokerServiceIntegrationSpec extends Specification {
             connection.onMessage { msg -> received.add(msg) }
 
             def storage = context.getBean(StorageEngine)
-            def remoteConsumers = context.getBean(RemoteConsumerRegistry)
+            def remoteConsumers = context.getBean(ConsumerRegistry)
             def offsetTracker = context.getBean(ConsumerOffsetTracker)
-            def dataRefreshManager = context.getBean(DataRefreshManager)
+            def dataRefreshCoordinator = context.getBean(RefreshCoordinator)
             def httpPort = context.getBean(EmbeddedServer).port
             def httpClient = HttpClient.newHttpClient()
 
@@ -344,7 +344,7 @@ class BrokerServiceIntegrationSpec extends Specification {
                 storage,
                 remoteConsumers,
                 offsetTracker,
-                dataRefreshManager,
+                dataRefreshCoordinator,
                 httpClient
             )
         }
@@ -357,9 +357,9 @@ class BrokerServiceIntegrationSpec extends Specification {
             int port,
             int httpPort,
             StorageEngine storage,
-            RemoteConsumerRegistry remoteConsumers,
+            ConsumerRegistry remoteConsumers,
             ConsumerOffsetTracker offsetTracker,
-            DataRefreshManager dataRefreshManager,
+            RefreshCoordinator dataRefreshCoordinator,
             HttpClient httpClient
         ) {
             this.context = context
@@ -371,7 +371,7 @@ class BrokerServiceIntegrationSpec extends Specification {
             this.storage = storage
             this.remoteConsumers = remoteConsumers
             this.offsetTracker = offsetTracker
-            this.dataRefreshManager = dataRefreshManager
+            this.dataRefreshCoordinator = dataRefreshCoordinator
             this.httpClient = httpClient
         }
 

@@ -8,15 +8,15 @@ import java.util.Map;
 import java.util.concurrent.*;
 
 /**
- * Fair scheduler with per-topic work queue bounds
- * Prevents hot topics from starving quieter ones
+ * Fair scheduler with per-topic work queue bounds.
  *
- * Each topic gets its own semaphore limiting max in-flight tasks.
- * If a topic's quota is exhausted, tasks for that topic are skipped
- * (not queued), allowing other topics to proceed.
+ * Prevents hot topics from starving quieter ones. Each topic gets its own
+ * semaphore limiting max in-flight tasks. If a topic's quota is exhausted,
+ * tasks for that topic are skipped instead of queued, allowing other topics
+ * to proceed.
  *
- * B11-5 OOM FIX: Tracks pending retry tasks per deliveryKey to prevent
- * unbounded recursive scheduling during DataRefresh saturation.
+ * Tracks one pending retry per delivery key to prevent unbounded recursive
+ * scheduling during refresh saturation.
  */
 @Singleton
 public class TopicFairScheduler {
@@ -24,7 +24,7 @@ public class TopicFairScheduler {
 
     private final ScheduledExecutorService scheduler;
     private final Map<String, Semaphore> topicSemaphores;
-    // B11-5 fix: Track pending retry tasks to prevent unbounded recursive scheduling
+    // Track pending retry tasks to prevent unbounded recursive scheduling.
     private final Map<String, ScheduledFuture<?>> pendingRetries;
     private final int maxInFlightPerTopic;
 
@@ -60,15 +60,15 @@ public class TopicFairScheduler {
     }
 
     /**
-     * B11-5 FIX: Schedule task with per-topic fairness and unique delivery key to prevent unbounded retries
+     * Schedule a task with per-topic fairness and a unique delivery key.
      *
-     * During DataRefresh, consumers are saturated and semaphore is full. Without retry tracking,
-     * each failed task recursively reschedules, creating exponential task buildup → heap OOM.
-     *
-     * This method tracks ONE pending retry per deliveryKey to prevent unbounded recursion.
+     * During refresh-driven backpressure, consumers can saturate the semaphore.
+     * Without retry tracking, each failed task can recursively reschedule and
+     * create unbounded task buildup. This method allows only one pending retry
+     * per delivery key.
      *
      * @param topic Topic name for fairness tracking (semaphore key)
-     * @param deliveryKey Unique key per consumer+topic (e.g., "clientId:topic")
+     * @param deliveryKey Unique key for the scheduled delivery task
      * @param task Task to execute
      * @param delay Delay before execution
      * @param unit Time unit for delay
@@ -92,8 +92,7 @@ public class TopicFairScheduler {
                     semaphore.release();
                 }
             } else {
-                // B11-5 FIX: No permit available — only reschedule if no retry already pending
-                // This prevents unbounded recursive scheduling during DataRefresh saturation
+                // No permit available: only reschedule if no retry is already pending.
                 ScheduledFuture<?> existingRetry = pendingRetries.get(deliveryKey);
                 if (existingRetry == null || existingRetry.isDone()) {
                     // No retry pending, schedule one

@@ -18,8 +18,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.zip.CRC32;
-
 /**
  * Represents a single segment file using FileChannel (no memory mapping)
  * Enables true zero-copy via Netty FileRegion
@@ -27,13 +25,16 @@ import java.util.zip.CRC32;
 public class Segment {
     private static final Logger log = LoggerFactory.getLogger(Segment.class);
 
-    // Unified format constants
-    private static final int INDEX_ENTRY_SIZE = 20; // offset:8 + logPosition:4 + recordSize:4 + crc32:4
+    // Segment format constants (index v2 = current 16-byte, index v1 = legacy 20-byte with CRC)
+    private static final int INDEX_ENTRY_SIZE = 16;        // v2: offset:8 + logPosition:4 + recordSize:4
+    private static final int INDEX_ENTRY_SIZE_LEGACY = 20; // v1 (legacy): same as v2 + crc32:4
     private static final int WRITE_BUFFER_SIZE = 16 * 1024; // 16KB reusable buffer
     private static final int FILE_HEADER_SIZE = 6; // magic:4 + version:2
     private static final byte[] LOG_MAGIC = "MLOG".getBytes(StandardCharsets.UTF_8);
     private static final byte[] INDEX_MAGIC = "MIDX".getBytes(StandardCharsets.UTF_8);
-    private static final short FORMAT_VERSION = 1;
+    private static final short FORMAT_VERSION = 1;          // Log file version (unchanged)
+    private static final short INDEX_FORMAT_VERSION = 2;    // New index format (16-byte entries)
+    private static final short INDEX_FORMAT_VERSION_LEGACY = 1; // Old index format (20-byte entries with CRC)
 
     private long baseOffset;
     private final Path logPath;
@@ -53,6 +54,7 @@ public class Segment {
     private long logPosition; // Current write position in log file
     private long recordCount; // Number of records actually in this segment (for dense indexing)
     private boolean active;
+    private final int effectiveIndexEntrySize; // INDEX_ENTRY_SIZE (v2) or INDEX_ENTRY_SIZE_LEGACY (v1)
 
     public Segment(Path logPath, Path indexPath, long baseOffset, long maxSize, String topic, int partition) throws StorageException {
         this.baseOffset = baseOffset;
@@ -79,8 +81,8 @@ public class Segment {
                     StandardOpenOption.WRITE,
                     StandardOpenOption.CREATE);
 
-            // Initialize files with headers if new, or validate existing headers
-            initializeOrValidateHeaders();
+            // Determine index entry size from file headers (v1=20 bytes legacy, v2=16 bytes current)
+            this.effectiveIndexEntrySize = initializeOrValidateHeaders();
 
             // Initialize write position from file size
             this.logPosition = logChannel.size();
@@ -104,17 +106,16 @@ public class Segment {
     /**
      * Initialize new files with headers or validate existing headers
      */
-    private void initializeOrValidateHeaders() throws StorageException {
+    private int initializeOrValidateHeaders() throws StorageException {
         try {
             long logSize = logChannel.size();
             long indexSize = indexChannel.size();
 
             if (logSize == 0 && indexSize == 0) {
-                // New files - write headers
                 writeFileHeaders();
+                return INDEX_ENTRY_SIZE; // new files always use v2 (16-byte entries)
             } else if (logSize >= FILE_HEADER_SIZE && indexSize >= FILE_HEADER_SIZE) {
-                // Existing files - validate headers
-                validateFileHeaders();
+                return validateFileHeaders();
             } else {
                 throw ExceptionLogger.logAndThrow(log,
                     StorageException.corruption("Corrupted segment files: log=" + logSize + "bytes, index=" + indexSize + "bytes")
@@ -148,14 +149,14 @@ public class Segment {
             // Write index header: [MIDX][version]
             ByteBuffer indexHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
             indexHeader.put(INDEX_MAGIC);
-            indexHeader.putShort(FORMAT_VERSION);
+            indexHeader.putShort(INDEX_FORMAT_VERSION); // v2 = 16-byte entries (no CRC)
             indexHeader.flip();
             indexChannel.write(indexHeader, 0);
 
             logChannel.force(false);
             indexChannel.force(false);
 
-            log.info("Initialized new segment files with unified format headers");
+            log.info("Initialized new segment files (index format v2, 16-byte entries)");
         } catch (IOException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.writeFailed(topic, partition, e)
@@ -167,7 +168,10 @@ public class Segment {
     /**
      * Validate file headers for existing segment files
      */
-    private void validateFileHeaders() throws StorageException {
+    /**
+     * @return the effective index entry size for this segment (16 for v2, 20 for legacy v1)
+     */
+    private int validateFileHeaders() throws StorageException {
         try {
             // Validate log header
             ByteBuffer logHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
@@ -217,17 +221,20 @@ public class Segment {
                         .withContext("actualMagic", new String(indexMagic, StandardCharsets.UTF_8)));
             }
 
-            if (indexVersion != FORMAT_VERSION) {
+            if (indexVersion == INDEX_FORMAT_VERSION_LEGACY) {
+                log.warn("Legacy index format (v1, 20-byte entries) detected for {}, reading with backward compatibility", indexPath);
+                return INDEX_ENTRY_SIZE_LEGACY;
+            } else if (indexVersion == INDEX_FORMAT_VERSION) {
+                return INDEX_ENTRY_SIZE;
+            } else {
                 throw ExceptionLogger.logAndThrow(log,
                     StorageException.corruption("Unsupported index file version")
                         .withTopic(topic)
                         .withPartition(partition)
                         .withSegmentPath(indexPath.toString())
-                        .withContext("expectedVersion", FORMAT_VERSION)
+                        .withContext("supportedVersions", "1 (legacy), 2 (current)")
                         .withContext("actualVersion", indexVersion));
             }
-
-            log.debug("Validated segment file headers: version {}", FORMAT_VERSION);
         } catch (IOException | MessagingException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.ioError("Failed to validate segment headers", e)
@@ -238,30 +245,41 @@ public class Segment {
     }
 
     /**
-     * Recover in-memory index by reading index file or scanning log
+     * Recover in-memory state (nextOffset, recordCount) from the index file.
+     * @throws StorageException if the index file is missing, empty, or unreadable
      */
-    private void recoverIndex() {
+    private void recoverIndex() throws StorageException {
         log.info("Recovering index for segment at baseOffset={}, logPosition={}", baseOffset, logPosition);
 
         try {
             long indexSize = indexChannel.size();
 
-            if (indexSize > 0) {
-                // Read index file into memory
+            if (indexSize > FILE_HEADER_SIZE) {
                 recoverFromIndexFile(indexSize);
             } else {
-                // No index file, scan log
-                recoverFromLogScan();
+                throw new StorageException(ErrorCode.STORAGE_INDEX_CORRUPTION,
+                        "Index file is empty for segment at baseOffset=" + baseOffset +
+                        ". Log records do not store offsets, so recovery without the index is not possible.")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(indexPath.toString());
             }
+        } catch (StorageException e) {
+            throw e;
         } catch (Exception e) {
-            log.error("Error recovering index, falling back to log scan", e);
-            recoverFromLogScan();
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.ioError("Unexpected error recovering index", e)
+                    .withTopic(topic)
+                    .withPartition(partition)
+                    .withSegmentPath(indexPath.toString()));
         }
     }
 
     /**
-     * Recover segment metadata from index file (unified format).
-     * Index entry: [offset:8][logPosition:4][recordSize:4][crc32:4]
+     * Recover segment metadata from the index file.
+     * Supports both current format (v2, 16-byte entries) and legacy format (v1, 20-byte entries with CRC32).
+     * Index entry v2: [offset:8][logPosition:4][recordSize:4]
+     * Index entry v1: [offset:8][logPosition:4][recordSize:4][crc32:4]
      *
      * Recovers:
      * - Sets nextOffset to highest offset + 1
@@ -273,7 +291,7 @@ public class Segment {
      */
     private void recoverFromIndexFile(long indexSize) throws MessagingException {
         try {
-            ByteBuffer buffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+            ByteBuffer buffer = ByteBuffer.allocate(effectiveIndexEntrySize);
             long position = FILE_HEADER_SIZE;  // Skip file header
             long highestOffset = baseOffset - 1;
             // B7-2 fix: track where valid log data ends according to the index.
@@ -284,13 +302,13 @@ public class Segment {
             while (position < indexSize) {
                 buffer.clear();
                 int bytesRead = indexChannel.read(buffer, position);
-                if (bytesRead < INDEX_ENTRY_SIZE) break;
+                if (bytesRead < effectiveIndexEntrySize) break;
 
                 buffer.flip();
                 long offset = buffer.getLong();
                 int logPos = buffer.getInt();
                 int recordSize = buffer.getInt();
-                int crc = buffer.getInt();
+                // CRC field (4 bytes) is present in legacy format but ignored
 
                 if (offset > highestOffset) {
                     highestOffset = offset;
@@ -301,12 +319,12 @@ public class Segment {
                     expectedLogEnd = entryEnd;
                 }
 
-                position += INDEX_ENTRY_SIZE;
+                position += effectiveIndexEntrySize;
             }
 
             this.nextOffset = highestOffset + 1;
             // Calculate recordCount from number of index entries read
-            this.recordCount = (int) ((position - FILE_HEADER_SIZE) / INDEX_ENTRY_SIZE);
+            this.recordCount = (int) ((position - FILE_HEADER_SIZE) / effectiveIndexEntrySize);
 
             // B7-2 fix: truncate log file if it has bytes beyond what the index knows about.
             // This removes any partial record written before a crash that prevented the
@@ -329,24 +347,6 @@ public class Segment {
                     .withSegmentPath(indexPath.toString())
                     .withContext("indexSize", indexSize));
         }
-    }
-
-    /**
-     * Fallback: Recover by scanning the entire log file (UNIFIED FORMAT - NOT SUPPORTED)
-     *
-     * In the unified format, log files don't contain offsets, so we can't scan them
-     * to rebuild the index. The index file is mandatory for recovery.
-     */
-    private void recoverFromLogScan() {
-        log.error("Log scan recovery not supported in unified format - index file is mandatory!");
-        log.error("Segment at baseOffset={} has corrupted or missing index file", baseOffset);
-        log.error("Solution: Delete this segment and re-ingest data from source");
-
-        // Use RuntimeException for fatal unrecoverable error (unchecked exception appropriate here)
-        // This will propagate up to caller and cause broker initialization failure
-        throw new RuntimeException("Cannot recover unified format segment without index file. " +
-                "topic=" + topic + " partition=" + partition + " baseOffset=" + baseOffset +
-                " segmentPath=" + logPath + ". Delete segment files and re-ingest data.");
     }
 
     /**
@@ -381,7 +381,7 @@ public class Segment {
     /**
      * Write record using unified format: split log/index writes
      * Log: [keyLen:4][key][eventType:1][dataLen:4][data][timestamp:8]
-     * Index: [offset:8][logPosition:4][recordSize:4][crc32:4]
+     * Index: [offset:8][logPosition:4][recordSize:4]
      */
     private void writeRecord(MessageRecord record, long offset) throws MessagingException {
         try {
@@ -418,9 +418,6 @@ public class Segment {
             // Save log position BEFORE writing
             long recordLogPosition = logPosition;
 
-            log.info("DEBUG writeRecord: path={}, offset={}, logPosition={}, recordSize={}, baseOffset={}",
-                     logPath, offset, logPosition, logRecordSize, baseOffset);
-
             // Write log data
             int written = 0;
             while (logBuffer.hasRemaining()) {
@@ -428,20 +425,11 @@ public class Segment {
             }
             logPosition += written;
 
-            log.info("DEBUG writeRecord AFTER write: newLogPosition={}, written={}", logPosition, written);
-
-            // 2. Calculate CRC32 from log data
-            logBuffer.rewind();
-            CRC32 crc = new CRC32();
-            crc.update(logBuffer);
-            int crc32Value = (int) crc.getValue();
-
-            // 3. Write to INDEX file (metadata: offset, position, size, CRC)
+            // 2. Write to INDEX file (metadata: offset, position, size)
             ByteBuffer indexBuffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
             indexBuffer.putLong(offset);                        // offset: 8 bytes
             indexBuffer.putInt((int) recordLogPosition);        // logPosition: 4 bytes
             indexBuffer.putInt(logRecordSize);                  // recordSize: 4 bytes
-            indexBuffer.putInt(crc32Value);                     // crc32: 4 bytes
             indexBuffer.flip();
 
             // Write index entry using DENSE indexing based on recordCount
@@ -510,7 +498,7 @@ public class Segment {
     private IndexEntry findIndexEntryForOffset(long targetOffset) throws MessagingException {
         try {
             long indexSize = indexChannel.size();
-            long numEntries = (indexSize - FILE_HEADER_SIZE) / INDEX_ENTRY_SIZE;
+            long numEntries = (indexSize - FILE_HEADER_SIZE) / effectiveIndexEntrySize;
 
             // Edge cases: empty segment or offset before segment start
             if (numEntries == 0) {
@@ -528,20 +516,20 @@ public class Segment {
             long right = numEntries - 1;      // Last entry index
             IndexEntry result = null;         // Best match so far (first offset >= target)
 
-            // Allocate buffer for reading index entries (20 bytes per entry)
-            ByteBuffer searchBuffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+            // Allocate buffer for reading index entries (size depends on format)
+            ByteBuffer searchBuffer = ByteBuffer.allocate(effectiveIndexEntrySize);
 
             while (left <= right) {
                 long mid = left + (right - left) / 2;
 
                 // Calculate file position for this entry (DENSE indexing)
-                long filePosition = FILE_HEADER_SIZE + (mid * INDEX_ENTRY_SIZE);
+                long filePosition = FILE_HEADER_SIZE + (mid * effectiveIndexEntrySize);
 
                 // Positioned read - thread-safe, doesn't modify channel position
                 searchBuffer.clear();
                 int bytesRead = indexChannel.read(searchBuffer, filePosition);
 
-                if (bytesRead < INDEX_ENTRY_SIZE) {
+                if (bytesRead < effectiveIndexEntrySize) {
                     // Incomplete entry (shouldn't happen unless file is corrupted)
                     log.warn("Incomplete index entry at position {}, bytes read: {}",
                              filePosition, bytesRead);
@@ -550,13 +538,12 @@ public class Segment {
 
                 searchBuffer.flip();
 
-                // Parse index entry: [offset:8][logPos:4][size:4][crc32:4]
+                // Parse index entry: [offset:8][logPos:4][size:4]
                 long entryOffset = searchBuffer.getLong();
                 int logPosition = searchBuffer.getInt();
                 int recordSize = searchBuffer.getInt();
-                int crc32 = searchBuffer.getInt();
 
-                IndexEntry entry = new IndexEntry(entryOffset, logPosition, recordSize, crc32);
+                IndexEntry entry = new IndexEntry(entryOffset, logPosition, recordSize);
 
                 if (entryOffset == targetOffset) {
                     // Exact match found
@@ -633,25 +620,7 @@ public class Segment {
             }
             logBuffer.flip();
 
-            // 4. Validate CRC32
-            logBuffer.mark();
-            CRC32 crc = new CRC32();
-            crc.update(logBuffer);
-            int calculatedCrc = (int) crc.getValue();
-
-            if (calculatedCrc != entry.crc32) {
-                throw ExceptionLogger.logAndThrow(log,
-                    StorageException.crcMismatch("CRC32 validation failed", offset)
-                        .withTopic(topic)
-                        .withPartition(partition)
-                        .withSegmentPath(logPath.toString())
-                        .withContext("expectedCrc", entry.crc32)
-                        .withContext("actualCrc", calculatedCrc));
-            }
-
-            logBuffer.reset();
-
-            // 5. Parse message data from log (same parsing logic as before)
+            // 4. Parse message data from log
             MessageRecord record = new MessageRecord();
             record.setOffset(entry.offset); // Use actual offset from index
 
@@ -714,7 +683,7 @@ public class Segment {
      * then sequential scan through index entries to accumulate batch.
      * This fixes the bug where SPARSE indexing (currentOffset++) failed with offset gaps.
      *
-     * Index entry format: [offset:8][logPosition:4][recordSize:4][crc32:4] = 20 bytes
+     * Index entry format: [offset:8][logPosition:4][recordSize:4] = 16 bytes
      */
     public BatchFileRegion getBatchFileRegion(long startOffset, long maxBytes) throws MessagingException {
         if (startOffset < baseOffset || startOffset >= nextOffset) {
@@ -753,7 +722,7 @@ public class Segment {
             // Now scan forward from the next index entry to accumulate more records
             // We need to find where firstEntry is in the index, then continue from there
             long currentIndexPos = FILE_HEADER_SIZE;
-            ByteBuffer scanBuffer = ByteBuffer.allocate(INDEX_ENTRY_SIZE);
+            ByteBuffer scanBuffer = ByteBuffer.allocate(effectiveIndexEntrySize);
             boolean foundFirstEntry = false;
 
             // Sequential scan through index file
@@ -761,7 +730,7 @@ public class Segment {
                 scanBuffer.clear();
                 int bytesRead = indexChannel.read(scanBuffer, currentIndexPos);
 
-                if (bytesRead < INDEX_ENTRY_SIZE) {
+                if (bytesRead < effectiveIndexEntrySize) {
                     log.debug("Reached end of index file at position {}", currentIndexPos);
                     break; // End of index
                 }
@@ -770,7 +739,7 @@ public class Segment {
                 long offset = scanBuffer.getLong();
                 int logPosition = scanBuffer.getInt();
                 int recordSize = scanBuffer.getInt();
-                int crc32 = scanBuffer.getInt();
+                // CRC field (4 bytes) present in legacy format is ignored
 
                 // Skip until we find our first entry
                 if (!foundFirstEntry) {
@@ -778,7 +747,7 @@ public class Segment {
                         foundFirstEntry = true;
                         // Skip this entry as we already added it above
                     }
-                    currentIndexPos += INDEX_ENTRY_SIZE;
+                    currentIndexPos += effectiveIndexEntrySize;
                     continue;
                 }
 
@@ -796,7 +765,7 @@ public class Segment {
                 lastRecordSize = recordSize;
                 lastOffset = offset;
                 recordCount++;
-                currentIndexPos += INDEX_ENTRY_SIZE;
+                currentIndexPos += effectiveIndexEntrySize;
 
                 log.debug("Added to batch: offset={}, recordSize={}, logPosition={}, recordCount={}",
                           offset, recordSize, logPosition, recordCount);
@@ -862,13 +831,11 @@ public class Segment {
         final long offset;      // Message offset (from cloud-server, can have gaps)
         final int logPosition;  // Position in log file where record starts
         final int recordSize;   // Size of log record in bytes
-        final int crc32;        // CRC32 checksum for validation
 
-        IndexEntry(long offset, int logPosition, int recordSize, int crc32) {
+        IndexEntry(long offset, int logPosition, int recordSize) {
             this.offset = offset;
             this.logPosition = logPosition;
             this.recordSize = recordSize;
-            this.crc32 = crc32;
         }
     }
 

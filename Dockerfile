@@ -1,47 +1,72 @@
-FROM amazoncorretto:17-alpine-jdk
+# Multi-stage Dockerfile for Messaging Provider Broker
 
-MAINTAINER Technology_Retail_PriceService_UK_5 <Technology_Retail_PriceService_UK_5@ABC.com>
+# Stage 1: Build
+FROM gradle:8.5-jdk17 AS builder
 
-# Install necessary packages
-RUN apk add --no-cache ca-certificates bash && update-ca-certificates
+WORKDIR /build
 
-# Create group+user (gid=1099, uid=1099)
-RUN addgroup -g 1099 app && adduser -D -u 1099 -G app app
+# Copy CA certificate and import it into JDK trust store
+# This is required for Maven Central access during Gradle build
+COPY mvnrepository.com.pem /tmp/mvnrepository.com.pem
+RUN keytool -import -trustcacerts -noprompt \
+    -alias messaging_maven_ca \
+    -file /tmp/mvnrepository.com.pem \
+    -keystore /opt/java/openjdk/lib/security/cacerts \
+    -storepass changeit && \
+    rm /tmp/mvnrepository.com.pem
 
-# Create application directories
-RUN mkdir -p /opt/magicpipe_provider \
-             /etc/magicpipe_provider \
-             /var/data/magicpipe \
-             /var/log/magicpipe_provider
+# Copy gradle files first for better caching
+COPY settings.gradle build.gradle ./
+COPY gradle gradle/
+COPY gradlew ./
 
-# Set ownership
-RUN chown -R 1099:1099 /opt/magicpipe_provider \
-                       /etc/magicpipe_provider \
-                       /var/data/magicpipe \
-                       /var/log/magicpipe_provider
+# Copy all module sources
+COPY common/ common/
+COPY storage/ storage/
+COPY network/ network/
+COPY pipe/ pipe/
+COPY broker/ broker/
 
-# Copy application JAR (Micronaut runner JAR)
-COPY --chown=1099:1099 broker/build/libs/broker-runner.jar /opt/magicpipe_provider/provider-all.jar
+# Build all modules (now with CA certificate trusted)
+RUN ./gradlew :broker:build -x test --no-daemon
 
-# Copy configuration files
-COPY --chown=1099:1099 configuration/* /etc/magicpipe_provider/
+# Stage 2: Runtime
+FROM eclipse-temurin:17-jre-jammy
 
-# Copy docker scripts
-COPY --chown=1099:1099 docker/* /opt/magicpipe_provider/
+# Create non-root user
+RUN groupadd -r broker && useradd -r -g broker broker
 
-# Make start script executable
-RUN chmod +x /opt/magicpipe_provider/start.sh
+# Install SQLite and curl for healthcheck
+RUN apt-get update && \
+    apt-get install -y sqlite3 libsqlite3-dev curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Expose ports
-# 8080 - Main HTTP API (if needed)
-# 8081 - Metrics/Health endpoint
-# 5005 - Remote debugging
-EXPOSE 8080
-EXPOSE 8081
-EXPOSE 5005
+WORKDIR /app
+
+# Extract the broker distribution (contains all libs and scripts)
+COPY --from=builder /build/broker/build/distributions/broker.tar /tmp/broker.tar
+RUN tar -xf /tmp/broker.tar -C /app --strip-components=1 && rm /tmp/broker.tar
+
+# Create data directory with proper permissions
+RUN mkdir -p /app/data && chown -R broker:broker /app
 
 # Switch to non-root user
-USER 1099
+USER broker
 
-# Start the application
-ENTRYPOINT ["/bin/bash", "/opt/magicpipe_provider/start.sh"]
+# Environment variables with defaults
+ENV NODE_ID=broker-001 \
+    BROKER_PORT=9092 \
+    HTTP_PORT=8081 \
+    DATA_DIR=/app/data \
+    REGISTRY_URL=http://localhost:8080 \
+    JAVA_OPTS="-Xms512m -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+# Expose ports
+EXPOSE 9092 8081 5005
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${HTTP_PORT}/health || exit 1
+
+# Run the application using the distribution script
+CMD ["/app/bin/broker"]

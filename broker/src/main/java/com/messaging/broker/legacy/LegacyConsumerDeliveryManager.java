@@ -1,7 +1,7 @@
 package com.messaging.broker.legacy;
 
 import com.messaging.broker.consumer.ConsumerOffsetTracker;
-import com.messaging.broker.metrics.BrokerMetrics;
+import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.MessageRecord;

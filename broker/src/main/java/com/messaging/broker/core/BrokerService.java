@@ -1,34 +1,32 @@
 package com.messaging.broker.core;
 
+import com.messaging.broker.handler.DisconnectHandler;
+import com.messaging.broker.handler.MessageHandler;
+import com.messaging.broker.handler.MessageHandlerRegistry;
 import com.messaging.broker.consumer.AdaptiveBatchDeliveryManager;
 import com.messaging.broker.consumer.ConsumerDeliveryManager;
-import com.messaging.broker.consumer.ConsumerOffsetTracker;
-import com.messaging.broker.consumer.RemoteConsumerRegistry;
-import com.messaging.broker.legacy.LegacyClientConfig;
-import com.messaging.broker.metrics.BrokerMetrics;
-import com.messaging.broker.refresh.DataRefreshManager;
-import com.messaging.broker.registry.TopologyManager;
+import com.messaging.broker.monitoring.BrokerMetrics;
+import com.messaging.broker.monitoring.TraceIds;
+import com.messaging.broker.core.TopologyManager;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
+import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.BrokerMessage;
-import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Inject;
+import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -41,57 +39,39 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final StorageEngine storage;
     private final NetworkServer server;
     private final ConsumerDeliveryManager consumerDelivery;
-    private final RemoteConsumerRegistry remoteConsumers;
     private final AdaptiveBatchDeliveryManager adaptiveDeliveryManager;
     private final TopologyManager topologyManager;
     private final BrokerMetrics metrics;
-    private final ConsumerOffsetTracker offsetTracker;
-    private final DataRefreshManager dataRefreshManager;
-    private final LegacyClientConfig legacyClientConfig;
-    private final int serverPort;
-    private final ObjectMapper objectMapper;
-
-    // Dedicated executor for ACK processing to prevent event loop blocking
+    private final MessageHandlerRegistry handlerRegistry;
+    private final DisconnectHandler disconnectHandler;
     private final ExecutorService ackExecutor;
+    private final int serverPort;
 
     @Inject
     public BrokerService(
             StorageEngine storage,
             NetworkServer server,
             ConsumerDeliveryManager consumerDelivery,
-            RemoteConsumerRegistry remoteConsumers,
             AdaptiveBatchDeliveryManager adaptiveDeliveryManager,
             TopologyManager topologyManager,
             BrokerMetrics metrics,
-            ConsumerOffsetTracker offsetTracker,
-            DataRefreshManager dataRefreshManager,
-            LegacyClientConfig legacyClientConfig,
+            MessageHandlerRegistry handlerRegistry,
+            DisconnectHandler disconnectHandler,
+            @Named("ackExecutor") ExecutorService ackExecutor,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
         this.server = server;
         this.consumerDelivery = consumerDelivery;
-        this.remoteConsumers = remoteConsumers;
         this.adaptiveDeliveryManager = adaptiveDeliveryManager;
         this.topologyManager = topologyManager;
         this.metrics = metrics;
-        this.offsetTracker = offsetTracker;
-        this.dataRefreshManager = dataRefreshManager;
-        this.legacyClientConfig = legacyClientConfig;
+        this.handlerRegistry = handlerRegistry;
+        this.disconnectHandler = disconnectHandler;
+        this.ackExecutor = ackExecutor;
         this.serverPort = serverPort;
-        this.objectMapper = new ObjectMapper();
 
-        // Create dedicated thread pool for ACK processing (CPU cores * 2)
-        // This prevents ACKs from being blocked by heavy delivery operations on Netty event loop
-        int ackThreads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
-        this.ackExecutor = Executors.newFixedThreadPool(ackThreads, runnable -> {
-            Thread t = new Thread(runnable);
-            t.setName("ACK-Processor-" + t.getId());
-            t.setDaemon(true);
-            return t;
-        });
-
-        log.info("BrokerService initialized with {} ACK processing threads", ackThreads);
+        log.info("BrokerService initialized with handler registry");
     }
 
     @Override
@@ -102,20 +82,32 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         try {
             storage.recover();
             log.info("Storage recovered");
+        } catch (StorageException e) {
+            // Framework limitation: ApplicationEventListener cannot throw checked exceptions
+            // Wrap in RuntimeException to propagate and fail application startup
+            throw new RuntimeException("Storage recovery failed - see cause for details", e);
         } catch (Exception e) {
             log.error("Failed to recover storage", e);
-            throw new RuntimeException("Storage recovery failed", e);
+            StorageException storageEx = new StorageException(ErrorCode.STORAGE_RECOVERY_FAILED,
+                "Storage recovery failed during broker initialization", e);
+            // Framework limitation: Wrap in RuntimeException to fail application startup
+            throw new RuntimeException("Storage recovery failed - see cause for details", storageEx);
         }
 
         // Register message handler
         server.registerHandler(this::handleMessage);
 
         // Register disconnect handler
-        server.registerDisconnectHandler(this::handleDisconnect);
+        server.registerDisconnectHandler(disconnectHandler::handleDisconnect);
 
         // Start network server
-        server.start(serverPort);
-        log.info("Broker ready on port {}", serverPort);
+        try {
+            server.start(serverPort);
+            log.info("Broker ready on port {}", serverPort);
+        } catch (NetworkException e) {
+            // Framework limitation: Wrap in RuntimeException to fail application startup
+            throw new RuntimeException("Network server startup failed - see cause for details", e);
+        }
 
         // Start consumer delivery
         consumerDelivery.startDelivery();
@@ -133,8 +125,16 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
     /**
      * Handle messages received from parent via Pipe
+     *
+     * TRANSACTIONAL SEMANTICS:
+     * Returns true if message was successfully stored, false otherwise.
+     * HttpPipeConnector uses the return value to decide whether to advance the offset.
+     * This prevents data loss on restart after storage failures.
+     *
+     * @param record Message record from parent broker
+     * @return true if message was successfully stored, false on any failure
      */
-    private void handlePipeMessage(MessageRecord record) {
+    private boolean handlePipeMessage(MessageRecord record) {
         Timer.Sample e2eSample = metrics.startE2ETimer();
 
         try {
@@ -167,631 +167,42 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             metrics.stopE2ETimer(e2eSample);
 
+            return true;  // Success
+
         } catch (Exception e) {
-            log.error("Error handling pipe message", e);
+            // Log the error but return false instead of throwing
+            log.error("CRITICAL: Failed to store pipe message at offset {}: {}",
+                     record.getOffset(), e.getMessage(), e);
+            return false;  // Failure - caller will not advance offset
         }
     }
 
     /**
-     * Handle incoming messages from clients
+     * Handle incoming messages from clients using handler registry.
      */
     private void handleMessage(String clientId, BrokerMessage message) {
-        log.debug("Handling message from {}: type={}, id={}",
-                  clientId, message.getType(), message.getMessageId());
+        String traceId = TraceIds.newTraceId();
+        log.debug("Handling message from {}: type={}, id={}, traceId={}",
+                  clientId, message.getType(), message.getMessageId(), traceId);
 
-        switch (message.getType()) {
-            case DATA:
-                handleDataMessage(clientId, message);
-                break;
+        BrokerMessage.MessageType messageType = message.getType();
 
-            case SUBSCRIBE:
-                handleSubscribe(clientId, message);
-                break;
-
-            case COMMIT_OFFSET:
-                handleCommitOffset(clientId, message);
-                break;
-
-            case RESET_ACK:
-                handleResetAck(clientId, message);
-                break;
-
-            case READY:
-                // Legacy clients send READY instead of READY_ACK - treat as READY_ACK for backwards compatibility
-                log.debug("Legacy client {} sent READY (expected READY_ACK) - treating as READY_ACK", clientId);
-                handleReadyAck(clientId, message);
-                break;
-
-            case READY_ACK:
-                handleReadyAck(clientId, message);
-                break;
-
-            case BATCH_ACK:
-                handleBatchAck(clientId, message);
-                break;
-
-            default:
-                log.warn("Unknown message type: {}", message.getType());
+        // Legacy compatibility: Legacy clients send READY instead of READY_ACK
+        if (messageType == BrokerMessage.MessageType.READY) {
+            log.debug("Legacy client {} sent READY (expected READY_ACK) - treating as READY_ACK", clientId);
+            messageType = BrokerMessage.MessageType.READY_ACK;
         }
-    }
 
-    /**
-     * Handle DATA message - store and ACK
-     */
-    private void handleDataMessage(String clientId, BrokerMessage message) {
-        Timer.Sample e2eSample = metrics.startE2ETimer();
+        // Look up handler from registry
+        MessageHandler handler = handlerRegistry.getHandler(messageType);
 
-        try {
-            metrics.recordMessageReceived();
-            metrics.recordMessageSize(message.getPayload().length);
-
-            // Decode payload
-            String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
-            JsonNode json = objectMapper.readTree(payload);
-
-            // Extract fields
-            String msgKey = json.has("msg_key") ? json.get("msg_key").asText() : "key_" + System.currentTimeMillis();
-            String eventTypeStr = json.has("event_type") ? json.get("event_type").asText() : "MESSAGE";
-            String data = json.has("data") ? json.get("data").toString() : payload;
-
-            EventType eventType = eventTypeStr.equals("DELETE") ? EventType.DELETE : EventType.MESSAGE;
-
-            // Determine topic (default to "default-topic" if not specified)
-            String topic = json.has("topic") ? json.get("topic").asText() : "default-topic";
-
-            // Create message record
-            MessageRecord record = new MessageRecord(
-                msgKey,
-                eventType,
-                eventType == EventType.DELETE ? null : data,
-                Instant.now()
-            );
-
-            // Store
-            Timer.Sample storageSample = metrics.startStorageWriteTimer();
-            long offset = storage.append(topic, 0, record);
-            metrics.stopStorageWriteTimer(storageSample);
-
-            metrics.recordMessageStored();
-            metrics.recordTopicLastMessageTime(topic);
-
-            log.debug("Stored message: topic={}, offset={}, key={}, type={}",
-                     topic, offset, msgKey, eventType);
-
-            // Broker will discover new messages via adaptive polling (watermark-based)
-            // No notification needed - Pipe is now fully decoupled from Broker
-
-            metrics.stopE2ETimer(e2eSample);
-
-            // Send ACK
-            BrokerMessage ack = new BrokerMessage(
-                BrokerMessage.MessageType.ACK,
-                message.getMessageId(),
-                new byte[0]
-            );
-
-            server.send(clientId, ack).whenComplete((v, ex) -> {
-                if (ex != null) {
-                    log.error("Failed to send ACK to {}", clientId, ex);
-                } else {
-                    log.debug("Sent ACK to {} for message {}", clientId, message.getMessageId());
-                }
-            });
-
-        } catch (Exception e) {
-            log.error("Error handling DATA message from {}", clientId, e);
-        }
-    }
-
-    /**
-     * Handle SUBSCRIBE message
-     */
-    /**
-     * Handle SUBSCRIBE message.
-     * Supports both modern and legacy formats:
-     * - Modern: {"topic": "prices-v1", "group": "price-quote-group"}
-     * - Legacy: {"isLegacy": true, "serviceName": "price-quote-service"}
-     */
-    private void handleSubscribe(String clientId, BrokerMessage message) {
-        try {
-            String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
-            JsonNode json = objectMapper.readTree(payload);
-
-            // Check if this is a legacy client
-            boolean isLegacy = json.has("isLegacy") && json.get("isLegacy").asBoolean();
-
-            if (isLegacy) {
-                // Legacy client - multi-topic subscription
-                handleLegacySubscribe(clientId, message, json);
-            } else {
-                // Modern client - single topic subscription
-                handleModernSubscribe(clientId, message, json);
-            }
-
-        } catch (Exception e) {
-            log.error("Error handling SUBSCRIBE from {}", clientId, e);
-        }
-    }
-
-    /**
-     * Handle modern SUBSCRIBE: single topic, explicit group
-     */
-    private void handleModernSubscribe(String clientId, BrokerMessage message, JsonNode json) {
-        String topic = json.get("topic").asText();
-        String group = json.get("group").asText();
-
-        log.info("Modern client {} subscribed: topic={}, group={}", clientId, topic, group);
-
-        // Register consumer for message delivery.
-        // B2-3 fix: only record connection metric for genuinely new registrations.
-        // Duplicate SUBSCRIBE (same clientId+topic) on the same connection would otherwise
-        // increment activeConsumers without a matching decrement on unregister.
-        boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group);
-        if (isNew) {
-            metrics.recordConsumerConnection();
+        if (handler != null) {
+            handler.handle(clientId, message, traceId);
         } else {
-            log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} — skipping activeConsumers increment",
-                    clientId, topic, group);
-        }
-
-        log.info("Registered remote consumer {} for topic={}, group={}", clientId, topic, group);
-
-        // Send ACK (modern client)
-        sendSubscribeAck(clientId, message, false);  // false = not legacy
-    }
-
-    /**
-     * Handle legacy SUBSCRIBE: multiple topics based on serviceName
-     */
-    private void handleLegacySubscribe(String clientId, BrokerMessage message, JsonNode json) {
-        String serviceName = json.get("serviceName").asText();
-
-        if (!legacyClientConfig.isEnabled()) {
-            log.warn("Legacy client support disabled, rejecting registration from service: {}", serviceName);
-            return;
-        }
-
-        java.util.List<String> topics = legacyClientConfig.getTopicsForService(serviceName);
-        if (topics.isEmpty()) {
-            log.error("Unknown legacy service: {}. No topics configured.", serviceName);
-            return;
-        }
-
-        log.info("Legacy client {} (service={}) subscribing to {} topics: {}",
-                clientId, serviceName, topics.size(), topics);
-
-        // Register consumer for ALL topics (serviceName is used as the consumer group)
-        // Mark as legacy (isLegacy=true) so delivery pipeline uses multi-topic merge
-        int newRegistrations = 0;
-        for (String topic : topics) {
-            boolean isNew = remoteConsumers.registerConsumer(clientId, topic, serviceName, true);
-            if (isNew) {
-                newRegistrations++;
-            }
-            log.info("Registered legacy consumer {} for topic={}, group={}",
-                    clientId, topic, serviceName);
-        }
-
-        // Record metrics only for new registrations
-        for (int i = 0; i < newRegistrations; i++) {
-            metrics.recordConsumerConnection();
-        }
-
-        log.info("Legacy client {} registered for {} topics (service={})",
-                clientId, topics.size(), serviceName);
-
-        // Send ACK (will be handled by sendSubscribeAck based on client type)
-        sendSubscribeAck(clientId, message, true);  // true = isLegacy
-    }
-
-    /**
-     * Send SUBSCRIBE acknowledgment
-     * @param isLegacy true if client is using legacy Event protocol
-     */
-    private void sendSubscribeAck(String clientId, BrokerMessage message, boolean isLegacy) {
-        // Legacy clients don't expect SUBSCRIBE ACK in their protocol
-        // They will start receiving BATCH events via scheduled delivery
-        if (isLegacy) {
-            log.debug("Legacy client registered, no SUBSCRIBE ACK sent (legacy protocol doesn't expect it)");
-            return;
-        }
-
-        // Modern client: send BrokerMessage ACK
-        BrokerMessage ack = new BrokerMessage(
-            BrokerMessage.MessageType.ACK,
-            message.getMessageId(),
-            new byte[0]
-        );
-
-        log.debug("Sending ACK to {}: type={}, messageId={}",
-                 clientId, ack.getType(), ack.getMessageId());
-
-        server.send(clientId, ack).whenComplete((v, ex) -> {
-            if (ex != null) {
-                log.error("Failed to send ACK to {}", clientId, ex);
-            } else {
-                log.info("Sent ACK to {} for SUBSCRIBE", clientId);
-            }
-        });
-    }
-
-    /**
-     * Handle COMMIT_OFFSET message
-     */
-    private void handleCommitOffset(String clientId, BrokerMessage message) {
-        try {
-            String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
-            JsonNode json = objectMapper.readTree(payload);
-
-            String topic = json.get("topic").asText();
-            String group = json.get("group").asText();
-            long offset = json.get("offset").asLong();
-
-            log.debug("Client {} committed offset: topic={}, group={}, offset={}",
-                     clientId, topic, group, offset);
-
-            // CRITICAL: Persist offset to property file - property file is ONLY source of truth
-            String consumerId = group + ":" + topic;
-            offsetTracker.updateOffset(consumerId, offset);
-
-            log.debug("Persisted offset to property file: consumerId={}, offset={}", consumerId, offset);
-
-            // Send ACK
-            BrokerMessage ack = new BrokerMessage(
-                BrokerMessage.MessageType.ACK,
-                message.getMessageId(),
-                new byte[0]
-            );
-
-            server.send(clientId, ack);
-
-        } catch (Exception e) {
-            log.error("Error handling COMMIT_OFFSET from {}", clientId, e);
+            log.warn("No handler registered for message type: {}, traceId={}", messageType, traceId);
         }
     }
 
-    /**
-     * Handle RESET ACK from consumer during data refresh workflow
-     */
-    private void handleResetAck(String clientId, BrokerMessage message) {
-        try {
-            // MULTI-GROUP FIX: Parse both topic and group from payload
-            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
-            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
-
-            // SECURITY FIX (BROKER-2): Validate payload size before reading
-            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
-                log.error("RESET_ACK payload too small from {}: {} bytes (expected >= 8)",
-                         clientId, buffer.remaining());
-                server.closeConnection(clientId);
-                return;
-            }
-
-            int topicLen = buffer.getInt();
-
-            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
-            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
-                log.error("Invalid topicLen in RESET_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, topicLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
-            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
-                log.error("Not enough data in RESET_ACK from {}: remaining={}, needed={}",
-                         clientId, buffer.remaining(), topicLen + 4);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            byte[] topicBytes = new byte[topicLen];
-            buffer.get(topicBytes);
-            String topic = new String(topicBytes, StandardCharsets.UTF_8);
-
-            int groupLen = buffer.getInt();
-
-            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
-            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
-                log.error("Invalid groupLen in RESET_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, groupLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
-            if (buffer.remaining() < groupLen) {
-                log.error("Not enough data for group in RESET_ACK from {}: remaining={}, needed={}",
-                         clientId, buffer.remaining(), groupLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            byte[] groupBytes = new byte[groupLen];
-            buffer.get(groupBytes);
-            String group = new String(groupBytes, StandardCharsets.UTF_8);
-
-            log.info("Received RESET ACK from client: {} for topic: {}, group: {}", clientId, topic, group);
-
-            // MULTI-GROUP FIX: Construct consumerGroupTopic directly from parsed group and topic
-            String consumerGroupTopic = group + ":" + topic;
-
-            log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
-
-            // Delegate to DataRefreshManager with BOTH identifiers:
-            // - consumerGroupTopic for stable tracking
-            // - clientId for triggering replay
-            dataRefreshManager.handleResetAck(consumerGroupTopic, clientId, topic);
-
-            // LEGACY FIX: Do NOT send ACK back to consumer
-            // Legacy clients disconnect when receiving unexpected ACK after RESET_ACK
-            log.debug("RESET_ACK processed for {} - no ACK sent (legacy protocol compatibility)", clientId);
-
-        } catch (Exception e) {
-            log.error("Error handling RESET from {}", clientId, e);
-        }
-    }
-
-    /**
-     * Handle READY ACK from consumer during data refresh workflow
-     */
-    private void handleReadyAck(String clientId, BrokerMessage message) {
-        try {
-            // MULTI-GROUP FIX: Parse both topic and group from payload
-            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
-            // Special case: Empty payload = legacy startup READY_ACK
-            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
-
-            // Handle empty payload for legacy startup READY_ACK
-            if (buffer.remaining() == 0) {
-                log.info("📥 READY_ACK for STARTUP from legacy client: {} (empty payload)", clientId);
-                remoteConsumers.markLegacyConsumerReady(clientId);
-                log.info("✅ Legacy consumer {} marked as READY (can now receive data)", clientId);
-
-                // LEGACY FIX: Do NOT send ACK back - legacy clients disconnect when receiving unexpected ACK
-                // They are now ready and will receive data when available
-                log.debug("Legacy client {} ready - no ACK sent (legacy protocol)", clientId);
-                return;
-            }
-
-            // SECURITY FIX (BROKER-2): Validate payload size before reading
-            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
-                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8 or 0)",
-                         clientId, buffer.remaining());
-                server.closeConnection(clientId);
-                return;
-            }
-
-            int topicLen = buffer.getInt();
-
-            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
-            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
-                log.error("Invalid topicLen in READY_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, topicLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
-            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
-                log.error("Not enough data in READY_ACK from {}: remaining={}, needed={}",
-                         clientId, buffer.remaining(), topicLen + 4);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            byte[] topicBytes = new byte[topicLen];
-            buffer.get(topicBytes);
-            String topic = new String(topicBytes, StandardCharsets.UTF_8);
-
-            int groupLen = buffer.getInt();
-
-            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
-            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
-                log.error("Invalid groupLen in READY_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, groupLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
-            if (buffer.remaining() < groupLen) {
-                log.error("Not enough data for group in READY_ACK from {}: remaining={}, needed={}",
-                         clientId, buffer.remaining(), groupLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            byte[] groupBytes = new byte[groupLen];
-            buffer.get(groupBytes);
-            String group = new String(groupBytes, StandardCharsets.UTF_8);
-
-            log.info("Received READY ACK from client: {} for topic: {}, group: {}", clientId, topic, group);
-
-            // MULTI-GROUP FIX: Construct consumerGroupTopic directly from parsed group and topic
-            String consumerGroupTopic = group + ":" + topic;
-
-            log.info("Mapped consumer {} to group:topic identifier: {}", clientId, consumerGroupTopic);
-
-            // Check if this is startup READY_ACK or refresh READY_ACK
-            boolean isRefreshActive = topic != null && !topic.isEmpty() &&
-                    dataRefreshManager.isRefreshActive(topic);
-
-            if (isRefreshActive) {
-                // Refresh READY_ACK - delegate to DataRefreshManager
-                log.info("📥 READY_ACK for REFRESH from client: {} topic: {} group: {}",
-                        clientId, topic, group);
-                dataRefreshManager.handleReadyAck(consumerGroupTopic, topic);
-            } else {
-                // Startup READY_ACK - mark consumer as ready
-                log.info("📥 READY_ACK for STARTUP from client: {} topic: {} group: {}",
-                        clientId, topic, group);
-
-                // Determine if this is a legacy or modern consumer
-                String consumerKey = clientId + ":" + topic + ":" + group;
-                boolean isLegacy = remoteConsumers.isLegacyConsumer(consumerKey);
-
-                if (isLegacy || topic.isEmpty()) {
-                    // Legacy consumer - mark entire client as ready
-                    remoteConsumers.markLegacyConsumerReady(clientId);
-                    log.info("✅ Legacy consumer {} marked as READY (can now receive data)", clientId);
-                } else {
-                    // Modern consumer - mark specific topic as ready
-                    remoteConsumers.markModernConsumerTopicReady(clientId, topic);
-                    log.info("✅ Modern consumer {} marked as READY for topic {} (can now receive data)",
-                            clientId, topic);
-                }
-            }
-
-            // LEGACY FIX: Do NOT send ACK back to consumer
-            // Legacy clients disconnect when receiving unexpected ACK after READY
-            log.debug("Consumer {} marked as READY - no ACK sent (legacy protocol compatibility)", clientId);
-
-        } catch (Exception e) {
-            log.error("Error handling READY from {}", clientId, e);
-        }
-    }
-
-    /**
-     * Handle BATCH_ACK message - consumer acknowledges receipt and processing of a batch
-     * MULTI-GROUP FIX: Payload now contains both topic and group
-     */
-    private void handleBatchAck(String clientId, BrokerMessage message) {
-        try {
-            // Legacy client detection: Empty payload indicates legacy merged batch ACK
-            if (message.getPayload().length == 0) {
-                handleLegacyBatchAck(clientId);
-                return;
-            }
-
-            // MULTI-GROUP FIX: Parse both topic and group from payload
-            // Format: [topicLen:4][topic:var][groupLen:4][group:var]
-            java.nio.ByteBuffer buffer = java.nio.ByteBuffer.wrap(message.getPayload());
-
-            // SECURITY FIX (BROKER-2): Validate payload size before reading
-            if (buffer.remaining() < 8) {  // Need at least 4 bytes for topicLen + 4 for groupLen
-                log.error("BATCH_ACK payload too small from {}: {} bytes (expected >= 8)",
-                         clientId, buffer.remaining());
-                server.closeConnection(clientId);
-                return;
-            }
-
-            int topicLen = buffer.getInt();
-
-            // SECURITY FIX (BROKER-2): Validate topicLen to prevent OOM attack
-            if (topicLen < 0 || topicLen > 65535) {  // Max 64KB topic name
-                log.error("Invalid topicLen in BATCH_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, topicLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
-            if (buffer.remaining() < topicLen + 4) {  // Need topicLen bytes + 4 for groupLen
-                log.error("Not enough data in BATCH_ACK from {}: remaining={}, needed={}",
-                         clientId, buffer.remaining(), topicLen + 4);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            byte[] topicBytes = new byte[topicLen];
-            buffer.get(topicBytes);
-            String topic = new String(topicBytes, StandardCharsets.UTF_8);
-
-            int groupLen = buffer.getInt();
-
-            // SECURITY FIX (BROKER-2): Validate groupLen to prevent OOM attack
-            if (groupLen < 0 || groupLen > 65535) {  // Max 64KB group name
-                log.error("Invalid groupLen in BATCH_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, groupLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            // SECURITY FIX (BROKER-2): Ensure sufficient data available before allocation
-            if (buffer.remaining() < groupLen) {
-                log.error("Not enough data for group in BATCH_ACK from {}: remaining={}, needed={}",
-                         clientId, buffer.remaining(), groupLen);
-                server.closeConnection(clientId);
-                return;
-            }
-
-            byte[] groupBytes = new byte[groupLen];
-            buffer.get(groupBytes);
-            String group = new String(groupBytes, StandardCharsets.UTF_8);
-
-            log.debug("Received BATCH_ACK from client: {}, topic: {}, group: {}", clientId, topic, group);
-
-            // Offload ACK processing to dedicated executor to prevent Netty event loop blocking
-            // This ensures ACKs are processed quickly even when delivery operations are heavy
-            final String finalTopic = topic;
-            final String finalGroup = group;
-            ackExecutor.execute(() -> {
-                try {
-                    remoteConsumers.handleBatchAck(clientId, finalTopic, finalGroup);
-                } catch (Exception e) {
-                    log.error("Error processing BATCH_ACK from {}", clientId, e);
-                }
-            });
-
-        } catch (Exception e) {
-            log.error("Error handling BATCH_ACK from {}", clientId, e);
-        }
-    }
-
-    /**
-     * Handle BATCH_ACK from legacy client (merged batch from multiple topics).
-     * Legacy clients send empty-payload ACK which gets resolved to BATCH_ACK by LegacyConnectionState.
-     *
-     * @param clientId The client ID that sent the ACK
-     */
-    private void handleLegacyBatchAck(String clientId) {
-        log.debug("Received legacy BATCH_ACK from client: {}", clientId);
-
-        // Look up legacy consumers to find the group
-        java.util.List<RemoteConsumerRegistry.RemoteConsumer> legacyConsumers =
-                remoteConsumers.getLegacyConsumersForClient(clientId);
-
-        if (legacyConsumers.isEmpty()) {
-            log.warn("Received legacy BATCH_ACK from unknown client: {}", clientId);
-            return;
-        }
-
-        // All legacy consumers for a client share the same group (serviceName)
-        String group = legacyConsumers.get(0).getGroup();
-
-        log.debug("Routing legacy BATCH_ACK to group: {}", group);
-
-        // Offload ACK processing to dedicated executor
-        ackExecutor.execute(() -> {
-            try {
-                remoteConsumers.handleLegacyBatchAck(clientId, group);
-            } catch (Exception e) {
-                log.error("Error processing legacy BATCH_ACK from {}", clientId, e);
-            }
-        });
-    }
-
-    /**
-     * Handle client disconnect
-     */
-    private void handleDisconnect(String clientId) {
-        log.info("Handling disconnect for client: {}", clientId);
-        int unregisteredCount = remoteConsumers.unregisterConsumer(clientId);
-
-        // Decrement metrics for each topic subscription that was removed
-        for (int i = 0; i < unregisteredCount; i++) {
-            metrics.recordConsumerDisconnection();
-        }
-
-        log.info("Disconnected client {} with {} topic subscriptions", clientId, unregisteredCount);
-    }
 
     @PreDestroy
     public void shutdown() {
@@ -819,9 +230,6 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
         // Stop consumer delivery
         consumerDelivery.shutdown();
-
-        // Stop remote consumer delivery
-        remoteConsumers.shutdown();
 
         // Shutdown server and storage
         server.shutdown();

@@ -326,32 +326,6 @@ class SegmentMemoryLeakSpec extends Specification {
         thrown(StorageException)
     }
 
-    def "crc mismatch is detected during read"() {
-        given: "a segment with one record"
-        def logPath = tempDir.resolve("00000000000000000800.log")
-        def indexPath = tempDir.resolve("00000000000000000800.index")
-        def baseOffset = 800L
-        def maxSize = 10 * 1024 * 1024L
-        def topic = "test-topic"
-        def partition = 0
-        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
-        segment.append(createTestRecord(baseOffset, "key", "data"))
-        segment.close()
-
-        and: "corrupt the index CRC field"
-        corruptIndexCrc(indexPath)
-
-        when: "reading the record after recovery"
-        def recovered = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
-        recovered.read(baseOffset)
-
-        then: "a CRC mismatch is reported"
-        thrown(StorageException)
-
-        cleanup:
-        recovered?.close()
-    }
-
     def "crash recovery truncates orphaned log bytes"() {
         given: "a segment with one record"
         def logPath = tempDir.resolve("00000000000000000900.log")
@@ -452,7 +426,7 @@ class SegmentMemoryLeakSpec extends Specification {
     }
 
     private static final int LOG_HEADER_SIZE = 6
-    private static final int INDEX_ENTRY_SIZE = 20
+    private static final int INDEX_ENTRY_SIZE = 16
     private static final Pattern LOG_FILE_PATTERN = Pattern.compile("(\\d{20})\\.log")
 
     private static long extractBaseOffset(Path logPath) {
@@ -490,16 +464,4 @@ class SegmentMemoryLeakSpec extends Specification {
         }
     }
 
-    private static void corruptIndexCrc(Path indexPath) {
-        def raf = new RandomAccessFile(indexPath.toFile(), "rw")
-        try {
-            long crcOffset = LOG_HEADER_SIZE + 8 + 4 + 4
-            raf.seek(crcOffset)
-            int original = raf.readInt()
-            raf.seek(crcOffset)
-            raf.writeInt(original + 1)
-        } finally {
-            raf.close()
-        }
-    }
 }

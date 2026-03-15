@@ -203,25 +203,37 @@ public class MMapStorageEngine implements StorageEngine {
 
     /**
      * Get or create segment manager for topic-partition
+     * @throws StorageException if manager creation fails
      */
-    private SegmentManager getOrCreateManager(String topic, int partition) {
+    private SegmentManager getOrCreateManager(String topic, int partition) throws StorageException {
         TopicPartition tp = new TopicPartition(topic, partition);
 
-        return managers.computeIfAbsent(tp, key -> {
-            try {
-                Path partitionDir = dataDir
-                        .resolve(topic)
-                        .resolve("partition-" + partition);
+        // Check if manager already exists
+        SegmentManager existing = managers.get(tp);
+        if (existing != null) {
+            return existing;
+        }
 
-                // Get topic-specific metadata store from factory
-                com.messaging.storage.metadata.SegmentMetadataStore metadataStore =
-                    metadataStoreFactory.getStoreForTopic(topic);
-
-                return new SegmentManager(topic, partition, partitionDir, maxSegmentSize, metadataStore);
-            } catch (StorageException e) {
-                throw new RuntimeException(e); // Wrap for computeIfAbsent
+        // Create new manager (synchronized to prevent race condition)
+        synchronized (this) {
+            // Double-check after acquiring lock
+            existing = managers.get(tp);
+            if (existing != null) {
+                return existing;
             }
-        });
+
+            Path partitionDir = dataDir
+                    .resolve(topic)
+                    .resolve("partition-" + partition);
+
+            // Get topic-specific metadata store from factory
+            com.messaging.storage.metadata.SegmentMetadataStore metadataStore =
+                metadataStoreFactory.getStoreForTopic(topic);
+
+            SegmentManager manager = new SegmentManager(topic, partition, partitionDir, maxSegmentSize, metadataStore);
+            managers.put(tp, manager);
+            return manager;
+        }
     }
 
     /**

@@ -2,7 +2,7 @@ package com.messaging.common.api;
 
 import com.messaging.common.model.MessageRecord;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * Pipe connector abstraction for connecting to parent broker.
@@ -19,9 +19,9 @@ public interface PipeConnector {
 
     /**
      * Register handler for incoming data stream
-     * @param handler Data handler
+     * @param handler Data handler that returns true on success, false on failure
      */
-    void onDataReceived(Consumer<MessageRecord> handler);
+    void onDataReceived(Function<MessageRecord, Boolean> handler);
 
     /**
      * Send ACK upstream to parent

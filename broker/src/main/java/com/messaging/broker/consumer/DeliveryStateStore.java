@@ -1,8 +1,6 @@
 package com.messaging.broker.consumer;
 
-import com.messaging.common.exception.ConsumerException;
-import com.messaging.common.exception.ErrorCode;
-import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.broker.consumer.FlushingPropertiesStore;
 import io.micronaut.context.annotation.Value;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -10,78 +8,56 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
-import java.nio.file.*;
 import java.util.Map;
-import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
- * Persist delivery state for (topic, consumer) pairs
- * Enables safe broker restart without duplicate delivery
+ * Persists delivery state for a subscription delivery key.
+ *
+ * Enables safe broker restart without duplicate delivery.
  *
  * State format in properties file:
  * - {deliveryKey}.offset = last acknowledged offset
  * - {deliveryKey}.until = timestamp when in-flight expires
  *
- * Where deliveryKey = "clientId:topic"
+ * Where deliveryKey = "group:topic".
  */
 @Singleton
 public class DeliveryStateStore {
     private static final Logger log = LoggerFactory.getLogger(DeliveryStateStore.class);
 
     private static final String STATE_FILE = "delivery-state.properties";
-    private static final long FLUSH_INTERVAL_MS = 5000;  // 5 seconds (same as ConsumerOffsetTracker)
+    private static final long FLUSH_INTERVAL_MS = 5000;
 
-    private final Path stateFilePath;
+    private final FlushingPropertiesStore repository;
     private final Map<String, DeliveryState> cache;
-    private final ScheduledExecutorService flusher;
 
     public DeliveryStateStore(@Value("${broker.storage.data-dir:./data}") String dataDir) {
-        this.stateFilePath = Paths.get(dataDir, STATE_FILE);
+        this.repository = new FlushingPropertiesStore(
+                dataDir,
+                STATE_FILE,
+                "Delivery State",
+                FLUSH_INTERVAL_MS
+        );
         this.cache = new ConcurrentHashMap<>();
-        this.flusher = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r);
-            t.setName("DeliveryStateStore-Flusher");
-            t.setDaemon(true);
-            return t;
-        });
 
-        try {
-            Files.createDirectories(Paths.get(dataDir));
-        } catch (IOException e) {
-            // Constructor can't throw checked exceptions - wrap in RuntimeException
-            log.error("Failed to create data directory: {}", dataDir, e);
-            throw new RuntimeException("Failed to create data directory: " + dataDir, e);
-        }
-
-        loadFromDisk();
-        log.info("DeliveryStateStore initialized: stateFile={}, loaded {} entries",
-                stateFilePath, cache.size());
+        loadFromRepository();
+        log.info("DeliveryStateStore initialized: loaded {} entries", cache.size());
     }
 
     /**
-     * Start periodic flush to disk
+     * Start periodic flush to disk.
      */
     @PostConstruct
     public void init() {
-        // Start periodic flush
-        flusher.scheduleWithFixedDelay(
-            this::persistToDisk,
-            FLUSH_INTERVAL_MS,
-            FLUSH_INTERVAL_MS,
-            TimeUnit.MILLISECONDS
-        );
+        repository.start();
         log.info("DeliveryStateStore started with {}ms flush interval", FLUSH_INTERVAL_MS);
     }
 
     /**
-     * Get delivery state for a consumer:topic pair
+     * Get delivery state for a subscription delivery key.
      *
-     * @param deliveryKey Format: "clientId:topic"
+     * @param deliveryKey Format: "group:topic"
      * @return DeliveryState (never null, returns zero state if not found)
      */
     public DeliveryState getState(String deliveryKey) {
@@ -89,10 +65,10 @@ public class DeliveryStateStore {
     }
 
     /**
-     * Save delivery state for a consumer:topic pair
-     * State is updated in memory immediately and flushed to disk periodically
+     * Save delivery state for a subscription delivery key.
+     * State is updated in memory immediately and flushed to disk periodically.
      *
-     * @param deliveryKey Format: "clientId:topic"
+     * @param deliveryKey Format: "group:topic"
      * @param lastAckedOffset Last offset that was acknowledged
      * @param inFlightUntil Timestamp when in-flight status expires
      */
@@ -100,8 +76,9 @@ public class DeliveryStateStore {
         DeliveryState state = new DeliveryState(lastAckedOffset, inFlightUntil);
         cache.put(deliveryKey, state);
 
-        // NO immediate flush - periodic scheduler handles persistence
-        // This eliminates blocking I/O from the adaptive polling loop
+        // Persist to repository (periodic flush handles disk I/O)
+        repository.put(deliveryKey + ".offset", String.valueOf(lastAckedOffset));
+        repository.put(deliveryKey + ".until", String.valueOf(inFlightUntil));
 
         log.trace("Saved delivery state: {}={}", deliveryKey, state);
     }
@@ -109,7 +86,7 @@ public class DeliveryStateStore {
     /**
      * Update only the acknowledged offset (keep existing inFlightUntil)
      *
-     * @param deliveryKey Format: "clientId:topic"
+     * @param deliveryKey Format: "group:topic"
      * @param lastAckedOffset New acknowledged offset
      */
     public void updateAckedOffset(String deliveryKey, long lastAckedOffset) {
@@ -120,7 +97,7 @@ public class DeliveryStateStore {
     /**
      * Update only the in-flight expiration (keep existing lastAckedOffset)
      *
-     * @param deliveryKey Format: "clientId:topic"
+     * @param deliveryKey Format: "group:topic"
      * @param inFlightUntil Timestamp when in-flight expires
      */
     public void updateInFlightUntil(String deliveryKey, long inFlightUntil) {
@@ -129,16 +106,16 @@ public class DeliveryStateStore {
     }
 
     /**
-     * Immediate flush to disk (used during shutdown or critical operations)
+     * Immediate flush to disk (used during shutdown or critical operations).
      */
     public void flush() {
-        persistToDisk();
+        repository.flush();
     }
 
     /**
-     * Check if delivery is currently in-flight
+     * Check if delivery is currently in-flight.
      *
-     * @param deliveryKey Format: "clientId:topic"
+     * @param deliveryKey Format: "group:topic"
      * @return true if in-flight and not expired
      */
     public boolean isInFlight(String deliveryKey) {
@@ -147,9 +124,9 @@ public class DeliveryStateStore {
     }
 
     /**
-     * Clear in-flight status (set expiration to 0)
+     * Clear in-flight status (set expiration to 0).
      *
-     * @param deliveryKey Format: "clientId:topic"
+     * @param deliveryKey Format: "group:topic"
      */
     public void clearInFlight(String deliveryKey) {
         DeliveryState current = getState(deliveryKey);
@@ -157,82 +134,36 @@ public class DeliveryStateStore {
     }
 
     /**
-     * Persist cache to disk
+     * Load state from repository.
      */
-    private synchronized void persistToDisk() {
-        Properties props = new Properties();
+    private void loadFromRepository() {
+        Map<String, String> allProperties = repository.getAll();
 
-        cache.forEach((key, state) -> {
-            props.setProperty(key + ".offset", String.valueOf(state.lastAckedOffset));
-            props.setProperty(key + ".until", String.valueOf(state.inFlightUntil));
-        });
+        // Parse properties back into cache
+        allProperties.keySet().stream()
+            .filter(k -> k.endsWith(".offset"))
+            .forEach(k -> {
+                String key = k.replace(".offset", "");
+                long offset = Long.parseLong(allProperties.get(k));
+                long until = Long.parseLong(allProperties.getOrDefault(key + ".until", "0"));
+                cache.put(key, new DeliveryState(offset, until));
+            });
 
-        try {
-            // Write to temp file first, then atomic rename
-            Path tempFile = stateFilePath.resolveSibling(STATE_FILE + ".tmp");
-
-            try (FileOutputStream fos = new FileOutputStream(tempFile.toFile())) {
-                props.store(fos, "Delivery state - DO NOT EDIT MANUALLY");
-            }
-
-            Files.move(tempFile, stateFilePath, StandardCopyOption.REPLACE_EXISTING);
-
-        } catch (IOException e) {
-            ConsumerException ex = new ConsumerException(ErrorCode.CONSUMER_OFFSET_COMMIT_FAILED,
-                "Failed to persist delivery state", e);
-            ex.withContext("stateFilePath", stateFilePath.toString());
-            ex.withContext("cacheSize", cache.size());
-            ExceptionLogger.logError(log, ex);
-            // Don't throw - this is background flush, just log the error
-        }
+        log.info("Loaded {} delivery states from repository", cache.size());
     }
 
     /**
-     * Load state from disk
-     */
-    private void loadFromDisk() {
-        if (!Files.exists(stateFilePath)) {
-            log.info("No existing delivery state file, starting fresh");
-            return;
-        }
-
-        Properties props = new Properties();
-        try (FileInputStream fis = new FileInputStream(stateFilePath.toFile())) {
-            props.load(fis);
-
-            // Parse properties back into cache
-            props.stringPropertyNames().stream()
-                .filter(k -> k.endsWith(".offset"))
-                .forEach(k -> {
-                    String key = k.replace(".offset", "");
-                    long offset = Long.parseLong(props.getProperty(k));
-                    long until = Long.parseLong(props.getProperty(key + ".until", "0"));
-                    cache.put(key, new DeliveryState(offset, until));
-                });
-
-            log.info("Loaded {} delivery states from disk", cache.size());
-
-        } catch (IOException e) {
-            ConsumerException ex = new ConsumerException(ErrorCode.CONSUMER_OFFSET_INVALID,
-                "Failed to load delivery state, starting fresh", e);
-            ex.withContext("stateFilePath", stateFilePath.toString());
-            ExceptionLogger.logError(log, ex);
-            // Don't throw - we can start with empty state
-        }
-    }
-
-    /**
-     * Get all tracked delivery keys
+     * Get all tracked delivery keys.
      */
     public int getTrackedCount() {
         return cache.size();
     }
 
     /**
-     * OOM FIX: Remove all delivery state entries for a disconnected consumer
+     * Remove all delivery state entries associated with a disconnected client.
      *
-     * Prevents memory leak from accumulating state entries when consumers
-     * reconnect with different ephemeral ports.
+     * This cleanup is conservative: delivery state is persisted by subscription
+     * key, but older entries may still be tied to client-specific prefixes.
      *
      * @param clientId Client identifier (includes ephemeral port)
      */
@@ -244,42 +175,34 @@ public class DeliveryStateStore {
         for (String key : cache.keySet()) {
             if (key.startsWith(keyPrefix)) {
                 if (cache.remove(key) != null) {
+                    // Remove both .offset and .until keys from repository
+                    repository.remove(key + ".offset");
+                    repository.remove(key + ".until");
                     removedCount++;
                 }
             }
         }
 
         if (removedCount > 0) {
-            log.info("OOM FIX: Removed {} delivery state entries for disconnected clientId={}",
+            log.info("Removed {} delivery state entries for disconnected clientId={}",
                     removedCount, clientId);
             // Trigger immediate flush to persist cleanup
-            persistToDisk();
+            repository.flush();
         }
     }
 
     /**
-     * Shutdown - stop flusher and perform final flush
+     * Shutdown - stop repository and perform final flush.
      */
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down DeliveryStateStore...");
-        flusher.shutdown();
-        try {
-            if (!flusher.awaitTermination(5, TimeUnit.SECONDS)) {
-                flusher.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            flusher.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
-
-        // Final flush to ensure all state is persisted
-        persistToDisk();
+        repository.stop();
         log.info("DeliveryStateStore shutdown complete");
     }
 
     /**
-     * Delivery state for a (consumer, topic) pair
+     * Delivery state for a subscription delivery key.
      */
     public static class DeliveryState {
         public final long lastAckedOffset;

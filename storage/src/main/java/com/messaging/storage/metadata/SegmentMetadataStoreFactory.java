@@ -1,5 +1,6 @@
 package com.messaging.storage.metadata;
 
+import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.StorageException;
 import io.micronaut.context.annotation.Value;
 import jakarta.annotation.PreDestroy;
@@ -35,19 +36,38 @@ public class SegmentMetadataStoreFactory {
      *
      * @param topic Topic name
      * @return SegmentMetadataStore for this topic
+     * @throws StorageException if metadata store creation fails
      */
-    public SegmentMetadataStore getStoreForTopic(String topic) {
-        return stores.computeIfAbsent(topic, t -> {
+    public SegmentMetadataStore getStoreForTopic(String topic) throws StorageException {
+        // Check if store already exists
+        SegmentMetadataStore existing = stores.get(topic);
+        if (existing != null) {
+            return existing;
+        }
+
+        // Create new store (synchronized to prevent race condition)
+        synchronized (this) {
+            // Double-check after acquiring lock
+            existing = stores.get(topic);
+            if (existing != null) {
+                return existing;
+            }
+
             try {
                 Path topicDir = dataDir.resolve(topic);
                 SegmentMetadataStore store = new SegmentMetadataStore(topicDir);
+                stores.put(topic, store);
                 log.debug("Created SegmentMetadataStore for topic: {}", topic);
                 return store;
             } catch (StorageException e) {
-                // Wrap in RuntimeException for computeIfAbsent
-                throw new RuntimeException("Failed to create SegmentMetadataStore for topic: " + topic, e);
+                // Re-throw as-is
+                throw e;
+            } catch (Exception e) {
+                // Wrap unexpected exceptions
+                throw new StorageException(ErrorCode.STORAGE_METADATA_ERROR,
+                    "Failed to create SegmentMetadataStore for topic: " + topic, e);
             }
-        });
+        }
     }
 
     /**

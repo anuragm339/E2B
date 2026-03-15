@@ -1,5 +1,6 @@
 package com.messaging.common.api;
 
+import com.messaging.common.exception.NetworkException;
 import com.messaging.common.model.BrokerMessage;
 import io.netty.channel.FileRegion;
 import java.util.concurrent.CompletableFuture;
@@ -14,8 +15,9 @@ public interface NetworkServer {
     /**
      * Start server on specified port
      * @param port Port number
+     * @throws NetworkException if server fails to start
      */
-    void start(int port);
+    void start(int port) throws NetworkException;
 
     /**
      * Register handler for incoming messages

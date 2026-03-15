@@ -60,7 +60,7 @@ public class NettyTcpServer implements NetworkServer {
     }
 
     @Override
-    public void start(int port) {
+    public void start(int port) throws NetworkException {
         try {
             bossGroup = new NioEventLoopGroup(bossThreads);
             workerGroup = new NioEventLoopGroup(workerThreads);
@@ -115,9 +115,9 @@ public class NettyTcpServer implements NetworkServer {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             log.error("Server startup interrupted", e);
-            // Wrap in RuntimeException as interface doesn't allow checked exceptions
-            // This is a fatal error that should crash broker startup
-            throw new RuntimeException("Failed to start server on port " + port, e);
+            // Fatal error during server startup - should crash broker startup
+            throw new NetworkException(ErrorCode.NETWORK_BIND_FAILED,
+                "Failed to start server on port " + port, e);
         }
     }
 
