@@ -59,10 +59,10 @@ public class RefreshContext {
 
     // For extensibility (future service/global refresh)
     private final String refreshScope;  // "TOPIC", "SERVICE", "GLOBAL"
-    private final String refreshType;   // "NO_DELETE", "WITH_DELETE"
+    private final String refreshType;   // "LOCAL", "WITH_DELETE"
 
     public RefreshContext(String topic, Set<String> expectedConsumers) {
-        this(topic, expectedConsumers, "TOPIC", "NO_DELETE");
+        this(topic, expectedConsumers, "TOPIC", "LOCAL");
     }
 
     public RefreshContext(String topic, Set<String> expectedConsumers, String refreshScope, String refreshType) {
