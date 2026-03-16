@@ -76,7 +76,6 @@ public class ConsumerRegistrationManager implements ConsumerRegistrationService 
         // Metrics
         metrics.updateConsumerOffset(clientId, topic, group, validatedOffset);
         metrics.updateConsumerLag(clientId, topic, group, 0);
-        metrics.recordConsumerConnection();
 
         // Structured logging
         LogContext context = LogContext.builder()

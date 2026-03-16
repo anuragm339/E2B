@@ -51,6 +51,22 @@ public interface PendingAckStore {
     Timer.Sample removeTimer(String clientId);
 
     /**
+     * Record the wall-clock time at which a batch was sent, for ACK latency calculation.
+     *
+     * @param clientId   Client connection identifier
+     * @param sendTimeMs System.currentTimeMillis() at send time
+     */
+    void recordSendTime(String clientId, long sendTimeMs);
+
+    /**
+     * Get the wall-clock send time for a client's pending batch.
+     *
+     * @param clientId Client connection identifier
+     * @return send time in ms, or -1 if not recorded
+     */
+    long getSendTime(String clientId);
+
+    /**
      * Remove all state for a client.
      *
      * @param clientId Client connection identifier

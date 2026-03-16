@@ -153,10 +153,11 @@ public class BatchAckService implements ConsumerAckService {
 
     @Override
     public void handleLegacyBatchAck(String clientId, String group) {
-        // Calculate ACK latency
         long ackReceiveTime = System.currentTimeMillis();
+        long sendTime = pendingAckStore.getSendTime(clientId);
         Timer.Sample deliverySample = pendingAckStore.removeTimer(clientId);
         MergedBatch batch = pendingAckStore.removePendingBatch(clientId);
+        pendingAckStore.removeClient(clientId); // clean up send time and any remaining state
 
         if (batch == null) {
             log.warn("⚠️ Legacy batch ACK with no pending data: clientId={}, group={} (likely a late ACK after timeout).",
@@ -164,12 +165,8 @@ public class BatchAckService implements ConsumerAckService {
             return;
         }
 
-        // Calculate latency from timer sample if available
-        long ackLatencyMs = -1;
-        if (deliverySample != null) {
-            // Timer sample stores the start time, we can estimate latency
-            ackLatencyMs = System.currentTimeMillis() - ackReceiveTime;
-        }
+        // Calculate ACK latency from stored send timestamp
+        long ackLatencyMs = sendTime > 0 ? (ackReceiveTime - sendTime) : -1;
 
         log.info("✅ Legacy batch ACK_RECEIVED for clientId={}, group={} at T={}ms",
                 clientId, group, ackLatencyMs);

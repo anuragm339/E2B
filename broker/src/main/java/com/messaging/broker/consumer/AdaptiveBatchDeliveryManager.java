@@ -6,6 +6,9 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
 /**
  * Adaptive polling-based batch delivery manager.
  *
@@ -26,6 +29,10 @@ public class AdaptiveBatchDeliveryManager {
     private final DeliveryStateStore deliveryStateStore;
 
     private volatile boolean running = false;
+
+    // Tracks legacy clientIds that already have a scheduled delivery task.
+    // Legacy consumers share one TCP connection across multiple topics; one task per clientId suffices.
+    private final Set<String> scheduledLegacyClients = ConcurrentHashMap.newKeySet();
 
     @Inject
     public AdaptiveBatchDeliveryManager(
@@ -79,11 +86,25 @@ public class AdaptiveBatchDeliveryManager {
      */
     public void registerConsumer(RemoteConsumer consumer) {
         if (running) {
+            if (consumer.isLegacy() && !scheduledLegacyClients.add(consumer.getClientId())) {
+                // Legacy consumers share one connection for N topics; only one delivery task needed.
+                log.debug("Legacy consumer {} already has a delivery task, skipping duplicate scheduling for topic {}",
+                        consumer.getClientId(), consumer.getTopic());
+                return;
+            }
             long initialDelay = deliveryScheduler.getInitialDelay();
             deliveryScheduler.scheduleDelivery(consumer, initialDelay);
             log.info("Started adaptive delivery for new consumer: {}:{}",
                     consumer.getClientId(), consumer.getTopic());
         }
+    }
+
+    /**
+     * Remove a legacy client from the scheduled-clients set when it disconnects,
+     * so it gets a fresh delivery task on reconnection.
+     */
+    public void removeConsumer(String clientId) {
+        scheduledLegacyClients.remove(clientId);
     }
 
     /**

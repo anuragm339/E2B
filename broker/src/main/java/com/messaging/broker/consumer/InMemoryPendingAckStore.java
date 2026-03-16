@@ -21,6 +21,9 @@ public class InMemoryPendingAckStore implements PendingAckStore {
     // Map: clientId -> Timer.Sample for delivery latency tracking
     private final ConcurrentHashMap<String, Timer.Sample> pendingLegacyTimers = new ConcurrentHashMap<>();
 
+    // Map: clientId -> wall-clock send time (ms) for ACK latency calculation
+    private final ConcurrentHashMap<String, Long> pendingLegacySendTimes = new ConcurrentHashMap<>();
+
     @Override
     public void putPendingBatch(String clientId, MergedBatch batch) {
         pendingLegacyBatches.put(clientId, batch);
@@ -47,14 +50,27 @@ public class InMemoryPendingAckStore implements PendingAckStore {
     }
 
     @Override
+    public void recordSendTime(String clientId, long sendTimeMs) {
+        pendingLegacySendTimes.put(clientId, sendTimeMs);
+    }
+
+    @Override
+    public long getSendTime(String clientId) {
+        Long time = pendingLegacySendTimes.get(clientId);
+        return time != null ? time : -1L;
+    }
+
+    @Override
     public void removeClient(String clientId) {
         pendingLegacyBatches.remove(clientId);
         pendingLegacyTimers.remove(clientId);
+        pendingLegacySendTimes.remove(clientId);
     }
 
     @Override
     public void clear() {
         pendingLegacyBatches.clear();
         pendingLegacyTimers.clear();
+        pendingLegacySendTimes.clear();
     }
 }

@@ -82,44 +82,6 @@ broker:
     fairness:
       max-in-flight-per-topic: 4  # Max concurrent deliveries per topic (prevents hot topics from starving quiet ones)
 
-# DataRefresh Configuration
-# Expected consumers list for data refresh workflow using "group:topic" format
-# This is stable across reconnections (unlike socket addresses which are dynamic)
-data-refresh:
-  expected-consumers:
-    - "prices-v1"
-    - "reference-data-v5"
-    - "non-promotable-products"
-    - "prices-v4"
-    - "minimum-price"
-    - "deposit"
-    - "product-base-document"
-    - "search-product"
-    - "location"
-    - "location-clusters"
-    - "selling-restrictions"
-    - "colleague-facts-jobs"
-    - "colleague-facts-legacy"
-    - "loss-prevention-configuration"
-    - "loss-prevention-store-configuration"
-    - "loss-prevention-product"
-    - "loss-prevention-rule-config"
-    - "stored-value-services-banned-promotion"
-    - "stored-value-services-active-promotion"
-    - "colleague-card-pin"
-    - "dcxp-content"
-    - "restriction-rules"
-    - "dcxp-ugc"
-
-  # Future: service-topic mapping for service-level refresh
-  # Uncomment and configure when implementing service-level refresh
-  # service-topics:
-  #   price-quote-service:
-  #     - prices-v1
-  #     - prices-v4
-  #     - minimum-price
-  #     - reference-data-v5
-
 # Legacy Client Configuration
 # Maps legacy serviceName (from RegisterEvent) to list of topics
 # Used by protocol adapter to auto-subscribe legacy clients

@@ -273,13 +273,13 @@ public class LegacyConsumerDeliveryManager {
 
     /**
      * Find the index file path for a topic at the given offset.
-     * This is a simplified version - in production, we'd use SegmentManager.
+     *
+     * Scans all *.index files in the partition directory, parses the base offset
+     * from each filename ({20-digit-zero-padded-offset}.index), and returns the
+     * file with the highest base offset that is still ≤ startOffset — i.e. the
+     * segment that contains startOffset.
      */
     private Path findIndexPath(String topic, long startOffset, boolean debugPriceQuote) {
-        // Format: {dataDir}/{topic}/partition-0/00000000000000000000.index
-        // For now, assume there's only one segment (baseOffset=0)
-        // TODO: Query SegmentManager to find correct segment
-
         Path topicDir = Paths.get(dataDir, topic, "partition-0");
         if (debugPriceQuote) {
             log.debug("[PRICE-QUOTE] Looking for index in directory: {}", topicDir);
@@ -292,38 +292,54 @@ public class LegacyConsumerDeliveryManager {
             return null;
         }
 
-        // List all files in the directory for debugging
-        if (debugPriceQuote) {
-            try {
-                java.io.File[] files = topicDir.toFile().listFiles();
-                if (files != null && files.length > 0) {
-                    String fileDetails = java.util.Arrays.stream(files)
-                            .map(f -> String.format("%s (%s)",
-                                    f.getName(),
-                                    formatFileSize(f.length())))
-                            .collect(java.util.stream.Collectors.joining(", "));
-                    log.info("📂 [PRICE-QUOTE] Files in {}: {}", topicDir, fileDetails);
-                } else {
-                    log.warn("⚠️ [PRICE-QUOTE] Topic directory is empty: {}", topicDir);
-                }
-            } catch (Exception e) {
-                log.error("[PRICE-QUOTE] Error listing files in {}", topicDir, e);
-            }
-        }
+        java.io.File[] indexFiles = topicDir.toFile().listFiles(
+                f -> f.isFile() && f.getName().endsWith(".index"));
 
-        Path indexPath = topicDir.resolve("00000000000000000000.index");
-
-        if (!indexPath.toFile().exists()) {
+        if (indexFiles == null || indexFiles.length == 0) {
             if (debugPriceQuote) {
-                log.warn("❌ [PRICE-QUOTE] Index file not found: {} (expected hardcoded baseOffset=0)", indexPath);
+                log.warn("⚠️ [PRICE-QUOTE] No .index files found in: {}", topicDir);
             }
             return null;
         }
 
         if (debugPriceQuote) {
-            log.debug("✅ [PRICE-QUOTE] Found index file: {}", indexPath);
+            String fileDetails = java.util.Arrays.stream(indexFiles)
+                    .map(f -> String.format("%s (%s)", f.getName(), formatFileSize(f.length())))
+                    .collect(java.util.stream.Collectors.joining(", "));
+            log.info("📂 [PRICE-QUOTE] Index files in {}: {}", topicDir, fileDetails);
         }
-        return indexPath;
+
+        // Find the segment with the highest base offset that is <= startOffset
+        Path bestIndexPath = null;
+        long bestBaseOffset = -1;
+
+        for (java.io.File indexFile : indexFiles) {
+            String name = indexFile.getName();
+            // Strip ".index" suffix to get the zero-padded base-offset string
+            String offsetStr = name.substring(0, name.length() - ".index".length());
+            try {
+                long baseOffset = Long.parseLong(offsetStr);
+                if (baseOffset <= startOffset && baseOffset > bestBaseOffset) {
+                    bestBaseOffset = baseOffset;
+                    bestIndexPath = indexFile.toPath();
+                }
+            } catch (NumberFormatException e) {
+                log.warn("Non-standard index filename (skipping): {}", name);
+            }
+        }
+
+        if (bestIndexPath == null) {
+            if (debugPriceQuote) {
+                log.warn("❌ [PRICE-QUOTE] No index file covers startOffset={} in {}", startOffset, topicDir);
+            }
+            return null;
+        }
+
+        if (debugPriceQuote) {
+            log.debug("✅ [PRICE-QUOTE] Selected index: {} (baseOffset={}) for startOffset={}",
+                    bestIndexPath.getFileName(), bestBaseOffset, startOffset);
+        }
+        return bestIndexPath;
     }
 
     /**

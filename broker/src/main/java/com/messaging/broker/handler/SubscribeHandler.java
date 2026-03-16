@@ -120,7 +120,7 @@ public class SubscribeHandler implements MessageHandler {
      * Handle legacy SUBSCRIBE: multiple topics based on serviceName.
      */
     private void handleLegacySubscribe(String clientId, BrokerMessage message, JsonNode json, String traceId) {
-        String serviceName = json.get("serviceName").asText();
+        String serviceName = safeGetText(json, "serviceName", clientId);
 
         if (!legacyClientConfig.isEnabled()) {
             log.warn("Legacy client support disabled, rejecting registration from service: {}, traceId={}", serviceName, traceId);

@@ -12,13 +12,17 @@ import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.BrokerMessage;
 import io.micrometer.core.instrument.Timer;
+import io.micronaut.context.annotation.Value;
 import jakarta.inject.Inject;
+import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -40,6 +44,8 @@ public class ConsumerRegistry {
     private final NetworkServer server;
     private final StorageEngine storage;
     private final ConsumerOffsetTracker offsetTracker;
+    private final ScheduledExecutorService consumerScheduler;
+    private final long legacyAckTimeoutMs;
     private final ObjectMapper objectMapper;
 
     private volatile AdaptiveBatchDeliveryManager adaptiveDeliveryManager; // Lazy injection
@@ -56,7 +62,9 @@ public class ConsumerRegistry {
             BrokerMetrics metrics,
             NetworkServer server,
             StorageEngine storage,
-            ConsumerOffsetTracker offsetTracker) {
+            ConsumerOffsetTracker offsetTracker,
+            @Named("consumerScheduler") ScheduledExecutorService consumerScheduler,
+            @Value("${broker.consumer.ack-timeout:60000}") long legacyAckTimeoutMs) {
         this.registrationService = registrationService;
         this.readinessService = readinessService;
         this.deliveryService = deliveryService;
@@ -68,6 +76,8 @@ public class ConsumerRegistry {
         this.server = server;
         this.storage = storage;
         this.offsetTracker = offsetTracker;
+        this.consumerScheduler = consumerScheduler;
+        this.legacyAckTimeoutMs = legacyAckTimeoutMs;
         this.objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
     }
 
@@ -123,6 +133,10 @@ public class ConsumerRegistry {
 
         readinessService.removeClient(clientId);
         ackService.clearPendingAcks(clientId);
+
+        if (adaptiveDeliveryManager != null) {
+            adaptiveDeliveryManager.removeConsumer(clientId);
+        }
 
         return registrationService.unregisterConsumer(clientId);
     }
@@ -200,6 +214,7 @@ public class ConsumerRegistry {
             // Store batch BEFORE sending to prevent race: consumer ACKs before putPendingBatch is called,
             // causing ACK handler to find no pending batch and the batch getting stuck in the store permanently.
             pendingAckStore.putPendingBatch(clientId, batch);
+            pendingAckStore.recordSendTime(clientId, System.currentTimeMillis());
             pendingAckStore.startTimer(clientId, deliverySample);
             metrics.recordBatchSize(batch.getMessageCount());
 
@@ -213,8 +228,23 @@ public class ConsumerRegistry {
                 // Send failed — remove the pre-stored batch so delivery isn't permanently blocked
                 pendingAckStore.removePendingBatch(clientId);
                 pendingAckStore.removeTimer(clientId);
+                pendingAckStore.removeClient(clientId);
                 throw sendEx;
             }
+
+            // Schedule ACK timeout: if the consumer never ACKs, unblock delivery after the timeout window.
+            final MergedBatch sentBatch = batch;
+            consumerScheduler.schedule(() -> {
+                MergedBatch still = pendingAckStore.getPendingBatch(clientId);
+                if (still == sentBatch) {
+                    log.warn("Legacy batch ACK timeout: clientId={}, group={} — clearing blocked pending batch",
+                            clientId, consumerGroup);
+                    pendingAckStore.removeClient(clientId);
+                    for (String t : sentBatch.getMaxOffsetPerTopic().keySet()) {
+                        metrics.completePendingAck(t, consumerGroup);
+                    }
+                }
+            }, legacyAckTimeoutMs, TimeUnit.MILLISECONDS);
 
             log.info("Sent legacy merged batch: clientId={}, group={}, messages={}, bytes={}, topics={}",
                     clientId, consumerGroup, batch.getMessageCount(), batch.getTotalBytes(),

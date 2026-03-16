@@ -22,6 +22,7 @@ public class RefreshCoordinator {
     private static final long READY_ACK_TIMEOUT_MS = 10000;
     private static final long REPLAY_CHECK_INTERVAL_MS = 1000;
     private static final long RESET_RETRY_INTERVAL_MS = 5000;
+    private static final long REFRESH_ABORT_TIMEOUT_MS = 600000; // 10 minutes
 
     // Services
     private final RefreshStarter initiationService;
@@ -123,7 +124,38 @@ public class RefreshCoordinator {
             scheduleResetRetry(topic);
         }
 
+        // Schedule abort watchdog: if the refresh is still in a non-terminal state after 10 minutes, abort it.
+        scheduler.schedule(() -> abortRefreshIfStuck(topic), REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+
         return result;
+    }
+
+    /**
+     * Abort a refresh that has not completed within the timeout window.
+     */
+    private void abortRefreshIfStuck(String topic) {
+        RefreshContext context = activeRefreshes.get(topic);
+        if (context == null) return;
+
+        RefreshState state = context.getState();
+        if (stateMachine.isTerminalState(state)) return;
+
+        log.error("Refresh timeout after {}ms for topic={}, state={}, refreshId={} — aborting",
+                REFRESH_ABORT_TIMEOUT_MS, topic, state, context.getRefreshId());
+
+        RefreshWorkflow.StateTransitionResult result = stateMachine.transition(state, RefreshState.ABORTED);
+        if (result.isSuccess()) {
+            context.setState(RefreshState.ABORTED);
+
+            ScheduledFuture<?> resetTask = resetRetryTasks.remove(topic);
+            if (resetTask != null) resetTask.cancel(false);
+
+            ScheduledFuture<?> replayTask = replayCheckTasks.remove(topic);
+            if (replayTask != null) replayTask.cancel(false);
+
+            activeRefreshes.remove(topic);
+            log.info("Refresh aborted and cleaned up for topic: {}", topic);
+        }
     }
 
     /**
