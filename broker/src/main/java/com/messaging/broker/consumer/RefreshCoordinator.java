@@ -400,6 +400,27 @@ public class RefreshCoordinator {
             context.recordResetAck(groupTopic);
             log.info("Late-joining consumer {} registered for topic {} in state {} - will receive refresh READY",
                     groupTopic, topic, state);
+
+            // If this ACK completes the set and we are still in RESET_SENT, drive the transition
+            // to REPLAYING ourselves — handleResetAck() was never called for this consumer so the
+            // normal transition path was bypassed.
+            if (state == RefreshState.RESET_SENT && context.allResetAcksReceived()) {
+                RefreshWorkflow.StateTransitionResult transition =
+                        stateMachine.transition(context.getState(), RefreshState.REPLAYING);
+                if (transition.isSuccess()) {
+                    context.setState(RefreshState.REPLAYING);
+
+                    ScheduledFuture<?> resetTask = resetRetryTasks.remove(topic);
+                    if (resetTask != null) {
+                        resetTask.cancel(false);
+                        log.info("Cancelled RESET retry task for topic {} (all ACKs via late-joiner)", topic);
+                    }
+
+                    scheduleReplayCheck(topic);
+                    log.info("All RESET ACKs received via late-joining consumer — transitioning {} RESET_SENT → REPLAYING",
+                            topic);
+                }
+            }
         }
     }
 

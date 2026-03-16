@@ -237,7 +237,17 @@ public class RefreshRecoveryService implements RefreshRecovery {
 
         repopulateMetricTimings(topic, context);
 
-        // Immediately send RESET once
+        if (missingResetAcks.isEmpty()) {
+            // All RESET ACKs were persisted before the previous shutdown.
+            // Advance directly to REPLAYING — no need to re-send RESET.
+            log.info("All RESET ACKs already received for topic {} (persisted state) — advancing to REPLAYING", topic);
+            context.setState(RefreshState.REPLAYING);
+            stateStore.saveState(context);
+            resumeReplaying(topic, context);
+            return;
+        }
+
+        // Still waiting for some ACKs — re-send RESET and schedule retry
         remoteConsumers.broadcastResetToTopic(topic);
 
         LogContext resetContext = LogContext.builder()
