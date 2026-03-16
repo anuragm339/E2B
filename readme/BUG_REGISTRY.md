@@ -2380,3 +2380,433 @@ During this 65-second window, adaptive polling storm created the memory pressure
 
 ---
 
+
+---
+
+## Pre-Deployment Review Bugs — Branch: feature/broker-modular-refactoring (2026-03-16)
+
+The following bugs were identified by static code analysis of both the legacy and modern consumer flows before deployment. They are not regressions — they existed in the previous architecture and carried over into the refactoring.
+
+---
+
+### B12-1 — Legacy delivery permanently blocks on missing BATCH_ACK (no timeout)
+
+**Status:** `OPEN`
+**Severity:** HIGH
+**Affected Component:** broker/consumer/ConsumerRegistry.java
+
+**Description:**
+Modern consumers have a 60-second ACK timeout in `BatchDeliveryService.deliverBatch()` (lines 225-244) that reverts the consumer offset and clears the in-flight state if no BATCH_ACK arrives. Legacy consumers have no equivalent. `deliverMergedBatchToLegacy()` stores the pending batch in `pendingAckStore` (line 202) but never schedules a timeout.
+
+If a legacy consumer receives a merged batch but never sends BATCH_ACK (crash, hang, network drop), the gate at line 169:
+```java
+if (pendingAckStore.getPendingBatch(clientId) != null) return false;
+```
+permanently blocks all future delivery to that client with no automatic recovery. The only recovery is a consumer reconnect, which triggers `unregisterConsumer()` and clears the pending store.
+
+**Root Cause:**
+The refactoring extracted modern delivery into `BatchDeliveryService` (which has the timeout) but left legacy delivery as a one-off method in `ConsumerRegistry` without porting the timeout logic.
+
+**Impact:**
+- Any transient send failure or consumer-side processing delay > reconnect time permanently stops delivery
+- Silent failure — no metrics or alerts fired, logs just show "Gate 2 BLOCKED" forever
+
+**Fix:**
+Add a `ScheduledFuture` timeout in `deliverMergedBatchToLegacy()` mirroring the pattern in `BatchDeliveryService` lines 225-244:
+- On timeout: call `pendingAckStore.removePendingBatch(clientId)`, revert per-topic offsets via `offsetTracker`, fire `metrics.recordAckTimeout()`
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/ConsumerRegistry.java
+
+**Verification:**
+```bash
+# Kill a legacy consumer mid-delivery, check broker does NOT stay blocked
+docker stop consumer-price-quote
+sleep 70
+docker start consumer-price-quote
+# Should see delivery resume within ackTimeoutMs (60s) after restart
+docker logs messaging-broker | grep "ACK_TIMEOUT\|deliverMergedBatch"
+```
+
+---
+
+### B12-2 — Legacy segment index hardcoded to segment 0 — silent delivery stop after 1GB
+
+**Status:** `OPEN`
+**Severity:** HIGH
+**Affected Component:** broker/legacy/LegacyConsumerDeliveryManager.java
+
+**Description:**
+`findIndexPath()` (line 314) hardcodes the index file to `00000000000000000000.index` (base offset 0). When any topic exceeds 1GB (the configured `segment-size: 1073741824` in application.yml), the active segment rolls over to a new file with a different base offset (e.g., `00000000001000000000.index`). The method returns the path to the sealed first segment regardless of the consumer's current offset.
+
+Consequence: once a topic rolls over, legacy consumers continue reading from the sealed segment 0. When the consumer offset advances beyond the last record in segment 0, `seekToOffset()` exhausts the cursor and `buildMergedBatch()` returns an empty batch for that topic. Delivery silently stops — no error, no metric, no log.
+
+**Root Cause:**
+The original code was written when topics were assumed to never exceed one segment. A TODO comment at line 281 acknowledges this limitation but was never addressed.
+
+**Impact:**
+- Any topic with > 1GB cumulative data stops delivering to all legacy consumers
+- Failure is silent — the broker continues operating normally for modern consumers
+
+**Fix:**
+Replace the hardcoded path with logic that calls `SegmentManager.findSegmentForOffset(topic, partition, consumerOffset)` and uses the returned segment's index file path. This mirrors what `FileChannelStorageEngine.getZeroCopyBatch()` already does correctly for modern consumers.
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/legacy/LegacyConsumerDeliveryManager.java
+
+**Verification:**
+```bash
+# Inject enough data to roll segment (> 1GB)
+# Then check legacy consumer still receives data
+curl http://localhost:8090/health  # price-quote consumer
+docker logs consumer-price-quote | grep "messages received" | tail -5
+# Count should keep increasing after the 1GB mark
+```
+
+---
+
+### B12-3 — LegacyConnectionState ACK queue desynchronised by per-topic RESET during refresh
+
+**Status:** `OPEN`
+**Severity:** HIGH
+**Affected Component:** network/legacy/LegacyConnectionState.java
+
+**Description:**
+`LegacyConnectionState` uses a FIFO `pendingAcks` queue mapping sent message types to expected ACK types. During a data refresh, `ConsumerRegistry.broadcastResetToTopic()` sends one RESET message per topic on each consumer's TCP connection. A legacy client (e.g., price-quote-service) subscribes to 6 topics — the broker sends 6 RESET messages on the same connection, enqueuing 6 `RESET → RESET_ACK` expectations.
+
+If the legacy client sends a single combined ACK (not 6 individual ACKs), the queue has 5 orphaned expectations remaining. All subsequent messages (BATCH_HEADER, READY) are then mis-classified by the queue consumer, causing ACKs to be mis-routed. The connection effectively becomes corrupt for the refresh lifecycle.
+
+**Root Cause:**
+The refresh was designed with modern consumers in mind (one consumer per topic, one RESET per consumer). Legacy consumers share a single connection for all topics, so one RESET on the wire should suffice.
+
+**Impact:**
+- Data refresh for topics with legacy consumers may never complete (RESET_ACK never routed correctly)
+- RefreshCoordinator stays in RESET_SENT indefinitely (see B12-6)
+
+**Fix:**
+In `broadcastResetToTopic()` / `RefreshResetService.sendReset()`, detect legacy consumers and send a single RESET (not one per topic) to each legacy clientId. The RESET payload can include all affected topics as a comma-separated list or JSON array so the client knows which topics to reset.
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/ConsumerRegistry.java (broadcastResetToTopic)
+- broker/src/main/java/com/messaging/broker/consumer/RefreshResetService.java (sendReset)
+- network/src/main/java/com/messaging/network/legacy/LegacyConnectionState.java (handle multi-topic RESET payload)
+
+**Verification:**
+```bash
+# Trigger refresh on a topic subscribed to by a legacy consumer
+curl -X POST http://localhost:8081/admin/refresh-topic -d '{"topic":"prices-v1"}'
+# Check refresh completes (state reaches COMPLETED)
+curl http://localhost:8081/admin/refresh-status
+# Should NOT stay in RESET_SENT indefinitely
+```
+
+---
+
+### B12-4 — Double metric increment for activeConsumers on new consumer registration
+
+**Status:** `OPEN`
+**Severity:** MEDIUM
+**Affected Component:** broker/consumer/ConsumerRegistrationManager.java, broker/handler/SubscribeHandler.java
+
+**Description:**
+When a new consumer subscribes, `metrics.recordConsumerConnection()` is called twice:
+1. Inside `ConsumerRegistrationManager.registerConsumer()` when a new `RemoteConsumer` is created (line 79)
+2. Inside `SubscribeHandler.handleModernSubscribe()` when `result.isNew() == true` (line 94)
+
+The `activeConsumers` gauge is incremented twice per connection. For legacy consumers the inflation is worse — `SubscribeHandler.handleLegacySubscribe()` (lines 152-154) loops through all newly registered topics and increments once per topic, while `ConsumerRegistrationManager` already incremented once per topic during registration.
+
+**Impact:**
+- Grafana `activeConsumers` gauge shows 2× the actual count for modern consumers
+- For a legacy consumer with 6 topics: shows 12 instead of 6
+- `broker_active_consumers` metric is unreliable
+
+**Fix:**
+Remove `metrics.recordConsumerConnection()` from `ConsumerRegistrationManager`. The metric should only be recorded in `SubscribeHandler` which owns the inbound connection event and already has the full context.
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/ConsumerRegistrationManager.java (remove metric call)
+
+**Verification:**
+```bash
+# Connect exactly 1 modern consumer, check metric
+curl http://localhost:8081/prometheus | grep broker_active_consumers
+# Should show 1.0, not 2.0
+```
+
+---
+
+### B12-5 — Legacy ACK latency metric always reports ~0ms
+
+**Status:** `OPEN`
+**Severity:** MEDIUM
+**Affected Component:** broker/consumer/BatchAckService.java
+
+**Description:**
+In `BatchAckService.handleLegacyBatchAck()` (lines 157-172), the latency is calculated as:
+```java
+long ackReceiveTime = System.currentTimeMillis();  // captured NOW
+// ... a few lines of code ...
+long ackLatencyMs = System.currentTimeMillis() - ackReceiveTime;  // always ~0ms
+```
+Both timestamps are taken microseconds apart on the same thread. The intent is to measure the round-trip latency from when the batch was sent to when the ACK was received, but the batch send time is never captured. The metric always reports 0–1ms regardless of actual ACK latency.
+
+**Impact:**
+- `broker_consumer_ack_latency_ms` metric for legacy consumers is meaningless
+- Cannot detect slow or struggling legacy consumers from metrics alone
+
+**Fix:**
+Record the batch send timestamp when `pendingAckStore.putPendingBatch()` is called (e.g., store it alongside the batch in `InMemoryPendingAckStore`). In the ACK handler, subtract the stored send time from the current time to get true round-trip latency.
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/InMemoryPendingAckStore.java (store send timestamp)
+- broker/src/main/java/com/messaging/broker/consumer/PendingAckStore.java (add getSendTime interface)
+- broker/src/main/java/com/messaging/broker/consumer/BatchAckService.java (use stored send time)
+
+**Verification:**
+```bash
+# Introduce artificial delay in legacy consumer ACK (e.g., sleep 2s in test)
+# Then check metric
+curl http://localhost:8081/prometheus | grep ack_latency
+# Should show ~2000ms, not ~0ms
+```
+
+---
+
+### B12-6 — No abort/timeout for stalled refresh — RESET_SENT hangs forever
+
+**Status:** `OPEN`
+**Severity:** MEDIUM
+**Affected Component:** broker/consumer/RefreshCoordinator.java
+
+**Description:**
+`RefreshStateMachine` defines an `ABORTED` state with valid transitions from `RESET_SENT`, `REPLAYING`, and `READY_SENT`. However, no code path in `RefreshCoordinator` ever triggers a transition to `ABORTED`. The RESET retry task (`scheduleWithFixedDelay`, 5-second interval) runs indefinitely if a consumer never ACKs RESET.
+
+`RefreshReplayService.checkReplayProgress()` requires `allCaughtUp && allResetAcksReceived` before advancing to the READY phase. If one consumer is permanently offline, the refresh hangs in `REPLAYING` forever. `RefreshGatePolicy` blocks all delivery during an active refresh, meaning the entire broker stops delivering messages for that topic indefinitely.
+
+**Root Cause:**
+The ABORTED state was added to the state machine as a design placeholder but the triggering mechanism was never implemented.
+
+**Impact:**
+- A single offline consumer during refresh permanently stops delivery for the affected topic
+- No alerting, no automatic recovery
+- Operator must manually restart the broker or implement a workaround
+
+**Fix:**
+Add a configurable `refreshTimeoutMs` (suggested default: 10 minutes). Schedule a timeout check in `RefreshCoordinator.startRefresh()`. On timeout:
+1. Transition state machine to `ABORTED`
+2. Resume pipe calls (`pipeConnector.resumePipeCalls()`)
+3. Clear the active refresh context
+4. Fire `metrics.recordRefreshAborted(topic, reason)`
+5. Log clearly which consumers failed to ACK
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/RefreshCoordinator.java
+- broker/src/main/java/com/messaging/broker/consumer/RefreshStateMachine.java (verify ABORTED transitions)
+- broker/src/main/java/com/messaging/broker/monitoring/DataRefreshMetrics.java (add recordRefreshAborted)
+
+**Verification:**
+```bash
+# Stop a consumer, trigger refresh, wait > timeout
+docker stop consumer-price-quote
+curl -X POST http://localhost:8081/admin/refresh-topic -d '{"topic":"prices-v1"}'
+sleep 600  # wait for timeout
+curl http://localhost:8081/admin/refresh-status
+# Should show ABORTED, not RESET_SENT
+# Delivery should resume for other consumers on the topic
+```
+
+---
+
+### B12-7 — Legacy consumers register N tasks in AdaptiveBatchDeliveryManager (one per topic) — scheduler waste
+
+**Status:** `OPEN`
+**Severity:** MEDIUM
+**Affected Component:** broker/consumer/ConsumerRegistry.java, broker/consumer/AdaptiveBatchDeliveryManager.java
+
+**Description:**
+A legacy client (e.g., `price-quote-service`) subscribes to 6 topics. Each topic creates a separate `RemoteConsumer` object, all with the same `clientId`. `ConsumerRegistry.registerConsumer()` (line 106) notifies `AdaptiveBatchDeliveryManager.registerConsumer()` for each — creating 6 independent delivery tasks in the scheduler.
+
+All 6 tasks eventually call `ConsumerRegistry.deliverBatch()`, which detects `consumer.isLegacy()` and routes to `deliverMergedBatchToLegacy()`. This method is `synchronized`, so only one executes at a time. The first task to acquire the lock finds no pending batch, builds and sends a merged batch covering ALL 6 topics, and returns `true`. The remaining 5 tasks acquire the lock sequentially, find a pending batch, and return `false` — pure wasted scheduler cycles.
+
+For the full system (13 legacy consumers, ~40 total topics), this creates ~27 no-op tasks per delivery cycle.
+
+**Impact:**
+- Scheduler thread pool contention
+- Increased CPU usage from lock contention on `deliverMergedBatchToLegacy` synchronized block
+- Harder to diagnose delivery timing from logs (5 out of 6 attempts logged as "pending ACK blocked")
+
+**Fix:**
+In `AdaptiveBatchDeliveryManager.registerConsumer()`, skip registration if a `RemoteConsumer` with the same `clientId` and `isLegacy=true` is already registered. One scheduler task per legacy clientId is sufficient since `deliverMergedBatchToLegacy` always delivers all topics in one merged batch.
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/AdaptiveBatchDeliveryManager.java
+
+**Verification:**
+```bash
+# Check scheduler task count after legacy consumer connects (should be 1, not 6)
+docker logs messaging-broker | grep "Registered consumer delivery task" | grep "price-quote"
+# Should see exactly 1 line, not 6
+```
+
+---
+
+### B12-8 — NPE on legacy SUBSCRIBE without serviceName field
+
+**Status:** `OPEN`
+**Severity:** MEDIUM
+**Affected Component:** broker/handler/SubscribeHandler.java
+
+**Description:**
+`handleLegacySubscribe()` reads the `serviceName` field without null-checking:
+```java
+String serviceName = json.get("serviceName").asText();  // NPE if field absent
+```
+If a client sends `{"isLegacy": true}` without `"serviceName"`, `json.get("serviceName")` returns `null` and `.asText()` throws `NullPointerException`. The exception is caught by the outer handler and the connection is closed, but the error log shows a generic NPE stack trace rather than a useful message about the missing field.
+
+Modern subscribe fields use `safeGetText()` with proper null handling throughout. Legacy subscribe was not updated to match.
+
+**Impact:**
+- Malformed legacy SUBSCRIBE closes the connection with a confusing log
+- Could mask misconfigured consumer-app deployments during startup
+
+**Fix:**
+Apply null-safe field reading before use:
+```java
+JsonNode serviceNameNode = json.get("serviceName");
+if (serviceNameNode == null || serviceNameNode.isNull()) {
+    log.error("Legacy SUBSCRIBE missing required 'serviceName' field from clientId={}", clientId);
+    // send error response and close
+    return;
+}
+String serviceName = serviceNameNode.asText();
+```
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/handler/SubscribeHandler.java
+
+**Verification:**
+```bash
+# Send malformed legacy subscribe
+echo '{"isLegacy":true}' | nc localhost 9092
+# Broker log should show clear error, not NPE stack trace
+docker logs messaging-broker | grep "missing required"
+```
+
+---
+
+### B12-9 — Data refresh size metrics: three reporting bugs
+
+**Status:** `FIXED`
+**Commit:** `a88ae79`, `dcecf0f`
+**Severity:** MEDIUM
+**Affected Component:** broker/monitoring/DataRefreshMetrics.java, broker/consumer/BatchDeliveryService.java, broker/consumer/RefreshResetService.java
+
+**Description:**
+Three separate bugs caused `data_refresh_bytes_transferred_total` to show wrong values:
+
+1. **Orphaned Prometheus time series per refresh run** — gauge key included `refreshId`, creating a new time series per run. Old zeroed series persisted alongside current ones. `sum by(refresh_id)` queries returned incorrect aggregates.
+
+2. **Empty topic gauge never created** — gauge was created lazily on the first batch. When the topic has no data, `allConsumersCaughtUp()` returns true immediately and no batches are delivered, so the gauge was never registered. Grafana showed stale values from a prior refresh instead of 0.
+
+3. **Post-refresh deliveries counted as replay bytes** — `RefreshContext` is cleaned up with a 60-second delay after completion. During that window, `getRefreshIdForTopic()` returned non-null and normal deliveries were counted as refresh data.
+
+**Fix:**
+1. Changed gauge key to `topic:consumer:refreshType` (stable, no refreshId). Deregisters old gauge and re-registers with new `refresh_id` tag on each refresh start via `initializeTransferMetrics()`.
+2. `initializeTransferMetrics()` called in `RefreshResetService.handleResetAck()` immediately on RESET ACK — gauge exists at 0 before any batches flow.
+3. Added `refreshCtx.getState() == RefreshState.REPLAYING` guard in `BatchDeliveryService` before recording refresh metrics.
+
+**Grafana query that now works correctly:**
+```promql
+sum by(refresh_id) (max_over_time(data_refresh_bytes_transferred_total_bytes[$__range:]))
+```
+Should equal:
+```promql
+(sum(broker_consumer_bytes_sent_bytes_total{...})
+ - sum(broker_consumer_bytes_failed_bytes_total{...} or vector(0))) / 1024 / 1024 / 1024
+```
+
+**Files Changed:**
+- broker/src/main/java/com/messaging/broker/monitoring/DataRefreshMetrics.java
+- broker/src/main/java/com/messaging/broker/consumer/BatchDeliveryService.java
+- broker/src/main/java/com/messaging/broker/consumer/RefreshResetService.java
+
+---
+
+### B12-10 — RefreshConfiguration is dead code — expected-consumers YAML block unused
+
+**Status:** `OPEN`
+**Severity:** LOW
+**Affected Component:** broker/consumer/RefreshConfiguration.java, broker/src/main/resources/application.yml
+
+**Description:**
+`RefreshConfiguration` is annotated `@ConfigurationProperties("data-refresh")` and declares fields for `expectedConsumers` and `serviceTopics`. However, it is never `@Inject`ed anywhere in the codebase. Expected consumers are determined dynamically by `RefreshInitiator.getExpectedConsumers()` via `remoteConsumers.getGroupTopicIdentifiers(topic)`.
+
+The 23-entry `data-refresh.expected-consumers` block in `application.yml` (lines 89-113) is therefore never read. Any changes to that YAML block have no effect.
+
+**Impact:**
+- Misleading configuration — operators editing `application.yml` believe they control refresh behaviour but changes have no effect
+- Dead code adds maintenance surface
+
+**Fix:**
+Either delete `RefreshConfiguration.java` and the `data-refresh.expected-consumers` block from `application.yml`, or inject `RefreshConfiguration` where appropriate and use it instead of dynamic lookup.
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/RefreshConfiguration.java (delete)
+- broker/src/main/resources/application.yml (remove data-refresh.expected-consumers block)
+
+**Verification:**
+```bash
+grep -r "RefreshConfiguration" broker/src/main/java/
+# Should return no results after deletion
+```
+
+---
+
+### B12-11 — AdaptiveBackoffPolicy spin-loop risk if minDelayMs configured to 0
+
+**Status:** `OPEN`
+**Severity:** LOW
+**Affected Component:** broker/consumer/AdaptiveBackoffPolicy.java
+
+**Description:**
+If `minDelayMs` is set to 0 (either by misconfiguration or a future config change), `calculateNextDelay(0, false)` returns `0 * 2 = 0`. The scheduler is then invoked with a 0ms delay, creating a tight busy-loop that saturates the consumer delivery thread pool and causes 100% CPU on delivery threads.
+
+Default is 1ms (safe), but no floor validation exists to prevent misconfiguration.
+
+**Impact:**
+- CPU saturation on delivery thread pool
+- Effectively DoS of the broker's delivery capacity
+
+**Fix:**
+Add a minimum floor validation in `AdaptiveBackoffPolicy` constructor or `calculateNextDelay()`:
+```java
+this.minDelayMs = Math.max(1, minDelayMs);
+```
+
+**Files to Modify:**
+- broker/src/main/java/com/messaging/broker/consumer/AdaptiveBackoffPolicy.java
+
+**Verification:**
+```bash
+# Set min-delay-ms=0 in application.yml and start broker
+# CPU usage on delivery threads should NOT spike to 100%
+docker stats messaging-broker
+```
+
+---
+
+## Fix Priority Order (B12 Series)
+
+| Priority | Bug | Reason |
+|----------|-----|--------|
+| 1 | B12-2 | Silent data loss for legacy consumers on any topic > 1GB |
+| 2 | B12-1 | Legacy delivery permanently blocks — requires consumer restart to recover |
+| 3 | B12-3 | Data refresh never completes for legacy consumers with multi-topic subscriptions |
+| 4 | B12-6 | Refresh hangs forever if any consumer is offline during RESET phase |
+| 5 | B12-8 | NPE on malformed legacy SUBSCRIBE (quick fix, low risk) |
+| 6 | B12-4 | activeConsumers metric double-counting (misleading dashboards) |
+| 7 | B12-7 | Scheduler waste for legacy multi-topic consumers |
+| 8 | B12-5 | Legacy ACK latency always 0ms (wrong metric) |
+| 9 | B12-10 | Dead code cleanup |
+| 10 | B12-11 | Backoff floor validation |
+
