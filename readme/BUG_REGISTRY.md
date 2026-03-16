@@ -2391,7 +2391,8 @@ The following bugs were identified by static code analysis of both the legacy an
 
 ### B12-1 — Legacy delivery permanently blocks on missing BATCH_ACK (no timeout)
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** HIGH
 **Affected Component:** broker/consumer/ConsumerRegistry.java
 
@@ -2432,7 +2433,8 @@ docker logs messaging-broker | grep "ACK_TIMEOUT\|deliverMergedBatch"
 
 ### B12-2 — Legacy segment index hardcoded to segment 0 — silent delivery stop after 1GB
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** HIGH
 **Affected Component:** broker/legacy/LegacyConsumerDeliveryManager.java
 
@@ -2504,7 +2506,8 @@ curl http://localhost:8081/admin/refresh-status
 
 ### B12-4 — Double metric increment for activeConsumers on new consumer registration
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** MEDIUM
 **Affected Component:** broker/consumer/ConsumerRegistrationManager.java, broker/handler/SubscribeHandler.java
 
@@ -2537,7 +2540,8 @@ curl http://localhost:8081/prometheus | grep broker_active_consumers
 
 ### B12-5 — Legacy ACK latency metric always reports ~0ms
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** MEDIUM
 **Affected Component:** broker/consumer/BatchAckService.java
 
@@ -2574,7 +2578,8 @@ curl http://localhost:8081/prometheus | grep ack_latency
 
 ### B12-6 — No abort/timeout for stalled refresh — RESET_SENT hangs forever
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** MEDIUM
 **Affected Component:** broker/consumer/RefreshCoordinator.java
 
@@ -2619,7 +2624,8 @@ curl http://localhost:8081/admin/refresh-status
 
 ### B12-7 — Legacy consumers register N tasks in AdaptiveBatchDeliveryManager (one per topic) — scheduler waste
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** MEDIUM
 **Affected Component:** broker/consumer/ConsumerRegistry.java, broker/consumer/AdaptiveBatchDeliveryManager.java
 
@@ -2652,7 +2658,8 @@ docker logs messaging-broker | grep "Registered consumer delivery task" | grep "
 
 ### B12-8 — NPE on legacy SUBSCRIBE without serviceName field
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** MEDIUM
 **Affected Component:** broker/handler/SubscribeHandler.java
 
@@ -2734,7 +2741,8 @@ Should equal:
 
 ### B12-10 — RefreshConfiguration is dead code — expected-consumers YAML block unused
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** LOW
 **Affected Component:** broker/consumer/RefreshConfiguration.java, broker/src/main/resources/application.yml
 
@@ -2764,7 +2772,8 @@ grep -r "RefreshConfiguration" broker/src/main/java/
 
 ### B12-11 — AdaptiveBackoffPolicy spin-loop risk if minDelayMs configured to 0
 
-**Status:** `OPEN`
+**Status:** `FIXED`
+**Commit:** `2caa163`
 **Severity:** LOW
 **Affected Component:** broker/consumer/AdaptiveBackoffPolicy.java
 
