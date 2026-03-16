@@ -253,18 +253,20 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             );
 
             // ================= DATA REFRESH METRICS (if in refresh mode) =================
+            // Guard: only record during active REPLAYING state, not during the 60-second
+            // post-completion cleanup window where getRefreshIdForTopic() still returns
+            // non-null. Without this guard, normal post-refresh deliveries inflate the
+            // bytes-transferred metric for the completed refresh.
             if (dataRefreshCoordinator != null) {
-                String refreshId = dataRefreshCoordinator.getRefreshIdForTopic(consumer.getTopic());
-                String refreshType = dataRefreshCoordinator.getRefreshTypeForTopic(consumer.getTopic());
-
-                if (refreshId != null && refreshType != null) {
+                RefreshContext refreshCtx = dataRefreshCoordinator.getRefreshStatus(consumer.getTopic());
+                if (refreshCtx != null && refreshCtx.getState() == RefreshState.REPLAYING) {
                     dataRefreshMetrics.recordDataTransferred(
                             consumer.getTopic(),
                             consumer.getGroup(),
                             batch.totalBytes,
                             batch.recordCount,
-                            refreshId,
-                            refreshType
+                            refreshCtx.getRefreshId(),
+                            refreshCtx.getRefreshType()
                     );
                 }
             }

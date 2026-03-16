@@ -436,10 +436,57 @@ public class DataRefreshMetrics {
     }
 
     /**
-     * Record data transferred during replay
+     * Initialize transfer metrics to 0 for a consumer at the start of replay.
+     *
+     * Called when a consumer ACKs RESET so the gauge exists immediately — even
+     * when the topic has no data to replay. Without this, the gauge is never
+     * created for empty topics and Prometheus/Grafana shows stale values from
+     * prior refreshes instead of 0.
+     */
+    public void initializeTransferMetrics(String topic, String consumer, String refreshType) {
+        String key = topic + ":" + consumer + ":" + refreshType;
+
+        AtomicLong bytesValue = bytesTransferredValues.computeIfAbsent(key, k -> {
+            AtomicLong atomicBytes = new AtomicLong(0);
+            bytesTransferredGauges.computeIfAbsent(key, gk ->
+                    Gauge.builder("data_refresh_bytes_transferred_total", atomicBytes, AtomicLong::get)
+                            .description("Total bytes transferred during current data refresh")
+                            .tag("topic", topic)
+                            .tag("consumer", consumer)
+                            .tag("refresh_type", refreshType)
+                            .baseUnit("bytes")
+                            .register(registry)
+            );
+            return atomicBytes;
+        });
+        bytesValue.set(0);
+
+        AtomicLong messagesValue = messagesTransferredValues.computeIfAbsent(key, k -> {
+            AtomicLong atomicMessages = new AtomicLong(0);
+            messagesTransferredGauges.computeIfAbsent(key, gk ->
+                    Gauge.builder("data_refresh_messages_transferred_total", atomicMessages, AtomicLong::get)
+                            .description("Total messages transferred during current data refresh")
+                            .tag("topic", topic)
+                            .tag("consumer", consumer)
+                            .tag("refresh_type", refreshType)
+                            .register(registry)
+            );
+            return atomicMessages;
+        });
+        messagesValue.set(0);
+    }
+
+    /**
+     * Record data transferred during replay.
+     *
+     * Uses a stable gauge key (topic:consumer:refreshType) rather than including
+     * refreshId. Including refreshId created a new Prometheus time series per
+     * refresh run — old zeroed series persisted alongside the current one,
+     * causing dashboards to show incorrect aggregated values.
      */
     public void recordDataTransferred(String topic, String consumer, long bytes, long messages, String refreshId, String refreshType) {
-        String key = topic + ":" + consumer + ":" + refreshType + ":" + refreshId;
+        // Stable key: no refreshId — one gauge per topic/consumer/type, reset each refresh
+        String key = topic + ":" + consumer + ":" + refreshType;
 
         // Bytes gauge (resettable)
         AtomicLong bytesValue = bytesTransferredValues.computeIfAbsent(key, k -> {
@@ -450,7 +497,6 @@ public class DataRefreshMetrics {
                             .tag("topic", topic)
                             .tag("consumer", consumer)
                             .tag("refresh_type", refreshType)
-                            .tag("refresh_id", refreshId)
                             .baseUnit("bytes")
                             .register(registry)
             );
@@ -467,7 +513,6 @@ public class DataRefreshMetrics {
                             .tag("topic", topic)
                             .tag("consumer", consumer)
                             .tag("refresh_type", refreshType)
-                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicMessages;

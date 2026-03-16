@@ -89,6 +89,13 @@ public class RefreshResetService implements ResetPhase {
         log.debug("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}, traceId={}",
                  clientId, consumerGroupTopic, topic, traceId);
 
+        // Initialize transfer metrics to 0 now that replay will begin for this consumer.
+        // This ensures the gauge exists in Prometheus immediately — even when the topic
+        // has no data to replay (empty folder). Without this, the gauge is created lazily
+        // on the first batch, so an empty-topic refresh never creates it at all and
+        // Grafana shows stale values from a prior refresh instead of 0.
+        metrics.initializeTransferMetrics(topic, group, context.getRefreshType());
+
         // Persist state after each ACK
         stateStore.saveState(context);
 
