@@ -233,15 +233,19 @@ public class ConsumerRegistry {
             }
 
             // Schedule ACK timeout: if the consumer never ACKs, unblock delivery after the timeout window.
-            final MergedBatch sentBatch = batch;
+            // Use send timestamp (not the batch object) as the identity check to avoid retaining the
+            // ~1MB MergedBatch in the lambda closure for the full 60-second timeout window.
+            final long batchSendTime = pendingAckStore.getSendTime(clientId);
             consumerScheduler.schedule(() -> {
-                MergedBatch still = pendingAckStore.getPendingBatch(clientId);
-                if (still == sentBatch) {
-                    log.warn("Legacy batch ACK timeout: clientId={}, group={} — clearing blocked pending batch",
-                            clientId, consumerGroup);
-                    pendingAckStore.removeClient(clientId);
-                    for (String t : sentBatch.getMaxOffsetPerTopic().keySet()) {
-                        metrics.completePendingAck(t, consumerGroup);
+                if (pendingAckStore.getSendTime(clientId) == batchSendTime) {
+                    MergedBatch pending = pendingAckStore.getPendingBatch(clientId);
+                    if (pending != null) {
+                        log.warn("Legacy batch ACK timeout: clientId={}, group={} — clearing blocked pending batch",
+                                clientId, consumerGroup);
+                        pendingAckStore.removeClient(clientId);
+                        for (String t : pending.getMaxOffsetPerTopic().keySet()) {
+                            metrics.completePendingAck(t, consumerGroup);
+                        }
                     }
                 }
             }, legacyAckTimeoutMs, TimeUnit.MILLISECONDS);
