@@ -33,6 +33,7 @@ public class RefreshCoordinator {
     private final RefreshWorkflow stateMachine;
     private final RefreshGatePolicy dataRefreshGatePolicy;
     private final BatchDeliveryService batchDeliveryService;
+    private final ConsumerRegistry remoteConsumers;
 
     // Shared state
     private final Map<String, RefreshContext> activeRefreshes;
@@ -48,7 +49,8 @@ public class RefreshCoordinator {
             RefreshRecovery recoveryService,
             RefreshWorkflow stateMachine,
             RefreshGatePolicy dataRefreshGatePolicy,
-            BatchDeliveryService batchDeliveryService) {
+            BatchDeliveryService batchDeliveryService,
+            ConsumerRegistry remoteConsumers) {
         this.initiationService = initiationService;
         this.resetService = resetService;
         this.replayService = replayService;
@@ -57,6 +59,7 @@ public class RefreshCoordinator {
         this.stateMachine = stateMachine;
         this.dataRefreshGatePolicy = dataRefreshGatePolicy;
         this.batchDeliveryService = batchDeliveryService;
+        this.remoteConsumers = remoteConsumers;
 
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r);
@@ -103,6 +106,7 @@ public class RefreshCoordinator {
     public void init() {
         dataRefreshGatePolicy.setDataRefreshCoordinator(this);
         batchDeliveryService.setDataRefreshCoordinator(this);
+        remoteConsumers.setRefreshCoordinator(this);
         log.info("RefreshCoordinator initialized");
 
         // Recover and resume in-progress refreshes

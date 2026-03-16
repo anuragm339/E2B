@@ -8,6 +8,7 @@ import com.messaging.broker.legacy.MergedBatch;
 import com.messaging.broker.model.ConsumerKey;
 import com.messaging.broker.model.DeliveryKey;
 import com.messaging.broker.monitoring.BrokerMetrics;
+import com.messaging.broker.monitoring.DataRefreshMetrics;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.BrokerMessage;
@@ -49,6 +50,8 @@ public class ConsumerRegistry {
     private final ObjectMapper objectMapper;
 
     private volatile AdaptiveBatchDeliveryManager adaptiveDeliveryManager; // Lazy injection
+    private volatile RefreshCoordinator refreshCoordinator; // Lazy injection (avoids circular dep)
+    private final DataRefreshMetrics dataRefreshMetrics;
 
     @Inject
     public ConsumerRegistry(
@@ -60,6 +63,7 @@ public class ConsumerRegistry {
             LegacyConsumerDeliveryManager legacyDeliveryManager,
             PendingAckStore pendingAckStore,
             BrokerMetrics metrics,
+            DataRefreshMetrics dataRefreshMetrics,
             NetworkServer server,
             StorageEngine storage,
             ConsumerOffsetTracker offsetTracker,
@@ -73,6 +77,7 @@ public class ConsumerRegistry {
         this.legacyDeliveryManager = legacyDeliveryManager;
         this.pendingAckStore = pendingAckStore;
         this.metrics = metrics;
+        this.dataRefreshMetrics = dataRefreshMetrics;
         this.server = server;
         this.storage = storage;
         this.offsetTracker = offsetTracker;
@@ -87,6 +92,11 @@ public class ConsumerRegistry {
     public void setAdaptiveBatchDeliveryManager(AdaptiveBatchDeliveryManager adaptiveDeliveryManager) {
         this.adaptiveDeliveryManager = adaptiveDeliveryManager;
         log.info("ConsumerRegistry wired to AdaptiveBatchDeliveryManager");
+    }
+
+    public void setRefreshCoordinator(RefreshCoordinator coordinator) {
+        this.refreshCoordinator = coordinator;
+        log.info("ConsumerRegistry wired to RefreshCoordinator");
     }
 
     // ==================== CONSUMER REGISTRATION ====================
@@ -253,6 +263,26 @@ public class ConsumerRegistry {
             log.info("Sent legacy merged batch: clientId={}, group={}, messages={}, bytes={}, topics={}",
                     clientId, consumerGroup, batch.getMessageCount(), batch.getTotalBytes(),
                     batch.getMaxOffsetPerTopic().keySet());
+
+            // Record bytes transferred per topic for refresh metrics (during REPLAYING state only)
+            if (refreshCoordinator != null) {
+                for (String topic : batch.getMaxOffsetPerTopic().keySet()) {
+                    RefreshContext refreshCtx = refreshCoordinator.getRefreshStatus(topic);
+                    if (refreshCtx != null && refreshCtx.getState() == RefreshState.REPLAYING) {
+                        // Apportion batch bytes equally across topics (merged batch doesn't split per-topic)
+                        long bytesForTopic = batch.getTotalBytes() / batch.getMaxOffsetPerTopic().size();
+                        dataRefreshMetrics.recordDataTransferred(
+                                topic,
+                                consumerGroup,
+                                bytesForTopic,
+                                0,
+                                refreshCtx.getRefreshId(),
+                                refreshCtx.getRefreshType()
+                        );
+                    }
+                }
+            }
+
             return true;
         } catch (Exception e) {
             log.error("Failed to send legacy merged batch: clientId={}, group={}", clientId, consumerGroup, e);
