@@ -443,52 +443,62 @@ public class DataRefreshMetrics {
      * created for empty topics and Prometheus/Grafana shows stale values from
      * prior refreshes instead of 0.
      */
-    public void initializeTransferMetrics(String topic, String consumer, String refreshType) {
+    public void initializeTransferMetrics(String topic, String consumer, String refreshType, String refreshId) {
         String key = topic + ":" + consumer + ":" + refreshType;
 
-        AtomicLong bytesValue = bytesTransferredValues.computeIfAbsent(key, k -> {
-            AtomicLong atomicBytes = new AtomicLong(0);
-            bytesTransferredGauges.computeIfAbsent(key, gk ->
-                    Gauge.builder("data_refresh_bytes_transferred_total", atomicBytes, AtomicLong::get)
-                            .description("Total bytes transferred during current data refresh")
-                            .tag("topic", topic)
-                            .tag("consumer", consumer)
-                            .tag("refresh_type", refreshType)
-                            .baseUnit("bytes")
-                            .register(registry)
-            );
-            return atomicBytes;
-        });
-        bytesValue.set(0);
+        // Deregister old bytes gauge so we can re-register with the new refreshId tag.
+        // Without this, Micrometer keeps the old gauge (tagged with the previous refreshId)
+        // alive in Prometheus, creating orphaned time series per refresh run.
+        Gauge oldBytesGauge = bytesTransferredGauges.remove(key);
+        if (oldBytesGauge != null) {
+            registry.remove(oldBytesGauge);
+        }
+        AtomicLong bytesAtomicLong = new AtomicLong(0);
+        bytesTransferredValues.put(key, bytesAtomicLong);
+        bytesTransferredGauges.put(key,
+                Gauge.builder("data_refresh_bytes_transferred_total", bytesAtomicLong, AtomicLong::get)
+                        .description("Total bytes transferred during current data refresh")
+                        .tag("topic", topic)
+                        .tag("consumer", consumer)
+                        .tag("refresh_type", refreshType)
+                        .tag("refresh_id", refreshId)
+                        .baseUnit("bytes")
+                        .register(registry)
+        );
 
-        AtomicLong messagesValue = messagesTransferredValues.computeIfAbsent(key, k -> {
-            AtomicLong atomicMessages = new AtomicLong(0);
-            messagesTransferredGauges.computeIfAbsent(key, gk ->
-                    Gauge.builder("data_refresh_messages_transferred_total", atomicMessages, AtomicLong::get)
-                            .description("Total messages transferred during current data refresh")
-                            .tag("topic", topic)
-                            .tag("consumer", consumer)
-                            .tag("refresh_type", refreshType)
-                            .register(registry)
-            );
-            return atomicMessages;
-        });
-        messagesValue.set(0);
+        // Same for messages gauge
+        Gauge oldMessagesGauge = messagesTransferredGauges.remove(key);
+        if (oldMessagesGauge != null) {
+            registry.remove(oldMessagesGauge);
+        }
+        AtomicLong messagesAtomicLong = new AtomicLong(0);
+        messagesTransferredValues.put(key, messagesAtomicLong);
+        messagesTransferredGauges.put(key,
+                Gauge.builder("data_refresh_messages_transferred_total", messagesAtomicLong, AtomicLong::get)
+                        .description("Total messages transferred during current data refresh")
+                        .tag("topic", topic)
+                        .tag("consumer", consumer)
+                        .tag("refresh_type", refreshType)
+                        .tag("refresh_id", refreshId)
+                        .register(registry)
+        );
     }
 
     /**
      * Record data transferred during replay.
      *
-     * Uses a stable gauge key (topic:consumer:refreshType) rather than including
-     * refreshId. Including refreshId created a new Prometheus time series per
-     * refresh run — old zeroed series persisted alongside the current one,
-     * causing dashboards to show incorrect aggregated values.
+     * The gauge was pre-created with the correct refreshId tag by
+     * initializeTransferMetrics(). The stable map key (topic:consumer:refreshType,
+     * no refreshId) means one gauge per consumer/topic exists in Prometheus at any
+     * time. The refreshId lives only as a tag, updated each refresh via
+     * deregister+re-register in initializeTransferMetrics(), so Grafana queries
+     * using sum by(refresh_id) work correctly.
      */
     public void recordDataTransferred(String topic, String consumer, long bytes, long messages, String refreshId, String refreshType) {
-        // Stable key: no refreshId — one gauge per topic/consumer/type, reset each refresh
         String key = topic + ":" + consumer + ":" + refreshType;
 
-        // Bytes gauge (resettable)
+        // Gauge was pre-created by initializeTransferMetrics with the correct refreshId tag.
+        // computeIfAbsent is a safe fallback if somehow called without prior initialization.
         AtomicLong bytesValue = bytesTransferredValues.computeIfAbsent(key, k -> {
             AtomicLong atomicBytes = new AtomicLong(0);
             bytesTransferredGauges.computeIfAbsent(key, gk ->
@@ -497,6 +507,7 @@ public class DataRefreshMetrics {
                             .tag("topic", topic)
                             .tag("consumer", consumer)
                             .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
                             .baseUnit("bytes")
                             .register(registry)
             );
@@ -504,7 +515,6 @@ public class DataRefreshMetrics {
         });
         bytesValue.addAndGet(bytes);
 
-        // Messages gauge (resettable)
         AtomicLong messagesValue = messagesTransferredValues.computeIfAbsent(key, k -> {
             AtomicLong atomicMessages = new AtomicLong(0);
             messagesTransferredGauges.computeIfAbsent(key, gk ->
@@ -513,6 +523,7 @@ public class DataRefreshMetrics {
                             .tag("topic", topic)
                             .tag("consumer", consumer)
                             .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
                             .register(registry)
             );
             return atomicMessages;

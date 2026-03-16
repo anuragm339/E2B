@@ -94,7 +94,7 @@ public class RefreshResetService implements ResetPhase {
         // has no data to replay (empty folder). Without this, the gauge is created lazily
         // on the first batch, so an empty-topic refresh never creates it at all and
         // Grafana shows stale values from a prior refresh instead of 0.
-        metrics.initializeTransferMetrics(topic, group, context.getRefreshType());
+        metrics.initializeTransferMetrics(topic, group, context.getRefreshType(), context.getRefreshId());
 
         // Persist state after each ACK
         stateStore.saveState(context);
