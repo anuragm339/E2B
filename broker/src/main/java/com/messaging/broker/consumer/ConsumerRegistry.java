@@ -264,18 +264,18 @@ public class ConsumerRegistry {
                     clientId, consumerGroup, batch.getMessageCount(), batch.getTotalBytes(),
                     batch.getMaxOffsetPerTopic().keySet());
 
-            // Record bytes transferred per topic for refresh metrics (during REPLAYING state only)
+            // Record bytes/messages transferred per topic for refresh metrics (during REPLAYING state only)
             if (refreshCoordinator != null) {
                 for (String topic : batch.getMaxOffsetPerTopic().keySet()) {
                     RefreshContext refreshCtx = refreshCoordinator.getRefreshStatus(topic);
                     if (refreshCtx != null && refreshCtx.getState() == RefreshState.REPLAYING) {
-                        // Apportion batch bytes equally across topics (merged batch doesn't split per-topic)
-                        long bytesForTopic = batch.getTotalBytes() / batch.getMaxOffsetPerTopic().size();
+                        long topicBytes = batch.getBytesPerTopic().getOrDefault(topic, 0L);
+                        long topicMessages = batch.getMessageCountPerTopic().getOrDefault(topic, 0);
                         dataRefreshMetrics.recordDataTransferred(
                                 topic,
                                 consumerGroup,
-                                bytesForTopic,
-                                0,
+                                topicBytes,
+                                topicMessages,
                                 refreshCtx.getRefreshId(),
                                 refreshCtx.getRefreshType()
                         );
