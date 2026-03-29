@@ -57,7 +57,7 @@ broker:
     port: ${BROKER_PORT:19092}
     threads:
       boss: 2
-      worker: 16
+      worker: 8   # 13 consumers → 8 workers sufficient (was 16, halves thread scheduling overhead)
 
   consumer:
     default-retry-policy: EXPONENTIAL_THEN_FIXED
@@ -75,7 +75,7 @@ broker:
 
     # Adaptive polling configuration (watermark-based delivery)
     adaptive-polling:
-      min-delay-ms: 1          # Immediate poll when data found (near-push latency)
+      min-delay-ms: 50         # Min poll interval when data found (50ms = 20 polls/sec per consumer; was 25ms)
       max-delay-ms: 1000       # Max backoff delay when idle (exponential backoff)
 
     # Per-topic fairness configuration
@@ -141,6 +141,24 @@ legacy-clients:
 
     dcxp-ugc:
       - dcxp-ugc
+
+executor:
+  ack:
+    threads: ${EXECUTOR_ACK_THREADS:4}
+  consumer-scheduler:
+    threads: ${EXECUTOR_CONSUMER_SCHEDULER_THREADS:4}
+  storage:
+    threads: ${EXECUTOR_STORAGE_THREADS:4}
+
+ack-store:
+  rocksdb:
+    path: ${DATA_DIR}/ack-store
+    block-cache-bytes: ${ACK_STORE_BLOCK_CACHE_BYTES:33554432}   # 32MB default
+  reconciliation:
+    interval: ${ACK_RECONCILIATION_INTERVAL:5m}
+    initial-delay: ${ACK_RECONCILIATION_INITIAL_DELAY:2m}
+    enabled: ${ACK_RECONCILIATION_ENABLED:true}
+    auto-sync-enabled: ${ACK_RECONCILIATION_AUTO_SYNC:false}   # future feature, default off
 
 logger:
   levels:

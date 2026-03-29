@@ -267,6 +267,289 @@ common (no dependencies)
       └── broker (depends on: all modules)
 ```
 
+## Class Diagram
+
+```mermaid
+classDiagram
+    %% ─── COMMON INTERFACES ───────────────────────────────────────
+    class StorageEngine {
+        <<interface>>
+        +append(topic, partition, MessageRecord) long
+        +read(topic, partition, fromOffset, maxRecords) List~MessageRecord~
+        +getCurrentOffset(topic, partition) long
+        +getEarliestOffset(topic, partition) long
+        +recover()
+    }
+
+    class NetworkServer {
+        <<interface>>
+        +start(port)
+        +send(clientId, BrokerMessage) CompletableFuture
+        +broadcast(BrokerMessage)
+        +closeConnection(clientId)
+        +getConnectedClients() List
+    }
+
+    %% ─── CORE ────────────────────────────────────────────────────
+    class BrokerService {
+        -StorageEngine storage
+        -NetworkServer server
+        -ConsumerDeliveryManager consumerDelivery
+        -AdaptiveBatchDeliveryManager adaptiveDeliveryManager
+        -TopologyManager topologyManager
+        -BrokerMetrics metrics
+        -ExecutorService ackExecutor
+        +onApplicationEvent(ServerStartupEvent)
+        +handleMessage(clientId, BrokerMessage)
+        +handlePipeMessage(MessageRecord)
+    }
+
+    class TopologyManager {
+        -CloudRegistryClient registryClient
+        -PipeConnector pipeConnector
+        +start()
+        +queryAndUpdateTopology()
+        +connectToParent(url)
+    }
+
+    class CloudRegistryClient {
+        -HttpClient httpClient
+        +getTopology(url, nodeId) CompletableFuture
+    }
+
+    %% ─── CONSUMER REGISTRY ───────────────────────────────────────
+    class ConsumerRegistry {
+        -ConsumerRegistrationService registrationService
+        -LegacyConsumerDeliveryManager legacyDeliveryManager
+        -NetworkServer server
+        -StorageEngine storage
+        -ConsumerOffsetTracker offsetTracker
+        -ScheduledExecutorService consumerScheduler
+        +registerConsumer(clientId, topic, group, isLegacy)
+        +deliverBatch(consumer, batchSizeBytes)
+        +deliverMergedBatchToLegacy(clientId, topics, group)
+        +broadcastResetToTopic(topic)
+    }
+
+    class ConsumerRegistrationManager {
+        -ConsumerSessionStore sessionStore
+        -ConsumerOffsetTracker offsetTracker
+        -StorageEngine storage
+        +registerConsumer(clientId, topic, group, isLegacy)
+        +unregisterConsumer(clientId)
+    }
+
+    class ConsumerOffsetTracker {
+        -FlushingPropertiesStore repository
+        +getOffset(consumerId) long
+        +updateOffset(consumerId, offset)
+        +resetOffset(consumerId, offset)
+    }
+
+    class RemoteConsumer {
+        +clientId: String
+        +topic: String
+        +group: String
+        +isLegacy: boolean
+        +currentOffset: long
+        +getBackoffDelay() long
+        +recordFailure()
+    }
+
+    %% ─── ADAPTIVE DELIVERY ───────────────────────────────────────
+    class AdaptiveBatchDeliveryManager {
+        -ConsumerRegistry consumerRegistry
+        -DeliveryScheduler deliveryScheduler
+        +start()
+        +registerConsumer(RemoteConsumer)
+        +removeConsumer(clientId)
+    }
+
+    class DeliveryScheduler {
+        -TopicFairScheduler fairScheduler
+        -ConsumerRegistry consumerRegistry
+        -DeliveryRetryPolicy retryPolicy
+        -List~DeliveryGatePolicy~ gatePolicies
+        +scheduleDelivery(consumer, delayMs)
+        +executeDelivery(consumer, delayMs)
+    }
+
+    class TopicFairScheduler {
+        -ScheduledExecutorService scheduler
+        -Map~String,Semaphore~ topicSemaphores
+        -Map~String,ScheduledFuture~ pendingRetries
+        -int maxInFlightPerTopic
+        +scheduleWithKey(topic, deliveryKey, task, delay)
+        +execute(topic, task)
+        +getInFlightCount(topic) int
+    }
+
+    class DeliveryRetryPolicy {
+        <<interface>>
+        +calculateNextDelay(currentDelay, dataFound) long
+        +getInitialDelay() long
+    }
+
+    class DeliveryGatePolicy {
+        <<interface>>
+        +shouldDeliver(RemoteConsumer) GateResult
+    }
+
+    %% ─── LEGACY DELIVERY ─────────────────────────────────────────
+    class LegacyConsumerDeliveryManager {
+        -StorageEngine storage
+        -ConsumerOffsetTracker offsetTracker
+        -BrokerMetrics metrics
+        -int MSG_CHUNK = 50
+        +buildMergedBatch(topics, group, maxBytes) MergedBatch
+        +handleMergedBatchAck(group, MergedBatch)
+        +createCursor(topic, startOffset) TopicCursor
+    }
+
+    class TopicCursor {
+        -String topic
+        -FileChannel indexChannel
+        -int indexEntrySize
+        -ByteBuffer indexBuffer
+        -int READ_CHUNK = 64
+        +seekToOffset(targetOffset)
+        +peek() IndexEntry
+        +advance() IndexEntry
+        +hasMore() boolean
+    }
+
+    class MergedBatch {
+        -List~MessageRecord~ messages
+        -Map~String,Long~ maxOffsetPerTopic
+        -long totalBytes
+        +add(topic, MessageRecord)
+        +getMessages() List
+        +getTotalBytes() long
+    }
+
+    %% ─── LOCAL CONSUMER DELIVERY ─────────────────────────────────
+    class ConsumerDeliveryManager {
+        -StorageEngine storage
+        -ConsumerAnnotationProcessor processor
+        -ConsumerOffsetTracker offsetTracker
+        -ScheduledExecutorService scheduler
+        -long POLL_INTERVAL_MS = 200
+        +startDelivery()
+        +startConsumerDelivery(ConsumerContext)
+        +stopConsumerDelivery(consumerId)
+    }
+
+    class ConsumerAnnotationProcessor {
+        -ApplicationContext context
+        -Map~String,ConsumerContext~ consumers
+        +onApplicationEvent(ServerStartupEvent)
+        +getAllConsumers() Collection
+    }
+
+    class ConsumerContext {
+        +consumerId: String
+        +topic: String
+        +group: String
+        +currentOffset: long
+        +retryPolicy: RetryPolicy
+        +calculateRetryDelay() long
+        +updateAverageMessageSize(bytes, count)
+    }
+
+    %% ─── REFRESH WORKFLOW ────────────────────────────────────────
+    class RefreshCoordinator {
+        -ResetPhase resetService
+        -ReplayPhase replayService
+        -ReadyPhase readyService
+        -RefreshWorkflow stateMachine
+        -RefreshGatePolicy gatePolicy
+        -ConsumerRegistry remoteConsumers
+        -Map~String,RefreshContext~ activeRefreshes
+        +startRefresh(topic)
+        +handleResetAck(topic, clientId)
+        +handleReadyAck(topic, clientId)
+    }
+
+    class RefreshContext {
+        +topic: String
+        +state: RefreshState
+        +expectedConsumers: Set
+        +receivedResetAcks: Set
+        +receivedReadyAcks: Set
+        +allResetAcksReceived() boolean
+        +allReadyAcksReceived() boolean
+    }
+
+    class RefreshGatePolicy {
+        -RefreshCoordinator coordinator
+        +shouldDeliver(RemoteConsumer) GateResult
+    }
+
+    %% ─── METRICS ─────────────────────────────────────────────────
+    class BrokerMetrics {
+        -MeterRegistry registry
+        +recordMessageReceived()
+        +recordConsumerMessageSent(group, topic)
+        +updateConsumerLag(group, topic, lag)
+        +removeConsumerMetrics(consumerId)
+    }
+
+    %% ─── RELATIONSHIPS ───────────────────────────────────────────
+
+    %% Core dependencies
+    BrokerService --> StorageEngine
+    BrokerService --> NetworkServer
+    BrokerService --> ConsumerDeliveryManager
+    BrokerService --> AdaptiveBatchDeliveryManager
+    BrokerService --> TopologyManager
+    BrokerService --> BrokerMetrics
+    BrokerService --> ConsumerRegistry
+
+    TopologyManager --> CloudRegistryClient
+
+    %% Consumer registry
+    ConsumerRegistry --> ConsumerRegistrationManager
+    ConsumerRegistry --> LegacyConsumerDeliveryManager
+    ConsumerRegistry --> NetworkServer
+    ConsumerRegistry --> StorageEngine
+    ConsumerRegistry --> ConsumerOffsetTracker
+    ConsumerRegistry --> BrokerMetrics
+    ConsumerRegistrationManager --> ConsumerOffsetTracker
+    ConsumerRegistrationManager --> StorageEngine
+    ConsumerRegistry "1" --> "many" RemoteConsumer
+
+    %% Adaptive delivery
+    AdaptiveBatchDeliveryManager --> ConsumerRegistry
+    AdaptiveBatchDeliveryManager --> DeliveryScheduler
+    DeliveryScheduler --> TopicFairScheduler
+    DeliveryScheduler --> ConsumerRegistry
+    DeliveryScheduler --> DeliveryRetryPolicy
+    DeliveryScheduler --> DeliveryGatePolicy
+
+    %% Legacy delivery
+    LegacyConsumerDeliveryManager --> StorageEngine
+    LegacyConsumerDeliveryManager --> ConsumerOffsetTracker
+    LegacyConsumerDeliveryManager --> BrokerMetrics
+    LegacyConsumerDeliveryManager "1" --> "many" TopicCursor
+    LegacyConsumerDeliveryManager ..> MergedBatch : builds
+
+    %% Local delivery
+    ConsumerDeliveryManager --> StorageEngine
+    ConsumerDeliveryManager --> ConsumerAnnotationProcessor
+    ConsumerDeliveryManager --> ConsumerOffsetTracker
+    ConsumerAnnotationProcessor "1" --> "many" ConsumerContext
+
+    %% Refresh workflow
+    RefreshCoordinator --> ResetPhase
+    RefreshCoordinator --> ReplayPhase
+    RefreshCoordinator --> ReadyPhase
+    RefreshCoordinator --> RefreshGatePolicy
+    RefreshCoordinator --> ConsumerRegistry
+    RefreshCoordinator "1" --> "many" RefreshContext
+    RefreshGatePolicy --> RefreshCoordinator
+    RefreshGatePolicy ..|> DeliveryGatePolicy
+```
+
 ## Build System
 
 Multi-module Gradle build:

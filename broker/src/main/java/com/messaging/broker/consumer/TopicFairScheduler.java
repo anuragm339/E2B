@@ -29,7 +29,7 @@ public class TopicFairScheduler {
     private final int maxInFlightPerTopic;
 
     public TopicFairScheduler() {
-        this(Runtime.getRuntime().availableProcessors() * 2, 4);
+        this(Math.max(2, Runtime.getRuntime().availableProcessors()), 4);
     }
 
     public TopicFairScheduler(int threads, int maxInFlightPerTopic) {

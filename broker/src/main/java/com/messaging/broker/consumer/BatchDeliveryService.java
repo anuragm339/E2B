@@ -192,6 +192,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             long nextOffset = batch.lastOffset + 1;
             consumer.setCurrentOffset(nextOffset);
             stateService.setPendingOffset(deliveryKey, nextOffset);
+            stateService.setFromOffset(deliveryKey, startOffset);  // persisted for ACK-time msgKey lookup
 
             LogContext startedContext = LogContext.builder()
                     .traceId(traceId)
@@ -226,6 +227,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                 String timeoutTraceId = stateService.getTraceId(deliveryKey);
                 if (stateService.getPendingOffset(deliveryKey) != null) {
                     stateService.clearPendingOffset(deliveryKey);
+                    stateService.clearFromOffset(deliveryKey);
                     stateService.recordBatchSendTime(deliveryKey, 0); // Clear timestamp
 
                     long pendingDuration = System.currentTimeMillis() - pendingStartTime;
@@ -326,6 +328,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
             metrics.recordConsumerFailure(consumer.getClientId(), consumer.getTopic(), consumer.getGroup());
             inFlight.set(false);
+            stateService.clearFromOffset(deliveryKey);  // clear regardless of permanent/transient failure
 
             // Revert offset reservation on error
             consumer.setCurrentOffset(startOffset);

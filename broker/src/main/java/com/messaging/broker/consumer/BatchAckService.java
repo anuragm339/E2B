@@ -1,5 +1,7 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.ack.AckRecord;
+import com.messaging.broker.ack.RocksDbAckStore;
 import com.messaging.broker.monitoring.ConsumerEventLogger;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.consumer.ConsumerAckService;
@@ -12,14 +14,19 @@ import com.messaging.broker.model.ConsumerKey;
 import com.messaging.broker.model.DeliveryKey;
 import com.messaging.broker.consumer.PendingAckStore;
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.model.MessageRecord;
 import io.micrometer.core.instrument.Timer;
 import jakarta.inject.Inject;
+import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -39,6 +46,8 @@ public class BatchAckService implements ConsumerAckService {
     private final ConsumerRegistrationService registrationService;
     private final LegacyConsumerDeliveryManager legacyDeliveryManager;
     private final ConsumerEventLogger consumerLogger;
+    private final RocksDbAckStore ackStore;
+    private final ExecutorService storageExecutor;
 
     @Inject
     public BatchAckService(
@@ -49,7 +58,9 @@ public class BatchAckService implements ConsumerAckService {
             StorageEngine storage,
             ConsumerRegistrationService registrationService,
             LegacyConsumerDeliveryManager legacyDeliveryManager,
-            ConsumerEventLogger consumerLogger) {
+            ConsumerEventLogger consumerLogger,
+            RocksDbAckStore ackStore,
+            @Named("storageExecutor") ExecutorService storageExecutor) {
         this.stateService = stateService;
         this.pendingAckStore = pendingAckStore;
         this.offsetTracker = offsetTracker;
@@ -58,6 +69,8 @@ public class BatchAckService implements ConsumerAckService {
         this.registrationService = registrationService;
         this.legacyDeliveryManager = legacyDeliveryManager;
         this.consumerLogger = consumerLogger;
+        this.ackStore = ackStore;
+        this.storageExecutor = storageExecutor;
     }
 
     @Override
@@ -148,6 +161,49 @@ public class BatchAckService implements ConsumerAckService {
         stateService.clearInFlight(deliveryKey);
         stateService.clearTraceId(deliveryKey);
 
+        // Async RocksDB write: re-read batch from storage to extract msgKeys
+        Long capturedFromOffset = stateService.getFromOffset(deliveryKey);
+        stateService.clearFromOffset(deliveryKey);  // clear before async task to prevent leak
+        if (capturedFromOffset != null) {
+            final long fromOffsetSnap = capturedFromOffset;
+            final long toOffsetSnap = committedOffset;
+            final String topicSnap = topic;
+            final String groupSnap = group;
+            final long ackReceiveTimeSnap = ackReceiveTime;
+            storageExecutor.execute(() -> {
+                int maxRecords = (int) Math.min(toOffsetSnap - fromOffsetSnap, 10_000);
+                if (maxRecords <= 0) return;
+                try {
+                    List<MessageRecord> records = storage.read(topicSnap, 0, fromOffsetSnap, maxRecords);
+                    if (records.isEmpty()) return;
+
+                    List<String> topicList = new ArrayList<>(records.size());
+                    List<String> groupList = new ArrayList<>(records.size());
+                    List<String> keyList = new ArrayList<>(records.size());
+                    List<AckRecord> ackList = new ArrayList<>(records.size());
+
+                    for (MessageRecord r : records) {
+                        if (r.getMsgKey() == null) continue;
+                        topicList.add(topicSnap);
+                        groupList.add(groupSnap);
+                        keyList.add(r.getMsgKey());
+                        ackList.add(new AckRecord(r.getOffset(), ackReceiveTimeSnap));
+                    }
+
+                    if (!topicList.isEmpty()) {
+                        ackStore.putBatch(
+                                topicList.toArray(new String[0]),
+                                groupList.toArray(new String[0]),
+                                keyList.toArray(new String[0]),
+                                ackList.toArray(new AckRecord[0]));
+                    }
+                } catch (Exception ex) {
+                    log.warn("RocksDB ACK write failed for topic={} group={} fromOffset={}",
+                            topicSnap, groupSnap, fromOffsetSnap, ex);
+                }
+            });
+        }
+
         log.debug("ACK committed for {} at offset {}, traceId={}", deliveryKeyStr, committedOffset, traceId);
     }
 
@@ -177,6 +233,29 @@ public class BatchAckService implements ConsumerAckService {
 
             log.info("Legacy batch ACK committed for clientId={}, group={}, topics={}",
                     clientId, group, batch.getMaxOffsetPerTopic());
+
+            // Write per-msgKey ACK records to RocksDB (no async needed — already on ackExecutor)
+            List<MessageRecord> messages = batch.getMessages();
+            if (!messages.isEmpty()) {
+                List<String> topicList = new ArrayList<>(messages.size());
+                List<String> groupList = new ArrayList<>(messages.size());
+                List<String> keyList = new ArrayList<>(messages.size());
+                List<AckRecord> ackList = new ArrayList<>(messages.size());
+                for (MessageRecord r : messages) {
+                    if (r.getMsgKey() == null) continue;
+                    topicList.add(r.getTopic());
+                    groupList.add(group);
+                    keyList.add(r.getMsgKey());
+                    ackList.add(new AckRecord(r.getOffset(), ackReceiveTime));
+                }
+                if (!topicList.isEmpty()) {
+                    ackStore.putBatch(
+                            topicList.toArray(new String[0]),
+                            groupList.toArray(new String[0]),
+                            keyList.toArray(new String[0]),
+                            ackList.toArray(new AckRecord[0]));
+                }
+            }
 
             // Record metrics for messages and bytes sent (NOW that ACK is received)
             metrics.recordBatchMessagesSent(batch.getMessageCount(), batch.getTotalBytes());

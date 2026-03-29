@@ -119,4 +119,28 @@ public interface ConsumerStateService {
      */
     void removeDeliveryState(DeliveryKey key);
 
+    /**
+     * Persist the start offset of the batch that was sent, so it can be
+     * re-read from storage on ACK for per-msgKey RocksDB writes.
+     *
+     * @param key        Delivery key
+     * @param fromOffset First offset of the batch (inclusive)
+     */
+    void setFromOffset(DeliveryKey key, long fromOffset);
+
+    /**
+     * Retrieve the stored fromOffset for the active batch.
+     *
+     * @param key Delivery key
+     * @return fromOffset, or null if not set
+     */
+    Long getFromOffset(DeliveryKey key);
+
+    /**
+     * Clear the fromOffset after it has been consumed (ACK, timeout, or send failure).
+     *
+     * @param key Delivery key
+     */
+    void clearFromOffset(DeliveryKey key);
+
 }

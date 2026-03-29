@@ -43,6 +43,9 @@ dependencies {
     // Management endpoints
     implementation 'io.micronaut:micronaut-management'
 
+    // RocksDB for per-msgKey ACK store
+    implementation 'org.rocksdb:rocksdbjni:8.10.0'
+
     // Unit test dependencies
     unitTestImplementation 'org.apache.groovy:groovy:4.0.15'
     unitTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'

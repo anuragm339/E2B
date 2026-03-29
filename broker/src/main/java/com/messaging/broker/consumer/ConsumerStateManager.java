@@ -92,4 +92,19 @@ public class ConsumerStateManager implements ConsumerStateService {
         deliveryStore.removeAll(key);
     }
 
+    @Override
+    public void setFromOffset(DeliveryKey key, long fromOffset) {
+        deliveryStore.setFromOffset(key, fromOffset);
+    }
+
+    @Override
+    public Long getFromOffset(DeliveryKey key) {
+        return deliveryStore.getFromOffset(key);
+    }
+
+    @Override
+    public void clearFromOffset(DeliveryKey key) {
+        deliveryStore.clearFromOffset(key);
+    }
+
 }

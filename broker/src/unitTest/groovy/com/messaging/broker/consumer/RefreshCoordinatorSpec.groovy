@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer
 
+import com.messaging.broker.ack.RocksDbAckStore
 import com.messaging.broker.monitoring.RefreshEventLogger
 import com.messaging.broker.consumer.ConsumerRegistry
 import com.messaging.broker.monitoring.DataRefreshMetrics
@@ -24,14 +25,15 @@ class RefreshCoordinatorSpec extends Specification {
 
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger)
+        def ackStoreMock = Mock(RocksDbAckStore)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
         def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
         def batchDeliveryService = Mock(com.messaging.broker.consumer.BatchDeliveryService)
-        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService)
+        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService, remoteConsumers)
 
         when:
         def result = coordinator.startRefresh("topic").get(2, TimeUnit.SECONDS)
@@ -62,14 +64,15 @@ class RefreshCoordinatorSpec extends Specification {
 
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger)
+        def ackStoreMock = Mock(RocksDbAckStore)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
         def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
         def batchDeliveryService = Mock(com.messaging.broker.consumer.BatchDeliveryService)
-        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService)
+        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService, remoteConsumers)
 
         when:
         def result = coordinator.startRefresh("topic").get(2, TimeUnit.SECONDS)
@@ -109,14 +112,15 @@ class RefreshCoordinatorSpec extends Specification {
 
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger)
+        def ackStoreMock = Mock(RocksDbAckStore)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
         def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
         def batchDeliveryService = Mock(com.messaging.broker.consumer.BatchDeliveryService)
-        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService)
+        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService, remoteConsumers)
         coordinator.startRefresh("topic").get(2, TimeUnit.SECONDS)
 
         when:
@@ -158,14 +162,15 @@ class RefreshCoordinatorSpec extends Specification {
 
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger)
+        def ackStoreMock = Mock(RocksDbAckStore)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
         def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
         def batchDeliveryService = Mock(com.messaging.broker.consumer.BatchDeliveryService)
-        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService)
+        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService, remoteConsumers)
         coordinator.startRefresh("topic").get(2, TimeUnit.SECONDS)
         def context = coordinator.getRefreshStatus("topic")
         context.setState(RefreshState.READY_SENT)

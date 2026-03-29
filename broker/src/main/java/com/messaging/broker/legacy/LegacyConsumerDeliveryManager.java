@@ -22,17 +22,21 @@ import java.util.*;
  * Algorithm:
  * 1. Create TopicCursor for each topic subscribed by the consumer
  * 2. Use PriorityQueue (min-heap) to merge by global offset
- * 3. Poll cursor with smallest offset, read message from storage
+ * 3. Poll cursor with smallest offset, read messages from storage in chunks
  * 4. Add to MergedBatch, re-add cursor to heap if it has more
  * 5. Continue until batch size limit reached or all cursors exhausted
  *
  * Complexity:
  * - Time: O(n log k) where n = messages in batch, k = number of topics
- * - Space: O(k) - constant memory regardless of data size
+ * - Space: O(k * MSG_CHUNK) — bounded pre-fetch per topic
+ * - storage.read() calls: O(n / MSG_CHUNK) instead of O(n)
  */
 @Singleton
 public class LegacyConsumerDeliveryManager {
     private static final Logger log = LoggerFactory.getLogger(LegacyConsumerDeliveryManager.class);
+
+    // Pre-fetch chunk size for storage.read() — reduces calls from O(n) to O(n/50)
+    private static final int MSG_CHUNK = 50;
 
     private final StorageEngine storage;
     private final ConsumerOffsetTracker offsetTracker;
@@ -191,27 +195,47 @@ public class LegacyConsumerDeliveryManager {
                 log.info("✅ [PRICE-QUOTE] K-way merge starting with {} cursors from {} topics", heap.size(), topics.size());
             }
 
-            // 2. K-way merge using min-heap
+            // 2. K-way merge using min-heap with per-topic message pre-fetch buffers
+            Map<String, ArrayDeque<MessageRecord>> msgBuffers = new HashMap<>();
+
             while (!heap.isEmpty() && batch.getTotalBytes() < maxBytes) {
                 TopicCursor cursor = heap.poll(); // O(log k)
+                String topic = cursor.getTopic();
+                ArrayDeque<MessageRecord> buf =
+                        msgBuffers.computeIfAbsent(topic, t -> new ArrayDeque<>());
 
                 try {
+                    // Refill message buffer if empty: one storage.read() for MSG_CHUNK messages
+                    if (buf.isEmpty()) {
+                        IndexEntry nextEntry = cursor.peek(); // does NOT advance cursor
+                        if (nextEntry != null) {
+                            List<MessageRecord> fetched =
+                                    storage.read(topic, 0, nextEntry.offset, MSG_CHUNK);
+                            if (fetched != null) buf.addAll(fetched);
+                        }
+                    }
+
+                    // Advance cursor index (always paired with buf.poll() below)
                     IndexEntry entry = cursor.advance();
                     if (entry == null) {
                         continue; // Cursor exhausted
                     }
 
-                    // Read actual message data from storage
-                    List<MessageRecord> messages = storage.read(cursor.getTopic(), 0, entry.offset, 1);
+                    MessageRecord msg = buf.poll(); // paired with cursor.advance()
+                    if (msg == null) {
+                        // Fallback: gap or pre-fetch mismatch — single direct read
+                        List<MessageRecord> messages = storage.read(topic, 0, entry.offset, 1);
+                        if (messages != null && !messages.isEmpty()) {
+                            msg = messages.get(0);
+                        }
+                    }
 
-                    if (messages != null && !messages.isEmpty()) {
-                        MessageRecord msg = messages.get(0);
-                        batch.add(cursor.getTopic(), msg);
-
+                    if (msg != null) {
+                        batch.add(topic, msg);
                         log.trace("Merged message: topic={}, offset={}, key={}",
-                                cursor.getTopic(), msg.getOffset(), msg.getMsgKey());
+                                topic, msg.getOffset(), msg.getMsgKey());
                     } else {
-                        log.warn("No message found at offset {} for topic {}", entry.offset, cursor.getTopic());
+                        log.warn("No message found at offset {} for topic {}", entry.offset, topic);
                     }
 
                     // Re-add cursor to heap if it has more entries

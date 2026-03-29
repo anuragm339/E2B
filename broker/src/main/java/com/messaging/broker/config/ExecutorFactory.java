@@ -1,6 +1,7 @@
 package com.messaging.broker.config;
 
 import io.micronaut.context.annotation.Factory;
+import io.micronaut.context.annotation.Value;
 import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -26,11 +27,11 @@ public class ExecutorFactory {
      */
     @Singleton
     @Named("ackExecutor")
-    public ExecutorService ackExecutor() {
-        int ackThreads = Math.max(4, Runtime.getRuntime().availableProcessors() * 2);
-        ExecutorService executor = Executors.newFixedThreadPool(ackThreads,
+    public ExecutorService ackExecutor(
+            @Value("${executor.ack.threads:4}") int threads) {
+        ExecutorService executor = Executors.newFixedThreadPool(threads,
                 createThreadFactory("ACK-Processor"));
-        log.info("Created ACK executor with {} threads", ackThreads);
+        log.info("Created ACK executor with {} threads", threads);
         return executor;
     }
 
@@ -41,11 +42,11 @@ public class ExecutorFactory {
      */
     @Singleton
     @Named("consumerScheduler")
-    public ScheduledExecutorService consumerScheduler() {
-        int schedulerThreads = Math.max(2, Runtime.getRuntime().availableProcessors());
-        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(schedulerThreads,
+    public ScheduledExecutorService consumerScheduler(
+            @Value("${executor.consumer-scheduler.threads:4}") int threads) {
+        ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(threads,
                 createThreadFactory("Consumer-Scheduler"));
-        log.info("Created consumer scheduler with {} threads", schedulerThreads);
+        log.info("Created consumer scheduler with {} threads", threads);
         return scheduler;
     }
 
@@ -56,11 +57,11 @@ public class ExecutorFactory {
      */
     @Singleton
     @Named("storageExecutor")
-    public ExecutorService storageExecutor() {
-        int storageThreads = Math.max(2, Runtime.getRuntime().availableProcessors());
-        ExecutorService executor = Executors.newFixedThreadPool(storageThreads,
+    public ExecutorService storageExecutor(
+            @Value("${executor.storage.threads:4}") int threads) {
+        ExecutorService executor = Executors.newFixedThreadPool(threads,
                 createThreadFactory("Storage-Executor"));
-        log.info("Created storage executor with {} threads", storageThreads);
+        log.info("Created storage executor with {} threads", threads);
         return executor;
     }
 

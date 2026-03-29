@@ -41,6 +41,12 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, AtomicLong> pendingAckStartTime = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Gauge> pendingAckAgeGauges = new ConcurrentHashMap<>();
 
+    // ACK reconciliation: number of msgKeys in sealed segments with no RocksDB ACK record
+    private final ConcurrentHashMap<String, AtomicLong> reconciliationMissingKeys = new ConcurrentHashMap<>();
+    // ACK reconciliation: offset range of the gap (min/max offset among unACKed msgKeys; -1 when fully consistent)
+    private final ConcurrentHashMap<String, AtomicLong> reconciliationGapMinOffset = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> reconciliationGapMaxOffset = new ConcurrentHashMap<>();
+
     // Topic freshness - track last message time per topic (seconds since epoch)
     private final ConcurrentHashMap<String, AtomicLong> topicLastMessageTimeSeconds = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Gauge> topicLastMessageTimeGauges = new ConcurrentHashMap<>();
@@ -674,6 +680,52 @@ public class BrokerMetrics {
             return atomicTime;
         });
         gauge.set(currentTime);
+    }
+
+    /**
+     * Update the count of msgKeys in sealed segments that have no ACK record in RocksDB.
+     * Called by AckReconciliationScheduler after each reconciliation run.
+     */
+    public void updateReconciliationMissingKeys(String topic, String group, long count) {
+        String key = group + ":" + topic;
+        AtomicLong counter = reconciliationMissingKeys.computeIfAbsent(key, k -> {
+            AtomicLong val = new AtomicLong(0);
+            Gauge.builder("ack.reconciliation.missing.keys", val, AtomicLong::get)
+                .description("Number of msgKeys in sealed segments with no ACK record in RocksDB")
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry);
+            return val;
+        });
+        counter.set(count);
+    }
+
+    /**
+     * Report the offset range of the ACK gap for a (topic, group) pair.
+     * When the pair is fully consistent (no missing keys) pass -1 for both min and max.
+     * These two gauges together tell you exactly which slice of the log has not been ACKed.
+     */
+    public void updateReconciliationGapOffsets(String topic, String group, long minOffset, long maxOffset) {
+        String key = group + ":" + topic;
+        reconciliationGapMinOffset.computeIfAbsent(key, k -> {
+            AtomicLong val = new AtomicLong(-1);
+            Gauge.builder("ack.reconciliation.gap.min.offset", val, AtomicLong::get)
+                .description("Earliest offset with no ACK record in RocksDB (-1 when fully consistent)")
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry);
+            return val;
+        }).set(minOffset);
+
+        reconciliationGapMaxOffset.computeIfAbsent(key, k -> {
+            AtomicLong val = new AtomicLong(-1);
+            Gauge.builder("ack.reconciliation.gap.max.offset", val, AtomicLong::get)
+                .description("Latest offset with no ACK record in RocksDB (-1 when fully consistent)")
+                .tag("topic", topic)
+                .tag("group", group)
+                .register(registry);
+            return val;
+        }).set(maxOffset);
     }
 
     /**

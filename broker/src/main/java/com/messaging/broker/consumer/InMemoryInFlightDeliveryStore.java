@@ -31,6 +31,9 @@ public class InMemoryInFlightDeliveryStore implements InFlightDeliveryStore {
     // Map: DeliveryKey -> timeout task
     private final ConcurrentHashMap<DeliveryKey, ScheduledFuture<?>> pendingTimeouts = new ConcurrentHashMap<>();
 
+    // Map: DeliveryKey -> batch start offset stored at send-time for ACK-time msgKey lookup
+    private final ConcurrentHashMap<DeliveryKey, Long> fromOffsets = new ConcurrentHashMap<>();
+
     @Override
     public AtomicBoolean markInFlight(DeliveryKey key) {
         return inFlightDeliveries.computeIfAbsent(key, k -> new AtomicBoolean(false));
@@ -118,7 +121,23 @@ public class InMemoryInFlightDeliveryStore implements InFlightDeliveryStore {
         pendingOffsets.remove(key);
         batchSendTimestamps.remove(key);
         traceIds.remove(key);
+        fromOffsets.remove(key);
         cancelTimeout(key);
+    }
+
+    @Override
+    public void setFromOffset(DeliveryKey key, long fromOffset) {
+        fromOffsets.put(key, fromOffset);
+    }
+
+    @Override
+    public Long getFromOffset(DeliveryKey key) {
+        return fromOffsets.get(key);
+    }
+
+    @Override
+    public void clearFromOffset(DeliveryKey key) {
+        fromOffsets.remove(key);
     }
 
 }
