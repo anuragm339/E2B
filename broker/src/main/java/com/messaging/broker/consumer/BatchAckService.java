@@ -94,7 +94,7 @@ public class BatchAckService implements ConsumerAckService {
         stateService.cancelTimeout(deliveryKey);
 
         if (committedOffset == null) {
-            log.warn("⚠️ ACK with no pending offset: {} (likely a late ACK after timeout). ACK_LATENCY={}ms. Clearing inFlight to unblock delivery. traceId={}",
+            log.warn("event=batch_ack.late_ack deliveryKey={} ackLatencyMs={} action=clear_inflight traceId={}",
                      deliveryKeyStr, ackLatencyMs, traceId);
             // Always clear inFlight on any ACK, even a late one
             stateService.recordBatchSendTime(deliveryKey, 0);
@@ -151,7 +151,7 @@ public class BatchAckService implements ConsumerAckService {
             }
         } else {
             // Consumer was unregistered, but we can still persist the offset
-            log.warn("ACK for unregistered consumer {}, persisting offset {} for group {}",
+            log.warn("event=batch_ack.unregistered_consumer deliveryKey={} committedOffset={} group={} action=persist_offset",
                      deliveryKeyStr, committedOffset, group);
             offsetTracker.updateOffset(group + ":" + topic, committedOffset);
         }
@@ -198,7 +198,7 @@ public class BatchAckService implements ConsumerAckService {
                                 ackList.toArray(new AckRecord[0]));
                     }
                 } catch (Exception ex) {
-                    log.warn("RocksDB ACK write failed for topic={} group={} fromOffset={}",
+                    log.warn("event=batch_ack.rocksdb_write_failed topic={} group={} fromOffset={}",
                             topicSnap, groupSnap, fromOffsetSnap, ex);
                 }
             });
@@ -216,7 +216,7 @@ public class BatchAckService implements ConsumerAckService {
         pendingAckStore.removeClient(clientId); // clean up send time and any remaining state
 
         if (batch == null) {
-            log.warn("⚠️ Legacy batch ACK with no pending data: clientId={}, group={} (likely a late ACK after timeout).",
+            log.warn("event=legacy_batch_ack.no_pending_data clientId={} group={} cause=late_ack_or_timeout",
                     clientId, group);
             return;
         }
@@ -224,14 +224,14 @@ public class BatchAckService implements ConsumerAckService {
         // Calculate ACK latency from stored send timestamp
         long ackLatencyMs = sendTime > 0 ? (ackReceiveTime - sendTime) : -1;
 
-        log.info("✅ Legacy batch ACK_RECEIVED for clientId={}, group={} at T={}ms",
+        log.debug("Legacy batch ACK_RECEIVED for clientId={}, group={} at T={}ms",
                 clientId, group, ackLatencyMs);
 
         try {
             // Use the handleMergedBatchAck method from LegacyConsumerDeliveryManager
             legacyDeliveryManager.handleMergedBatchAck(group, batch);
 
-            log.info("Legacy batch ACK committed for clientId={}, group={}, topics={}",
+            log.debug("Legacy batch ACK committed for clientId={}, group={}, topics={}",
                     clientId, group, batch.getMaxOffsetPerTopic());
 
             // Write per-msgKey ACK records to RocksDB (no async needed — already on ackExecutor)

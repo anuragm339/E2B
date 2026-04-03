@@ -91,12 +91,12 @@ public class ConsumerRegistry {
      */
     public void setAdaptiveBatchDeliveryManager(AdaptiveBatchDeliveryManager adaptiveDeliveryManager) {
         this.adaptiveDeliveryManager = adaptiveDeliveryManager;
-        log.info("ConsumerRegistry wired to AdaptiveBatchDeliveryManager");
+        log.info("event=consumer_registry.adaptive_delivery_wired");
     }
 
     public void setRefreshCoordinator(RefreshCoordinator coordinator) {
         this.refreshCoordinator = coordinator;
-        log.info("ConsumerRegistry wired to RefreshCoordinator");
+        log.info("event=consumer_registry.refresh_coordinator_wired");
     }
 
     // ==================== CONSUMER REGISTRATION ====================
@@ -250,7 +250,7 @@ public class ConsumerRegistry {
                 if (pendingAckStore.getSendTime(clientId) == batchSendTime) {
                     MergedBatch pending = pendingAckStore.getPendingBatch(clientId);
                     if (pending != null) {
-                        log.warn("Legacy batch ACK timeout: clientId={}, group={} — clearing blocked pending batch",
+                        log.warn("event=legacy_batch.ack_timeout clientId={} group={} action=clear_pending_batch",
                                 clientId, consumerGroup);
                         pendingAckStore.removeClient(clientId);
                         for (String t : pending.getMaxOffsetPerTopic().keySet()) {
@@ -260,7 +260,7 @@ public class ConsumerRegistry {
                 }
             }, legacyAckTimeoutMs, TimeUnit.MILLISECONDS);
 
-            log.info("Sent legacy merged batch: clientId={}, group={}, messages={}, bytes={}, topics={}",
+            log.debug("Sent legacy merged batch: clientId={}, group={}, messages={}, bytes={}, topics={}",
                     clientId, consumerGroup, batch.getMessageCount(), batch.getTotalBytes(),
                     batch.getMaxOffsetPerTopic().keySet());
 
@@ -361,7 +361,7 @@ public class ConsumerRegistry {
                     new byte[0]
             );
             server.send(clientId, readyMessage).get();
-            log.info("Sent READY to legacy consumer: {}", clientId);
+            log.debug("Sent READY to legacy consumer: {}", clientId);
 
             // Schedule retry if no ACK received
             readinessService.scheduleReadyRetry(clientId, null, null, 0);
@@ -382,7 +382,7 @@ public class ConsumerRegistry {
                     topicBytes
             );
             server.send(clientId, readyMessage).get();
-            log.info("Sent READY to modern consumer: {}:{}:{}", clientId, topic, group);
+            log.debug("Sent READY to modern consumer: {}:{}:{}", clientId, topic, group);
 
             // Schedule retry if no ACK received
             readinessService.scheduleReadyRetry(clientId, topic, group, 0);
@@ -407,13 +407,13 @@ public class ConsumerRegistry {
         for (String clientId : clientIds) {
             try {
                 server.send(clientId, resetMsg).get();
-                log.info("Sent RESET to consumer {} for topic {}", clientId, topic);
+                log.debug("Sent RESET to consumer {} for topic {}", clientId, topic);
             } catch (Exception e) {
                 log.error("Failed to send RESET to consumer {} for topic {}", clientId, topic, e);
             }
         }
 
-        log.info("Broadcast RESET to {} consumers for topic: {}", clientIds.size(), topic);
+        log.info("event=refresh.reset_broadcast topic={} consumerCount={}", topic, clientIds.size());
     }
 
     /**
@@ -432,13 +432,13 @@ public class ConsumerRegistry {
         for (String clientId : clientIds) {
             try {
                 server.send(clientId, readyMsg).get();
-                log.info("Sent READY to consumer {} for topic {}", clientId, topic);
+                log.debug("Sent READY to consumer {} for topic {}", clientId, topic);
             } catch (Exception e) {
                 log.error("Failed to send READY to consumer {} for topic {}", clientId, topic, e);
             }
         }
 
-        log.info("Broadcast READY to {} consumers for topic: {}", clientIds.size(), topic);
+        log.info("event=refresh.ready_broadcast topic={} consumerCount={}", topic, clientIds.size());
     }
 
     /**
@@ -454,7 +454,7 @@ public class ConsumerRegistry {
         );
         try {
             server.send(clientId, readyMsg).get();
-            log.info("Sent refresh READY to late-connecting consumer {} for topic {}", clientId, topic);
+            log.info("event=refresh.ready_sent_late_joiner clientId={} topic={}", clientId, topic);
         } catch (Exception e) {
             log.error("Failed to send refresh READY to consumer {} for topic {}", clientId, topic, e);
         }
@@ -482,7 +482,7 @@ public class ConsumerRegistry {
                     if (ackedGroupTopics.contains(groupTopic)) {
                         try {
                             server.send(clientId, readyMsg).get();
-                            log.info("Sent refresh READY to consumer {} for topic {}", clientId, topic);
+                            log.info("event=refresh.ready_sent clientId={} topic={}", clientId, topic);
                         } catch (Exception e) {
                             log.error("Failed to send refresh READY to consumer {} for topic {}", clientId, topic, e);
                         }
@@ -515,9 +515,9 @@ public class ConsumerRegistry {
             RemoteConsumer consumer = consumerOpt.get();
             consumer.setCurrentOffset(offset);
             offsetTracker.updateOffset(group + ":" + topic, offset);
-            log.info("Reset consumer offset: {}:{}:{} -> {}", clientId, topic, group, offset);
+            log.info("event=consumer.offset_reset clientId={} topic={} group={} offset={}", clientId, topic, group, offset);
         } else {
-            log.warn("Cannot reset offset for unregistered consumer: {}:{}:{}", clientId, topic, group);
+            log.warn("event=consumer.offset_reset_skipped clientId={} topic={} group={} reason=unregistered_consumer", clientId, topic, group);
         }
     }
 
@@ -618,9 +618,9 @@ public class ConsumerRegistry {
      * Shutdown facade (cleanup resources).
      */
     public void shutdown() {
-        log.info("Shutting down ConsumerRegistry...");
+        log.info("event=consumer_registry.shutdown_started");
         // Services are managed by DI container, no manual cleanup needed
-        log.info("ConsumerRegistry shutdown complete");
+        log.info("event=consumer_registry.shutdown_complete");
     }
 
     /**

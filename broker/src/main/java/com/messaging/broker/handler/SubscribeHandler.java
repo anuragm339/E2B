@@ -86,18 +86,18 @@ public class SubscribeHandler implements MessageHandler {
             String topic = safeGetText(json, "topic", clientId);
             String group = safeGetText(json, "group", clientId);
 
-            log.info("Modern client {} subscribed: topic={}, group={}, traceId={}", clientId, topic, group, traceId);
+            log.info("event=subscribe.processed mode=modern clientId={} topic={} group={} traceId={}", clientId, topic, group, traceId);
 
             // Register consumer - only record connection metric for new registrations
             boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group, false, traceId);
             if (isNew) {
                 metrics.recordConsumerConnection();
             } else {
-                log.warn("Duplicate SUBSCRIBE from clientId={} topic={} group={} traceId={} - skipping activeConsumers increment",
+                log.warn("event=subscribe.duplicate clientId={} topic={} group={} traceId={}",
                         clientId, topic, group, traceId);
             }
 
-            log.info("Registered remote consumer {} for topic={}, group={}, traceId={}", clientId, topic, group, traceId);
+            log.debug("Registered remote consumer {} for topic={}, group={}, traceId={}", clientId, topic, group, traceId);
 
             // Send ACK (modern client)
             sendSubscribeAck(clientId, message, false, traceId);
@@ -123,7 +123,7 @@ public class SubscribeHandler implements MessageHandler {
         String serviceName = safeGetText(json, "serviceName", clientId);
 
         if (!legacyClientConfig.isEnabled()) {
-            log.warn("Legacy client support disabled, rejecting registration from service: {}, traceId={}", serviceName, traceId);
+            log.warn("event=subscribe.legacy_rejected service={} reason=legacy_disabled traceId={}", serviceName, traceId);
             return;
         }
 
@@ -133,8 +133,8 @@ public class SubscribeHandler implements MessageHandler {
             return;
         }
 
-        log.info("Legacy client {} (service={}) subscribing to {} topics: {}, traceId={}",
-                clientId, serviceName, topics.size(), topics, traceId);
+        log.info("event=subscribe.processed mode=legacy clientId={} service={} topicCount={} traceId={}",
+                clientId, serviceName, topics.size(), traceId);
 
         // Register consumer for ALL topics (serviceName is used as the consumer group)
         // Mark as legacy (isLegacy=true) so delivery pipeline uses multi-topic merge
@@ -144,7 +144,7 @@ public class SubscribeHandler implements MessageHandler {
             if (isNew) {
                 newRegistrations++;
             }
-            log.info("Registered legacy consumer {} for topic={}, group={}, traceId={}",
+            log.debug("Registered legacy consumer {} for topic={}, group={}, traceId={}",
                     clientId, topic, serviceName, traceId);
         }
 
@@ -153,7 +153,7 @@ public class SubscribeHandler implements MessageHandler {
             metrics.recordConsumerConnection();
         }
 
-        log.info("Legacy client {} registered for {} topics (service={}), traceId={}",
+        log.info("event=subscribe.legacy_registered clientId={} service={} topicCount={} traceId={}",
                 clientId, topics.size(), serviceName, traceId);
 
         // Send READY to start delivery (legacy consumers deliver only after READY_ACK)
@@ -168,7 +168,7 @@ public class SubscribeHandler implements MessageHandler {
             if (anyRefreshActive) {
                 // Refresh in progress — bypass startup READY, mark consumer ready directly
                 remoteConsumers.markLegacyConsumerReady(clientId);
-                log.info("Refresh active — consumer {} marked ready immediately, skipping startup READY, traceId={}",
+                log.info("event=subscribe.ready_bypass clientId={} reason=refresh_active traceId={}",
                         clientId, traceId);
 
                 for (String topic : topics) {
@@ -180,7 +180,7 @@ public class SubscribeHandler implements MessageHandler {
 
                     if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
                         // Already past replay — send refresh READY directly
-                        log.info("Consumer {} connected during READY_SENT for topic={} - sending refresh READY, traceId={}",
+                        log.info("event=subscribe.refresh_ready_sent clientId={} topic={} traceId={}",
                                 clientId, topic, traceId);
                         remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
                     } else if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
@@ -224,7 +224,7 @@ public class SubscribeHandler implements MessageHandler {
             if (ex != null) {
                 log.error("Failed to send ACK to {}, traceId={}", clientId, traceId, ex);
             } else {
-                log.info("Sent ACK to {} for SUBSCRIBE, traceId={}", clientId, traceId);
+                log.info("event=subscribe.ack_sent clientId={} traceId={}", clientId, traceId);
             }
         });
     }

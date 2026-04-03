@@ -93,7 +93,7 @@ public class ResetAckHandler implements MessageHandler {
                         .findFirst()
                         .orElse(null);
                 if (group == null) {
-                    log.warn("RESET_ACK from {}: topic={} found but no registered consumer group, traceId={}",
+                    log.warn("event=reset_ack.group_resolution_failed clientId={} topic={} traceId={}",
                              clientId, topic, traceId);
                     return; // soft-fail, do not close connection
                 }
@@ -111,14 +111,13 @@ public class ResetAckHandler implements MessageHandler {
                 group = new String(groupBytes, StandardCharsets.UTF_8);
             }
 
-            log.info("Received RESET ACK from client: {} for topic: {}, group: {}, traceId={}", clientId, topic, group, traceId);
-
             // Construct consumerGroupTopic identifier
             String consumerGroupTopic = group + ":" + topic;
 
-            log.info("Mapped consumer {} to group:topic identifier: {}, traceId={}", clientId, consumerGroupTopic, traceId);
+            log.debug("Mapped consumer {} to group:topic identifier: {}, traceId={}", clientId, consumerGroupTopic, traceId);
 
             // Delegate to RefreshCoordinator
+            log.info("event=reset_ack.processed clientId={} topic={} group={} traceId={}", clientId, topic, group, traceId);
             dataRefreshCoordinator.handleResetAck(consumerGroupTopic, clientId, topic, traceId);
 
             // Do NOT send ACK back - legacy protocol compatibility

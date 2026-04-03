@@ -55,7 +55,7 @@ public class LegacyConsumerDeliveryManager {
         this.dataDir = System.getProperty("broker.storage.dataDir",
                 System.getenv().getOrDefault("DATA_DIR", "./data"));
 
-        log.info("LegacyConsumerDeliveryManager initialized with dataDir={}", dataDir);
+        log.info("event=legacy_delivery.initialized dataDir={}", dataDir);
     }
 
     /**
@@ -73,16 +73,11 @@ public class LegacyConsumerDeliveryManager {
         // Enable detailed logging only for price-quote consumer group
         boolean debugPriceQuote = consumerGroup != null && consumerGroup.contains("price-quote");
 
-        if (debugPriceQuote) {
-            log.info("🔍 [PRICE-QUOTE] Building merged batch: topics={}, group={}, maxBytes={}",
-                    topics, consumerGroup, maxBytes);
-        } else {
-            log.debug("Building merged batch: topics={}, group={}, maxBytes={}",
-                    topics, consumerGroup, maxBytes);
-        }
+        log.debug("Building merged batch: topics={}, group={}, maxBytes={}",
+                topics, consumerGroup, maxBytes);
 
         if (topics == null || topics.isEmpty()) {
-            log.warn("No topics provided for merge");
+            log.warn("event=legacy_delivery.merge_skipped reason=no_topics");
             return new MergedBatch();
         }
 
@@ -115,13 +110,13 @@ public class LegacyConsumerDeliveryManager {
                     if (committedOffset < 0) {
                         startOffset = earliestOffset;
                         if (debugPriceQuote) {
-                            log.info("📍 [PRICE-QUOTE] Topic {} - No committed offset, starting from earliest: {} (current: {})",
+                            log.debug("[PRICE-QUOTE] Topic {} - No committed offset, starting from earliest: {} (current: {})",
                                     topic, startOffset, currentOffset);
                         }
                     } else {
                         startOffset = committedOffset + 1; // Next offset after last committed
                         if (debugPriceQuote) {
-                            log.info("📍 [PRICE-QUOTE] Topic {} - Committed offset: {}, starting from: {} (earliest: {}, current: {})",
+                            log.debug("[PRICE-QUOTE] Topic {} - Committed offset: {}, starting from: {} (earliest: {}, current: {})",
                                     topic, committedOffset, startOffset, earliestOffset, currentOffset);
                         }
                     }
@@ -129,14 +124,14 @@ public class LegacyConsumerDeliveryManager {
                     // Validate offset range
                     if (currentOffset < 0) {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - No data available (currentOffset: -1)", topic);
+                            log.debug("[PRICE-QUOTE] Topic {} - No data available (currentOffset: -1)", topic);
                         }
                         continue;
                     }
 
                     if (startOffset > currentOffset) {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - startOffset ({}) beyond currentOffset ({}) - no new data",
+                            log.debug("[PRICE-QUOTE] Topic {} - startOffset ({}) beyond currentOffset ({}) - no new data",
                                     topic, startOffset, currentOffset);
                         }
                         continue;
@@ -150,7 +145,7 @@ public class LegacyConsumerDeliveryManager {
 
                     if (cursor == null) {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - createCursor returned NULL (startOffset: {})", topic, startOffset);
+                            log.debug("[PRICE-QUOTE] Topic {} - createCursor returned NULL (startOffset: {})", topic, startOffset);
                         }
                         continue;
                     }
@@ -164,11 +159,11 @@ public class LegacyConsumerDeliveryManager {
                         cursors.add(cursor);
                         heap.add(cursor);
                         if (debugPriceQuote) {
-                            log.info("✅ [PRICE-QUOTE] Added cursor: topic={}, startOffset={}", topic, startOffset);
+                            log.debug("[PRICE-QUOTE] Added cursor: topic={}, startOffset={}", topic, startOffset);
                         }
                     } else {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - cursor.hasMore() returned false (startOffset: {}, current: {})",
+                            log.debug("[PRICE-QUOTE] Topic {} - cursor.hasMore() returned false (startOffset: {}, current: {})",
                                     topic, startOffset, currentOffset);
                         }
                         cursor.close();
@@ -181,10 +176,10 @@ public class LegacyConsumerDeliveryManager {
 
             if (heap.isEmpty()) {
                 if (debugPriceQuote) {
-                    log.warn("⚠️ [PRICE-QUOTE] EMPTY HEAP - No cursors available after processing {} topics (group: {}). " +
-                             "Check if: (1) startOffset > currentOffset, (2) createCursor() failed, " +
-                             "(3) cursor.hasMore() returned false",
-                             topics.size(), consumerGroup);
+                    log.debug("[PRICE-QUOTE] EMPTY HEAP - No cursors available after processing {} topics (group: {}). " +
+                              "Check if: (1) startOffset > currentOffset, (2) createCursor() failed, " +
+                              "(3) cursor.hasMore() returned false",
+                              topics.size(), consumerGroup);
                 } else {
                     log.debug("No cursors available - all topics exhausted");
                 }
@@ -192,7 +187,7 @@ public class LegacyConsumerDeliveryManager {
             }
 
             if (debugPriceQuote) {
-                log.info("✅ [PRICE-QUOTE] K-way merge starting with {} cursors from {} topics", heap.size(), topics.size());
+                log.debug("[PRICE-QUOTE] K-way merge starting with {} cursors from {} topics", heap.size(), topics.size());
             }
 
             // 2. K-way merge using min-heap with per-topic message pre-fetch buffers
@@ -235,7 +230,7 @@ public class LegacyConsumerDeliveryManager {
                         log.trace("Merged message: topic={}, offset={}, key={}",
                                 topic, msg.getOffset(), msg.getMsgKey());
                     } else {
-                        log.warn("No message found at offset {} for topic {}", entry.offset, topic);
+                        log.debug("No message found at offset {} for topic {}", entry.offset, topic);
                     }
 
                     // Re-add cursor to heap if it has more entries
@@ -280,13 +275,13 @@ public class LegacyConsumerDeliveryManager {
         Path indexPath = findIndexPath(topic, startOffset, debugPriceQuote);
         if (indexPath == null) {
             if (debugPriceQuote) {
-                log.warn("❌ [PRICE-QUOTE] No index file found for topic: {}, startOffset={}", topic, startOffset);
+                log.debug("[PRICE-QUOTE] No index file found for topic: {}, startOffset={}", topic, startOffset);
             }
             return null;
         }
 
         if (debugPriceQuote) {
-            log.debug("✅ [PRICE-QUOTE] Found index path: {}", indexPath);
+            log.debug("[PRICE-QUOTE] Found index path: {}", indexPath);
         }
         TopicCursor cursor = new TopicCursor(topic, indexPath, startOffset);
         if (debugPriceQuote) {
@@ -311,7 +306,7 @@ public class LegacyConsumerDeliveryManager {
 
         if (!topicDir.toFile().exists()) {
             if (debugPriceQuote) {
-                log.warn("❌ [PRICE-QUOTE] Topic directory does not exist: {}", topicDir);
+                log.debug("[PRICE-QUOTE] Topic directory does not exist: {}", topicDir);
             }
             return null;
         }
@@ -321,7 +316,7 @@ public class LegacyConsumerDeliveryManager {
 
         if (indexFiles == null || indexFiles.length == 0) {
             if (debugPriceQuote) {
-                log.warn("⚠️ [PRICE-QUOTE] No .index files found in: {}", topicDir);
+                log.debug("[PRICE-QUOTE] No .index files found in: {}", topicDir);
             }
             return null;
         }
@@ -330,7 +325,7 @@ public class LegacyConsumerDeliveryManager {
             String fileDetails = java.util.Arrays.stream(indexFiles)
                     .map(f -> String.format("%s (%s)", f.getName(), formatFileSize(f.length())))
                     .collect(java.util.stream.Collectors.joining(", "));
-            log.info("📂 [PRICE-QUOTE] Index files in {}: {}", topicDir, fileDetails);
+            log.debug("[PRICE-QUOTE] Index files in {}: {}", topicDir, fileDetails);
         }
 
         // Find the segment with the highest base offset that is <= startOffset
@@ -348,19 +343,19 @@ public class LegacyConsumerDeliveryManager {
                     bestIndexPath = indexFile.toPath();
                 }
             } catch (NumberFormatException e) {
-                log.warn("Non-standard index filename (skipping): {}", name);
+                log.warn("event=legacy_delivery.index_file_skipped filename={} reason=non_standard_name", name);
             }
         }
 
         if (bestIndexPath == null) {
             if (debugPriceQuote) {
-                log.warn("❌ [PRICE-QUOTE] No index file covers startOffset={} in {}", startOffset, topicDir);
+                log.debug("[PRICE-QUOTE] No index file covers startOffset={} in {}", startOffset, topicDir);
             }
             return null;
         }
 
         if (debugPriceQuote) {
-            log.debug("✅ [PRICE-QUOTE] Selected index: {} (baseOffset={}) for startOffset={}",
+            log.debug("[PRICE-QUOTE] Selected index: {} (baseOffset={}) for startOffset={}",
                     bestIndexPath.getFileName(), bestBaseOffset, startOffset);
         }
         return bestIndexPath;

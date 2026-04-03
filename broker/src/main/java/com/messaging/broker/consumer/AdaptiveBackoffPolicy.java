@@ -16,8 +16,8 @@ public class AdaptiveBackoffPolicy implements DeliveryRetryPolicy {
     private final long maxDelayMs;
 
     public AdaptiveBackoffPolicy(
-            @Value("${broker.delivery.min-poll-delay-ms:1}") long minDelayMs,
-            @Value("${broker.delivery.max-poll-delay-ms:1000}") long maxDelayMs) {
+            @Value("${broker.consumer.adaptive-polling.min-delay-ms}") long minDelayMs,
+            @Value("${broker.consumer.adaptive-polling.max-delay-ms}") long maxDelayMs) {
         this.minDelayMs = Math.max(1, minDelayMs);
         this.maxDelayMs = maxDelayMs;
     }

@@ -50,9 +50,8 @@ public class ReadyAckHandler implements MessageHandler {
 
             // Handle empty payload for legacy startup READY_ACK
             if (buffer.remaining() == 0) {
-                log.info("📥 READY_ACK for STARTUP from legacy client: {} (empty payload), traceId={}", clientId, traceId);
                 remoteConsumers.markLegacyConsumerReady(clientId);
-                log.info("✅ Legacy consumer {} marked as READY (can now receive data), traceId={}", clientId, traceId);
+                log.info("event=ready_ack.processed mode=legacy_startup clientId={} traceId={}", clientId, traceId);
 
                 // Do NOT send ACK back - legacy clients disconnect when receiving unexpected ACK
                 log.debug("Legacy client {} ready - no ACK sent (legacy protocol), traceId={}", clientId, traceId);
@@ -107,7 +106,7 @@ public class ReadyAckHandler implements MessageHandler {
                         .findFirst()
                         .orElse(null);
                 if (group == null) {
-                    log.warn("READY_ACK from {}: topic={} but no registered consumer group, traceId={}",
+                    log.warn("event=ready_ack.group_resolution_failed clientId={} topic={} traceId={}",
                              clientId, topic, traceId);
                     return; // soft-fail, do not close connection
                 }
@@ -125,12 +124,10 @@ public class ReadyAckHandler implements MessageHandler {
                 group = new String(groupBytes, StandardCharsets.UTF_8);
             }
 
-            log.info("Received READY ACK from client: {} for topic: {}, group: {}, traceId={}", clientId, topic, group, traceId);
-
             // Construct consumerGroupTopic identifier
             String consumerGroupTopic = group + ":" + topic;
 
-            log.info("Mapped consumer {} to group:topic identifier: {}, traceId={}", clientId, consumerGroupTopic, traceId);
+            log.debug("Mapped consumer {} to group:topic identifier: {}, traceId={}", clientId, consumerGroupTopic, traceId);
 
             // Check if this is startup READY_ACK or refresh READY_ACK
             boolean isRefreshActive = topic != null && !topic.isEmpty() &&
@@ -138,14 +135,11 @@ public class ReadyAckHandler implements MessageHandler {
 
             if (isRefreshActive) {
                 // Refresh READY_ACK - delegate to RefreshCoordinator
-                log.info("📥 READY_ACK for REFRESH from client: {} topic: {} group: {}, traceId={}",
+                log.info("event=ready_ack.processed mode=refresh clientId={} topic={} group={} traceId={}",
                         clientId, topic, group, traceId);
                 dataRefreshCoordinator.handleReadyAck(consumerGroupTopic, topic, traceId);
             } else {
                 // Startup READY_ACK - mark consumer as ready
-                log.info("📥 READY_ACK for STARTUP from client: {} topic: {} group: {}, traceId={}",
-                        clientId, topic, group, traceId);
-
                 // Determine if this is a legacy or modern consumer
                 String consumerKey = clientId + ":" + topic + ":" + group;
                 boolean isLegacy = remoteConsumers.isLegacyConsumer(consumerKey);
@@ -153,11 +147,12 @@ public class ReadyAckHandler implements MessageHandler {
                 if (isLegacy || topic.isEmpty()) {
                     // Legacy consumer - mark entire client as ready
                     remoteConsumers.markLegacyConsumerReady(clientId);
-                    log.info("✅ Legacy consumer {} marked as READY (can now receive data), traceId={}", clientId, traceId);
+                    log.info("event=ready_ack.processed mode=legacy clientId={} topic={} group={} traceId={}",
+                            clientId, topic, group, traceId);
                 } else {
                     // Modern consumer - mark specific topic as ready
                     remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
-                    log.info("✅ Modern consumer {} marked as READY for topic {} group {} (can now receive data), traceId={}",
+                    log.info("event=ready_ack.processed mode=modern clientId={} topic={} group={} traceId={}",
                             clientId, topic, group, traceId);
                 }
             }

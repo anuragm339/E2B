@@ -29,7 +29,7 @@ public class PipeServer {
         this.storage = storage;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
-        log.info("PipeServer initialized");
+        log.info("event=pipe_server.initialized");
     }
 
     /**
@@ -55,7 +55,7 @@ public class PipeServer {
 
             // Serialize to JSON
             String json = objectMapper.writeValueAsString(records);
-            log.info("Serving {} messages to child broker: topic={}, offset={}",
+            log.debug("Serving {} messages to child broker: topic={}, offset={}",
                     records.size(), topic, offset);
 
             return HttpResponse.ok(json);
