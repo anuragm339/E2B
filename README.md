@@ -1,620 +1,235 @@
-# Kafka-like Messaging System - Provider
+# Messaging Provider
 
-A modular, high-performance distributed messaging broker with pluggable architecture.
+A modular messaging broker with pluggable storage, transport, topology, and refresh workflows.
 
-## Architecture Overview
+This repository is the broker/provider side of the system. The current design separates broker orchestration from storage and network implementations so new backends can be added without changing broker code.
 
-### Design Principles
-- **Modular & Pluggable**: Swap storage/network/pipe layers via configuration
-- **Cloud-Managed Topology**: Automatic node discovery and parent assignment
-- **Full Persistence**: Segment-based storage with metadata indexing
-- **Remote Consumers**: TCP-connected consumers (see consumer-app project)
-- **Hierarchical Topology**: Parent-child broker relationships via pipe connectors
+## Current Design
 
-## Project Structure
+- `broker` owns orchestration, consumer delivery, refresh, topology, and metrics.
+- `storage` owns persistence and batch creation.
+- `network` owns wire protocol, TCP transport, client/server codecs, and batch transfer.
+- `pipe` owns parent-broker polling and upstream replication.
+- `common` owns the shared contracts and models used across all modules.
 
-```
+The main pluggable boundaries are:
+
+- `StorageEngine`: generic append/read/offset storage contract
+- `BatchReadableStorage`: optional capability for storage engines that can produce a `DeliveryBatch`
+- `NetworkServer`: transport contract used by the broker to send messages and batches
+- `DeliveryBatch`: storage-produced delivery unit consumed by the transport
+
+That means:
+
+- a new storage backend such as SQLite/Postgres can implement `StorageEngine`, and if it supports remote batch delivery, `BatchReadableStorage`
+- a new transport such as gRPC/RSocket can implement `NetworkServer`
+- the broker module does not need transport-specific or storage-specific branching
+
+## Latest Design Changes
+
+- Removed transport leakage from broker/common APIs. Batch delivery no longer exposes Netty `FileRegion`.
+- Removed concrete storage branching from broker delivery logic. The broker now uses `BatchReadableStorage` instead of `instanceof` dispatch.
+- Introduced `DeliveryBatch` as the storage-to-transport handoff object.
+- Kept `StorageEngine` generic so non-file-backed storage remains possible.
+- Moved the batch-header responsibility into the transport via `NetworkServer.sendBatch(...)`.
+- Updated the architecture docs in [`readme/C4_ARCHITECTURE.md`](readme/C4_ARCHITECTURE.md) to reflect both structural C4 views and dynamic runtime flows.
+
+## Module Layout
+
+```text
 provider/
-├── common/              ✅ Core interfaces & models
-│   ├── api/
-│   │   ├── StorageEngine.java
-│   │   ├── NetworkServer.java
-│   │   ├── NetworkClient.java
-│   │   └── PipeConnector.java
-│   ├── model/
-│   │   ├── EventType.java
-│   │   ├── MessageRecord.java
-│   │   ├── ConsumerRecord.java
-│   │   ├── BrokerMessage.java
-│   │   ├── TopologyResponse.java
-│   │   └── HealthStatus.java
-│   └── annotation/
-│       ├── @Consumer
-│       ├── MessageHandler
-│       ├── ErrorHandler
-│       └── RetryPolicy
-│
-├── storage/             ✅ Memory-mapped storage
-│   ├── mmap/           - MMapStorageEngine
-│   ├── segment/        - Segment & SegmentManager
-│   └── metadata/       - SegmentMetadata & Store
-│
-├── network/             ✅ Netty TCP implementation
-│   ├── tcp/            - NettyTcpServer & Client
-│   ├── codec/          - BinaryMessageEncoder/Decoder
-│   └── handler/        - ServerMessageHandler & ClientMessageHandler
-│
-├── pipe/                ✅ Parent broker connection
-│   ├── HttpPipeConnector.java
-│   └── PipeServer.java
-│
-└── broker/              ✅ Core broker service
-    ├── core/           - BrokerService
-    ├── consumer/       - RemoteConsumerRegistry
-    │                   - ConsumerDeliveryManager (local @Consumer support)
-    │                   - ConsumerAnnotationProcessor
-    │                   - ConsumerOffsetTracker
-    ├── registry/       - TopologyManager
-    │                   - CloudRegistryClient
-    │                   - TopologyPropertiesStore
-    └── pipe/           - PipeMessageForwarder
+├── common/    Shared APIs, models, exceptions, annotations
+├── storage/   File-backed storage engines, segments, metadata, batch production
+├── network/   Netty TCP server/client, codecs, protocol handlers
+├── pipe/      Parent-broker polling, pipe server, replication transport
+├── broker/    Broker orchestration, delivery, refresh, topology, metrics
+├── readme/    Architecture and design docs
+└── scripts/   Monitoring and support tooling
 ```
 
-## Key Features
+## Runtime Architecture
 
-### ✅ Storage Layer
-- Memory-mapped file I/O for high performance
-- Segment-based storage with auto-rolling (configurable size)
-- Sparse indexing (every 4KB) for O(log n) offset lookups
-- CRC32 data integrity validation on read/write
-- Binary record format with efficient encoding
-- Recovery from disk on restart
-- SQLite metadata store for segment tracking
+### Producer ingress
 
-### ✅ Network Layer
-- Netty-based non-blocking I/O
-- Binary message protocol (DATA, ACK, SUBSCRIBE, RESET, READY, etc.)
-- TCP server with multiple client support
-- ACK tracking and wait mechanism
-- Connection management and cleanup
+1. Producer sends broker protocol messages to the broker TCP port.
+2. `NettyTcpServer` decodes the message and forwards it to broker handlers.
+3. `BrokerService` routes data to the configured `StorageEngine`.
+4. Consumer delivery is scheduled from broker-side delivery services.
 
-### ✅ Broker Core
-- Main orchestrator service (BrokerService)
-- Remote consumer registry (TCP-connected consumers)
-- Local consumer annotation framework (@Consumer support)
-- Message routing and delivery
-- Offset tracking and persistence
-- Topology management (parent connection via pipe)
+### Parent-broker replication
 
-### ✅ Pipe Connector
-- HTTP-based polling from parent broker
-- Health monitoring (HEALTHY/DEGRADED/UNHEALTHY)
-- Automatic reconnection
-- Message forwarding to local storage
+1. `TopologyManager` queries the cloud registry for the current topology.
+2. If the node has a parent, `HttpPipeConnector` polls the parent broker's `/pipe/poll` endpoint.
+3. Pipe messages are converted into local `MessageRecord`s and stored through broker services.
 
-## Configuration
+### Remote consumer delivery
 
-Example `application.yml`:
+1. `BatchDeliveryService` asks `BatchReadableStorage` for a `DeliveryBatch`.
+2. `NetworkServer.sendBatch(clientId, group, batch)` hands the batch to the transport.
+3. The transport writes the batch header and streams payload bytes.
+4. The client decodes the batch and sends `BATCH_ACK`.
+5. The broker advances offsets only after the ACK path completes.
+
+### Refresh workflow
+
+The broker supports coordinated refresh via `RESET`, replay, and `READY`:
+
+1. broker starts refresh for a topic
+2. subscribed consumers receive `RESET`
+3. broker waits for `RESET_ACK`
+4. broker replays historical data
+5. broker sends `READY`
+6. broker waits for `READY_ACK`
+7. normal forward delivery resumes
+
+For the exact class and method flow, including modern and legacy client behavior, see [`readme/C4_ARCHITECTURE.md`](readme/C4_ARCHITECTURE.md).
+
+## Default Runtime Configuration
+
+Current defaults are defined in `broker/src/main/resources/application.yml`.
 
 ```yaml
+micronaut:
+  server:
+    port: ${HTTP_PORT:8082}
+
 broker:
-  node:
-    id: ${NODE_ID:local-001}
+  nodeId: ${NODE_ID:local-001}
 
   storage:
-    type: mmap
-    data-dir: ${DATA_DIR:./data}
-    segment-size: 1073741824  # 1GB
+    type: filechannel
+    dataDir: ${DATA_DIR:./data}
+    segment-size: 1073741824
 
   network:
     type: tcp
-    port: ${BROKER_PORT:9092}
-    threads:
-      boss: 2
-      worker: 16
+    port: ${BROKER_PORT:19092}
 
-  registry:
-    url: ${REGISTRY_URL:http://localhost:8080}
-    poll-interval: 30000
+  consumer:
+    ack-timeout: ${ACK_TIMEOUT_MS:120000}
+    max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:2097152}
+    adaptive-polling:
+      min-delay-ms: 200
+      max-delay-ms: 5000
 
   pipe:
-    poll-interval: 1000
-    batch-size: 100
+    min-poll-interval-ms: 500
+    max-poll-interval-ms: 20000
+    poll-limit: 5
 ```
 
-## Running the Broker
+Notes:
 
-### Standalone Mode
+- default storage is `filechannel`
+- default broker TCP port is `19092`
+- default HTTP/admin port is `8082`
+- the current config is tuned for lower CPU usage rather than maximum throughput
+
+## Supported Extension Points
+
+### Add a new storage implementation
+
+Implement:
+
+- `StorageEngine`
+- optionally `BatchReadableStorage` if the backend supports remote consumer batch delivery
+
+Examples:
+
+- file-backed zero-copy storage can return a file-backed `DeliveryBatch`
+- DB-backed storage can return `ByteArrayDeliveryBatch`
+
+### Add a new transport implementation
+
+Implement:
+
+- `NetworkServer`
+
+The transport is responsible for:
+
+- accepting broker messages
+- sending point-to-point broker messages
+- sending `DeliveryBatch` payloads
+- encoding the batch header
+- closing the batch on success, failure, cancellation, or rejection
+
+## Running The Broker
+
+### Local run
+
 ```bash
 ./gradlew :broker:run
 ```
 
-### With Environment Variables
+### With environment variables
+
 ```bash
 export NODE_ID=broker-001
-export REGISTRY_URL=http://registry.example.com
-export DATA_DIR=/var/lib/broker
-export BROKER_PORT=9092
+export REGISTRY_URL=http://localhost:8080
+export DATA_DIR=./data-local
+export BROKER_PORT=19092
+export HTTP_PORT=8082
 
 ./gradlew :broker:run
 ```
 
 ### Docker
+
 ```bash
 docker build -t messaging-broker:latest -f broker/Dockerfile .
 
 docker run -d \
-  --name broker \
+  --name messaging-broker \
   -e NODE_ID=broker-001 \
-  -e BROKER_PORT=9092 \
+  -e REGISTRY_URL=http://host.docker.internal:8080 \
+  -e BROKER_PORT=19092 \
+  -e HTTP_PORT=8082 \
   -e DATA_DIR=/app/data \
-  -p 9092:9092 \
-  -p 8080:8080 \
+  -p 19092:19092 \
+  -p 8082:8082 \
   -v broker-data:/app/data \
   messaging-broker:latest
 ```
 
-## Consumer Applications
+## Monitoring
 
-For consumer implementations, see the **consumer-app** project (separate module).
+Grafana dashboards and support-facing monitoring assets live outside this module under the sibling `monitoring/` directory.
 
-Consumer-app features:
-- Environment-driven configuration
-- TCP connection to broker
-- Segment-based local storage
-- SQLite metadata indexing
-- RESET/READY data refresh workflow
-- REST API for queries
+Useful starting points:
 
-## Data Flow
+- broker and per-consumer dashboards
+- thread monitoring and bottleneck dashboards
+- pipe performance dashboards
+- refresh and ACK reconciliation dashboards
 
-```
-Producer/Parent Broker
-    ↓ [TCP: BrokerMessage]
-NettyTcpServer
-    ↓
-BrokerService
-    ↓ [Store]
-MMapStorageEngine
-    ↓ [Segments on disk]
-    ↑ [Read]
-RemoteConsumerRegistry
-    ↓ [TCP: DATA messages]
-Remote Consumer (consumer-app)
-```
+The architecture/design document for flows and drilldowns is here:
 
-## Binary Protocol
+- [`readme/C4_ARCHITECTURE.md`](readme/C4_ARCHITECTURE.md)
 
-### Message Format
-```
-[Type:1B][MessageId:8B][PayloadLength:4B][Payload:variable]
-```
+## Build And Test
 
-### Message Types
-- `DATA` (0x01): Message delivery
-- `ACK` (0x02): Acknowledgment
-- `SUBSCRIBE` (0x03): Consumer subscription
-- `COMMIT_OFFSET` (0x04): Offset commit
-- `RESET` (0x05): Data refresh trigger
-- `READY` (0x06): Data refresh complete
-- `DISCONNECT` (0x07): Client disconnect
-- `HEARTBEAT` (0x08): Keep-alive
-
-## Topology Management
-
-The broker can connect to a cloud registry to:
-- Discover parent brokers
-- Get assigned role (ROOT, L2, L3, POS, LOCAL)
-- Automatically connect to parent via pipe
-- Receive topology updates
-
-### Topology Hierarchy
-```
-Cloud Registry (REST API)
-    ↓ [Topology polling]
-Root Broker
-    ↓ [Pipe: HTTP polling]
-L2 Brokers
-    ↓ [Pipe: HTTP polling]
-L3 Brokers
-    ↓ [TCP consumers]
-Consumer Apps
-```
-
-## Recent Updates & Fixes (Dec 2025)
-
-### ✅ Kafka-Style Active Segment Reading
-- **Active segments** use sequential scan (no index required) - similar to Kafka's approach
-- **Sealed segments** use sparse index for O(log n) lookups
-- **Zero sealing/unsealing overhead** - segments remain active during writes
-- **Performance**: No index building delay for active segments
-
-### ✅ Push-Based Message Delivery
-- **Immediate delivery** when messages arrive from pipe or producers
-- **Event-driven**: `notifyNewMessage()` triggers instant consumer delivery
-- **Eliminated polling delay**: Messages delivered in ~1ms vs up to 100ms
-- **Low latency**: End-to-end message delivery < 5ms
-
-### ✅ Bug Fixes
-- Fixed infinite loop in `SegmentManager.read()` when reaching end of active segment
-- Fixed segment boundary traversal logic
-- Added proper active/sealed segment detection
-- Resolved storage.read() timeout issues
-
-## Performance Characteristics
-
-### Storage
-- **Write**: ~50,000+ messages/sec (mmap)
-- **Read (Active Segment)**: ~20,000 messages/sec (sequential scan)
-- **Read (Sealed Segment)**: ~100,000+ messages/sec (indexed lookup)
-- **Lookup**: < 1ms (via sparse index on sealed segments)
-
-### Network
-- **Latency**: < 5ms (push-based delivery, local network)
-- **Throughput**: ~10,000 messages/sec per consumer
-- **Connections**: Limited by OS (typically 10,000+)
-- **Message Delivery**: Push model (event-driven, no polling delay)
-
-## Module Dependencies
-
-```
-common (no dependencies)
-  ↑
-  ├── storage (depends on: common)
-  ├── network (depends on: common)
-  └── pipe (depends on: common)
-      ↑
-      └── broker (depends on: all modules)
-```
-
-## Class Diagram
-
-```mermaid
-classDiagram
-    %% ─── COMMON INTERFACES ───────────────────────────────────────
-    class StorageEngine {
-        <<interface>>
-        +append(topic, partition, MessageRecord) long
-        +read(topic, partition, fromOffset, maxRecords) List~MessageRecord~
-        +getCurrentOffset(topic, partition) long
-        +getEarliestOffset(topic, partition) long
-        +recover()
-    }
-
-    class NetworkServer {
-        <<interface>>
-        +start(port)
-        +send(clientId, BrokerMessage) CompletableFuture
-        +broadcast(BrokerMessage)
-        +closeConnection(clientId)
-        +getConnectedClients() List
-    }
-
-    %% ─── CORE ────────────────────────────────────────────────────
-    class BrokerService {
-        -StorageEngine storage
-        -NetworkServer server
-        -ConsumerDeliveryManager consumerDelivery
-        -AdaptiveBatchDeliveryManager adaptiveDeliveryManager
-        -TopologyManager topologyManager
-        -BrokerMetrics metrics
-        -ExecutorService ackExecutor
-        +onApplicationEvent(ServerStartupEvent)
-        +handleMessage(clientId, BrokerMessage)
-        +handlePipeMessage(MessageRecord)
-    }
-
-    class TopologyManager {
-        -CloudRegistryClient registryClient
-        -PipeConnector pipeConnector
-        +start()
-        +queryAndUpdateTopology()
-        +connectToParent(url)
-    }
-
-    class CloudRegistryClient {
-        -HttpClient httpClient
-        +getTopology(url, nodeId) CompletableFuture
-    }
-
-    %% ─── CONSUMER REGISTRY ───────────────────────────────────────
-    class ConsumerRegistry {
-        -ConsumerRegistrationService registrationService
-        -LegacyConsumerDeliveryManager legacyDeliveryManager
-        -NetworkServer server
-        -StorageEngine storage
-        -ConsumerOffsetTracker offsetTracker
-        -ScheduledExecutorService consumerScheduler
-        +registerConsumer(clientId, topic, group, isLegacy)
-        +deliverBatch(consumer, batchSizeBytes)
-        +deliverMergedBatchToLegacy(clientId, topics, group)
-        +broadcastResetToTopic(topic)
-    }
-
-    class ConsumerRegistrationManager {
-        -ConsumerSessionStore sessionStore
-        -ConsumerOffsetTracker offsetTracker
-        -StorageEngine storage
-        +registerConsumer(clientId, topic, group, isLegacy)
-        +unregisterConsumer(clientId)
-    }
-
-    class ConsumerOffsetTracker {
-        -FlushingPropertiesStore repository
-        +getOffset(consumerId) long
-        +updateOffset(consumerId, offset)
-        +resetOffset(consumerId, offset)
-    }
-
-    class RemoteConsumer {
-        +clientId: String
-        +topic: String
-        +group: String
-        +isLegacy: boolean
-        +currentOffset: long
-        +getBackoffDelay() long
-        +recordFailure()
-    }
-
-    %% ─── ADAPTIVE DELIVERY ───────────────────────────────────────
-    class AdaptiveBatchDeliveryManager {
-        -ConsumerRegistry consumerRegistry
-        -DeliveryScheduler deliveryScheduler
-        +start()
-        +registerConsumer(RemoteConsumer)
-        +removeConsumer(clientId)
-    }
-
-    class DeliveryScheduler {
-        -TopicFairScheduler fairScheduler
-        -ConsumerRegistry consumerRegistry
-        -DeliveryRetryPolicy retryPolicy
-        -List~DeliveryGatePolicy~ gatePolicies
-        +scheduleDelivery(consumer, delayMs)
-        +executeDelivery(consumer, delayMs)
-    }
-
-    class TopicFairScheduler {
-        -ScheduledExecutorService scheduler
-        -Map~String,Semaphore~ topicSemaphores
-        -Map~String,ScheduledFuture~ pendingRetries
-        -int maxInFlightPerTopic
-        +scheduleWithKey(topic, deliveryKey, task, delay)
-        +execute(topic, task)
-        +getInFlightCount(topic) int
-    }
-
-    class DeliveryRetryPolicy {
-        <<interface>>
-        +calculateNextDelay(currentDelay, dataFound) long
-        +getInitialDelay() long
-    }
-
-    class DeliveryGatePolicy {
-        <<interface>>
-        +shouldDeliver(RemoteConsumer) GateResult
-    }
-
-    %% ─── LEGACY DELIVERY ─────────────────────────────────────────
-    class LegacyConsumerDeliveryManager {
-        -StorageEngine storage
-        -ConsumerOffsetTracker offsetTracker
-        -BrokerMetrics metrics
-        -int MSG_CHUNK = 50
-        +buildMergedBatch(topics, group, maxBytes) MergedBatch
-        +handleMergedBatchAck(group, MergedBatch)
-        +createCursor(topic, startOffset) TopicCursor
-    }
-
-    class TopicCursor {
-        -String topic
-        -FileChannel indexChannel
-        -int indexEntrySize
-        -ByteBuffer indexBuffer
-        -int READ_CHUNK = 64
-        +seekToOffset(targetOffset)
-        +peek() IndexEntry
-        +advance() IndexEntry
-        +hasMore() boolean
-    }
-
-    class MergedBatch {
-        -List~MessageRecord~ messages
-        -Map~String,Long~ maxOffsetPerTopic
-        -long totalBytes
-        +add(topic, MessageRecord)
-        +getMessages() List
-        +getTotalBytes() long
-    }
-
-    %% ─── LOCAL CONSUMER DELIVERY ─────────────────────────────────
-    class ConsumerDeliveryManager {
-        -StorageEngine storage
-        -ConsumerAnnotationProcessor processor
-        -ConsumerOffsetTracker offsetTracker
-        -ScheduledExecutorService scheduler
-        -long POLL_INTERVAL_MS = 200
-        +startDelivery()
-        +startConsumerDelivery(ConsumerContext)
-        +stopConsumerDelivery(consumerId)
-    }
-
-    class ConsumerAnnotationProcessor {
-        -ApplicationContext context
-        -Map~String,ConsumerContext~ consumers
-        +onApplicationEvent(ServerStartupEvent)
-        +getAllConsumers() Collection
-    }
-
-    class ConsumerContext {
-        +consumerId: String
-        +topic: String
-        +group: String
-        +currentOffset: long
-        +retryPolicy: RetryPolicy
-        +calculateRetryDelay() long
-        +updateAverageMessageSize(bytes, count)
-    }
-
-    %% ─── REFRESH WORKFLOW ────────────────────────────────────────
-    class RefreshCoordinator {
-        -ResetPhase resetService
-        -ReplayPhase replayService
-        -ReadyPhase readyService
-        -RefreshWorkflow stateMachine
-        -RefreshGatePolicy gatePolicy
-        -ConsumerRegistry remoteConsumers
-        -Map~String,RefreshContext~ activeRefreshes
-        +startRefresh(topic)
-        +handleResetAck(topic, clientId)
-        +handleReadyAck(topic, clientId)
-    }
-
-    class RefreshContext {
-        +topic: String
-        +state: RefreshState
-        +expectedConsumers: Set
-        +receivedResetAcks: Set
-        +receivedReadyAcks: Set
-        +allResetAcksReceived() boolean
-        +allReadyAcksReceived() boolean
-    }
-
-    class RefreshGatePolicy {
-        -RefreshCoordinator coordinator
-        +shouldDeliver(RemoteConsumer) GateResult
-    }
-
-    %% ─── METRICS ─────────────────────────────────────────────────
-    class BrokerMetrics {
-        -MeterRegistry registry
-        +recordMessageReceived()
-        +recordConsumerMessageSent(group, topic)
-        +updateConsumerLag(group, topic, lag)
-        +removeConsumerMetrics(consumerId)
-    }
-
-    %% ─── RELATIONSHIPS ───────────────────────────────────────────
-
-    %% Core dependencies
-    BrokerService --> StorageEngine
-    BrokerService --> NetworkServer
-    BrokerService --> ConsumerDeliveryManager
-    BrokerService --> AdaptiveBatchDeliveryManager
-    BrokerService --> TopologyManager
-    BrokerService --> BrokerMetrics
-    BrokerService --> ConsumerRegistry
-
-    TopologyManager --> CloudRegistryClient
-
-    %% Consumer registry
-    ConsumerRegistry --> ConsumerRegistrationManager
-    ConsumerRegistry --> LegacyConsumerDeliveryManager
-    ConsumerRegistry --> NetworkServer
-    ConsumerRegistry --> StorageEngine
-    ConsumerRegistry --> ConsumerOffsetTracker
-    ConsumerRegistry --> BrokerMetrics
-    ConsumerRegistrationManager --> ConsumerOffsetTracker
-    ConsumerRegistrationManager --> StorageEngine
-    ConsumerRegistry "1" --> "many" RemoteConsumer
-
-    %% Adaptive delivery
-    AdaptiveBatchDeliveryManager --> ConsumerRegistry
-    AdaptiveBatchDeliveryManager --> DeliveryScheduler
-    DeliveryScheduler --> TopicFairScheduler
-    DeliveryScheduler --> ConsumerRegistry
-    DeliveryScheduler --> DeliveryRetryPolicy
-    DeliveryScheduler --> DeliveryGatePolicy
-
-    %% Legacy delivery
-    LegacyConsumerDeliveryManager --> StorageEngine
-    LegacyConsumerDeliveryManager --> ConsumerOffsetTracker
-    LegacyConsumerDeliveryManager --> BrokerMetrics
-    LegacyConsumerDeliveryManager "1" --> "many" TopicCursor
-    LegacyConsumerDeliveryManager ..> MergedBatch : builds
-
-    %% Local delivery
-    ConsumerDeliveryManager --> StorageEngine
-    ConsumerDeliveryManager --> ConsumerAnnotationProcessor
-    ConsumerDeliveryManager --> ConsumerOffsetTracker
-    ConsumerAnnotationProcessor "1" --> "many" ConsumerContext
-
-    %% Refresh workflow
-    RefreshCoordinator --> ResetPhase
-    RefreshCoordinator --> ReplayPhase
-    RefreshCoordinator --> ReadyPhase
-    RefreshCoordinator --> RefreshGatePolicy
-    RefreshCoordinator --> ConsumerRegistry
-    RefreshCoordinator "1" --> "many" RefreshContext
-    RefreshGatePolicy --> RefreshCoordinator
-    RefreshGatePolicy ..|> DeliveryGatePolicy
-```
-
-## Build System
-
-Multi-module Gradle build:
 ```bash
-# Build all modules
 ./gradlew build
-
-# Build specific module
-./gradlew :broker:build
-
-# Run tests
 ./gradlew test
-
-# Create JARs
-./gradlew jar
+./gradlew :broker:build
+./gradlew :network:build
+./gradlew :storage:build
 ```
 
-## Technologies
+## Technology Stack
 
-- **Java 17**
-- **Micronaut 4.x** - Dependency injection & configuration
-- **Netty** - Non-blocking I/O
-- **Memory-Mapped Files** - High-performance storage
-- **SQLite** - Metadata storage
-- **Jackson** - JSON serialization
-- **Gradle** - Build system
+- Java 17
+- Micronaut 4
+- Netty TCP transport
+- FileChannel-based segment storage
+- SQLite metadata store
+- Prometheus metrics
+- Grafana dashboards
+- Gradle multi-module build
 
-## Testing & Verification
+## Notes
 
-### End-to-End Test (Verified Working ✅)
-```bash
-# 1. Start cloud test server (mock registry)
-python3 cloud-test-server.py
-
-# 2. Start broker
-NODE_ID=local-001 REGISTRY_URL=http://localhost:8080 \
-BROKER_PORT=9092 DATA_DIR=./data-local HTTP_PORT=8081 \
-./gradlew :broker:run
-
-# 3. Start consumer (in consumer-app directory)
-cd consumer-app
-CONSUMER_TYPE=price CONSUMER_TOPIC=price-topic \
-CONSUMER_GROUP=price-group CONSUMER_PORT=8082 \
-BROKER_HOST=localhost BROKER_PORT=9092 \
-STORAGE_DATA_DIR=./consumer-data ./gradlew run
-```
-
-### Verified Flow
-1. ✅ Cloud → Broker: 5 messages received (AAPL, GOOGL, MSFT, TSLA, AMZN)
-2. ✅ Broker → Storage: All messages stored in active segment
-3. ✅ Storage → Read: Sequential scan reads all 5 messages successfully
-4. ✅ Broker → Consumer: All 5 DATA messages sent via TCP
-5. ✅ Consumer: Received and processed all messages
-6. ✅ Offset Tracking: Consumer offset advanced from 0 → 5
-
-## Next Steps
-
-1. ~~Build and run the broker~~ ✅ Done
-2. ~~Set up consumer-app instances~~ ✅ Done
-3. ~~Configure topology (if using cloud registry)~~ ✅ Done
-4. **Add monitoring** (Prometheus + Grafana) - In Progress
-5. **Containerize with Docker** - In Progress
-6. **Add test endpoints** (SQLite data transfer) - In Progress
-7. Scale horizontally by adding more brokers
-
-## License
-
-[Your License Here]
+- The broker supports both modern clients and legacy clients.
+- `BATCH_ACK` is automatic on the modern client path after batch decode.
+- `RESET_ACK` and `READY_ACK` are part of the refresh workflow and are handled separately from normal batch ACKs.
+- The current detailed flow documentation is intentionally kept in `readme/C4_ARCHITECTURE.md` instead of duplicating it here.
