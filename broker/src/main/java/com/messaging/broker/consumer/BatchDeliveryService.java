@@ -12,10 +12,11 @@ import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.broker.monitoring.DataRefreshMetrics;
 import com.messaging.broker.model.DeliveryKey;
 import com.messaging.broker.consumer.RefreshCoordinator;
+import com.messaging.common.api.BatchReadableStorage;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.BrokerMessage;
-import com.messaging.storage.segment.Segment;
 import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Inject;
@@ -24,8 +25,7 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -40,6 +40,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
     private final NetworkServer server;
     private final StorageEngine storage;
+    private final BatchReadableStorage batchStorage;
     private final ConsumerStateService stateService;
     private final ConsumerReadinessService readinessService;
     private final ConsumerOffsetTracker offsetTracker;
@@ -49,6 +50,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
     private final ScheduledExecutorService scheduler;
     private final ExecutorService storageExecutor;
     private final long ackTimeoutMs;
+    private final long sendTimeoutBaseSeconds;
+    private final long sendTimeoutPerMbSeconds;
     private final ConsumerEventLogger consumerLogger;
 
     private volatile RefreshCoordinator dataRefreshCoordinator; // Lazy injection to avoid circular dependency
@@ -57,6 +60,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
     public BatchDeliveryService(
             NetworkServer server,
             StorageEngine storage,
+            BatchReadableStorage batchStorage,
             ConsumerStateService stateService,
             ConsumerReadinessService readinessService,
             ConsumerOffsetTracker offsetTracker,
@@ -66,9 +70,12 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             @Named("consumerScheduler") ScheduledExecutorService scheduler,
             @Named("storageExecutor") ExecutorService storageExecutor,
             @Value("${broker.consumer.ack-timeout}") long ackTimeoutMs,
+            @Value("${broker.consumer.send-timeout-base-seconds:1}") long sendTimeoutBaseSeconds,
+            @Value("${broker.consumer.send-timeout-per-mb-seconds:2}") long sendTimeoutPerMbSeconds,
             ConsumerEventLogger consumerLogger) {
         this.server = server;
         this.storage = storage;
+        this.batchStorage = batchStorage;
         this.stateService = stateService;
         this.readinessService = readinessService;
         this.offsetTracker = offsetTracker;
@@ -78,6 +85,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         this.scheduler = scheduler;
         this.storageExecutor = storageExecutor;
         this.ackTimeoutMs = ackTimeoutMs;
+        this.sendTimeoutBaseSeconds = sendTimeoutBaseSeconds;
+        this.sendTimeoutPerMbSeconds = sendTimeoutPerMbSeconds;
         this.consumerLogger = consumerLogger;
     }
 
@@ -86,7 +95,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
      */
     public void setDataRefreshCoordinator(RefreshCoordinator dataRefreshCoordinator) {
         this.dataRefreshCoordinator = dataRefreshCoordinator;
-        log.info("BatchDeliveryService wired to RefreshCoordinator");
+        log.info("event=batch_delivery.refresh_coordinator_wired");
     }
 
     @Override
@@ -147,7 +156,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         long startOffset = consumer.getCurrentOffset();
         Timer.Sample readSample = null;
         Timer.Sample deliverySample = null;
-        Segment.BatchFileRegion batch = null;
+        DeliveryBatch batch = null;
         String traceId = null;
 
         try {
@@ -156,28 +165,19 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
             // Read batch from storage (using storage executor to prevent deadlock)
             final long capturedOffset = startOffset;
-            batch = storageExecutor.submit(() -> {
-                if (storage instanceof com.messaging.storage.filechannel.FileChannelStorageEngine) {
-                    return ((com.messaging.storage.filechannel.FileChannelStorageEngine) storage)
-                            .getZeroCopyBatch(consumer.getTopic(), 0, capturedOffset, batchSizeBytes);
-                } else if (storage instanceof com.messaging.storage.mmap.MMapStorageEngine) {
-                    return ((com.messaging.storage.mmap.MMapStorageEngine) storage)
-                            .getZeroCopyBatch(consumer.getTopic(), 0, capturedOffset, batchSizeBytes);
-                } else {
-                    throw new IllegalStateException("StorageEngine implementation does not support " +
-                            "getZeroCopyBatch(): " + storage.getClass().getName());
-                }
-            }).get(10, TimeUnit.MINUTES);
+            batch = storageExecutor.submit(() ->
+                batchStorage.getBatch(consumer.getTopic(), 0, capturedOffset, batchSizeBytes)
+            ).get(10, TimeUnit.MINUTES);
 
             metrics.stopStorageReadTimer(readSample);
             metrics.recordStorageRead();
 
-            log.debug("deliverBatch: Batch read complete for {}, recordCount={}, fileRegion={}",
-                     deliveryKeyStr, batch.recordCount, (batch.fileRegion != null ? "present" : "NULL"));
+            log.debug("deliverBatch: Batch read complete for {}, recordCount={}",
+                     deliveryKeyStr, batch.getRecordCount());
 
-            if (batch.recordCount == 0 || batch.fileRegion == null) {
-                log.debug("deliverBatch: EMPTY BATCH (recordCount={}, fileRegion={}) for {}, startOffset={}",
-                         batch.recordCount, (batch.fileRegion != null ? "present" : "NULL"), deliveryKeyStr, startOffset);
+            if (batch.isEmpty()) {
+                log.debug("deliverBatch: EMPTY BATCH for {}, startOffset={}", deliveryKeyStr, startOffset);
+                try { batch.close(); } catch (IOException ignored) {}
                 inFlight.set(false);
                 return DeliveryResult.blocked("no-data");
             }
@@ -185,11 +185,11 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             traceId = TraceIds.newTraceId();
 
             // ================= BATCH VISIBILITY =================
-            metrics.recordBatchSize(batch.recordCount);
+            metrics.recordBatchSize(batch.getRecordCount());
 
             // ================= OFFSET RESERVATION =================
             long originalOffset = startOffset;
-            long nextOffset = batch.lastOffset + 1;
+            long nextOffset = batch.getLastOffset() + 1;
             consumer.setCurrentOffset(nextOffset);
             stateService.setPendingOffset(deliveryKey, nextOffset);
             stateService.setFromOffset(deliveryKey, startOffset);  // persisted for ACK-time msgKey lookup
@@ -200,8 +200,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                     .topic(consumer.getTopic())
                     .consumerGroup(consumer.getGroup())
                     .offset(startOffset)
-                    .custom("messageCount", batch.recordCount)
-                    .custom("bytes", batch.totalBytes)
+                    .custom("messageCount", batch.getRecordCount())
+                    .custom("bytes", batch.getTotalBytes())
                     .custom("deliveryKey", deliveryKey)
                     .build();
             consumerLogger.logBatchDeliveryStarted(startedContext);
@@ -220,8 +220,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             long pendingStartTime = System.currentTimeMillis();
             stateService.recordBatchSendTime(deliveryKey, pendingStartTime);
 
-            log.warn("⏱️ BATCH_SENT to {} at T=0ms, startOffset={}, recordCount={}, bytes={}, ackTimeoutConfigured={}ms, traceId={}",
-                     deliveryKeyStr, startOffset, batch.recordCount, batch.totalBytes, ackTimeoutMs, traceId);
+            log.debug("BATCH_SENT to {} at startOffset={}, recordCount={}, bytes={}, ackTimeoutConfigured={}ms, traceId={}",
+                     deliveryKeyStr, startOffset, batch.getRecordCount(), batch.getTotalBytes(), ackTimeoutMs, traceId);
 
             ScheduledFuture<?> timeoutFuture = scheduler.schedule(() -> {
                 String timeoutTraceId = stateService.getTraceId(deliveryKey);
@@ -231,7 +231,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                     stateService.recordBatchSendTime(deliveryKey, 0); // Clear timestamp
 
                     long pendingDuration = System.currentTimeMillis() - pendingStartTime;
-                    log.warn("⏰ ACK_TIMEOUT for {} after {}ms, reverting offset from {} to {}, traceId={}",
+                    log.warn("event=batch_delivery.ack_timeout deliveryKey={} pendingMs={} revertFrom={} revertTo={} traceId={}",
                              deliveryKeyStr, pendingDuration, nextOffset, originalOffset, timeoutTraceId);
 
                     // REVERT consumer offset to prevent delivery gap
@@ -265,8 +265,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                     dataRefreshMetrics.recordDataTransferred(
                             consumer.getTopic(),
                             consumer.getGroup(),
-                            batch.totalBytes,
-                            batch.recordCount,
+                            batch.getTotalBytes(),
+                            batch.getRecordCount(),
                             refreshCtx.getRefreshId(),
                             refreshCtx.getRefreshType()
                     );
@@ -283,8 +283,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                     .topic(consumer.getTopic())
                     .consumerGroup(consumer.getGroup())
                     .offset(startOffset)
-                    .custom("messageCount", batch.recordCount)
-                    .custom("bytes", batch.totalBytes)
+                    .custom("messageCount", batch.getRecordCount())
+                    .custom("bytes", batch.getTotalBytes())
                     .custom("deliveryKey", deliveryKey)
                     .build();
             consumerLogger.logBatchDeliverySucceeded(successContext);
@@ -347,8 +347,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                          deliveryKeyStr, MAX_CONSECUTIVE_FAILURES);
                 registrationService.unregisterConsumer(consumer.getClientId());
             } else {
-                log.warn("Transient failure for {}, KEEPING pending offset to prevent rapid retries. " +
-                        "Will wait for ACK or timeout ({}ms). consecutiveFailures={}",
+                log.warn("event=batch_delivery.transient_failure deliveryKey={} pendingOffsetRetained=true ackTimeoutMs={} consecutiveFailures={}",
                         deliveryKeyStr, ackTimeoutMs, consumer.getConsecutiveFailures());
             }
 
@@ -358,8 +357,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                     consumer.getClientId(),
                     consumer.getTopic(),
                     consumer.getGroup(),
-                    batch.recordCount,
-                    batch.totalBytes
+                    batch.getRecordCount(),
+                    batch.getTotalBytes()
                 );
             }
 
@@ -368,72 +367,30 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
     }
 
     /**
-     * Send batch to consumer using zero-copy transfer.
+     * Send batch to consumer. Transport (NettyTcpServer) takes ownership of the payload:
+     * it encodes the BATCH_HEADER, transfers the payload bytes, and closes the payload
+     * on success, failure, or cancellation.
      */
-    private void sendBatchToConsumer(RemoteConsumer consumer, Segment.BatchFileRegion batchRegion, long startOffset)
+    private void sendBatchToConsumer(RemoteConsumer consumer, DeliveryBatch batch, long startOffset)
             throws Exception {
 
-        if (batchRegion.fileRegion == null) {
-            log.debug("No data to send for consumer {}", consumer.getClientId());
-            return;
-        }
+        long batchMb = batch.getTotalBytes() / (1024 * 1024);
+        long timeoutSeconds = sendTimeoutBaseSeconds + (batchMb * sendTimeoutPerMbSeconds);
 
-        // Step 1: Create and send header message with batch metadata
-        byte[] topicBytes = consumer.getTopic().getBytes(StandardCharsets.UTF_8);
-        int topicLen = topicBytes.length;
-        byte[] groupBytes = consumer.getGroup().getBytes(StandardCharsets.UTF_8);
-        int groupLen = groupBytes.length;
+        log.debug("Sending batch to consumer {}: topic={}, group={}, recordCount={}, totalBytes={}, startOffset={}",
+                 consumer.getClientId(), consumer.getTopic(), consumer.getGroup(),
+                 batch.getRecordCount(), batch.getTotalBytes(), startOffset);
 
-        // Header format: [recordCount:4][totalBytes:8][topicLen:4][topic:var][groupLen:4][group:var]
-        ByteBuffer headerBuffer = ByteBuffer.allocate(12 + 4 + topicLen + 4 + groupLen);
-        headerBuffer.putInt(batchRegion.recordCount);
-        headerBuffer.putLong(batchRegion.totalBytes);
-        headerBuffer.putInt(topicLen);
-        headerBuffer.put(topicBytes);
-        headerBuffer.putInt(groupLen);
-        headerBuffer.put(groupBytes);
-        headerBuffer.flip();
+        // Transport owns batch from this point — NettyTcpServer closes it via deallocate()
+        server.sendBatch(consumer.getClientId(), consumer.getGroup(), batch)
+              .get(timeoutSeconds, TimeUnit.SECONDS);
 
-        byte[] header = new byte[12 + 4 + topicLen + 4 + groupLen];
-        headerBuffer.get(header);
+        log.debug("Sent batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
+                 consumer.getClientId(), batch.getRecordCount(), batch.getTotalBytes(),
+                 startOffset, batch.getLastOffset());
 
-        // Send header using BATCH_HEADER message type
-        BrokerMessage headerMsg = new BrokerMessage(
-            BrokerMessage.MessageType.BATCH_HEADER,
-            System.currentTimeMillis(),
-            header
-        );
-
-        log.debug("Sending BATCH_HEADER to consumer {}: topic={}, group={}, recordCount={}, totalBytes={}",
-                 consumer.getClientId(), consumer.getTopic(), consumer.getGroup(), batchRegion.recordCount, batchRegion.totalBytes);
-
-        long timeoutSeconds = 1 + (batchRegion.totalBytes / (1024 * 1024) * 10);
-        server.send(consumer.getClientId(), headerMsg).get(timeoutSeconds, TimeUnit.SECONDS);
-
-        // Step 2: Send FileRegion for true zero-copy transfer
-        log.debug("Sending zero-copy FileRegion: position={}, count={}, records={}, bytes={}, consumer={}, topic={}, startOffset={}",
-                 batchRegion.fileRegion.position(), batchRegion.fileRegion.count(),
-                 batchRegion.recordCount, batchRegion.totalBytes, consumer.getClientId(), consumer.getTopic(), startOffset);
-
-        try {
-            server.sendFileRegion(consumer.getClientId(), batchRegion.fileRegion)
-                  .get(timeoutSeconds, TimeUnit.SECONDS);
-        } catch (Exception e) {
-            // CRITICAL: BATCH_HEADER was already sent — consumer decoder has transitioned to
-            // READING_ZERO_COPY_BATCH and is waiting for expectedTotalBytes that will never arrive.
-            // Close the connection so the consumer reconnects and decoder resets to initial state.
-            log.error("FileRegion send failed after BATCH_HEADER was already sent for consumer {} topic {}. " +
-                      "Closing connection to reset consumer decoder state.",
-                      consumer.getClientId(), consumer.getTopic(), e);
-            server.closeConnection(consumer.getClientId());
-            throw e;
-        }
-
-        log.debug("Sent zero-copy batch to consumer {}: recordCount={}, bytes={}, startOffset={}, lastOffset={}",
-                 consumer.getClientId(), batchRegion.recordCount, batchRegion.totalBytes, startOffset, batchRegion.lastOffset);
-
-        // Record metrics for messages and bytes sent
-        metrics.recordConsumerBatchSent(consumer.getClientId(), consumer.getTopic(), consumer.getGroup(), batchRegion.recordCount, batchRegion.totalBytes);
+        metrics.recordConsumerBatchSent(consumer.getClientId(), consumer.getTopic(), consumer.getGroup(),
+                batch.getRecordCount(), batch.getTotalBytes());
     }
 
     @Override

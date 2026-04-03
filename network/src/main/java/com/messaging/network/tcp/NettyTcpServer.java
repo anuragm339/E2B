@@ -3,6 +3,7 @@ package com.messaging.network.tcp;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.NetworkException;
+import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.network.codec.BinaryMessageDecoder;
 import com.messaging.network.legacy.ProtocolDetectionDecoder;
@@ -17,11 +18,18 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.util.AbstractReferenceCounted;
+import java.nio.ByteBuffer;
+import java.nio.channels.WritableByteChannel;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -154,8 +162,71 @@ public class NettyTcpServer implements NetworkServer {
         return future;
     }
 
+    /**
+     * Send a batch to a consumer.
+     *
+     * This method owns the full protocol detail:
+     *   1. Reads routing metadata (topic, group, recordCount, totalBytes) from the DeliveryBatch
+     *      and encodes the BATCH_HEADER message — broker passes one object, transport owns encoding
+     *   2. Wraps the batch in a Netty FileRegion whose deallocate() closes the batch
+     *   3. Sends payload bytes via the internal FileRegion path (sendfile or buffered copy)
+     *   4. Closes the connection on failure so the consumer decoder resets to its initial state
+     *
+     * Ownership: the transport owns the batch from the moment sendBatch() is called.
+     * batch.close() is called via BatchFileRegion.deallocate() for all outcomes; if the
+     * header send fails before the region is created the exceptionally handler closes it directly.
+     */
     @Override
-    public CompletableFuture<Void> sendFileRegion(String clientId, FileRegion fileRegion) {
+    public CompletableFuture<Void> sendBatch(String clientId, String group, DeliveryBatch batch) {
+        // Build BATCH_HEADER bytes — topic/count/size from batch; group from delivery call site
+        byte[] topicBytes = batch.getTopic().getBytes(StandardCharsets.UTF_8);
+        byte[] groupBytes = group.getBytes(StandardCharsets.UTF_8);
+        ByteBuffer headerBuffer = ByteBuffer.allocate(12 + 4 + topicBytes.length + 4 + groupBytes.length);
+        headerBuffer.putInt(batch.getRecordCount());
+        headerBuffer.putLong(batch.getTotalBytes());
+        headerBuffer.putInt(topicBytes.length);
+        headerBuffer.put(topicBytes);
+        headerBuffer.putInt(groupBytes.length);
+        headerBuffer.put(groupBytes);
+        headerBuffer.flip();
+        byte[] headerBytes = new byte[headerBuffer.remaining()];
+        headerBuffer.get(headerBytes);
+
+        BrokerMessage headerMsg = new BrokerMessage(
+                BrokerMessage.MessageType.BATCH_HEADER,
+                System.currentTimeMillis(),
+                headerBytes);
+
+        long timeoutSeconds = 1 + (batch.getTotalBytes() / (1024 * 1024) * 10);
+
+        // Track whether the BatchFileRegion was created so the exceptionally handler
+        // knows whether deallocate() will eventually close the batch.
+        AtomicReference<BatchPayloadFileRegion> regionRef = new AtomicReference<>();
+
+        return send(clientId, headerMsg)
+                .thenCompose(ignored -> {
+                    BatchPayloadFileRegion nettyRegion = new BatchPayloadFileRegion(batch, clientId);
+                    regionRef.set(nettyRegion);
+                    return sendFileRegionInternal(clientId, nettyRegion);
+                })
+                .exceptionally(e -> {
+                    // If the BatchPayloadFileRegion was never created (header send failed),
+                    // deallocate() will never be called — close the batch directly.
+                    if (regionRef.get() == null) {
+                        try {
+                            batch.close();
+                        } catch (IOException closeEx) {
+                            log.warn("Failed to close DeliveryBatch after header send failure for client {}", clientId, closeEx);
+                        }
+                    }
+                    log.error("sendBatch failed after BATCH_HEADER sent for client {}. " +
+                              "Closing connection to reset consumer decoder state.", clientId, e);
+                    closeConnection(clientId);
+                    throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
+                });
+    }
+
+    private CompletableFuture<Void> sendFileRegionInternal(String clientId, FileRegion fileRegion) {
         Channel channel = clientChannels.get(clientId);
         if (channel == null || !channel.isActive()) {
             return CompletableFuture.failedFuture(
@@ -242,5 +313,83 @@ public class NettyTcpServer implements NetworkServer {
 
         clientChannels.clear();
         log.info("NettyTcpServer shutdown complete");
+    }
+
+    /**
+     * Netty FileRegion adapter that wraps a DeliveryBatch for zero-copy transfer.
+     *
+     * Extends AbstractReferenceCounted so Netty manages the reference count.
+     * When the refcount reaches zero, deallocate() is called which closes the DeliveryBatch,
+     * releasing any underlying file descriptor (FileChannel) or heap resources.
+     */
+    private static final class BatchPayloadFileRegion extends AbstractReferenceCounted implements FileRegion {
+        private static final Logger rlog = LoggerFactory.getLogger(BatchPayloadFileRegion.class);
+        private final DeliveryBatch batch;
+        private final String clientId;
+        private long transferred = 0;
+
+        BatchPayloadFileRegion(DeliveryBatch batch, String clientId) {
+            this.batch = batch;
+            this.clientId = clientId;
+        }
+
+        @Override
+        public long position() {
+            return 0;
+        }
+
+        @Override
+        public long count() {
+            return batch.getTotalBytes();
+        }
+
+        @Override
+        public long transferred() {
+            return transferred;
+        }
+
+        @Override
+        @SuppressWarnings("deprecation")
+        public long transfered() {
+            return transferred;
+        }
+
+        @Override
+        public long transferTo(WritableByteChannel target, long position) throws IOException {
+            long written = batch.transferTo(target, position);
+            if (written > 0) transferred += written;
+            return written;
+        }
+
+        @Override
+        protected void deallocate() {
+            try {
+                batch.close();
+            } catch (IOException e) {
+                rlog.warn("Failed to close DeliveryBatch in deallocate() for client {}", clientId, e);
+            }
+        }
+
+        @Override
+        public FileRegion retain() {
+            super.retain();
+            return this;
+        }
+
+        @Override
+        public FileRegion retain(int increment) {
+            super.retain(increment);
+            return this;
+        }
+
+        @Override
+        public FileRegion touch() {
+            return this;
+        }
+
+        @Override
+        public FileRegion touch(Object hint) {
+            return this;
+        }
     }
 }

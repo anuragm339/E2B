@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer;
 
+import io.micronaut.context.annotation.Value;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,11 +29,9 @@ public class TopicFairScheduler {
     private final Map<String, ScheduledFuture<?>> pendingRetries;
     private final int maxInFlightPerTopic;
 
-    public TopicFairScheduler() {
-        this(Math.max(2, Runtime.getRuntime().availableProcessors()), 4);
-    }
-
-    public TopicFairScheduler(int threads, int maxInFlightPerTopic) {
+    public TopicFairScheduler(
+            @Value("${broker.consumer.fairness.threads:2}") int threads,
+            @Value("${broker.consumer.fairness.max-in-flight-per-topic:1}") int maxInFlightPerTopic) {
         this.scheduler = Executors.newScheduledThreadPool(threads, r -> {
             Thread t = new Thread(r);
             t.setName("TopicFairScheduler-" + t.getId());
@@ -41,10 +40,10 @@ public class TopicFairScheduler {
         });
         this.topicSemaphores = new ConcurrentHashMap<>();
         this.pendingRetries = new ConcurrentHashMap<>(); // B11-5 fix
-        this.maxInFlightPerTopic = maxInFlightPerTopic;
+        this.maxInFlightPerTopic = Math.max(1, maxInFlightPerTopic);
 
         log.info("TopicFairScheduler initialized: threads={}, maxInFlightPerTopic={}",
-                threads, maxInFlightPerTopic);
+                threads, this.maxInFlightPerTopic);
     }
 
     /**

@@ -4,23 +4,24 @@ import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.exception.StorageException;
+import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
-import io.netty.channel.DefaultFileRegion;
-import io.netty.channel.FileRegion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 /**
  * Represents a single segment file using FileChannel (no memory mapping)
- * Enables true zero-copy via Netty FileRegion
+ * Enables true zero-copy via FileChannel.transferTo() (sendfile).
+ * BatchFileRegion implements DeliveryBatch — carries both routing metadata and file bytes.
  */
 public class Segment {
     private static final Logger log = LoggerFactory.getLogger(Segment.class);
@@ -688,7 +689,7 @@ public class Segment {
     public BatchFileRegion getBatchFileRegion(long startOffset, long maxBytes) throws MessagingException {
         if (startOffset < baseOffset || startOffset >= nextOffset) {
             log.debug("Offset {} outside segment range [{}, {})", startOffset, baseOffset, nextOffset);
-            return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+            return new BatchFileRegion(topic, null, 0, 0L, 0L, startOffset);
         }
 
         try {
@@ -698,7 +699,7 @@ public class Segment {
             if (firstEntry == null) {
                 log.debug("No entries found at or after offset {} in segment baseOffset={}",
                           startOffset, baseOffset);
-                return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+                return new BatchFileRegion(topic, null, 0, 0L, 0L, startOffset);
             }
 
             // 2. Sequential scan from first entry to accumulate batch
@@ -773,28 +774,20 @@ public class Segment {
 
             if (recordCount == 0) {
                 log.debug("No records accumulated for batch starting at offset {}", startOffset);
-                return new BatchFileRegion(null, null, 0, 0, 0, startOffset);
+                return new BatchFileRegion(topic, null, 0, 0L, 0L, startOffset);
             }
 
-            // 3. Create FileRegion for zero-copy transfer (Kafka-style sendfile)
+            // 3. Open a read-only FileChannel for zero-copy transfer (Kafka-style sendfile)
             // Calculate actual batch size: from first record start to last record end
             long totalBytes = (lastLogPosition + lastRecordSize) - firstLogPosition;
 
             // Open separate READ-ONLY channel to avoid interference with writes
             FileChannel readChannel = FileChannel.open(logPath, StandardOpenOption.READ);
-            FileRegion fileRegion = new DefaultFileRegion(readChannel, firstLogPosition, totalBytes);
 
             log.debug("Created zero-copy batch: offset={}-{}, bytes={}, records={}, firstLogPos={}",
                       startOffset, lastOffset, totalBytes, recordCount, firstLogPosition);
 
-            return new BatchFileRegion(
-                fileRegion,
-                readChannel,  // Will be closed by FileRegion
-                recordCount,
-                totalBytes,
-                lastOffset,
-                firstLogPosition
-            );
+            return new BatchFileRegion(topic, readChannel, recordCount, totalBytes, lastOffset, firstLogPosition);
         } catch (IOException | MessagingException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.readFailed(topic, partition, startOffset, e)
@@ -840,24 +833,51 @@ public class Segment {
     }
 
     /**
-     * Metadata about a batch for zero-copy transfer
+     * File-backed DeliveryBatch for zero-copy transfer via FileChannel.transferTo() (sendfile).
+     *
+     * Carries storage metadata (topic) and byte payload. Consumer group is intentionally absent
+     * — it is a delivery-routing concept passed separately at the NetworkServer call site.
      */
-    public static class BatchFileRegion {
-        public final FileRegion fileRegion;  // null if no records
-        public final FileChannel fileChannel;  // For reading batch data
-        public final int recordCount;
-        public final long totalBytes;
-        public final long lastOffset;
-        public final long filePosition;
+    public static class BatchFileRegion implements DeliveryBatch {
+        private final String topic;
+        private final FileChannel fileChannel;  // null if empty batch
+        private final int recordCount;
+        private final long totalBytes;
+        private final long lastOffset;
+        private final long filePosition;  // position in log file where payload starts
 
-        public BatchFileRegion(FileRegion fileRegion, FileChannel fileChannel, int recordCount, long totalBytes,
-                              long lastOffset, long filePosition) {
-            this.fileRegion = fileRegion;
+        public BatchFileRegion(String topic, FileChannel fileChannel,
+                               int recordCount, long totalBytes, long lastOffset, long filePosition) {
+            this.topic = topic;
             this.fileChannel = fileChannel;
             this.recordCount = recordCount;
             this.totalBytes = totalBytes;
             this.lastOffset = lastOffset;
             this.filePosition = filePosition;
+        }
+
+        @Override public String getTopic()    { return topic; }
+        @Override public int getRecordCount() { return recordCount; }
+        @Override public long getTotalBytes() { return totalBytes; }
+        @Override public long getLastOffset() { return lastOffset; }
+
+        @Override
+        public long transferTo(WritableByteChannel target, long position) throws IOException {
+            if (fileChannel == null) {
+                return -1;
+            }
+            long remaining = totalBytes - position;
+            if (remaining <= 0) {
+                return -1;
+            }
+            return fileChannel.transferTo(filePosition + position, remaining, target);
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (fileChannel != null && fileChannel.isOpen()) {
+                fileChannel.close();
+            }
         }
     }
 

@@ -1,10 +1,12 @@
 package com.messaging.storage.filechannel;
 
+import com.messaging.common.api.BatchReadableStorage;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.exception.StorageException;
+import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.storage.metadata.SegmentMetadataStore;
 import com.messaging.storage.segment.SegmentManager;
@@ -28,11 +30,11 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * FileChannel-based storage engine implementation
  * Uses FileChannel for direct I/O without memory mapping
- * Enables true zero-copy via Netty FileRegion
+ * Enables true zero-copy via FileChannel.transferTo() (sendfile)
  */
 @Singleton
 @Requires(property = "broker.storage.type", value = "filechannel")
-public class FileChannelStorageEngine implements StorageEngine {
+public class FileChannelStorageEngine implements StorageEngine, BatchReadableStorage {
     private static final Logger log = LoggerFactory.getLogger(FileChannelStorageEngine.class);
 
     private final Path dataDir;
@@ -81,21 +83,23 @@ public class FileChannelStorageEngine implements StorageEngine {
     }
 
     /**
-     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
-     * This enables Kafka-style zero-copy using sendfile() syscall
-     * @return BatchFileRegion containing FileRegion for zero-copy transfer + metadata
+     * Zero-copy batch read: Get DeliveryBatch for direct file-to-network transfer.
+     * This enables Kafka-style zero-copy using sendfile() syscall.
      */
-    public com.messaging.storage.segment.Segment.BatchFileRegion getZeroCopyBatch(
-            String topic, int partition, long fromOffset, long maxBytes) throws MessagingException{
+    @Override
+    public DeliveryBatch getBatch(
+            String topic, int partition, long fromOffset, long maxBytes) throws MessagingException {
         try {
             SegmentManager manager = managers.get(new TopicPartition(topic, partition));
             if (manager == null) {
                 log.debug("No segment manager for topic={}, partition={}", topic, partition);
-                return new com.messaging.storage.segment.Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
+                return new com.messaging.storage.segment.Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
             }
-            return manager.getZeroCopyBatch(fromOffset, maxBytes);
+            return manager.getBatch(fromOffset, maxBytes);
         } catch (Exception e) {
-            throw ExceptionLogger.logAndThrow(log, new StorageException(ErrorCode.STORAGE_READ_FAILED, String.format("Failed to get zero-copy batch: topic=%s partition=%d fromOffset=%d maxBytes=%d", topic, partition, fromOffset, maxBytes), e));
+            throw ExceptionLogger.logAndThrow(log, new StorageException(ErrorCode.STORAGE_READ_FAILED,
+                    String.format("Failed to get batch: topic=%s partition=%d fromOffset=%d maxBytes=%d",
+                            topic, partition, fromOffset, maxBytes), e));
         }
     }
 

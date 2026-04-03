@@ -56,8 +56,8 @@ broker:
     type: tcp
     port: ${BROKER_PORT:19092}
     threads:
-      boss: 2
-      worker: 8   # 13 consumers → 8 workers sufficient (was 16, halves thread scheduling overhead)
+      boss: 1
+      worker: 4   # Low-CPU profile: fewer Netty workers, lower parallelism during peaks
 
   consumer:
     default-retry-policy: EXPONENTIAL_THEN_FIXED
@@ -68,19 +68,32 @@ broker:
     # ACK timeout in milliseconds - how long to wait for consumer to ACK a batch before reverting offset
     # Baseline: 60s works for most 1-2MB batches. Increase for larger batches or slower consumers.
     # If timeout fires frequently, increase this value or reduce batch size.
-    ack-timeout: ${ACK_TIMEOUT_MS:60000}  # 60 seconds (was 5s, then hardcoded 30 min)
-    max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:1048576}  # 1MB max data per consumer per delivery cycle
+    ack-timeout: ${ACK_TIMEOUT_MS:120000}  # Low-CPU profile: tolerate slower/larger deliveries
+
+    # Send timeout: how long the broker waits for the TCP transfer itself to complete.
+    # Total = base + (batch size in MB × per-mb).
+    # Example: a 50 MB batch → 1 + (50 × 2) = 101 seconds.
+    # Raise per-mb-seconds for slow networks; raise base-seconds for high-latency links.
+    send-timeout-base-seconds: ${SEND_TIMEOUT_BASE_SECONDS:1}
+    send-timeout-per-mb-seconds: ${SEND_TIMEOUT_PER_MB_SECONDS:2}
+    max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:2097152}  # 2MB batches reduce delivery frequency
     # DEPRECATED: max-batch-size-per-consumer no longer used (size-only batching now)
     # max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}
 
     # Adaptive polling configuration (watermark-based delivery)
     adaptive-polling:
-      min-delay-ms: 50         # Min poll interval when data found (50ms = 20 polls/sec per consumer; was 25ms)
-      max-delay-ms: 1000       # Max backoff delay when idle (exponential backoff)
+      min-delay-ms: 200        # Low-CPU profile: fewer successful polls, higher delivery latency
+      max-delay-ms: 5000       # Longer backoff when idle to reduce scheduler wakeups
 
     # Per-topic fairness configuration
     fairness:
-      max-in-flight-per-topic: 4  # Max concurrent deliveries per topic (prevents hot topics from starving quiet ones)
+      threads: 2                  # Low-CPU profile: smaller scheduler pool
+      max-in-flight-per-topic: 1  # Serialize per-topic delivery to reduce parallel work
+
+  pipe:
+    min-poll-interval-ms: 500   # Low-CPU profile: less frequent upstream polling
+    max-poll-interval-ms: 20000
+    poll-limit: 5
 
 # Legacy Client Configuration
 # Maps legacy serviceName (from RegisterEvent) to list of topics
@@ -144,11 +157,11 @@ legacy-clients:
 
 executor:
   ack:
-    threads: ${EXECUTOR_ACK_THREADS:4}
+    threads: ${EXECUTOR_ACK_THREADS:2}
   consumer-scheduler:
-    threads: ${EXECUTOR_CONSUMER_SCHEDULER_THREADS:4}
+    threads: ${EXECUTOR_CONSUMER_SCHEDULER_THREADS:2}
   storage:
-    threads: ${EXECUTOR_STORAGE_THREADS:4}
+    threads: ${EXECUTOR_STORAGE_THREADS:2}
 
 ack-store:
   rocksdb:
@@ -162,8 +175,11 @@ ack-store:
 
 logger:
   levels:
-    com.messaging: WARN  # Only show warnings and errors (was INFO)
-    com.messaging.broker.core: INFO  # Keep broker lifecycle events
-    com.messaging.broker.refresh: INFO  # Keep data refresh events
-    com.messaging.broker.consumer: WARN  # Keep timing instrumentation logs
-    io.netty: ERROR  # Only show Netty errors (was WARN)
+    com.messaging: WARN  # Default to warnings/errors unless a package is explicitly promoted
+    com.messaging.broker.core: INFO  # Broker lifecycle and orchestration
+    com.messaging.broker.refresh: INFO  # Refresh workflow state changes
+    com.messaging.broker.consumer: INFO  # Consumer lifecycle, timeouts, failures; hot-path batch logs stay DEBUG
+    com.messaging.broker.handler: INFO  # Subscribe / READY_ACK / RESET_ACK lifecycle events
+    com.messaging.broker.legacy: INFO  # Legacy consumer lifecycle; merge internals stay DEBUG
+    com.messaging.pipe: INFO  # Pipe connect/pause/resume and failures; poll traffic stays DEBUG
+    io.netty: ERROR  # Only show Netty errors

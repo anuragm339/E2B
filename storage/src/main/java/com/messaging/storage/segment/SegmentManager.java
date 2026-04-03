@@ -4,6 +4,7 @@ import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.exception.StorageException;
+import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.storage.metadata.SegmentMetadata;
 import com.messaging.storage.metadata.SegmentMetadataStore;
@@ -276,11 +277,14 @@ public class SegmentManager {
     }
 
     /**
-     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
-     * Currently only supports reading from a single segment (no cross-segment batches)
-     * Size-only batching: Limited by maxBytes only, no message count limit
+     * Zero-copy batch read: Get DeliveryBatch for direct file-to-network transfer.
+     * Currently only supports reading from a single segment (no cross-segment batches).
+     * Size-only batching: Limited by maxBytes only, no message count limit.
+     *
+     * @param fromOffset first offset to include (inclusive)
+     * @param maxBytes   maximum payload bytes
      */
-    public Segment.BatchFileRegion getZeroCopyBatch(long fromOffset, long maxBytes) throws MessagingException {
+    public DeliveryBatch getBatch(long fromOffset, long maxBytes) throws MessagingException {
         // B6-2 fix: detect consumer offset below earliest available data.
         // This happens when segments have been deleted (compaction/wipe) while consumer was offline.
         // Without this check, getBatchFileRegion() returns empty silently and delivery stalls forever.
@@ -302,7 +306,7 @@ public class SegmentManager {
             log.error("Consumer offset {} EXCEEDS storage head {} for topic={} partition={} — " +
                      "COMMIT_OFFSET validation failure detected. Returning empty batch to prevent infinite polling.",
                      fromOffset, storageHead, topic, partition);
-            return new Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
+            return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
         }
 
         // Find the segment that contains this offset
@@ -314,7 +318,7 @@ public class SegmentManager {
             if (active != null && fromOffset < active.getNextOffset()) {
                 return active.getBatchFileRegion(fromOffset, maxBytes);
             } else {
-                return new Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
+                return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
             }
         }
 
@@ -327,7 +331,7 @@ public class SegmentManager {
         // at the rollover boundary), fall through to the active segment.
         // floorEntry() returns the OLD sealed segment even when fromOffset equals the new active
         // segment's baseOffset, so without this check delivery stalls permanently at segment rollover.
-        if ((result == null || result.recordCount == 0) && activeSegment.get() != null) {
+        if ((result == null || result.isEmpty()) && activeSegment.get() != null) {
             // B6-1 fix: sealed segment returned empty at rollover boundary — fall through to active segment
             result = activeSegment.get().getBatchFileRegion(fromOffset, maxBytes);
         }
