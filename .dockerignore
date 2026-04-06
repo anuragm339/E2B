@@ -1,8 +1,5 @@
 # Gradle
 .gradle/
-gradle/
-gradlew
-gradlew.bat
 
 # Build output (except the final JAR)
 build/classes/

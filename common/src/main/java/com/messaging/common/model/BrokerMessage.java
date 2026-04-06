@@ -71,7 +71,7 @@ public class BrokerMessage {
             return code;
         }
 
-        public static MessageType fromCode(byte code) {
+        public static MessageType fromCode(byte code) throws NetworkException {
             for (MessageType type : values()) {
                 if (type.code == code) {
                     return type;
@@ -80,8 +80,7 @@ public class BrokerMessage {
             NetworkException ex = new NetworkException(ErrorCode.NETWORK_DECODING_ERROR,
                 "Unknown message type code: " + code);
             ex.withContext("messageTypeCode", code);
-            // Wrap in RuntimeException since enum methods can't declare checked exceptions
-            throw new RuntimeException("Invalid message type code: " + code, ex);
+            throw ex;
         }
     }
 }

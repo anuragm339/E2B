@@ -1,10 +1,12 @@
 package com.messaging.storage.mmap;
 
+import com.messaging.common.api.BatchReadableStorage;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.exception.StorageException;
+import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.storage.segment.Segment;
 import com.messaging.storage.segment.SegmentManager;
@@ -30,7 +32,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Singleton
 @Requires(property = "broker.storage.type", value = "mmap")
-public class MMapStorageEngine implements StorageEngine {
+public class MMapStorageEngine implements StorageEngine, BatchReadableStorage {
     private static final Logger log = LoggerFactory.getLogger(MMapStorageEngine.class);
 
     private final Path dataDir;
@@ -80,16 +82,16 @@ public class MMapStorageEngine implements StorageEngine {
     }
 
     /**
-     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
-     * @return BatchFileRegion containing FileRegion for zero-copy transfer + metadata
+     * Zero-copy batch read: Get DeliveryBatch for direct file-to-network transfer.
      */
-    public Segment.BatchFileRegion getZeroCopyBatch(String topic, int partition, long fromOffset, long maxBytes) throws MessagingException {
+    @Override
+    public DeliveryBatch getBatch(String topic, int partition, long fromOffset, long maxBytes) throws MessagingException {
         SegmentManager manager = managers.get(new TopicPartition(topic, partition));
         if (manager == null) {
             log.debug("No segment manager for topic={}, partition={}", topic, partition);
-            return new com.messaging.storage.segment.Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
+            return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
         }
-        return manager.getZeroCopyBatch(fromOffset, maxBytes);
+        return manager.getBatch(fromOffset, maxBytes);
     }
 
     @Override
@@ -203,25 +205,37 @@ public class MMapStorageEngine implements StorageEngine {
 
     /**
      * Get or create segment manager for topic-partition
+     * @throws StorageException if manager creation fails
      */
-    private SegmentManager getOrCreateManager(String topic, int partition) {
+    private SegmentManager getOrCreateManager(String topic, int partition) throws StorageException {
         TopicPartition tp = new TopicPartition(topic, partition);
 
-        return managers.computeIfAbsent(tp, key -> {
-            try {
-                Path partitionDir = dataDir
-                        .resolve(topic)
-                        .resolve("partition-" + partition);
+        // Check if manager already exists
+        SegmentManager existing = managers.get(tp);
+        if (existing != null) {
+            return existing;
+        }
 
-                // Get topic-specific metadata store from factory
-                com.messaging.storage.metadata.SegmentMetadataStore metadataStore =
-                    metadataStoreFactory.getStoreForTopic(topic);
-
-                return new SegmentManager(topic, partition, partitionDir, maxSegmentSize, metadataStore);
-            } catch (StorageException e) {
-                throw new RuntimeException(e); // Wrap for computeIfAbsent
+        // Create new manager (synchronized to prevent race condition)
+        synchronized (this) {
+            // Double-check after acquiring lock
+            existing = managers.get(tp);
+            if (existing != null) {
+                return existing;
             }
-        });
+
+            Path partitionDir = dataDir
+                    .resolve(topic)
+                    .resolve("partition-" + partition);
+
+            // Get topic-specific metadata store from factory
+            com.messaging.storage.metadata.SegmentMetadataStore metadataStore =
+                metadataStoreFactory.getStoreForTopic(topic);
+
+            SegmentManager manager = new SegmentManager(topic, partition, partitionDir, maxSegmentSize, metadataStore);
+            managers.put(tp, manager);
+            return manager;
+        }
     }
 
     /**

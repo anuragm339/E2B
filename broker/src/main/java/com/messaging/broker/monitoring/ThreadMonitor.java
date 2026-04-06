@@ -297,7 +297,8 @@ public class ThreadMonitor {
     private String categorizeThread(String threadName) {
         if (threadName.contains("nioEventLoopGroup") || threadName.contains("netty")) {
             return "Network I/O";
-        } else if (threadName.contains("RemoteConsumerRegistry") || threadName.contains("consumer-delivery")
+        } else if (threadName.contains("RemoteConsumerRegistry") || threadName.contains("ConsumerRegistry")
+                || threadName.contains("consumer-delivery")
                 || threadName.contains("ConsumerDeliveryScheduler") || threadName.contains("ConsumerOffsetFlusher")
                 || threadName.contains("DeliveryStateStore") || threadName.contains("ACK-Processor")
                 || threadName.contains("TopicFairScheduler")) {
@@ -306,7 +307,7 @@ public class ThreadMonitor {
             return "Storage";
         } else if (threadName.contains("HttpPipeConnector") || threadName.contains("pipe")) {
             return "Pipe/Replication";
-        } else if (threadName.contains("DataRefreshManager")) {
+        } else if (threadName.contains("RefreshCoordinator") || threadName.contains("DataRefreshCoordinator") || threadName.contains("DataRefreshManager")) {
             return "Data Refresh";
         } else if (threadName.contains("TopologyManager")) {
             return "Broker Management";

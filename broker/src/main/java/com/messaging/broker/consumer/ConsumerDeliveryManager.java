@@ -20,7 +20,7 @@ import java.util.concurrent.*;
 @Singleton
 public class ConsumerDeliveryManager {
     private static final Logger log = LoggerFactory.getLogger(ConsumerDeliveryManager.class);
-    private static final long POLL_INTERVAL_MS = 100L;
+    private static final long POLL_INTERVAL_MS = 200L;
 
     private final StorageEngine storage;
     private final ConsumerAnnotationProcessor processor;
@@ -34,7 +34,8 @@ public class ConsumerDeliveryManager {
         this.storage = storage;
         this.processor = processor;
         this.offsetTracker = offsetTracker;
-        this.scheduler = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), r -> {
+        int schedulerThreads = Math.min(4, Runtime.getRuntime().availableProcessors());
+        this.scheduler = Executors.newScheduledThreadPool(schedulerThreads, r -> {
             Thread t = new Thread(r);
             t.setName("ConsumerDeliveryScheduler-" + t.getId());
             return t;
@@ -103,6 +104,12 @@ public class ConsumerDeliveryManager {
             }
 
             long currentOffset = context.getCurrentOffset();
+
+            // Skip the mmap scan if consumer is already at the log head
+            long headOffset = storage.getCurrentOffset(context.getTopic(), 0);
+            if (currentOffset >= headOffset) {
+                return;
+            }
 
             // Use dynamic batch size from context
             int batchSize = context.getCurrentBatchSize();

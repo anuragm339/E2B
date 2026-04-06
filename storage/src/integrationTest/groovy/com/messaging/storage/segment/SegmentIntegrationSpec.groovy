@@ -2,6 +2,7 @@ package com.messaging.storage.segment
 
 import com.messaging.common.model.EventType
 import com.messaging.common.model.MessageRecord
+import io.micronaut.test.extensions.spock.annotation.MicronautTest
 import spock.lang.Specification
 import spock.lang.TempDir
 
@@ -9,160 +10,144 @@ import java.nio.file.Path
 import java.time.Instant
 
 /**
- * Integration tests for Segment - multi-segment scenarios, recovery, and cross-segment operations
+ * Integration tests for Segment — multi-segment scenarios, recovery, and cross-segment operations.
+ *
+ * Segment is a plain Java class (not a Micronaut bean); tests instantiate it directly.
+ * @MicronautTest is used for project-wide consistency.
  */
+@MicronautTest
 class SegmentIntegrationSpec extends Specification {
 
     @TempDir
     Path tempDir
 
-    def "integration test setup verification"() {
-        given: "a simple segment"
-        def logPath = tempDir.resolve("00000000000000000000.log")
-        def indexPath = tempDir.resolve("00000000000000000000.index")
-        def baseOffset = 0L
-        def maxSize = 1024 * 1024L // 1MB
-        def topic = "integration-test-topic"
-        def partition = 0
+    // =========================================================================
+    // Basic single-segment append / read
+    // =========================================================================
 
-        when: "creating segment and writing a record"
-        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
-        def record = createTestRecord(0L, "test-key", "test-data")
-        segment.append(record)
-        def readRecord = segment.read(0L)
+    def "segment append and read round-trip"() {
+        given:
+        def segment = newSegment(tempDir, "00000000000000000000", 0L, 1024 * 1024L)
 
-        then: "record can be read back"
-        readRecord != null
-        readRecord.getMsgKey() == "test-key"
-        readRecord.getData() == "test-data"
+        when:
+        segment.append(record(0L, "test-key", "test-data"))
+        def read = segment.read(0L)
+
+        then:
+        read != null
+        read.msgKey == "test-key"
+        read.data   == "test-data"
 
         cleanup:
         segment?.close()
     }
 
+    def "segment header is written and validated on reopen"() {
+        given:
+        def segment = newSegment(tempDir, "00000000000000000000", 0L, 1024 * 1024L)
+        segment.append(record(0L, "k", "v"))
+        segment.close()
+
+        when:
+        def reopened = newSegment(tempDir, "00000000000000000000", 0L, 1024 * 1024L)
+
+        then:
+        reopened.nextOffset == 1L
+
+        cleanup:
+        reopened?.close()
+    }
+
+    // =========================================================================
+    // Multi-segment recovery and cross-segment reads
+    // =========================================================================
+
     def "multiple segments can be recovered and read correctly"() {
         given: "three segments with different base offsets"
-        def topic = "multi-segment-test"
+        def topic     = "multi-segment-test"
         def partition = 0
-        def maxSize = 1024 * 1024L
+        def maxSize   = 1024 * 1024L
 
-        def segment1 = new Segment(
-            tempDir.resolve("00000000000000000000.log"),
-            tempDir.resolve("00000000000000000000.index"),
-            0L, maxSize, topic, partition
-        )
-        def segment2 = new Segment(
-            tempDir.resolve("00000000000000001000.log"),
-            tempDir.resolve("00000000000000001000.index"),
-            1000L, maxSize, topic, partition
-        )
-        def segment3 = new Segment(
-            tempDir.resolve("00000000000000002000.log"),
-            tempDir.resolve("00000000000000002000.index"),
-            2000L, maxSize, topic, partition
-        )
+        def seg1 = newSegmentAt(tempDir, 0L,    maxSize, topic, partition)
+        def seg2 = newSegmentAt(tempDir, 1000L, maxSize, topic, partition)
+        def seg3 = newSegmentAt(tempDir, 2000L, maxSize, topic, partition)
 
         and: "write 100 records to each segment"
         100.times { i ->
-            segment1.append(createTestRecord(i, "seg1-key-${i}", "seg1-data-${i}"))
-            segment2.append(createTestRecord(1000 + i, "seg2-key-${i}", "seg2-data-${i}"))
-            segment3.append(createTestRecord(2000 + i, "seg3-key-${i}", "seg3-data-${i}"))
+            seg1.append(record(i,        "seg1-key-${i}", "seg1-data-${i}"))
+            seg2.append(record(1000 + i, "seg2-key-${i}", "seg2-data-${i}"))
+            seg3.append(record(2000 + i, "seg3-key-${i}", "seg3-data-${i}"))
         }
+        [seg1, seg2, seg3].each { it.close() }
 
-        and: "close all segments"
-        segment1.close()
-        segment2.close()
-        segment3.close()
+        when: "recovering all three segments"
+        def rec1 = newSegmentAt(tempDir, 0L,    maxSize, topic, partition)
+        def rec2 = newSegmentAt(tempDir, 1000L, maxSize, topic, partition)
+        def rec3 = newSegmentAt(tempDir, 2000L, maxSize, topic, partition)
 
-        when: "recovering all segments"
-        def recovered1 = new Segment(
-            tempDir.resolve("00000000000000000000.log"),
-            tempDir.resolve("00000000000000000000.index"),
-            0L, maxSize, topic, partition
-        )
-        def recovered2 = new Segment(
-            tempDir.resolve("00000000000000001000.log"),
-            tempDir.resolve("00000000000000001000.index"),
-            1000L, maxSize, topic, partition
-        )
-        def recovered3 = new Segment(
-            tempDir.resolve("00000000000000002000.log"),
-            tempDir.resolve("00000000000000002000.index"),
-            2000L, maxSize, topic, partition
-        )
+        then: "nextOffset is correct for each segment"
+        rec1.nextOffset == 100L
+        rec2.nextOffset == 1100L
+        rec3.nextOffset == 2100L
 
-        then: "all segments have correct nextOffset"
-        recovered1.getNextOffset() == 100
-        recovered2.getNextOffset() == 1100
-        recovered3.getNextOffset() == 2100
-
-        and: "can read records from all segments"
-        def rec1 = recovered1.read(50)
-        rec1 != null
-        rec1.getMsgKey() == "seg1-key-50"
-
-        def rec2 = recovered2.read(1050)
-        rec2 != null
-        rec2.getMsgKey() == "seg2-key-50"
-
-        def rec3 = recovered3.read(2050)
-        rec3 != null
-        rec3.getMsgKey() == "seg3-key-50"
+        and: "arbitrary reads within each segment return the right record"
+        rec1.read(50).msgKey    == "seg1-key-50"
+        rec2.read(1050).msgKey  == "seg2-key-50"
+        rec3.read(2050).msgKey  == "seg3-key-50"
 
         cleanup:
-        recovered1?.close()
-        recovered2?.close()
-        recovered3?.close()
+        [rec1, rec2, rec3].each { it?.close() }
     }
 
-    def "large segment recovery with 10000 records verifies STORAGE-1 memory fix"() {
-        given: "a segment that will contain many records"
-        def logPath = tempDir.resolve("00000000000000000000.log")
-        def indexPath = tempDir.resolve("00000000000000000000.index")
-        def baseOffset = 0L
-        def maxSize = 100 * 1024 * 1024L // 100MB
-        def topic = "large-segment-test"
-        def partition = 0
+    // =========================================================================
+    // Large segment — verifies STORAGE-1 O(1)-memory index recovery fix
+    // =========================================================================
 
-        and: "write 10000 records"
-        def segment = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
-        10000.times { i ->
-            def record = createTestRecord(i, "key-${i}", "data-value-${i}")
-            segment.append(record)
-        }
+    def "large segment recovery with 10 000 records uses binary search correctly"() {
+        given:
+        def segment = newSegment(tempDir, "00000000000000000000", 0L, 100 * 1024 * 1024L)
+        10_000.times { i -> segment.append(record(i, "key-${i}", "data-value-${i}")) }
         segment.close()
 
-        when: "recovering segment with many records"
-        def recovered = new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+        when:
+        def recovered = newSegment(tempDir, "00000000000000000000", 0L, 100 * 1024 * 1024L)
 
-        then: "nextOffset is correct (no memory leak from index map)"
-        recovered.getNextOffset() == 10000
+        then: "index recovery gives the correct nextOffset — no in-memory map was used"
+        recovered.nextOffset == 10_000L
 
-        and: "random reads work correctly using binary search"
-        def mid = recovered.read(5000)
-        mid != null
-        mid.getMsgKey() == "key-5000"
-
-        def last = recovered.read(9999)
-        last != null
-        last.getMsgKey() == "key-9999"
-
-        def first = recovered.read(0)
-        first != null
-        first.getMsgKey() == "key-0"
+        and: "binary search finds records at first, middle, and last offsets"
+        recovered.read(0).msgKey    == "key-0"
+        recovered.read(5000).msgKey == "key-5000"
+        recovered.read(9999).msgKey == "key-9999"
 
         cleanup:
         recovered?.close()
     }
 
-    // Helper method to create test records
-    private MessageRecord createTestRecord(long offset, String key, String data) {
-        def record = new MessageRecord()
-        record.setOffset(offset)
-        record.setMsgKey(key)
-        record.setData(data)
-        record.setEventType(EventType.MESSAGE)
-        record.setCreatedAt(Instant.now())
-        return record
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
+    private static Segment newSegment(Path dir, String name, long baseOffset, long maxSize,
+                                      String topic = "test-topic", int partition = 0) {
+        def logPath   = dir.resolve("${name}.log")
+        def indexPath = dir.resolve("${name}.index")
+        return new Segment(logPath, indexPath, baseOffset, maxSize, topic, partition)
+    }
+
+    private static Segment newSegmentAt(Path dir, long baseOffset, long maxSize,
+                                         String topic, int partition) {
+        def name = String.format("%020d", baseOffset)
+        newSegment(dir, name, baseOffset, maxSize, topic, partition)
+    }
+
+    private static MessageRecord record(long offset, String key, String data) {
+        def r = new MessageRecord()
+        r.offset    = offset
+        r.msgKey    = key
+        r.data      = data
+        r.eventType = EventType.MESSAGE
+        r.createdAt = Instant.now()
+        return r
     }
 }

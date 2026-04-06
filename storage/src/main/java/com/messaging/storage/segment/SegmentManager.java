@@ -4,6 +4,7 @@ import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.exception.StorageException;
+import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.storage.metadata.SegmentMetadata;
 import com.messaging.storage.metadata.SegmentMetadataStore;
@@ -19,16 +20,12 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Stream;
 
 /**
- * Manages multiple segments for a topic-partition
+ * Manages multiple segments for a topic-partition (Phase 10: Refactored to use service layer)
  */
 public class SegmentManager {
     private static final Logger log = LoggerFactory.getLogger(SegmentManager.class);
-    private static final Pattern SEGMENT_PATTERN = Pattern.compile("(\\d{20})\\.log");
     private static final int METADATA_UPDATE_INTERVAL = 1000; // Update metadata every 1000 appends
 
     private final String topic;
@@ -40,6 +37,10 @@ public class SegmentManager {
     private final SegmentMetadataStore metadataStore;
     private final AtomicLong appendsSinceMetadataUpdate; // Track appends for periodic metadata updates
 
+    // Phase 10: Service layer dependencies
+    private final StorageRecoveryService recoveryService;
+    private final SegmentFactory segmentFactory;
+
     public SegmentManager(String topic, int partition, Path dataDir, long maxSegmentSize, SegmentMetadataStore metadataStore) throws  StorageException {
         this.topic = topic;
         this.partition = partition;
@@ -50,6 +51,10 @@ public class SegmentManager {
         this.metadataStore = metadataStore;
         this.appendsSinceMetadataUpdate = new AtomicLong(0);
 
+        // Phase 10: Initialize service layer
+        this.recoveryService = new DefaultStorageRecoveryService();
+        this.segmentFactory = new DefaultSegmentFactory();
+
         // Create data directory if it doesn't exist
         try {
             Files.createDirectories(dataDir);
@@ -57,8 +62,8 @@ public class SegmentManager {
            throw new StorageException(ErrorCode.STORAGE_IO_ERROR, "Failed to create data directory: " + dataDir, e);
         }
 
-        // Load existing segments
-        loadSegments();
+        // Phase 10: Use StorageRecoveryService to load segments
+        recoverSegmentsFromDisk();
 
         // Create initial segment if none exist
         if (segments.isEmpty()) {
@@ -75,66 +80,19 @@ public class SegmentManager {
     }
 
     /**
-     * Load existing segments from disk
+     * Phase 10: Load existing segments from disk using StorageRecoveryService
      */
-    private void loadSegments() throws StorageException {
-        List<Path> logFiles = new ArrayList<>();
+    private void recoverSegmentsFromDisk() throws StorageException {
+        StorageRecoveryService.RecoveryResult result =
+                recoveryService.recoverSegments(dataDir, topic, partition, maxSegmentSize);
 
-        // Collect all log files first
-        try (Stream<Path> paths = Files.list(dataDir)) {
-            paths.filter(path -> path.toString().endsWith(".log"))
-                    .forEach(logFiles::add);
-        } catch (IOException e) {
-            throw new StorageException(ErrorCode.STORAGE_IO_ERROR, "Failed to list segment files", e);
+        // Add all recovered segments to the segments map
+        for (Segment segment : result.getSegments()) {
+            segments.put(segment.getBaseOffset(), segment);
         }
 
-        // Sort by filename (which contains offset)
-        logFiles.sort(Path::compareTo);
-
-        // Load segments - seal all except the last one
-        for (int i = 0; i < logFiles.size(); i++) {
-            Path logPath = logFiles.get(i);
-            boolean isLastSegment = (i == logFiles.size() - 1);
-
-            try {
-                long baseOffset = extractOffsetFromFilename(logPath.getFileName().toString());
-                Path indexPath = dataDir.resolve(String.format("%020d.index", baseOffset));
-
-                Segment segment = new Segment(logPath, indexPath, baseOffset, maxSegmentSize, topic, partition);
-
-                // Only seal old segments, keep the last one active
-                if (!isLastSegment) {
-                    segment.seal();
-                    log.info("Loaded and sealed segment: topic={}, partition={}, baseOffset={}",
-                            topic, partition, baseOffset);
-                } else {
-                    log.info("Loaded active segment: topic={}, partition={}, baseOffset={}",
-                            topic, partition, baseOffset);
-                }
-
-                segments.put(baseOffset, segment);
-
-//                // Save metadata to database
-//                saveSegmentMetadata(segment);
-
-            } catch (StorageException e) {
-                log.error("Failed to load segment: {}", logPath, e);
-            }
-        }
-    }
-
-    /**
-     * Extract base offset from segment filename
-     */
-    private long extractOffsetFromFilename(String filename) {
-        Matcher matcher = SEGMENT_PATTERN.matcher(filename);
-        if (matcher.matches()) {
-            return Long.parseLong(matcher.group(1));
-        }
-        // Use RuntimeException for corrupted filesystem state (unchecked exception appropriate here)
-        // This will be caught by the caller (loadSegments) which already handles StorageException
-        throw new RuntimeException("Invalid segment filename: " + filename +
-                " for topic=" + topic + " partition=" + partition);
+        log.info("Recovered {} segments from disk for topic={}, partition={}",
+                result.getTotalSegments(), topic, partition);
     }
 
     /**
@@ -201,13 +159,10 @@ public class SegmentManager {
     }
 
     /**
-     * Create a new segment
+     * Phase 10: Create a new segment using SegmentFactory
      */
     private void createNewSegment(long baseOffset) throws StorageException {
-        Path logPath = dataDir.resolve(String.format("%020d.log", baseOffset));
-        Path indexPath = dataDir.resolve(String.format("%020d.index", baseOffset));
-
-        Segment segment = new Segment(logPath, indexPath, baseOffset, maxSegmentSize, topic, partition);
+        Segment segment = segmentFactory.createSegment(dataDir, topic, partition, baseOffset, metadataStore);
         activeSegment.set(segment);
 
         log.info("Created new segment: topic={}, partition={}, baseOffset={}",
@@ -322,14 +277,14 @@ public class SegmentManager {
     }
 
     /**
-     * Zero-copy batch read: Get FileRegion for direct file-to-network transfer
-     * Currently only supports reading from a single segment (no cross-segment batches)
-     * Size-only batching: Limited by maxBytes only, no message count limit
+     * Zero-copy batch read: Get DeliveryBatch for direct file-to-network transfer.
+     * Currently only supports reading from a single segment (no cross-segment batches).
+     * Size-only batching: Limited by maxBytes only, no message count limit.
+     *
+     * @param fromOffset first offset to include (inclusive)
+     * @param maxBytes   maximum payload bytes
      */
-    public Segment.BatchFileRegion getZeroCopyBatch(long fromOffset, long maxBytes) throws MessagingException {
-        log.info("DEBUG SegmentManager.getZeroCopyBatch(): topic={}, partition={}, fromOffset={}, maxBytes={}, segments.size={}",
-                topic, partition, fromOffset, maxBytes, segments.size());
-
+    public DeliveryBatch getBatch(long fromOffset, long maxBytes) throws MessagingException {
         // B6-2 fix: detect consumer offset below earliest available data.
         // This happens when segments have been deleted (compaction/wipe) while consumer was offline.
         // Without this check, getBatchFileRegion() returns empty silently and delivery stalls forever.
@@ -343,30 +298,31 @@ public class SegmentManager {
             fromOffset = earliestBase;
         }
 
+        // ISSUE #2 FIX: Detect forward gap (defense-in-depth)
+        // This should never happen if COMMIT_OFFSET validation is working correctly,
+        // but provides a safety net in case of corrupted offset files or bugs
+        long storageHead = getCurrentOffset();
+        if (fromOffset > storageHead) {
+            log.error("Consumer offset {} EXCEEDS storage head {} for topic={} partition={} — " +
+                     "COMMIT_OFFSET validation failure detected. Returning empty batch to prevent infinite polling.",
+                     fromOffset, storageHead, topic, partition);
+            return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
+        }
+
         // Find the segment that contains this offset
         var entry = segments.floorEntry(fromOffset);
 
         if (entry == null) {
-            log.info("DEBUG SegmentManager: segments.floorEntry({}) returned NULL", fromOffset);
-            // Check active segment
+            // No sealed segment contains this offset — check the active segment
             Segment active = activeSegment.get();
-            log.info("DEBUG SegmentManager: activeSegment={}, baseOffset={}, nextOffset={}",
-                     (active != null ? "present" : "NULL"),
-                     (active != null ? active.getBaseOffset() : "N/A"),
-                     (active != null ? active.getNextOffset() : "N/A"));
             if (active != null && fromOffset < active.getNextOffset()) {
-                log.info("DEBUG SegmentManager: Using active segment for zero-copy read (fromOffset={} < nextOffset={})",
-                         fromOffset, active.getNextOffset());
                 return active.getBatchFileRegion(fromOffset, maxBytes);
             } else {
-                log.info("DEBUG SegmentManager: No segment found for offset {}, returning EMPTY BatchFileRegion", fromOffset);
-                return new Segment.BatchFileRegion(null, null, 0, 0, 0, fromOffset);
+                return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
             }
         }
 
         Segment currentSegment = entry.getValue();
-        log.info("DEBUG SegmentManager: Found segment via floorEntry, baseOffset={}, nextOffset={}",
-                 currentSegment.getBaseOffset(), currentSegment.getNextOffset());
 
         // Get zero-copy batch from segment (size-only batching)
         Segment.BatchFileRegion result = currentSegment.getBatchFileRegion(fromOffset, maxBytes);
@@ -375,11 +331,9 @@ public class SegmentManager {
         // at the rollover boundary), fall through to the active segment.
         // floorEntry() returns the OLD sealed segment even when fromOffset equals the new active
         // segment's baseOffset, so without this check delivery stalls permanently at segment rollover.
-        if ((result == null || result.recordCount == 0) && activeSegment.get() != null) {
-            Segment active = activeSegment.get();
-            log.info("DEBUG SegmentManager: Sealed segment returned empty for offset {}, checking active segment (baseOffset={}, nextOffset={})",
-                     fromOffset, active.getBaseOffset(), active.getNextOffset());
-            result = active.getBatchFileRegion(fromOffset, maxBytes);
+        if ((result == null || result.isEmpty()) && activeSegment.get() != null) {
+            // B6-1 fix: sealed segment returned empty at rollover boundary — fall through to active segment
+            result = activeSegment.get().getBatchFileRegion(fromOffset, maxBytes);
         }
 
         return result;

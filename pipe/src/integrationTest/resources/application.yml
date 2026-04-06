@@ -1,0 +1,13 @@
+micronaut:
+  server:
+    port: -1          # Random port — each test run gets a fresh port
+  application:
+    name: pipe-integration-test
+
+broker:
+  storage:
+    data-dir: ${java.io.tmpdir}/pipe-integration-test   # Needed by HttpPipeConnector for offset file
+  pipe:
+    min-poll-interval-ms: 100
+    max-poll-interval-ms: 1000
+    poll-limit: 5

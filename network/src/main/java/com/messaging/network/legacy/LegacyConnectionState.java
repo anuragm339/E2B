@@ -7,6 +7,8 @@ import io.netty.channel.ChannelPromise;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Deque;
 
@@ -77,19 +79,25 @@ public class LegacyConnectionState extends ChannelDuplexHandler {
 
         switch (type) {
             case RESET:
-                pendingAcks.addLast(new AckExpectation(BrokerMessage.MessageType.RESET_ACK, "RESET"));
-                log.debug("Expecting RESET_ACK (pending queue size: {})", pendingAcks.size());
+                String topic = msg.getPayload() != null && msg.getPayload().length > 0
+                        ? new String(msg.getPayload(), StandardCharsets.UTF_8) : "";
+                pendingAcks.addLast(new AckExpectation(BrokerMessage.MessageType.RESET_ACK, "RESET", topic));
+                log.debug("Expecting RESET_ACK for topic={} (pending queue size: {})", topic, pendingAcks.size());
                 break;
 
             case READY:
-                pendingAcks.addLast(new AckExpectation(BrokerMessage.MessageType.READY_ACK, "READY"));
-                log.debug("Expecting READY_ACK (pending queue size: {})", pendingAcks.size());
+                // Capture topic from payload so refresh READY_ACK can be routed correctly.
+                // Startup READY has empty payload; refresh READY carries the topic name.
+                String readyTopic = msg.getPayload() != null && msg.getPayload().length > 0
+                        ? new String(msg.getPayload(), StandardCharsets.UTF_8) : null;
+                pendingAcks.addLast(new AckExpectation(BrokerMessage.MessageType.READY_ACK, "READY", readyTopic));
+                log.debug("Expecting READY_ACK for topic={} (pending queue size: {})", readyTopic, pendingAcks.size());
                 break;
 
             case BATCH_HEADER:
             case DATA:
                 // Both BATCH_HEADER and individual DATA messages expect BATCH_ACK
-                pendingAcks.addLast(new AckExpectation(BrokerMessage.MessageType.BATCH_ACK, "BATCH"));
+                pendingAcks.addLast(new AckExpectation(BrokerMessage.MessageType.BATCH_ACK, "BATCH", null));
                 log.debug("Expecting BATCH_ACK (pending queue size: {})", pendingAcks.size());
                 break;
 
@@ -118,7 +126,21 @@ public class LegacyConnectionState extends ChannelDuplexHandler {
         BrokerMessage resolvedMsg = new BrokerMessage();
         resolvedMsg.setType(expectation.expectedType);
         resolvedMsg.setMessageId(genericAck.getMessageId());
-        resolvedMsg.setPayload(genericAck.getPayload());
+
+        // For RESET_ACK and READY_ACK from legacy clients, build the structured payload that the
+        // handler expects: [topicLen:4][topic:var][groupLen:4]  — groupLen=0 signals legacy fallback.
+        if ((expectation.expectedType == BrokerMessage.MessageType.RESET_ACK
+                || expectation.expectedType == BrokerMessage.MessageType.READY_ACK)
+                && expectation.topic != null && !expectation.topic.isEmpty()) {
+            byte[] topicBytes = expectation.topic.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer buf = ByteBuffer.allocate(4 + topicBytes.length + 4);
+            buf.putInt(topicBytes.length);
+            buf.put(topicBytes);
+            buf.putInt(0); // groupLen=0 → handler will look up the group from consumer registry
+            resolvedMsg.setPayload(buf.array());
+        } else {
+            resolvedMsg.setPayload(genericAck.getPayload());
+        }
 
         return resolvedMsg;
     }
@@ -144,11 +166,22 @@ public class LegacyConnectionState extends ChannelDuplexHandler {
         log.debug("Legacy client sent READY (expected {}), converting to READY_ACK, remaining pending: {}",
                 expectation.expectedType, pendingAcks.size());
 
-        // Always convert READY to READY_ACK for backwards compatibility
+        // Always convert READY to READY_ACK for backwards compatibility.
+        // If the expectation carried a topic (refresh READY), build the structured payload.
         BrokerMessage resolvedMsg = new BrokerMessage();
         resolvedMsg.setType(BrokerMessage.MessageType.READY_ACK);
         resolvedMsg.setMessageId(readyMsg.getMessageId());
-        resolvedMsg.setPayload(readyMsg.getPayload());
+
+        if (expectation.topic != null && !expectation.topic.isEmpty()) {
+            byte[] topicBytes = expectation.topic.getBytes(StandardCharsets.UTF_8);
+            ByteBuffer buf = ByteBuffer.allocate(4 + topicBytes.length + 4);
+            buf.putInt(topicBytes.length);
+            buf.put(topicBytes);
+            buf.putInt(0); // groupLen=0 → ReadyAckHandler will look up the group
+            resolvedMsg.setPayload(buf.array());
+        } else {
+            resolvedMsg.setPayload(readyMsg.getPayload());
+        }
 
         return resolvedMsg;
     }
@@ -159,15 +192,17 @@ public class LegacyConnectionState extends ChannelDuplexHandler {
     private static class AckExpectation {
         final BrokerMessage.MessageType expectedType;
         final String description;
+        final String topic; // non-null for RESET expectations; null otherwise
 
-        AckExpectation(BrokerMessage.MessageType expectedType, String description) {
+        AckExpectation(BrokerMessage.MessageType expectedType, String description, String topic) {
             this.expectedType = expectedType;
             this.description = description;
+            this.topic = topic;
         }
 
         @Override
         public String toString() {
-            return String.format("AckExpectation{type=%s, desc=%s}", expectedType, description);
+            return String.format("AckExpectation{type=%s, desc=%s, topic=%s}", expectedType, description, topic);
         }
     }
 

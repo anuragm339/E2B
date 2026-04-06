@@ -27,7 +27,7 @@ public enum EventType {
         return code;
     }
 
-    public static EventType fromCode(char code) {
+    public static EventType fromCode(char code) throws NetworkException {
         for (EventType type : values()) {
             if (type.code == code) {
                 return type;
@@ -36,7 +36,6 @@ public enum EventType {
         NetworkException ex = new NetworkException(ErrorCode.NETWORK_DECODING_ERROR,
             "Unknown event type code: " + code);
         ex.withContext("eventTypeCode", (int) code);
-        // Wrap in RuntimeException since enum methods can't declare checked exceptions
-        throw new RuntimeException("Invalid event type code: " + code, ex);
+        throw ex;
     }
 }

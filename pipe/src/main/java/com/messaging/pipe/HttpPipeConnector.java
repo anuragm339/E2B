@@ -3,6 +3,7 @@ package com.messaging.pipe;
 import com.messaging.common.api.PipeConnector;
 import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.MessagingException;
+import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.pipe.metrics.PipeMetrics;
 import com.fasterxml.jackson.core.JsonParser;
@@ -22,7 +23,7 @@ import java.io.*;
 import java.nio.file.*;
 import java.util.Properties;
 import java.util.concurrent.*;
-import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * HTTP-based PipeConnector with streaming JSON parsing
@@ -33,9 +34,6 @@ public class HttpPipeConnector implements PipeConnector {
 
     private static final Logger log = LoggerFactory.getLogger(HttpPipeConnector.class);
 
-    private static final long MIN_POLL_INTERVAL_MS = 200;  // Reduced polling frequency (was 100ms)
-    private static final long MAX_POLL_INTERVAL_MS = 10000;  // Longer backoff when idle (was 5000ms)
-    private static final long PERSIST_INTERVAL_MS = 5000;
     private static final String OFFSET_FILE = "pipe-offset.properties";
 
     private final HttpClient httpClient;
@@ -43,25 +41,35 @@ public class HttpPipeConnector implements PipeConnector {
     private final ScheduledExecutorService scheduler;
     private final Path offsetFilePath;
     private final PipeMetrics metrics;
+    private final long minPollIntervalMs;
+    private final long maxPollIntervalMs;
+    private final int pollLimit;
 
     private volatile PipeConnectionImpl connection;
-    private volatile Consumer<MessageRecord> dataHandler;
+    private volatile Function<MessageRecord, Boolean> dataHandler;
     private volatile boolean running;
     private volatile boolean pausePipeCalls = false;  // For DataRefresh support
 
     private volatile long currentOffset = 0;
     private volatile long lastPersistedOffset = -1;
-    private volatile long adaptiveDelay = MIN_POLL_INTERVAL_MS;
+    private volatile long adaptiveDelay;
 
     public HttpPipeConnector(
             @Client("/") HttpClient httpClient,
             @Value("${broker.storage.data-dir:./data}") String dataDir,
-            PipeMetrics metrics) {
+            @Value("${broker.pipe.min-poll-interval-ms:500}") long minPollIntervalMs,
+            @Value("${broker.pipe.max-poll-interval-ms:20000}") long maxPollIntervalMs,
+            @Value("${broker.pipe.poll-limit:5}") int pollLimit,
+            PipeMetrics metrics) throws StorageException {
         this.httpClient = httpClient;
 
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
         this.metrics = metrics;
+        this.minPollIntervalMs = Math.max(100, minPollIntervalMs);
+        this.maxPollIntervalMs = Math.max(this.minPollIntervalMs, maxPollIntervalMs);
+        this.pollLimit = Math.max(1, pollLimit);
+        this.adaptiveDelay = this.minPollIntervalMs;
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "HttpPipeConnector");
@@ -71,15 +79,17 @@ public class HttpPipeConnector implements PipeConnector {
         try {
             Files.createDirectories(Paths.get(dataDir));
         } catch (IOException e) {
-            // Wrap in RuntimeException as constructor can't throw checked exceptions
+            // Fatal error during initialization
             log.error("Failed to create data directory: {}", dataDir, e);
-            throw new RuntimeException("Failed to create data directory: " + dataDir, e);
+            throw new StorageException(ErrorCode.STORAGE_IO_ERROR,
+                "Failed to create data directory: " + dataDir, e);
         }
 
         this.offsetFilePath = Paths.get(dataDir, OFFSET_FILE);
         loadOffset();
 
-        log.info("HttpPipeConnector initialized with metrics, offset={}", currentOffset);
+        log.info("event=pipe_connector.initialized offset={} minPollIntervalMs={} maxPollIntervalMs={} pollLimit={}",
+                currentOffset, this.minPollIntervalMs, this.maxPollIntervalMs, this.pollLimit);
     }
 
     @Override
@@ -87,17 +97,14 @@ public class HttpPipeConnector implements PipeConnector {
         return CompletableFuture.supplyAsync(() -> {
             this.connection = new PipeConnectionImpl(parentUrl);
             this.running = true;
+            this.adaptiveDelay = minPollIntervalMs;
 
             scheduler.execute(this::pollLoop);
 
-            scheduler.scheduleWithFixedDelay(
-                    this::persistOffset,
-                    PERSIST_INTERVAL_MS,
-                    PERSIST_INTERVAL_MS,
-                    TimeUnit.MILLISECONDS
-            );
+            // NOTE: Offset persistence now happens immediately after each successful batch
+            // in streamAndHandle() - no separate periodic task needed
 
-            log.info("Connected to parent {}", parentUrl);
+            log.info("event=pipe_connector.connected parentUrl={}", parentUrl);
             return connection;
         });
     }
@@ -124,13 +131,13 @@ public class HttpPipeConnector implements PipeConnector {
                 long duration = System.currentTimeMillis() - start;
 
                 if (received > 0) {
-                    adaptiveDelay = Math.max(MIN_POLL_INTERVAL_MS, duration / 2);
+                    adaptiveDelay = Math.max(minPollIntervalMs, duration / 2);
                 } else {
-                    adaptiveDelay = Math.min(adaptiveDelay * 2, MAX_POLL_INTERVAL_MS);
+                    adaptiveDelay = Math.min(adaptiveDelay * 2, maxPollIntervalMs);
                 }
             } catch (Exception e) {
                 log.error("Polling error", e);
-                adaptiveDelay = Math.min(adaptiveDelay * 3, MAX_POLL_INTERVAL_MS);
+                adaptiveDelay = Math.min(adaptiveDelay * 3, maxPollIntervalMs);
             }
 
             try {
@@ -143,7 +150,7 @@ public class HttpPipeConnector implements PipeConnector {
     }
 
     @Override
-    public void onDataReceived(Consumer<MessageRecord> handler) {
+    public void onDataReceived(Function<MessageRecord, Boolean> handler) {
         this.dataHandler = handler;
     }
 
@@ -175,7 +182,7 @@ public class HttpPipeConnector implements PipeConnector {
      */
     public void pausePipeCalls() {
         this.pausePipeCalls = true;
-        log.info("Pipe calls PAUSED for data refresh");
+        log.info("event=pipe_connector.paused reason=data_refresh");
     }
 
     /**
@@ -183,7 +190,7 @@ public class HttpPipeConnector implements PipeConnector {
      */
     public void resumePipeCalls() {
         this.pausePipeCalls = false;
-        log.info("Pipe calls RESUMED after data refresh");
+        log.info("event=pipe_connector.resumed reason=data_refresh_complete");
     }
 
     @Override
@@ -207,7 +214,7 @@ public class HttpPipeConnector implements PipeConnector {
 
         try {
             String parentUrl = normalizeUrl(connection.parentUrl);
-            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=5";  // Reduced from 10 to 5
+            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + pollLimit;
 
             HttpRequest<?> request = HttpRequest.GET(pollUrl);
 
@@ -236,7 +243,7 @@ public class HttpPipeConnector implements PipeConnector {
                 // No content available - this is normal
                 metrics.recordEmptyFetch();
             } else if (response.getStatus().getCode() != 204) {
-                log.warn("Poll failed: {}", response.getStatus().getCode());
+                log.warn("event=pipe_connector.poll_failed status={}", response.getStatus().getCode());
                 metrics.recordFetchError();
             }
 
@@ -251,9 +258,16 @@ public class HttpPipeConnector implements PipeConnector {
 
     /**
      * Stream JSON array → MessageRecord (constant memory)
+     *
+     * TRANSACTIONAL PROCESSING:
+     * - Only advances offset for successfully stored messages
+     * - Stops batch processing on first storage failure
+     * - Persists offset file after successful batch
+     * - On failure, next poll retries from last successful offset (no data loss)
      */
     private int streamAndHandle(InputStream is) throws IOException {
         int count = 0;
+        long lastSuccessfulOffset = currentOffset;  // Track last successful offset
 
         JsonParser parser = objectMapper.createParser(is);
 
@@ -266,13 +280,39 @@ public class HttpPipeConnector implements PipeConnector {
                     objectMapper.readValue(parser, MessageRecord.class);
 
             if (dataHandler != null) {
-                dataHandler.accept(record);
-            }
+                // Attempt to store message - handler returns true on success, false on failure
+                boolean success = dataHandler.apply(record);
 
-            currentOffset = record.getOffset();
-            connection.lastReceivedOffset = record.getOffset();
-            connection.lastMessageTime = System.currentTimeMillis();
-            count++;
+                if (success) {
+                    // SUCCESS - update last successful offset
+                    lastSuccessfulOffset = record.getOffset();
+                    count++;
+
+                    log.trace("Successfully stored pipe message at offset {}", record.getOffset());
+                } else {
+                    // STORAGE FAILURE - stop processing batch, keep old offset
+                    log.error("CRITICAL: Failed to store pipe message at offset {}, " +
+                             "stopping batch. Next poll will retry from offset {}",
+                             record.getOffset(), lastSuccessfulOffset);
+
+                    metrics.recordFetchError();
+
+                    // Stop processing this batch - remaining messages will be retried on next poll
+                    break;
+                }
+            }
+        }
+
+        // Update current offset only to last successfully stored message
+        currentOffset = lastSuccessfulOffset;
+        connection.lastReceivedOffset = lastSuccessfulOffset;
+        connection.lastMessageTime = System.currentTimeMillis();
+
+        // Persist offset file ONLY if we successfully stored messages
+        if (count > 0) {
+            persistOffset();
+            log.debug("Persisted pipe offset after successful batch: offset={}, messagesStored={}",
+                     currentOffset, count);
         }
 
         // Record metrics: messages received from pipe
@@ -300,7 +340,7 @@ public class HttpPipeConnector implements PipeConnector {
                     props.getProperty("pipe.current.offset", "0"));
             lastPersistedOffset = currentOffset;
         } catch (Exception e) {
-            log.warn("Failed to load offset, starting at 0", e);
+            log.warn("event=pipe_connector.offset_load_failed action=start_at_zero", e);
             currentOffset = 0;
         }
     }

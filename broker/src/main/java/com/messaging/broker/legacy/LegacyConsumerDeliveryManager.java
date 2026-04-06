@@ -1,10 +1,11 @@
 package com.messaging.broker.legacy;
 
 import com.messaging.broker.consumer.ConsumerOffsetTracker;
-import com.messaging.broker.metrics.BrokerMetrics;
+import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.MessageRecord;
+import io.micronaut.context.annotation.Value;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -22,17 +23,21 @@ import java.util.*;
  * Algorithm:
  * 1. Create TopicCursor for each topic subscribed by the consumer
  * 2. Use PriorityQueue (min-heap) to merge by global offset
- * 3. Poll cursor with smallest offset, read message from storage
+ * 3. Poll cursor with smallest offset, read messages from storage in chunks
  * 4. Add to MergedBatch, re-add cursor to heap if it has more
  * 5. Continue until batch size limit reached or all cursors exhausted
  *
  * Complexity:
  * - Time: O(n log k) where n = messages in batch, k = number of topics
- * - Space: O(k) - constant memory regardless of data size
+ * - Space: O(k * MSG_CHUNK) — bounded pre-fetch per topic
+ * - storage.read() calls: O(n / MSG_CHUNK) instead of O(n)
  */
 @Singleton
 public class LegacyConsumerDeliveryManager {
     private static final Logger log = LoggerFactory.getLogger(LegacyConsumerDeliveryManager.class);
+
+    // Pre-fetch chunk size for storage.read() — reduces calls from O(n) to O(n/50)
+    private static final int MSG_CHUNK = 50;
 
     private final StorageEngine storage;
     private final ConsumerOffsetTracker offsetTracker;
@@ -42,16 +47,13 @@ public class LegacyConsumerDeliveryManager {
     @Inject
     public LegacyConsumerDeliveryManager(StorageEngine storage,
                                          ConsumerOffsetTracker offsetTracker,
-                                         BrokerMetrics metrics) {
+                                         BrokerMetrics metrics,
+                                         @Value("${broker.storage.data-dir:./data}") String dataDir) {
         this.storage = storage;
         this.offsetTracker = offsetTracker;
         this.metrics = metrics;
-
-        // Get data directory from system property or environment variable
-        this.dataDir = System.getProperty("broker.storage.dataDir",
-                System.getenv().getOrDefault("DATA_DIR", "./data"));
-
-        log.info("LegacyConsumerDeliveryManager initialized with dataDir={}", dataDir);
+        this.dataDir = dataDir;
+        log.info("event=legacy_delivery.initialized dataDir={}", dataDir);
     }
 
     /**
@@ -69,16 +71,11 @@ public class LegacyConsumerDeliveryManager {
         // Enable detailed logging only for price-quote consumer group
         boolean debugPriceQuote = consumerGroup != null && consumerGroup.contains("price-quote");
 
-        if (debugPriceQuote) {
-            log.info("🔍 [PRICE-QUOTE] Building merged batch: topics={}, group={}, maxBytes={}",
-                    topics, consumerGroup, maxBytes);
-        } else {
-            log.debug("Building merged batch: topics={}, group={}, maxBytes={}",
-                    topics, consumerGroup, maxBytes);
-        }
+        log.debug("Building merged batch: topics={}, group={}, maxBytes={}",
+                topics, consumerGroup, maxBytes);
 
         if (topics == null || topics.isEmpty()) {
-            log.warn("No topics provided for merge");
+            log.warn("event=legacy_delivery.merge_skipped reason=no_topics");
             return new MergedBatch();
         }
 
@@ -111,13 +108,13 @@ public class LegacyConsumerDeliveryManager {
                     if (committedOffset < 0) {
                         startOffset = earliestOffset;
                         if (debugPriceQuote) {
-                            log.info("📍 [PRICE-QUOTE] Topic {} - No committed offset, starting from earliest: {} (current: {})",
+                            log.debug("[PRICE-QUOTE] Topic {} - No committed offset, starting from earliest: {} (current: {})",
                                     topic, startOffset, currentOffset);
                         }
                     } else {
                         startOffset = committedOffset + 1; // Next offset after last committed
                         if (debugPriceQuote) {
-                            log.info("📍 [PRICE-QUOTE] Topic {} - Committed offset: {}, starting from: {} (earliest: {}, current: {})",
+                            log.debug("[PRICE-QUOTE] Topic {} - Committed offset: {}, starting from: {} (earliest: {}, current: {})",
                                     topic, committedOffset, startOffset, earliestOffset, currentOffset);
                         }
                     }
@@ -125,14 +122,14 @@ public class LegacyConsumerDeliveryManager {
                     // Validate offset range
                     if (currentOffset < 0) {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - No data available (currentOffset: -1)", topic);
+                            log.debug("[PRICE-QUOTE] Topic {} - No data available (currentOffset: -1)", topic);
                         }
                         continue;
                     }
 
                     if (startOffset > currentOffset) {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - startOffset ({}) beyond currentOffset ({}) - no new data",
+                            log.debug("[PRICE-QUOTE] Topic {} - startOffset ({}) beyond currentOffset ({}) - no new data",
                                     topic, startOffset, currentOffset);
                         }
                         continue;
@@ -146,7 +143,7 @@ public class LegacyConsumerDeliveryManager {
 
                     if (cursor == null) {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - createCursor returned NULL (startOffset: {})", topic, startOffset);
+                            log.debug("[PRICE-QUOTE] Topic {} - createCursor returned NULL (startOffset: {})", topic, startOffset);
                         }
                         continue;
                     }
@@ -160,11 +157,11 @@ public class LegacyConsumerDeliveryManager {
                         cursors.add(cursor);
                         heap.add(cursor);
                         if (debugPriceQuote) {
-                            log.info("✅ [PRICE-QUOTE] Added cursor: topic={}, startOffset={}", topic, startOffset);
+                            log.debug("[PRICE-QUOTE] Added cursor: topic={}, startOffset={}", topic, startOffset);
                         }
                     } else {
                         if (debugPriceQuote) {
-                            log.warn("⚠️ [PRICE-QUOTE] Topic {} - cursor.hasMore() returned false (startOffset: {}, current: {})",
+                            log.debug("[PRICE-QUOTE] Topic {} - cursor.hasMore() returned false (startOffset: {}, current: {})",
                                     topic, startOffset, currentOffset);
                         }
                         cursor.close();
@@ -177,10 +174,10 @@ public class LegacyConsumerDeliveryManager {
 
             if (heap.isEmpty()) {
                 if (debugPriceQuote) {
-                    log.warn("⚠️ [PRICE-QUOTE] EMPTY HEAP - No cursors available after processing {} topics (group: {}). " +
-                             "Check if: (1) startOffset > currentOffset, (2) createCursor() failed, " +
-                             "(3) cursor.hasMore() returned false",
-                             topics.size(), consumerGroup);
+                    log.debug("[PRICE-QUOTE] EMPTY HEAP - No cursors available after processing {} topics (group: {}). " +
+                              "Check if: (1) startOffset > currentOffset, (2) createCursor() failed, " +
+                              "(3) cursor.hasMore() returned false",
+                              topics.size(), consumerGroup);
                 } else {
                     log.debug("No cursors available - all topics exhausted");
                 }
@@ -188,30 +185,50 @@ public class LegacyConsumerDeliveryManager {
             }
 
             if (debugPriceQuote) {
-                log.info("✅ [PRICE-QUOTE] K-way merge starting with {} cursors from {} topics", heap.size(), topics.size());
+                log.debug("[PRICE-QUOTE] K-way merge starting with {} cursors from {} topics", heap.size(), topics.size());
             }
 
-            // 2. K-way merge using min-heap
+            // 2. K-way merge using min-heap with per-topic message pre-fetch buffers
+            Map<String, ArrayDeque<MessageRecord>> msgBuffers = new HashMap<>();
+
             while (!heap.isEmpty() && batch.getTotalBytes() < maxBytes) {
                 TopicCursor cursor = heap.poll(); // O(log k)
+                String topic = cursor.getTopic();
+                ArrayDeque<MessageRecord> buf =
+                        msgBuffers.computeIfAbsent(topic, t -> new ArrayDeque<>());
 
                 try {
+                    // Refill message buffer if empty: one storage.read() for MSG_CHUNK messages
+                    if (buf.isEmpty()) {
+                        IndexEntry nextEntry = cursor.peek(); // does NOT advance cursor
+                        if (nextEntry != null) {
+                            List<MessageRecord> fetched =
+                                    storage.read(topic, 0, nextEntry.offset, MSG_CHUNK);
+                            if (fetched != null) buf.addAll(fetched);
+                        }
+                    }
+
+                    // Advance cursor index (always paired with buf.poll() below)
                     IndexEntry entry = cursor.advance();
                     if (entry == null) {
                         continue; // Cursor exhausted
                     }
 
-                    // Read actual message data from storage
-                    List<MessageRecord> messages = storage.read(cursor.getTopic(), 0, entry.offset, 1);
+                    MessageRecord msg = buf.poll(); // paired with cursor.advance()
+                    if (msg == null) {
+                        // Fallback: gap or pre-fetch mismatch — single direct read
+                        List<MessageRecord> messages = storage.read(topic, 0, entry.offset, 1);
+                        if (messages != null && !messages.isEmpty()) {
+                            msg = messages.get(0);
+                        }
+                    }
 
-                    if (messages != null && !messages.isEmpty()) {
-                        MessageRecord msg = messages.get(0);
-                        batch.add(cursor.getTopic(), msg);
-
+                    if (msg != null) {
+                        batch.add(topic, msg);
                         log.trace("Merged message: topic={}, offset={}, key={}",
-                                cursor.getTopic(), msg.getOffset(), msg.getMsgKey());
+                                topic, msg.getOffset(), msg.getMsgKey());
                     } else {
-                        log.warn("No message found at offset {} for topic {}", entry.offset, cursor.getTopic());
+                        log.debug("No message found at offset {} for topic {}", entry.offset, topic);
                     }
 
                     // Re-add cursor to heap if it has more entries
@@ -256,13 +273,13 @@ public class LegacyConsumerDeliveryManager {
         Path indexPath = findIndexPath(topic, startOffset, debugPriceQuote);
         if (indexPath == null) {
             if (debugPriceQuote) {
-                log.warn("❌ [PRICE-QUOTE] No index file found for topic: {}, startOffset={}", topic, startOffset);
+                log.debug("[PRICE-QUOTE] No index file found for topic: {}, startOffset={}", topic, startOffset);
             }
             return null;
         }
 
         if (debugPriceQuote) {
-            log.debug("✅ [PRICE-QUOTE] Found index path: {}", indexPath);
+            log.debug("[PRICE-QUOTE] Found index path: {}", indexPath);
         }
         TopicCursor cursor = new TopicCursor(topic, indexPath, startOffset);
         if (debugPriceQuote) {
@@ -273,13 +290,13 @@ public class LegacyConsumerDeliveryManager {
 
     /**
      * Find the index file path for a topic at the given offset.
-     * This is a simplified version - in production, we'd use SegmentManager.
+     *
+     * Scans all *.index files in the partition directory, parses the base offset
+     * from each filename ({20-digit-zero-padded-offset}.index), and returns the
+     * file with the highest base offset that is still ≤ startOffset — i.e. the
+     * segment that contains startOffset.
      */
     private Path findIndexPath(String topic, long startOffset, boolean debugPriceQuote) {
-        // Format: {dataDir}/{topic}/partition-0/00000000000000000000.index
-        // For now, assume there's only one segment (baseOffset=0)
-        // TODO: Query SegmentManager to find correct segment
-
         Path topicDir = Paths.get(dataDir, topic, "partition-0");
         if (debugPriceQuote) {
             log.debug("[PRICE-QUOTE] Looking for index in directory: {}", topicDir);
@@ -287,43 +304,59 @@ public class LegacyConsumerDeliveryManager {
 
         if (!topicDir.toFile().exists()) {
             if (debugPriceQuote) {
-                log.warn("❌ [PRICE-QUOTE] Topic directory does not exist: {}", topicDir);
+                log.debug("[PRICE-QUOTE] Topic directory does not exist: {}", topicDir);
             }
             return null;
         }
 
-        // List all files in the directory for debugging
-        if (debugPriceQuote) {
-            try {
-                java.io.File[] files = topicDir.toFile().listFiles();
-                if (files != null && files.length > 0) {
-                    String fileDetails = java.util.Arrays.stream(files)
-                            .map(f -> String.format("%s (%s)",
-                                    f.getName(),
-                                    formatFileSize(f.length())))
-                            .collect(java.util.stream.Collectors.joining(", "));
-                    log.info("📂 [PRICE-QUOTE] Files in {}: {}", topicDir, fileDetails);
-                } else {
-                    log.warn("⚠️ [PRICE-QUOTE] Topic directory is empty: {}", topicDir);
-                }
-            } catch (Exception e) {
-                log.error("[PRICE-QUOTE] Error listing files in {}", topicDir, e);
-            }
-        }
+        java.io.File[] indexFiles = topicDir.toFile().listFiles(
+                f -> f.isFile() && f.getName().endsWith(".index"));
 
-        Path indexPath = topicDir.resolve("00000000000000000000.index");
-
-        if (!indexPath.toFile().exists()) {
+        if (indexFiles == null || indexFiles.length == 0) {
             if (debugPriceQuote) {
-                log.warn("❌ [PRICE-QUOTE] Index file not found: {} (expected hardcoded baseOffset=0)", indexPath);
+                log.debug("[PRICE-QUOTE] No .index files found in: {}", topicDir);
             }
             return null;
         }
 
         if (debugPriceQuote) {
-            log.debug("✅ [PRICE-QUOTE] Found index file: {}", indexPath);
+            String fileDetails = java.util.Arrays.stream(indexFiles)
+                    .map(f -> String.format("%s (%s)", f.getName(), formatFileSize(f.length())))
+                    .collect(java.util.stream.Collectors.joining(", "));
+            log.debug("[PRICE-QUOTE] Index files in {}: {}", topicDir, fileDetails);
         }
-        return indexPath;
+
+        // Find the segment with the highest base offset that is <= startOffset
+        Path bestIndexPath = null;
+        long bestBaseOffset = -1;
+
+        for (java.io.File indexFile : indexFiles) {
+            String name = indexFile.getName();
+            // Strip ".index" suffix to get the zero-padded base-offset string
+            String offsetStr = name.substring(0, name.length() - ".index".length());
+            try {
+                long baseOffset = Long.parseLong(offsetStr);
+                if (baseOffset <= startOffset && baseOffset > bestBaseOffset) {
+                    bestBaseOffset = baseOffset;
+                    bestIndexPath = indexFile.toPath();
+                }
+            } catch (NumberFormatException e) {
+                log.warn("event=legacy_delivery.index_file_skipped filename={} reason=non_standard_name", name);
+            }
+        }
+
+        if (bestIndexPath == null) {
+            if (debugPriceQuote) {
+                log.debug("[PRICE-QUOTE] No index file covers startOffset={} in {}", startOffset, topicDir);
+            }
+            return null;
+        }
+
+        if (debugPriceQuote) {
+            log.debug("[PRICE-QUOTE] Selected index: {} (baseOffset={}) for startOffset={}",
+                    bestIndexPath.getFileName(), bestBaseOffset, startOffset);
+        }
+        return bestIndexPath;
     }
 
     /**

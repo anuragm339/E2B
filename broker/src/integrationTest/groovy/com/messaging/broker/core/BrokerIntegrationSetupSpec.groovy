@@ -1,71 +1,68 @@
 package com.messaging.broker.core
 
+import com.messaging.broker.consumer.ConsumerOffsetTracker
+import com.messaging.broker.consumer.ConsumerRegistry
+import com.messaging.broker.consumer.RefreshCoordinator
+import com.messaging.common.api.NetworkServer
+import com.messaging.common.api.StorageEngine
+import io.micronaut.runtime.server.EmbeddedServer
+import io.micronaut.test.extensions.spock.annotation.MicronautTest
+import jakarta.inject.Inject
 import spock.lang.Specification
 
 /**
- * Integration test setup verification for Broker module
- * Verifies that integration test infrastructure works
+ * Smoke tests: verifies the Micronaut application context starts cleanly
+ * and all core broker beans are injectable.
  */
+@MicronautTest
 class BrokerIntegrationSetupSpec extends Specification {
 
-    def "broker integration test setup verification"() {
-        expect: "basic Spock integration test infrastructure works"
-        true
+    @Inject BrokerService brokerService
+    @Inject StorageEngine storage
+    @Inject NetworkServer networkServer
+    @Inject ConsumerRegistry consumerRegistry
+    @Inject ConsumerOffsetTracker offsetTracker
+    @Inject RefreshCoordinator refreshCoordinator
+    @Inject EmbeddedServer embeddedServer
+
+    def "broker application context starts and all core beans are injectable"() {
+        expect:
+        brokerService != null
+        storage != null
+        networkServer != null
+        consumerRegistry != null
+        offsetTracker != null
+        refreshCoordinator != null
+        embeddedServer.isRunning()
     }
 
-    def "broker can load required classes"() {
-        when: "attempting to load broker classes"
-        def brokerServiceClass = Class.forName("com.messaging.broker.core.BrokerService")
-        def storageEngineInterface = Class.forName("com.messaging.common.api.StorageEngine")
-        def networkServerInterface = Class.forName("com.messaging.common.api.NetworkServer")
-
-        then: "all classes load successfully"
-        brokerServiceClass != null
-        storageEngineInterface != null
-        networkServerInterface != null
+    def "broker can load all required module classes"() {
+        expect:
+        [
+            'com.messaging.broker.core.BrokerService',
+            'com.messaging.common.api.StorageEngine',
+            'com.messaging.common.api.NetworkServer',
+            'com.messaging.common.model.BrokerMessage',
+            'com.messaging.common.model.MessageRecord',
+            'com.messaging.storage.mmap.MMapStorageEngine',
+            'com.messaging.storage.segment.Segment',
+            'com.messaging.network.tcp.NettyTcpServer',
+            'com.messaging.network.tcp.NettyTcpClient'
+        ].every { className ->
+            try { Class.forName(className) != null } catch (ClassNotFoundException e) { false }
+        }
     }
 
-    def "broker dependencies are accessible"() {
-        when: "checking broker module dependencies"
-        def commonClasses = [
-            "com.messaging.common.model.BrokerMessage",
-            "com.messaging.common.model.MessageRecord",
-            "com.messaging.common.api.StorageEngine"
-        ]
+    def "storage engine is operational"() {
+        when:
+        long offset = storage.getCurrentOffset('__health-check__', 0)
 
-        def storageClasses = [
-            "com.messaging.storage.mmap.MMapStorageEngine",
-            "com.messaging.storage.segment.Segment"
-        ]
+        then: "no exception; returns -1 for an empty topic"
+        offset == -1L
+    }
 
-        def networkClasses = [
-            "com.messaging.network.tcp.NettyTcpServer",
-            "com.messaging.network.tcp.NettyTcpClient"
-        ]
-
-        then: "all dependency classes are accessible"
-        commonClasses.every { className ->
-            try {
-                Class.forName(className) != null
-            } catch (ClassNotFoundException e) {
-                false
-            }
-        }
-
-        storageClasses.every { className ->
-            try {
-                Class.forName(className) != null
-            } catch (ClassNotFoundException e) {
-                false
-            }
-        }
-
-        networkClasses.every { className ->
-            try {
-                Class.forName(className) != null
-            } catch (ClassNotFoundException e) {
-                false
-            }
-        }
+    def "consumer registry starts empty"() {
+        expect:
+        consumerRegistry.getAllConsumers() != null
     }
 }

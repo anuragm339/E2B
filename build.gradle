@@ -9,6 +9,7 @@ version = '1.0.0-SNAPSHOT'
 
 subprojects {
     apply plugin: 'java'
+    apply plugin: 'jacoco'
     apply plugin: 'io.micronaut.library'
 
     java {
@@ -98,6 +99,42 @@ subprojects {
         useJUnitPlatform()
         shouldRunAfter test
     }
+
+    // -------------------------------------------------------------------------
+    // JaCoCo: collect execution data from every test task and merge into one
+    // HTML report per module (build/reports/jacoco/jacocoReport/html/index.html)
+    // -------------------------------------------------------------------------
+    jacoco {
+        toolVersion = '0.8.11'
+    }
+
+    // Enable JaCoCo agent on every Test task (test, integrationTest, unitTest …)
+    tasks.withType(Test).configureEach {
+        jacoco {
+            destinationFile = layout.buildDirectory.file("jacoco/${name}.exec").get().asFile
+        }
+    }
+
+    tasks.register('jacocoReport', JacocoReport) {
+        description = 'Generates a JaCoCo coverage report for all test tasks in this module.'
+        group = 'verification'
+
+        // Merge execution data from all test tasks that ran
+        executionData.setFrom(fileTree(layout.buildDirectory).include('jacoco/*.exec'))
+
+        // Source and class directories from the main source set only
+        sourceSets sourceSets.main
+
+        reports {
+            xml.required  = true
+            html.required = true
+            csv.required  = false
+        }
+
+        // Run after any test task completes
+        tasks.withType(Test).each { t -> mustRunAfter t }
+    }
+
     tasks.withType(Jar).configureEach {
         manifest {
             attributes(

@@ -79,7 +79,7 @@ class SegmentManagerSpec extends Specification {
         manager?.close()
     }
 
-    def "getZeroCopyBatch reads from active segment at boundary"() {
+    def "getBatch reads from active segment at boundary"() {
         given: "a segment manager with a rollover"
         def logRecordSize = calculateLogRecordSize("k", "d")
         def maxSize = (LOG_HEADER_SIZE + (logRecordSize * 3)) as long
@@ -94,20 +94,20 @@ class SegmentManagerSpec extends Specification {
         def activeSegment = manager.getAllSegments().find { it.isActive() }
         def activeBase = activeSegment.getBaseOffset()
 
-        when: "requesting zero-copy batch from active base"
-        def batch = manager.getZeroCopyBatch(activeBase, 1024 * 1024L)
+        when: "requesting batch from active base"
+        def batch = manager.getBatch(activeBase, 1024 * 1024L)
 
         then: "batch is returned from active segment"
-        batch.recordCount > 0
-        batch.lastOffset >= activeBase
-        batch.fileRegion != null
+        batch.getRecordCount() > 0
+        batch.getLastOffset() >= activeBase
+        !batch.isEmpty()
 
         cleanup:
-        batch?.fileChannel?.close()
+        batch?.close()
         manager?.close()
     }
 
-    def "getZeroCopyBatch does not span segments"() {
+    def "getBatch does not span segments"() {
         given: "a segment manager with a rollover"
         def logRecordSize = calculateLogRecordSize("k", "d")
         def maxSize = (LOG_HEADER_SIZE + (logRecordSize * 3)) as long
@@ -123,15 +123,15 @@ class SegmentManagerSpec extends Specification {
         def activeBase = segments.find { it.isActive() }.getBaseOffset()
         def sealedBase = segments.collect { it.getBaseOffset() }.min()
 
-        when: "reading zero-copy batch from sealed segment"
-        def batch = manager.getZeroCopyBatch(sealedBase, 1024 * 1024L)
+        when: "reading batch from sealed segment"
+        def batch = manager.getBatch(sealedBase, 1024 * 1024L)
 
         then: "batch stays within sealed segment"
-        batch.recordCount > 0
-        batch.lastOffset < activeBase
+        batch.getRecordCount() > 0
+        batch.getLastOffset() < activeBase
 
         cleanup:
-        batch?.fileChannel?.close()
+        batch?.close()
         manager?.close()
     }
 
