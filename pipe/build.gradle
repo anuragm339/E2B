@@ -17,13 +17,14 @@ dependencies {
     implementation 'io.micronaut:micronaut-http-client'
     implementation 'io.micronaut:micronaut-http-server-netty'
 
+    // Jackson (includes JsonMapper required by DefaultHttpClient)
+    implementation 'io.micronaut:micronaut-jackson-databind'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.15.3'
+
     // Metrics
     implementation 'io.micronaut.micrometer:micronaut-micrometer-core'
     implementation 'io.micrometer:micrometer-core'
-
-    // Jackson for JSON
-    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'
-    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.15.3'
 
     // Logging
     implementation 'org.slf4j:slf4j-api:2.0.9'
@@ -38,6 +39,10 @@ dependencies {
     // Integration test dependencies (integrationTestImplementation defined in root build.gradle)
     integrationTestImplementation 'org.apache.groovy:groovy:4.0.15'
     integrationTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    integrationTestImplementation 'io.micronaut.test:micronaut-test-spock'
+    integrationTestImplementation 'io.micronaut:micronaut-inject-groovy'  // AST transforms for @MicronautTest on Groovy specs
+    integrationTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
+    integrationTestImplementation 'org.objenesis:objenesis:3.3'
     integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
@@ -63,3 +68,9 @@ test {
 }
 
 // integrationTest task already defined in root build.gradle
+
+// The integrationTest resources dir is registered twice (root build.gradle + Gradle default convention),
+// so we must declare a duplicates strategy to avoid a build error.
+processIntegrationTestResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}

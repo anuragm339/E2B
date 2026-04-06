@@ -39,7 +39,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
         metrics = Mock(BrokerMetrics)
         // Point the manager at our temp directory
         System.setProperty("broker.storage.dataDir", tempDir.toString())
-        manager = new LegacyConsumerDeliveryManager(storage, offsetTracker, metrics)
+        manager = new LegacyConsumerDeliveryManager(storage, offsetTracker, metrics, tempDir.toString())
     }
 
     def cleanup() {

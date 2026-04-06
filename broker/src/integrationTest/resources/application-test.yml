@@ -1,0 +1,37 @@
+broker:
+  nodeId: test-broker
+  network:
+    port: 19092
+    threads:
+      boss: 1
+      worker: 2
+  storage:
+    data-dir: ${java.io.tmpdir}/broker-integration-test
+    segment-size: 10485760
+  registry:
+    url: ""
+  pipe:
+    min-poll-interval-ms: 999999999
+    max-poll-interval-ms: 999999999
+  consumer:
+    max-message-size-per-consumer: 1048576
+    ack-timeout: 5000
+    fairness:
+      threads: 2
+      max-in-flight-per-topic: 1
+    adaptive-polling:
+      min-delay-ms: 1
+      max-delay-ms: 100
+ack-store:
+  rocksdb:
+    path: ${java.io.tmpdir}/broker-integration-ack-store
+  reconciliation:
+    enabled: false
+    auto-sync-enabled: false
+data-refresh:
+  enabled: false
+micronaut:
+  server:
+    port: 18082
+  application:
+    name: broker-integration-test

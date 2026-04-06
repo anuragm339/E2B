@@ -5,6 +5,7 @@ import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.MessageRecord;
+import io.micronaut.context.annotation.Value;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -46,15 +47,12 @@ public class LegacyConsumerDeliveryManager {
     @Inject
     public LegacyConsumerDeliveryManager(StorageEngine storage,
                                          ConsumerOffsetTracker offsetTracker,
-                                         BrokerMetrics metrics) {
+                                         BrokerMetrics metrics,
+                                         @Value("${broker.storage.data-dir:./data}") String dataDir) {
         this.storage = storage;
         this.offsetTracker = offsetTracker;
         this.metrics = metrics;
-
-        // Get data directory from system property or environment variable
-        this.dataDir = System.getProperty("broker.storage.dataDir",
-                System.getenv().getOrDefault("DATA_DIR", "./data"));
-
+        this.dataDir = dataDir;
         log.info("event=legacy_delivery.initialized dataDir={}", dataDir);
     }
 

@@ -1,3 +1,7 @@
+plugins {
+    id 'groovy'
+}
+
 dependencies {
     // Depend on common for annotations and models
     api project(':common')
@@ -20,4 +24,28 @@ dependencies {
     compileOnly 'io.micronaut:micronaut-runtime'
     compileOnly 'jakarta.annotation:jakarta.annotation-api'
     compileOnly 'jakarta.inject:jakarta.inject-api'
+
+    // Integration test dependencies
+    integrationTestImplementation 'org.apache.groovy:groovy:4.0.15'
+    integrationTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    integrationTestImplementation 'io.micronaut.test:micronaut-test-spock'
+    integrationTestImplementation 'io.micronaut:micronaut-inject-groovy'   // AST transforms for @MicronautTest on Groovy
+    integrationTestImplementation 'io.micronaut:micronaut-http-server-netty' // embedded server fires ServerStartupEvent
+    integrationTestImplementation 'io.micronaut:micronaut-jackson-databind'  // JsonMapper required at runtime
+    integrationTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
+    integrationTestImplementation 'org.objenesis:objenesis:3.3'
+    integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Add Groovy support to the integrationTest source set (task is defined in root build.gradle)
+sourceSets {
+    integrationTest {
+        groovy.srcDir 'src/integrationTest/groovy'
+    }
+}
+
+// The integrationTest resources dir is registered twice (root build.gradle + Gradle default convention),
+// so we must declare a duplicates strategy to avoid a build error.
+processIntegrationTestResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }

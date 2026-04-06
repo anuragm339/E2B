@@ -20,7 +20,7 @@ class HttpPipeConnectorSpec extends Specification {
         def metrics = Mock(PipeMetrics)
 
         when: "creating HttpPipeConnector"
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         then: "connector is created successfully"
         connector != null
@@ -30,7 +30,7 @@ class HttpPipeConnectorSpec extends Specification {
         given: "a connector instance"
         def dataDir = tempDir.toString()
         def metrics = Mock(PipeMetrics)
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         when: "pausing pipe calls"
         connector.pausePipeCalls()
@@ -51,7 +51,7 @@ class HttpPipeConnectorSpec extends Specification {
         def metrics = Mock(PipeMetrics)
 
         when: "creating connector"
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         then: "offset file location is in data directory"
         def offsetFile = new File(dataDir, "pipe-offset.properties")
@@ -73,7 +73,7 @@ class HttpPipeConnectorSpec extends Specification {
         def metrics = Mock(PipeMetrics)
 
         when: "creating connector"
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         then: "connector loads the offset"
         noExceptionThrown()
@@ -85,7 +85,7 @@ class HttpPipeConnectorSpec extends Specification {
         def metrics = Mock(PipeMetrics)
 
         when: "creating connector"
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         then: "connector starts with default offset"
         noExceptionThrown()
@@ -105,7 +105,7 @@ class HttpPipeConnectorSpec extends Specification {
         def metrics = Mock(PipeMetrics)
 
         when: "creating connector"
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         then: "connector handles corruption and starts with default"
         noExceptionThrown()
@@ -115,7 +115,7 @@ class HttpPipeConnectorSpec extends Specification {
         given: "a connector without connection"
         def dataDir = tempDir.toString()
         def metrics = Mock(PipeMetrics)
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         when: "getting health status"
         def health = connector.getHealth()
@@ -128,10 +128,10 @@ class HttpPipeConnectorSpec extends Specification {
         given: "a connector"
         def dataDir = tempDir.toString()
         def metrics = Mock(PipeMetrics)
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         and: "a data handler"
-        def handler = Mock(java.util.function.Consumer)
+        def handler = { record -> true } as java.util.function.Function
 
         when: "registering the handler"
         connector.onDataReceived(handler)
@@ -144,7 +144,7 @@ class HttpPipeConnectorSpec extends Specification {
         given: "a connector"
         def dataDir = tempDir.toString()
         def metrics = Mock(PipeMetrics)
-        def connector = new HttpPipeConnector(dataDir, metrics)
+        def connector = new HttpPipeConnector(null, dataDir, 500L, 20000L, 5, metrics)
 
         when: "sending an ack"
         def future = connector.sendAck(100L)

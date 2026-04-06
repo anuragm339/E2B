@@ -30,7 +30,7 @@ public class WatermarkGatePolicy implements DeliveryGatePolicy {
             long consumerOffset = consumer.getCurrentOffset();
             long storageOffset = storage.getCurrentOffset(consumer.getTopic(), 0);
 
-            if (storageOffset <= consumerOffset) {
+            if (storageOffset < consumerOffset) {
                 log.trace("WatermarkGate DENY: {}:{} - no new data (storage={}, consumer={})",
                         consumer.getClientId(), consumer.getTopic(), storageOffset, consumerOffset);
                 return GateResult.deny("No new data available");

@@ -56,8 +56,11 @@ dependencies {
     // Integration test dependencies
     integrationTestImplementation 'org.apache.groovy:groovy:4.0.15'
     integrationTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    integrationTestImplementation 'io.micronaut.test:micronaut-test-spock'
+    integrationTestImplementation 'io.micronaut:micronaut-inject-groovy'  // AST transforms for @MicronautTest on Groovy specs
     integrationTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
     integrationTestImplementation 'org.objenesis:objenesis:3.3'
+    integrationTestImplementation 'org.xerial:sqlite-jdbc:3.45.1.0'  // SQLite driver for TestDataController tests
     integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
@@ -83,6 +86,12 @@ test {
 }
 
 // integrationTest task already defined in root build.gradle
+
+// The integrationTest resources dir is registered twice (root build.gradle + Gradle default convention),
+// so we must declare a duplicates strategy to avoid a build error when any file is placed there.
+processIntegrationTestResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
 
 application {
     mainClass = 'com.messaging.broker.Application'

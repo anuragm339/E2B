@@ -1,0 +1,5 @@
+micronaut:
+  server:
+    port: -1          # Random port — fires ServerStartupEvent without a fixed port
+  application:
+    name: client-integration-test
