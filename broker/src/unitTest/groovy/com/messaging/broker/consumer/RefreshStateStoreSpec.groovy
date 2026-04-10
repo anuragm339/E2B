@@ -3,6 +3,7 @@ package com.messaging.broker.consumer
 import spock.lang.Specification
 import spock.lang.TempDir
 
+import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Instant
 
@@ -58,5 +59,58 @@ class RefreshStateStoreSpec extends Specification {
 
         then:
         contexts.isEmpty()
+    }
+
+    def "loadState supports deprecated old single topic format"() {
+        given:
+        def store = new RefreshStateStore(tempDir.toString())
+        def stateFile = tempDir.resolve("data-refresh-state.properties")
+        Files.writeString(stateFile, """\
+active.refresh.topic=topic
+active.refresh.state=READY_SENT
+active.refresh.expected.consumers=groupA:topic,groupB:topic
+consumer.groupA\\:topic.reset.ack.received=true
+consumer.groupA\\:topic.ready.ack.received=true
+consumer.groupA\\:topic.current.offset=77
+""".stripIndent())
+
+        when:
+        def loaded = store.loadState()
+
+        then:
+        loaded != null
+        loaded.topic == "topic"
+        loaded.state == RefreshState.READY_SENT
+        loaded.receivedResetAcks == ["groupA:topic"] as Set
+        loaded.receivedReadyAcks == ["groupA:topic"] as Set
+        loaded.consumerOffsets["groupA:topic"] == 77L
+    }
+
+    def "clearState preserves other active topics and clearState without topic removes file"() {
+        given:
+        def store = new RefreshStateStore(tempDir.toString())
+        def first = new RefreshContext("topic-a", ["groupA:topic-a"] as Set)
+        first.setState(RefreshState.REPLAYING)
+        first.setRefreshId("refresh-a")
+        first.setLastShutdownTime(Instant.parse("2025-01-01T00:00:00Z"))
+        def second = new RefreshContext("topic-b", ["groupB:topic-b"] as Set)
+        second.setState(RefreshState.READY_SENT)
+        second.setRefreshId("refresh-b")
+        store.saveState(first)
+        store.saveState(second)
+
+        when:
+        store.clearState("topic-a")
+        def remaining = store.loadAllRefreshes()
+
+        then:
+        remaining.keySet() == ["topic-b"] as Set
+        remaining["topic-b"].refreshId == "refresh-b"
+
+        when:
+        store.clearState()
+
+        then:
+        store.loadAllRefreshes().isEmpty()
     }
 }

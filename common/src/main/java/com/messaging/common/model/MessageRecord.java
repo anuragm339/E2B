@@ -34,7 +34,7 @@ public class MessageRecord {
 
     private EventType eventType;   // MESSAGE or DELETE (auto-detected from data field)
 
-    @JsonSetter(nulls = Nulls.SKIP)  // Allow null data for DELETE events
+    @JsonSetter(nulls = Nulls.SET)   // Invoke setter for null data so DELETE can be inferred
     private String data;           // JSON payload (null for DELETE events)
 
     @JsonProperty("created")

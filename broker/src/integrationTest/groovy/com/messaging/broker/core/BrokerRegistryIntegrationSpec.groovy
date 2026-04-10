@@ -1,7 +1,7 @@
 package com.messaging.broker.core
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.messaging.broker.support.ModernConsumerHarness
+import com.messaging.broker.support.ModernConsumerClient
 import com.messaging.common.api.StorageEngine
 import com.messaging.common.model.BrokerMessage
 import com.sun.net.httpserver.HttpExchange
@@ -64,10 +64,10 @@ class BrokerRegistryIntegrationSpec extends Specification implements TestPropert
     @Value('${broker.network.port}')
     int tcpPort
 
-    ModernConsumerHarness consumer
+    ModernConsumerClient consumer
 
     def setup() {
-        consumer = ModernConsumerHarness.connect('127.0.0.1', tcpPort)
+        consumer = ModernConsumerClient.connect('127.0.0.1', tcpPort)
         registryStub.reset()
     }
 

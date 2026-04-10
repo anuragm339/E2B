@@ -395,9 +395,11 @@ class NettyTcpIntegrationSpec extends Specification {
 
         when:
         connection.send(brokerMsg(BrokerMessage.MessageType.DATA, 8888L, "payload".getBytes()))
+        boolean received = serverMessageLatch.await(5, TimeUnit.SECONDS)
         boolean acked = connection.waitForAck(8888L, 5000L)
 
         then:
+        received
         acked
 
         cleanup:

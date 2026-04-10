@@ -147,9 +147,11 @@ public class NettyTcpClient implements NetworkClient {
         private Consumer<BrokerMessage> messageHandler;
         private Runnable disconnectHandler;
         private final ConcurrentHashMap<Long, CompletableFuture<Void>> pendingAcks;
+        private final java.util.Set<Long> completedAcks;
 
         public TcpConnection() {
             this.pendingAcks = new ConcurrentHashMap<>();
+            this.completedAcks = ConcurrentHashMap.newKeySet();
         }
 
         public void setChannel(Channel channel) {
@@ -162,6 +164,7 @@ public class NettyTcpClient implements NetworkClient {
                 pendingAcks.values().forEach(f -> f.completeExceptionally(
                         new IllegalStateException("Connection closed")));
                 pendingAcks.clear();
+                completedAcks.clear();
 
                 // Notify disconnect handler
                 if (disconnectHandler != null) {
@@ -209,6 +212,9 @@ public class NettyTcpClient implements NetworkClient {
                 CompletableFuture<Void> ackFuture = pendingAcks.remove(message.getMessageId());
                 if (ackFuture != null) {
                     ackFuture.complete(null);
+                } else {
+                    // Preserve ACKs that arrive before waitForAck() registers interest.
+                    completedAcks.add(message.getMessageId());
                 }
             }
 
@@ -229,6 +235,10 @@ public class NettyTcpClient implements NetworkClient {
 
         @Override
         public boolean waitForAck(long messageId, long timeoutMs) {
+            if (completedAcks.remove(messageId)) {
+                return true;
+            }
+
             CompletableFuture<Void> ackFuture = new CompletableFuture<>();
             pendingAcks.put(messageId, ackFuture);
 
