@@ -225,10 +225,14 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
             ScheduledFuture<?> timeoutFuture = scheduler.schedule(() -> {
                 String timeoutTraceId = stateService.getTraceId(deliveryKey);
-                if (stateService.getPendingOffset(deliveryKey) != null) {
-                    stateService.clearPendingOffset(deliveryKey);
+                // Atomically claim ownership of the pending offset.
+                // removePendingOffset() returns non-null only once — whichever thread (ACK handler
+                // or this timeout) calls it first wins. The other gets null and is a no-op, preventing
+                // the double-revert / double-advance race between concurrent ACK and timeout paths.
+                Long claimedOffset = stateService.removePendingOffset(deliveryKey);
+                if (claimedOffset != null) {
                     stateService.clearFromOffset(deliveryKey);
-                    stateService.recordBatchSendTime(deliveryKey, 0); // Clear timestamp
+                    stateService.recordBatchSendTime(deliveryKey, 0);
 
                     long pendingDuration = System.currentTimeMillis() - pendingStartTime;
                     log.warn("event=batch_delivery.ack_timeout deliveryKey={} pendingMs={} revertFrom={} revertTo={} traceId={}",

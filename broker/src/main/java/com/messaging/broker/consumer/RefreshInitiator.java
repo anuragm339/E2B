@@ -88,19 +88,29 @@ public class RefreshInitiator implements RefreshStarter {
             );
         }
 
-        // Thread-safe initialization of currentRefreshId and metrics reset
+        // Build the context object before acquiring the lock — construction is safe without it.
+        RefreshContext context = new RefreshContext(topic, expectedConsumers);
+        context.setState(RefreshState.RESET_SENT);
+        context.setResetSentTime(Instant.now());
+
+        // Synchronized block covers both refreshId assignment AND activeRefreshes.put().
+        // Previously put() was outside the block, leaving a window where two concurrent
+        // startRefresh() calls for different topics both entered the isEmpty() branch,
+        // each generated a new refreshId, and the second write overwrote the first —
+        // causing both topics to share the same refreshId.
         synchronized (this) {
             if (activeRefreshes.isEmpty()) {
-                // Generate new refresh_id for this batch
                 currentRefreshId = generateRefreshId();
                 metrics.resetMetricsForNewRefresh();
             }
 
-            // Defensive: ensure currentRefreshId is never null
             if (currentRefreshId == null) {
                 currentRefreshId = generateRefreshId();
                 log.warn("currentRefreshId was null, initializing to: {}", currentRefreshId);
             }
+
+            context.setRefreshId(currentRefreshId);
+            activeRefreshes.put(topic, context); // inside lock — visible as a unit with refreshId
         }
 
         // Log refresh started with structured context
@@ -112,15 +122,7 @@ public class RefreshInitiator implements RefreshStarter {
                 .build();
         refreshLogger.logRefreshStarted(startContext);
 
-        // Create refresh context
-        RefreshContext context = new RefreshContext(topic, expectedConsumers);
-        activeRefreshes.put(topic, context);
-
-        context.setState(RefreshState.RESET_SENT);
-        context.setResetSentTime(Instant.now());
-        context.setRefreshId(currentRefreshId);
-
-        // Record metrics
+        // Record metrics and pause pipe calls outside the lock (I/O-free, order doesn't matter)
         metrics.recordRefreshStarted(topic, "LOCAL", currentRefreshId);
 
         // Pause pipe calls before starting refresh

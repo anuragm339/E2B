@@ -183,13 +183,25 @@ public class ConsumerRegistry {
 
     /**
      * Deliver a merged batch to a legacy consumer across multiple topics.
+     *
+     * Previously this method was {@code synchronized}, which blocked the entire ConsumerRegistry
+     * instance (including registration and ACK handling) for the duration of a blocking network
+     * send. It also serialized all legacy deliveries globally across all clients.
+     *
+     * Replaced with a lock-free approach:
+     *   1. A non-atomic fast-path check (readiness, pending ACK) avoids building the batch needlessly.
+     *   2. {@code putPendingBatchIfAbsent()} is the single atomic gate: only the thread that wins
+     *      the CAS-like putIfAbsent proceeds to the network send. Any concurrent caller sees the
+     *      slot occupied and returns false — no lock held during I/O.
      */
-    public synchronized boolean deliverMergedBatchToLegacy(String clientId, String consumerGroup, long maxBytes) {
+    public boolean deliverMergedBatchToLegacy(String clientId, String consumerGroup, long maxBytes) {
         if (!readinessService.isLegacyConsumerReady(clientId)) {
             log.debug("Legacy delivery blocked until READY_ACK: clientId={}, group={}", clientId, consumerGroup);
             return false;
         }
 
+        // Non-atomic fast-path: if a batch is already pending, skip building the next one.
+        // The authoritative gate is putPendingBatchIfAbsent() below.
         if (pendingAckStore.getPendingBatch(clientId) != null) {
             log.debug("Legacy delivery blocked by pending ACK: clientId={}, group={}", clientId, consumerGroup);
             return false;
@@ -221,9 +233,14 @@ public class ConsumerRegistry {
 
             Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
 
-            // Store batch BEFORE sending to prevent race: consumer ACKs before putPendingBatch is called,
-            // causing ACK handler to find no pending batch and the batch getting stuck in the store permanently.
-            pendingAckStore.putPendingBatch(clientId, batch);
+            // Atomic delivery-slot reservation: putIfAbsent on the underlying ConcurrentHashMap
+            // ensures only one thread proceeds to the network send even without a method-level lock.
+            // Must happen BEFORE the send so an early ACK finds the pending batch in the store.
+            if (!pendingAckStore.putPendingBatchIfAbsent(clientId, batch)) {
+                log.debug("Legacy delivery slot already taken for clientId={}, group={} — skipping",
+                        clientId, consumerGroup);
+                return false;
+            }
             pendingAckStore.recordSendTime(clientId, System.currentTimeMillis());
             pendingAckStore.startTimer(clientId, deliverySample);
             metrics.recordBatchSize(batch.getMessageCount());

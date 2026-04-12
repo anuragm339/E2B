@@ -59,6 +59,16 @@ public interface ConsumerStateService {
     void clearPendingOffset(DeliveryKey key);
 
     /**
+     * Atomically remove and return the pending offset.
+     * Use instead of getPendingOffset + clearPendingOffset to prevent the ACK handler
+     * and ACK-timeout handler racing on the same offset.
+     *
+     * @param key Delivery key
+     * @return The pending offset that was removed, or null if none was set
+     */
+    Long removePendingOffset(DeliveryKey key);
+
+    /**
      * Record timestamp when batch was sent.
      *
      * @param key Delivery key

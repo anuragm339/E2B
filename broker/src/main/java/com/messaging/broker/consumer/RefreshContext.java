@@ -7,6 +7,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Tracks state of a data refresh operation for a single topic
@@ -51,8 +53,15 @@ public class RefreshContext {
     private volatile Instant readySentTime;
 
     // Downtime tracking
-    private final List<DowntimePeriod> downtimePeriods;  // All completed downtime periods
+    // CopyOnWriteArrayList: recordStartup() (recovery thread) and getDowntimePeriods() (health/
+    // monitoring threads) can race — ArrayList iteration during a concurrent add throws CME.
+    private final List<DowntimePeriod> downtimePeriods;
     private volatile Instant lastShutdownTime;  // Current/ongoing shutdown time
+
+    // Tracks whether the REPLAYING transition has already been claimed.
+    // CAS on this flag ensures exactly one thread drives RESET_SENT → REPLAYING even when
+    // two RESET_ACKs arrive simultaneously (add() + size()==1 is not atomic on a concurrent set).
+    private final AtomicBoolean firstResetAckClaimed = new AtomicBoolean(false);
 
     // Refresh batch tracking
     private volatile String refreshId;  // Unique identifier for the refresh batch (survives broker restarts)
@@ -77,7 +86,7 @@ public class RefreshContext {
         this.resetAckTimes = new ConcurrentHashMap<>();
         this.readyAckTimes = new ConcurrentHashMap<>();
         this.startTime = Instant.now();
-        this.downtimePeriods = new ArrayList<>();
+        this.downtimePeriods = new CopyOnWriteArrayList<>();
         this.lastShutdownTime = null;
         this.refreshScope = refreshScope;
         this.refreshType = refreshType;
@@ -85,6 +94,16 @@ public class RefreshContext {
 
     public boolean allResetAcksReceived() {
         return receivedResetAcks.containsAll(expectedConsumers);
+    }
+
+    /**
+     * Atomically claim the right to drive the RESET_SENT → REPLAYING transition.
+     * Returns true exactly once regardless of how many threads call it concurrently.
+     * Fixes the race where two simultaneous RESET_ACKs both see size()==2 and neither
+     * returns true from the old size()==1 check.
+     */
+    public boolean markFirstResetAck() {
+        return firstResetAckClaimed.compareAndSet(false, true);
     }
 
     public boolean allReadyAcksReceived() {

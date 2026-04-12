@@ -48,8 +48,21 @@ public class ConsumerRegistrationManager implements ConsumerRegistrationService 
     public RegistrationResult registerConsumer(String clientId, String topic, String group, boolean isLegacy, String traceId) {
         ConsumerKey key = ConsumerKey.of(clientId, topic, group);
 
-        // Check for duplicate registration
-        if (sessionStore.contains(key)) {
+        // Load and validate persisted offset before the atomic insert.
+        // This work is safe to do speculatively — it is idempotent and cheap even if we
+        // later discover another thread already registered the same consumer.
+        DeliveryKey deliveryKey = DeliveryKey.of(group, topic);
+        long restoredOffset = offsetTracker.getOffset(deliveryKey.toString());
+        long validatedOffset = validateAndCorrectOffset(deliveryKey, restoredOffset, traceId);
+
+        RemoteConsumer consumer = new RemoteConsumer(clientId, topic, group, isLegacy);
+        consumer.setCurrentOffset(validatedOffset);
+
+        // Atomic check-and-insert: replaces the non-atomic contains() + put() pair that was
+        // vulnerable to a TOCTOU race when two concurrent SUBSCRIBE messages arrived for the
+        // same consumer key (both could pass the contains() check before either called put()).
+        Optional<RemoteConsumer> existing = sessionStore.putIfAbsent(key, consumer);
+        if (existing.isPresent()) {
             LogContext context = LogContext.builder()
                     .traceId(traceId)
                     .clientId(clientId)
@@ -57,21 +70,8 @@ public class ConsumerRegistrationManager implements ConsumerRegistrationService 
                     .consumerGroup(group)
                     .build();
             consumerLogger.logConsumerRegistrationDuplicate(context);
-            RemoteConsumer existing = sessionStore.get(key).orElseThrow();
-            return RegistrationResult.duplicate(existing);
+            return RegistrationResult.duplicate(existing.get());
         }
-
-        // Load and validate persisted offset
-        DeliveryKey deliveryKey = DeliveryKey.of(group, topic);
-        long restoredOffset = offsetTracker.getOffset(deliveryKey.toString());
-        long validatedOffset = validateAndCorrectOffset(deliveryKey, restoredOffset, traceId);
-
-        // Create consumer
-        RemoteConsumer consumer = new RemoteConsumer(clientId, topic, group, isLegacy);
-        consumer.setCurrentOffset(validatedOffset);
-
-        // Store
-        sessionStore.put(key, consumer);
 
         // Metrics
         metrics.updateConsumerOffset(clientId, topic, group, validatedOffset);

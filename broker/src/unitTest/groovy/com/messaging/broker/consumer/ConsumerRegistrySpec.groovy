@@ -167,7 +167,7 @@ class ConsumerRegistrySpec extends Specification {
 
         then:
         !delivered
-        1 * pendingAckStore.putPendingBatch("legacy-client", batch)
+        1 * pendingAckStore.putPendingBatchIfAbsent("legacy-client", batch) >> true
         1 * pendingAckStore.recordSendTime("legacy-client", _ as Long)
         1 * pendingAckStore.startTimer("legacy-client", _ as Timer.Sample)
         1 * pendingAckStore.removePendingBatch("legacy-client")
@@ -189,6 +189,7 @@ class ConsumerRegistrySpec extends Specification {
 
         readinessService.isLegacyConsumerReady("legacy-client") >> true
         pendingAckStore.getPendingBatch("legacy-client") >> null >>  batch >> batch
+        pendingAckStore.putPendingBatchIfAbsent("legacy-client", batch) >> true
         pendingAckStore.getSendTime("legacy-client") >> 123L
         registrationService.getConsumersByClient("legacy-client") >> [legacy]
         legacyDeliveryManager.buildMergedBatch(["prices-v1"], "svc", 1024) >> batch

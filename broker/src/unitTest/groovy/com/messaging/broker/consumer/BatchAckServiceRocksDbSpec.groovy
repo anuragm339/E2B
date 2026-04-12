@@ -48,7 +48,7 @@ class BatchAckServiceRocksDbSpec extends Specification {
         def deliveryKey = DeliveryKey.of("group1", "prices-v1")
         stateService.getTraceId(deliveryKey) >> "trace-1"
         stateService.getBatchSendTime(deliveryKey) >> 1000L
-        stateService.getPendingOffset(deliveryKey) >> 5L          // nextOffset = 5
+        stateService.removePendingOffset(deliveryKey) >> 5L       // nextOffset = 5 (atomic remove)
         stateService.getFromOffset(deliveryKey) >> 2L             // startOffset = 2
 
         def consumerKey = ConsumerKey.of("client-1", "prices-v1", "group1")
@@ -80,7 +80,7 @@ class BatchAckServiceRocksDbSpec extends Specification {
         def deliveryKey = DeliveryKey.of("group1", "prices-v1")
         stateService.getTraceId(deliveryKey) >> "trace-1"
         stateService.getBatchSendTime(deliveryKey) >> 1000L
-        stateService.getPendingOffset(deliveryKey) >> 5L
+        stateService.removePendingOffset(deliveryKey) >> 5L       // atomic remove
         stateService.getFromOffset(deliveryKey) >> null           // not set
 
         def consumerKey = ConsumerKey.of("client-1", "prices-v1", "group1")

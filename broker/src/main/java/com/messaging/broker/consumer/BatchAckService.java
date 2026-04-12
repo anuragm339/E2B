@@ -84,11 +84,11 @@ public class BatchAckService implements ConsumerAckService {
         Long sendTime = stateService.getBatchSendTime(deliveryKey);
         long ackLatencyMs = sendTime != null && sendTime > 0 ? (ackReceiveTime - sendTime) : -1;
 
-        // Remove pending state
-        Long committedOffset = stateService.getPendingOffset(deliveryKey);
-        if (committedOffset != null) {
-            stateService.clearPendingOffset(deliveryKey);
-        }
+        // Atomically claim ownership of the pending offset.
+        // removePendingOffset() is a single ConcurrentHashMap.remove() call — whichever thread
+        // (this ACK handler or the scheduled timeout) calls it first gets the non-null value.
+        // The other gets null and short-circuits, preventing the double-revert race.
+        Long committedOffset = stateService.removePendingOffset(deliveryKey);
 
         // Cancel timeout
         stateService.cancelTimeout(deliveryKey);

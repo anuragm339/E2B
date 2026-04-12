@@ -69,6 +69,11 @@ public class InMemoryInFlightDeliveryStore implements InFlightDeliveryStore {
     }
 
     @Override
+    public Long removePendingOffset(DeliveryKey key) {
+        return pendingOffsets.remove(key);
+    }
+
+    @Override
     public void recordBatchSendTime(DeliveryKey key, long timestamp) {
         batchSendTimestamps.put(key, timestamp);
     }

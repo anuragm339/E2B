@@ -53,6 +53,11 @@ public class ConsumerStateManager implements ConsumerStateService {
     }
 
     @Override
+    public Long removePendingOffset(DeliveryKey key) {
+        return deliveryStore.removePendingOffset(key);
+    }
+
+    @Override
     public void recordBatchSendTime(DeliveryKey key, long timestamp) {
         deliveryStore.recordBatchSendTime(key, timestamp);
     }

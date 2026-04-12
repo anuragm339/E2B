@@ -22,6 +22,17 @@ public interface ConsumerSessionStore {
     void put(ConsumerKey key, RemoteConsumer consumer);
 
     /**
+     * Register consumer only if no consumer with the given key is already present.
+     * Delegates to ConcurrentHashMap.putIfAbsent(), making the check-and-insert atomic
+     * and preventing duplicate registration from concurrent SUBSCRIBE messages.
+     *
+     * @param key      Consumer key
+     * @param consumer Consumer to register
+     * @return the existing consumer if the key was already present, empty if newly inserted
+     */
+    Optional<RemoteConsumer> putIfAbsent(ConsumerKey key, RemoteConsumer consumer);
+
+    /**
      * Get consumer by key.
      *
      * @param key Consumer key

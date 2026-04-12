@@ -1,6 +1,7 @@
 package com.messaging.broker.consumer;
 
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Represents a remote consumer connected via TCP.
@@ -16,7 +17,9 @@ public class RemoteConsumer {
     public volatile long currentOffset;
     public volatile Future<?> deliveryTask;
     public volatile long lastDeliveryAttempt; // Rate limiting: timestamp of last delivery attempt
-    public volatile int consecutiveFailures; // Track consecutive failures for exponential backoff
+    // AtomicInteger prevents lost-update races when delivery scheduler and ACK-timeout threads
+    // both call recordFailure() concurrently (volatile int + ++ is not an atomic operation).
+    private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
     public volatile long lastFailureTime; // Timestamp of last failure
 
     public RemoteConsumer(String clientId, String topic, String group) {
@@ -30,7 +33,6 @@ public class RemoteConsumer {
         this.isLegacy = isLegacy;
         this.currentOffset = 0;
         this.lastDeliveryAttempt = 0; // Allow immediate first delivery
-        this.consecutiveFailures = 0;
         this.lastFailureTime = 0;
     }
 
@@ -59,7 +61,7 @@ public class RemoteConsumer {
     }
 
     public int getConsecutiveFailures() {
-        return consecutiveFailures;
+        return consecutiveFailures.get();
     }
 
     public long getLastFailureTime() {
@@ -80,21 +82,21 @@ public class RemoteConsumer {
      * @return delay in milliseconds before next retry
      */
     public long getBackoffDelay() {
-        if (consecutiveFailures == 0) {
+        int failures = consecutiveFailures.get();
+        if (failures == 0) {
             return 0; // No delay on first attempt
         }
         // Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1600ms, max 5000ms
-        long delay = Math.min(100L * (1L << (consecutiveFailures - 1)), 5000L);
-        return delay;
+        return Math.min(100L * (1L << (failures - 1)), 5000L);
     }
 
     public void recordFailure() {
-        consecutiveFailures++;
+        consecutiveFailures.incrementAndGet(); // atomic: prevents lost-update under concurrent calls
         lastFailureTime = System.currentTimeMillis();
     }
 
     public void resetFailures() {
-        consecutiveFailures = 0;
+        consecutiveFailures.set(0);
         lastFailureTime = 0;
     }
 }

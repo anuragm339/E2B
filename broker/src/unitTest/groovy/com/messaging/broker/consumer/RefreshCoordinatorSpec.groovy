@@ -448,6 +448,342 @@ class RefreshCoordinatorSpec extends Specification {
         coordinator.shutdown()
     }
 
+    def "abortRefreshIfStuck is a no-op when no refresh is active for the topic"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        when:
+        invokePrivate(coordinator, "abortRefreshIfStuck", "missing-topic")
+
+        then:
+        noExceptionThrown()
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "abortRefreshIfStuck is a no-op when refresh is already in a terminal state"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.COMPLETED)
+        coordinator.@activeRefreshes.put("topic", context)
+
+        when:
+        invokePrivate(coordinator, "abortRefreshIfStuck", "topic")
+
+        then:
+        coordinator.isRefreshActive("topic")  // context was NOT removed
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "abortRefreshIfStuck aborts without NPE when no scheduled tasks exist"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.REPLAYING)
+        coordinator.@activeRefreshes.put("topic", context)
+        // deliberately NO entries in resetRetryTasks or replayCheckTasks
+
+        when:
+        invokePrivate(coordinator, "abortRefreshIfStuck", "topic")
+
+        then:
+        !coordinator.isRefreshActive("topic")
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "handleResetAck transitions to replaying when no reset retry task was scheduled"() {
+        given:
+        def resetService = Mock(ResetPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), resetService, Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.RESET_SENT)
+        coordinator.@activeRefreshes.put("topic", context)
+        resetService.handleResetAck("groupA:topic", "client-1", "topic", context, "trace-1") >> true
+        // no task in resetRetryTasks
+
+        when:
+        coordinator.handleResetAck("groupA:topic", "client-1", "topic", "trace-1")
+
+        then:
+        context.state == RefreshState.REPLAYING
+        noExceptionThrown()
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "handleResetAck transition failure leaves state unchanged"() {
+        given:
+        def resetService = Mock(ResetPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), resetService, Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.REPLAYING)  // wrong state — REPLAYING→REPLAYING is invalid
+        coordinator.@activeRefreshes.put("topic", context)
+        resetService.handleResetAck("groupA:topic", "client-1", "topic", context, "trace-1") >> true
+
+        when:
+        coordinator.handleResetAck("groupA:topic", "client-1", "topic", "trace-1")
+
+        then:
+        context.state == RefreshState.REPLAYING
+        noExceptionThrown()
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "handleReadyAck transition failure leaves state unchanged"() {
+        given:
+        def readyService = Mock(ReadyPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), readyService,
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.REPLAYING)  // REPLAYING→COMPLETED is invalid (must go via READY_SENT)
+        coordinator.@activeRefreshes.put("topic", context)
+        readyService.handleReadyAck("groupA:topic", "topic", context, "trace-1") >> true
+
+        when:
+        coordinator.handleReadyAck("groupA:topic", "topic", "trace-1")
+
+        then:
+        context.state == RefreshState.REPLAYING
+        0 * readyService.completeRefresh(_, _)
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "retryResetBroadcast is a no-op when no active refresh exists"() {
+        given:
+        def resetService = Mock(ResetPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), resetService, Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        when:
+        invokePrivate(coordinator, "retryResetBroadcast", "missing-topic")
+
+        then:
+        0 * resetService.retryResetBroadcast(_, _)
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "checkReplayProgress is a no-op when no active refresh exists"() {
+        given:
+        def replayService = Mock(ReplayPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), replayService, Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        when:
+        invokePrivate(coordinator, "checkReplayProgress", "missing-topic")
+
+        then:
+        0 * replayService.checkReplayProgress(_, _)
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "checkReplayProgress stays idle when replay is not yet complete"() {
+        given:
+        def replayService = Mock(ReplayPhase)
+        def readyService = Mock(ReadyPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), replayService, readyService,
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.REPLAYING)
+        coordinator.@activeRefreshes.put("topic", context)
+        replayService.checkReplayProgress("topic", context) >> false
+
+        when:
+        invokePrivate(coordinator, "checkReplayProgress", "topic")
+
+        then:
+        0 * readyService.sendReady(_, _)
+        context.state == RefreshState.REPLAYING
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "checkReplayProgress transition failure leaves state unchanged"() {
+        given:
+        def replayService = Mock(ReplayPhase)
+        def readyService = Mock(ReadyPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), replayService, readyService,
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.RESET_SENT)  // RESET_SENT→READY_SENT is invalid (must go via REPLAYING)
+        coordinator.@activeRefreshes.put("topic", context)
+        replayService.checkReplayProgress("topic", context) >> true
+
+        when:
+        invokePrivate(coordinator, "checkReplayProgress", "topic")
+
+        then:
+        0 * readyService.sendReady(_, _)
+        context.state == RefreshState.RESET_SENT
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "checkReadyAckTimeout is a no-op when no active refresh exists"() {
+        given:
+        def readyService = Mock(ReadyPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), readyService,
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        when:
+        invokePrivate(coordinator, "checkReadyAckTimeout", "missing-topic")
+
+        then:
+        0 * readyService.checkReadyAckTimeout(_, _)
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "checkReadyAckTimeout does not reschedule when all ready acks are received"() {
+        given:
+        def readyService = Mock(ReadyPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), readyService,
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.READY_SENT)
+        context.recordReadyAck("groupA:topic")  // all expected acks now received
+        coordinator.@activeRefreshes.put("topic", context)
+
+        when:
+        invokePrivate(coordinator, "checkReadyAckTimeout", "topic")
+
+        then:
+        1 * readyService.checkReadyAckTimeout("topic", context)
+        noExceptionThrown()
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "getCurrentRefreshId returns null when initiationService is not a RefreshInitiator"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter),  // not a RefreshInitiator instance
+                Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        expect:
+        coordinator.getCurrentRefreshId() == null
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "getRefreshIdForTopic and getRefreshTypeForTopic return null for unknown topic"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        expect:
+        coordinator.getRefreshIdForTopic("no-such-topic") == null
+        coordinator.getRefreshTypeForTopic("no-such-topic") == null
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "registerLateJoiningConsumer is a no-op when no active refresh exists"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        when:
+        coordinator.registerLateJoiningConsumer("missing-topic", "groupA:missing-topic")
+
+        then:
+        noExceptionThrown()
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "registerLateJoiningConsumer in RESET_SENT records ack but stays in RESET_SENT when more acks are pending"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic", "groupB:topic"] as Set)
+        context.setState(RefreshState.RESET_SENT)
+        coordinator.@activeRefreshes.put("topic", context)
+
+        when:
+        coordinator.registerLateJoiningConsumer("topic", "groupA:topic")  // only one of two acks
+
+        then:
+        context.state == RefreshState.RESET_SENT
+        context.receivedResetAcks.contains("groupA:topic")
+        !context.receivedResetAcks.contains("groupB:topic")
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "shutdown with no active refreshes completes cleanly"() {
+        given:
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+
+        when:
+        coordinator.shutdown()
+
+        then:
+        noExceptionThrown()
+    }
+
     private static Object invokePrivate(Object target, String methodName, Object... args) {
         Method method = target.class.getDeclaredMethod(methodName, args.collect { it.class } as Class[])
         method.accessible = true
