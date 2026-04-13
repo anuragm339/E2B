@@ -1,5 +1,6 @@
 package com.messaging.broker.systemtest.journey
 
+import com.messaging.broker.ack.RocksDbAckStore
 import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.consumer.RefreshCoordinator
 import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
@@ -41,6 +42,12 @@ class DataRefreshJourneySpec extends BrokerSystemTestSupport {
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             assert offsetTracker.getOffset('system-test-group:prices-v1') > 0
         }
+
+        and: "init-1 msgKey is written to RocksDB ack-store"
+        def ackStore = brokerCtx.getBean(RocksDbAckStore)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert ackStore.get('prices-v1', 'system-test-group', 'init-1') != null
+        }
         collector().reset()
 
         when: "refresh is triggered for prices-v1"
@@ -70,6 +77,12 @@ class DataRefreshJourneySpec extends BrokerSystemTestSupport {
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             assert offsetTracker.getOffset('system-test-group:prices-v1') > 0
+        }
+
+        and: "pre-refresh msgKey is written to RocksDB ack-store"
+        def ackStore = brokerCtx.getBean(RocksDbAckStore)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert ackStore.get('prices-v1', 'system-test-group', 'pre-refresh') != null
         }
         collector().reset()
 
@@ -101,5 +114,9 @@ class DataRefreshJourneySpec extends BrokerSystemTestSupport {
             assert stored.any { it.msgKey == 'post-refresh' && it.data == '{"x":2}' }
         }
 
+        and: "post-refresh msgKey is written to RocksDB ack-store after ACK"
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert ackStore.get('prices-v1', 'system-test-group', 'post-refresh') != null
+        }
     }
 }

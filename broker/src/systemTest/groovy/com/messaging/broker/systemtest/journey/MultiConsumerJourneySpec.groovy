@@ -1,5 +1,6 @@
 package com.messaging.broker.systemtest.journey
 
+import com.messaging.broker.ack.RocksDbAckStore
 import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
 import com.messaging.broker.systemtest.support.TestRecordCollector
@@ -85,6 +86,27 @@ class MultiConsumerJourneySpec extends BrokerSystemTestSupport {
 
         and: "there is no cross-group contamination — group-b offset for prices-v1 is zero (never delivered)"
         offsetTracker.getOffset('group-b:prices-v1') == 0
+
+        and: "prices-v1 msgKeys are written to RocksDB under group-a (not group-b)"
+        def ackStore = brokerCtx.getBean(RocksDbAckStore)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert ackStore.get('prices-v1',  'group-a', 'p-1') != null
+            assert ackStore.get('prices-v1',  'group-a', 'p-2') != null
+        }
+
+        and: "ref-data-v5 msgKeys are written to RocksDB under group-b (not group-a)"
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert ackStore.get('ref-data-v5', 'group-b', 'r-1') != null
+            assert ackStore.get('ref-data-v5', 'group-b', 'r-2') != null
+            assert ackStore.get('ref-data-v5', 'group-b', 'r-3') != null
+        }
+
+        and: "cross-group RocksDB keys are absent — group-b did not ACK prices-v1"
+        ackStore.get('prices-v1', 'group-b', 'p-1') == null
+        ackStore.get('prices-v1', 'group-b', 'p-2') == null
+
+        and: "cross-group RocksDB keys are absent — group-a did not ACK ref-data-v5"
+        ackStore.get('ref-data-v5', 'group-a', 'r-1') == null
     }
 
     private static int findFreePort() {
