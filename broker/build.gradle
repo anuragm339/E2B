@@ -62,6 +62,16 @@ dependencies {
     integrationTestImplementation 'org.objenesis:objenesis:3.3'
     integrationTestImplementation 'org.xerial:sqlite-jdbc:3.45.1.0'  // SQLite driver for TestDataController tests
     integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // System test dependencies
+    systemTestImplementation project(':test-consumer')
+    systemTestImplementation 'org.apache.groovy:groovy:4.0.15'
+    systemTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    systemTestImplementation 'io.micronaut.test:micronaut-test-spock'
+    systemTestImplementation 'io.micronaut:micronaut-inject-groovy'
+    systemTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
+    systemTestImplementation 'org.objenesis:objenesis:3.3'
+    systemTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 // Configure source sets for unit tests
@@ -75,6 +85,10 @@ sourceSets {
     // Add Groovy support to integrationTest source set (defined in root build.gradle)
     integrationTest {
         groovy.srcDir 'src/integrationTest/groovy'
+    }
+    // Add Groovy support to systemTest source set (defined in root build.gradle)
+    systemTest {
+        groovy.srcDir 'src/systemTest/groovy'
     }
 }
 
@@ -90,6 +104,10 @@ test {
 // The integrationTest resources dir is registered twice (root build.gradle + Gradle default convention),
 // so we must declare a duplicates strategy to avoid a build error when any file is placed there.
 processIntegrationTestResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+processSystemTestResources {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 

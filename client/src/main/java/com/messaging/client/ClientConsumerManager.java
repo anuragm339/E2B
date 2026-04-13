@@ -50,7 +50,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @Singleton
 @Requires(property = "messaging.broker.host")
-@Requires(beans = MessageHandler.class)
 public class ClientConsumerManager implements ApplicationEventListener<ServerStartupEvent> {
     private static final Logger log = LoggerFactory.getLogger(ClientConsumerManager.class);
 

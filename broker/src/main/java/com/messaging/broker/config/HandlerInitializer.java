@@ -2,6 +2,7 @@ package com.messaging.broker.config;
 
 import com.messaging.broker.handler.MessageHandlerRegistry;
 import com.messaging.broker.handler.*;
+import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.context.event.StartupEvent;
 import jakarta.inject.Inject;
@@ -13,6 +14,7 @@ import org.slf4j.LoggerFactory;
  * Initializes and registers all message handlers with the handler registry.
  */
 @Singleton
+@Requires(property = "broker.network.type")
 public class HandlerInitializer implements ApplicationEventListener<StartupEvent> {
     private static final Logger log = LoggerFactory.getLogger(HandlerInitializer.class);
 
