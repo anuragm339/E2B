@@ -8,7 +8,7 @@ class ByteArrayDeliveryBatchSpec extends Specification {
 
     def "transferTo copies bytes from an arbitrary position"() {
         given:
-        def batch = new ByteArrayDeliveryBatch('prices-v1', 'abcdef'.bytes, 2, 11L)
+        def batch = new ByteArrayDeliveryBatch('prices-v1', 'abcdef'.bytes, 2, 10L, 11L)
         def output = new ByteArrayOutputStream()
         def channel = Channels.newChannel(output)
 
@@ -22,7 +22,7 @@ class ByteArrayDeliveryBatchSpec extends Specification {
 
     def "isEmpty reflects record count"() {
         expect:
-        new ByteArrayDeliveryBatch('topic', new byte[0], 0, 0L).isEmpty()
-        !new ByteArrayDeliveryBatch('topic', 'x'.bytes, 1, 0L).isEmpty()
+        new ByteArrayDeliveryBatch('topic', new byte[0], 0, -1L, 0L).isEmpty()
+        !new ByteArrayDeliveryBatch('topic', 'x'.bytes, 1, 0L, 0L).isEmpty()
     }
 }

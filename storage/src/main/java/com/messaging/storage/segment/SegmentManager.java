@@ -306,7 +306,7 @@ public class SegmentManager {
             log.error("Consumer offset {} EXCEEDS storage head {} for topic={} partition={} — " +
                      "COMMIT_OFFSET validation failure detected. Returning empty batch to prevent infinite polling.",
                      fromOffset, storageHead, topic, partition);
-            return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
+            return new Segment.BatchFileRegion(topic, null, 0, 0L, -1L, 0L, fromOffset);
         }
 
         // Find the segment that contains this offset
@@ -318,7 +318,7 @@ public class SegmentManager {
             if (active != null && fromOffset < active.getNextOffset()) {
                 return active.getBatchFileRegion(fromOffset, maxBytes);
             } else {
-                return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
+                return new Segment.BatchFileRegion(topic, null, 0, 0L, -1L, 0L, fromOffset);
             }
         }
 

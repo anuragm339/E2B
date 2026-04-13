@@ -192,7 +192,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             long nextOffset = batch.getLastOffset() + 1;
             consumer.setCurrentOffset(nextOffset);
             stateService.setPendingOffset(deliveryKey, nextOffset);
-            stateService.setFromOffset(deliveryKey, startOffset);  // persisted for ACK-time msgKey lookup
+            stateService.setFromOffset(deliveryKey, batch.getFirstOffset());  // actual first record offset, used for ACK-time RocksDB write
 
             LogContext startedContext = LogContext.builder()
                     .traceId(traceId)

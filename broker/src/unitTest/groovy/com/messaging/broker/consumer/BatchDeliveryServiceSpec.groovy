@@ -473,6 +473,7 @@ class BatchDeliveryServiceSpec extends Specification {
         final String topic
         final byte[] data
         final int recordCount
+        final long firstOffset
         final long lastOffset
         boolean closed = false
 
@@ -480,6 +481,7 @@ class BatchDeliveryServiceSpec extends Specification {
             this.topic = topic
             this.data = data
             this.recordCount = recordCount
+            this.firstOffset = lastOffset > 0 ? lastOffset : 0L
             this.lastOffset = lastOffset
         }
 
@@ -491,6 +493,9 @@ class BatchDeliveryServiceSpec extends Specification {
 
         @Override
         long getTotalBytes() { data.length }
+
+        @Override
+        long getFirstOffset() { firstOffset }
 
         @Override
         long getLastOffset() { lastOffset }

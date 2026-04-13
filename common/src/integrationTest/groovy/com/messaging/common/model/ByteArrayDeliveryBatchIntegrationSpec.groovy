@@ -11,7 +11,7 @@ class ByteArrayDeliveryBatchIntegrationSpec extends Specification {
     def "byte array delivery batch transfers bytes and reports completion"() {
         given:
         byte[] payload = 'batch-payload'.bytes
-        def batch = new ByteArrayDeliveryBatch('prices-v1', payload, 1, 99L)
+        def batch = new ByteArrayDeliveryBatch('prices-v1', payload, 1, 98L, 99L)
         def output = new ByteArrayOutputStream()
         def channel = Channels.newChannel(output)
 
@@ -23,6 +23,7 @@ class ByteArrayDeliveryBatchIntegrationSpec extends Specification {
         batch.topic == 'prices-v1'
         batch.recordCount == 1
         batch.totalBytes == payload.length
+        batch.firstOffset == 98L
         batch.lastOffset == 99L
         written == payload.length
         exhausted == -1L

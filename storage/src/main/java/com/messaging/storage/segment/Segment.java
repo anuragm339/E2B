@@ -598,12 +598,13 @@ public class Segment {
                 return null; // No data at or after this offset
             }
 
-            // 2. Handle offset gaps - if exact match not found, return null
-            // This triggers SegmentManager to continue traversal to next segment
+            // 2. Exact offset match required. findIndexEntryForOffset returns first entry >= targetOffset.
+            // If there is a gap (entry.offset != offset), the requested offset does not exist in this segment.
+            // Return null so SegmentManager can advance to the next segment or report no data.
             if (entry.offset != offset) {
-                log.debug("Offset gap detected: requested={}, found={}, segment baseOffset={}",
+                log.debug("Offset gap: requested={}, nearest available={}, segment baseOffset={} — returning null",
                           offset, entry.offset, baseOffset);
-                return null; // Trigger SegmentManager traversal
+                return null;
             }
 
             // 3. Read from log file using entry metadata
@@ -689,7 +690,7 @@ public class Segment {
     public BatchFileRegion getBatchFileRegion(long startOffset, long maxBytes) throws MessagingException {
         if (startOffset < baseOffset || startOffset >= nextOffset) {
             log.debug("Offset {} outside segment range [{}, {})", startOffset, baseOffset, nextOffset);
-            return new BatchFileRegion(topic, null, 0, 0L, 0L, startOffset);
+            return new BatchFileRegion(topic, null, 0, 0L, -1L, 0L, startOffset);
         }
 
         try {
@@ -699,7 +700,7 @@ public class Segment {
             if (firstEntry == null) {
                 log.debug("No entries found at or after offset {} in segment baseOffset={}",
                           startOffset, baseOffset);
-                return new BatchFileRegion(topic, null, 0, 0L, 0L, startOffset);
+                return new BatchFileRegion(topic, null, 0, 0L, -1L, 0L, startOffset);
             }
 
             // 2. Sequential scan from first entry to accumulate batch
@@ -774,7 +775,7 @@ public class Segment {
 
             if (recordCount == 0) {
                 log.debug("No records accumulated for batch starting at offset {}", startOffset);
-                return new BatchFileRegion(topic, null, 0, 0L, 0L, startOffset);
+                return new BatchFileRegion(topic, null, 0, 0L, -1L, 0L, startOffset);
             }
 
             // 3. Open a read-only FileChannel for zero-copy transfer (Kafka-style sendfile)
@@ -787,7 +788,7 @@ public class Segment {
             log.debug("Created zero-copy batch: offset={}-{}, bytes={}, records={}, firstLogPos={}",
                       startOffset, lastOffset, totalBytes, recordCount, firstLogPosition);
 
-            return new BatchFileRegion(topic, readChannel, recordCount, totalBytes, lastOffset, firstLogPosition);
+            return new BatchFileRegion(topic, readChannel, recordCount, totalBytes, firstEntry.offset, lastOffset, firstLogPosition);
         } catch (IOException | MessagingException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.readFailed(topic, partition, startOffset, e)
@@ -843,23 +844,26 @@ public class Segment {
         private final FileChannel fileChannel;  // null if empty batch
         private final int recordCount;
         private final long totalBytes;
+        private final long firstOffset; // actual offset of first record in batch (-1 if empty)
         private final long lastOffset;
         private final long filePosition;  // position in log file where payload starts
 
         public BatchFileRegion(String topic, FileChannel fileChannel,
-                               int recordCount, long totalBytes, long lastOffset, long filePosition) {
+                               int recordCount, long totalBytes, long firstOffset, long lastOffset, long filePosition) {
             this.topic = topic;
             this.fileChannel = fileChannel;
             this.recordCount = recordCount;
             this.totalBytes = totalBytes;
+            this.firstOffset = firstOffset;
             this.lastOffset = lastOffset;
             this.filePosition = filePosition;
         }
 
-        @Override public String getTopic()    { return topic; }
-        @Override public int getRecordCount() { return recordCount; }
-        @Override public long getTotalBytes() { return totalBytes; }
-        @Override public long getLastOffset() { return lastOffset; }
+        @Override public String getTopic()      { return topic; }
+        @Override public int getRecordCount()   { return recordCount; }
+        @Override public long getTotalBytes()   { return totalBytes; }
+        @Override public long getFirstOffset()  { return firstOffset; }
+        @Override public long getLastOffset()   { return lastOffset; }
 
         @Override
         public long transferTo(WritableByteChannel target, long position) throws IOException {

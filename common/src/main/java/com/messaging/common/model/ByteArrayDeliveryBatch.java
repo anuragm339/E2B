@@ -18,18 +18,21 @@ public final class ByteArrayDeliveryBatch implements DeliveryBatch {
     private final String topic;
     private final byte[] data;
     private final int recordCount;
+    private final long firstOffset;
     private final long lastOffset;
 
-    public ByteArrayDeliveryBatch(String topic, byte[] data, int recordCount, long lastOffset) {
+    public ByteArrayDeliveryBatch(String topic, byte[] data, int recordCount, long firstOffset, long lastOffset) {
         this.topic = topic;
         this.data = data;
         this.recordCount = recordCount;
+        this.firstOffset = firstOffset;
         this.lastOffset = lastOffset;
     }
 
     @Override public String getTopic()       { return topic; }
     @Override public int getRecordCount()    { return recordCount; }
     @Override public long getTotalBytes()    { return data.length; }
+    @Override public long getFirstOffset()   { return firstOffset; }
     @Override public long getLastOffset()    { return lastOffset; }
 
     @Override
