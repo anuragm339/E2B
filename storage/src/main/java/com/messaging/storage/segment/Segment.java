@@ -598,13 +598,16 @@ public class Segment {
                 return null; // No data at or after this offset
             }
 
-            // 2. Exact offset match required. findIndexEntryForOffset returns first entry >= targetOffset.
-            // If there is a gap (entry.offset != offset), the requested offset does not exist in this segment.
-            // Return null so SegmentManager can advance to the next segment or report no data.
+            // 2. Gap handling: findIndexEntryForOffset returns the first entry >= targetOffset.
+            // If entry.offset > offset there is a gap in this segment.  We do NOT return null here
+            // because null causes SegmentManager.readWithSizeLimit() to abandon this segment and
+            // move to the next one — silently skipping every record that sits after the gap but
+            // within this same segment.  Instead we fall through and read the record at entry.offset;
+            // SegmentManager already advances currentOffset to record.getOffset()+1, so subsequent
+            // iterations will skip over the gap automatically.
             if (entry.offset != offset) {
-                log.debug("Offset gap: requested={}, nearest available={}, segment baseOffset={} — returning null",
+                log.debug("Offset gap: requested={}, reading nearest available={}, segment baseOffset={}",
                           offset, entry.offset, baseOffset);
-                return null;
             }
 
             // 3. Read from log file using entry metadata

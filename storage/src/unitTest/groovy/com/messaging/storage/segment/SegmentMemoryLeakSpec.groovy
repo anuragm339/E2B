@@ -213,8 +213,8 @@ class SegmentMemoryLeakSpec extends Specification {
         segment?.close()
     }
 
-    def "reading offset gaps returns null for missing and reads existing"() {
-        given: "a segment with offset gaps"
+    def "reading a gap offset returns the next available record, not null"() {
+        given: "a segment with offset gaps: records at 500, 700, 1200"
         def logPath = tempDir.resolve("00000000000000000500.log")
         def indexPath = tempDir.resolve("00000000000000000500.index")
         def baseOffset = 500L
@@ -232,17 +232,22 @@ class SegmentMemoryLeakSpec extends Specification {
         def record500 = segment.read(500L)
         def record700 = segment.read(700L)
 
-        then: "records are found"
+        then: "records are found at their exact offsets"
         record500 != null
         record500.getMsgKey() == "key-500"
         record700 != null
         record700.getMsgKey() == "key-700"
 
-        when: "reading a missing offset in the gap"
-        def missing = segment.read(900L)
+        when: "reading an offset that falls inside a gap (900 — between 700 and 1200)"
+        def gapRecord = segment.read(900L)
 
-        then: "null is returned"
-        missing == null
+        then: "the next available record (offset 1200) is returned — gap is skipped transparently"
+        gapRecord != null
+        gapRecord.getOffset() == 1200L
+        gapRecord.getMsgKey() == "key-1200"
+
+        and: "reading past the last record returns null (no further records exist)"
+        segment.read(1201L) == null
 
         cleanup:
         segment?.close()

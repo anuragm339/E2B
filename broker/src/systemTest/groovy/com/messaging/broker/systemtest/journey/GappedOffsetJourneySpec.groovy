@@ -25,17 +25,12 @@ import spock.util.concurrent.PollingConditions
  * 4. The committed offset in ConsumerOffsetTracker reflects the actual last
  *    record offset + 1, not a sequential counter.
  *
- * Note on storage.read() and gaps:
- *   The storage.read() API (used for StorageEngine assertions) requires an exact
- *   offset match when scanning within a segment.  Assertions that span a gap
- *   (e.g. read(1, 1000)) only return records up to the first gap.  Tests
- *   therefore use individual reads starting at the exact offset of each record.
- *
- * Note on RocksDB ack-store and gaps:
- *   The ACK-time RocksDB write path also uses storage.read(), so it suffers the
- *   same gap limitation: only the first record in a gapped batch is written to
- *   the ack-store.  The assertion below therefore only checks the single record
- *   that was delivered after reconnect (offset 50000), which has no gap.
+ * Note on storage.read() and gaps (fixed in BUG-1):
+ *   storage.read() previously stopped at the first offset gap, returning only the
+ *   record at offset 1 for a batch of [1, 100, 1000].  The fix in Segment.java
+ *   makes readRecordAtOffset() return the record at the next available offset
+ *   rather than null, so readWithSizeLimit() now traverses through gaps correctly.
+ *   Tests therefore assert all three gapped records are in the RocksDB ack-store.
  */
 class GappedOffsetJourneySpec extends BrokerSystemTestSupport {
 
@@ -122,9 +117,12 @@ class GappedOffsetJourneySpec extends BrokerSystemTestSupport {
             assert r.data == '{"i":50000}'
         }
 
-        and: "RocksDB ack-store contains the post-reconnect record (single-record batch — no gap in write path)"
+        and: "RocksDB ack-store contains all four records — gapped batch writes now traverse gaps correctly (BUG-1 fixed)"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert ackStore.get('prices-v1', 'system-test-group', 'sparse-1')     != null
+            assert ackStore.get('prices-v1', 'system-test-group', 'sparse-100')   != null
+            assert ackStore.get('prices-v1', 'system-test-group', 'sparse-1000')  != null
             assert ackStore.get('prices-v1', 'system-test-group', 'sparse-50000') != null
         }
 

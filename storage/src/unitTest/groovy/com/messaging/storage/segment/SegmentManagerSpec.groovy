@@ -135,6 +135,44 @@ class SegmentManagerSpec extends Specification {
         manager?.close()
     }
 
+    def "readWithSizeLimit returns all records across offset gaps"() {
+        given: "a segment manager with records at widely-spaced offsets (1, 100, 1000)"
+        def manager = newManager("gap-topic", 10 * 1024 * 1024L)
+        manager.append(createRecord(1L,    "sparse-1",    "d1"))
+        manager.append(createRecord(100L,  "sparse-100",  "d100"))
+        manager.append(createRecord(1000L, "sparse-1000", "d1000"))
+
+        when: "reading from offset 0 — all three records should be returned despite the gaps"
+        def records = manager.read(0L, 10)
+
+        then: "all three records are returned, in offset order"
+        records.size() == 3
+        records[0].getOffset() == 1L
+        records[0].getMsgKey() == "sparse-1"
+        records[1].getOffset() == 100L
+        records[1].getMsgKey() == "sparse-100"
+        records[2].getOffset() == 1000L
+        records[2].getMsgKey() == "sparse-1000"
+
+        when: "reading from an offset that falls inside a gap (e.g. offset 2)"
+        def fromGap = manager.read(2L, 10)
+
+        then: "records after the gap (100 and 1000) are returned — gap is skipped"
+        fromGap.size() == 2
+        fromGap[0].getOffset() == 100L
+        fromGap[1].getOffset() == 1000L
+
+        when: "reading from the exact offset of the last gapped record"
+        def fromLast = manager.read(1000L, 10)
+
+        then: "only the last record is returned"
+        fromLast.size() == 1
+        fromLast[0].getOffset() == 1000L
+
+        cleanup:
+        manager?.close()
+    }
+
     private SegmentManager newManager(String topic, long maxSize) {
         def partitionDir = tempDir.resolve(topic).resolve("partition-0")
         def metadataStore = new SegmentMetadataStore(tempDir.resolve(topic))
