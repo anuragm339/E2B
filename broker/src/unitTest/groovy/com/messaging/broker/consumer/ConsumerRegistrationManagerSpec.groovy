@@ -71,6 +71,53 @@ class ConsumerRegistrationManagerSpec extends Specification {
         1 * localTracker.updateOffset(_, 100L)
     }
 
+    def "registerConsumer corrects negative offset to earliest available offset"() {
+        // Branch (b): restoredOffset < 0 — e.g. a corrupted properties file written -1.
+        // validateAndCorrectOffset() calls storage.getEarliestOffset() and resets to it,
+        // preventing the consumer from polling from an invalid position.
+        given:
+        def localStorage = Mock(StorageEngine) {
+            getCurrentOffset("prices-v1", 0) >> 50L
+            getEarliestOffset("prices-v1", 0) >> 10L
+        }
+        def localTracker = Mock(ConsumerOffsetTracker) {
+            getOffset(_) >> -1L   // corrupted / uninitialised persisted offset
+        }
+        def localManager = new ConsumerRegistrationManager(
+                new InMemoryConsumerSessionStore(), localTracker, localStorage, metrics, consumerLogger)
+
+        when:
+        def result = localManager.registerConsumer("client-1", "prices-v1", "group-a", false, "trace-1")
+
+        then:
+        result.isNew()
+        result.consumer().currentOffset == 10L          // corrected to earliest
+        1 * localTracker.updateOffset(_, 10L)           // persisted so it survives the next restart
+    }
+
+    def "registerConsumer falls back to restored offset when storage validation throws"() {
+        // Branch (c): storage.getCurrentOffset() throws (e.g. disk error during startup).
+        // The exception is caught; the consumer is registered with whatever offset was
+        // previously persisted, rather than blocking registration entirely.
+        given:
+        def localStorage = Mock(StorageEngine) {
+            getCurrentOffset("prices-v1", 0) >> { throw new RuntimeException("disk-error") }
+        }
+        def localTracker = Mock(ConsumerOffsetTracker) {
+            getOffset(_) >> 42L   // last persisted offset before the disk error
+        }
+        def localManager = new ConsumerRegistrationManager(
+                new InMemoryConsumerSessionStore(), localTracker, localStorage, metrics, consumerLogger)
+
+        when:
+        def result = localManager.registerConsumer("client-1", "prices-v1", "group-a", false, "trace-1")
+
+        then:
+        result.isNew()
+        result.consumer().currentOffset == 42L    // restored offset returned unchanged
+        0 * localTracker.updateOffset(_, _)       // no correction written — we don't know the right value
+    }
+
     def "unregisterConsumer removes all entries for that clientId"() {
         given:
         manager.registerConsumer("client-1", "prices-v1", "group-a", false, "t1")
