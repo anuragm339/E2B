@@ -183,7 +183,7 @@ class BatchDeliveryServiceSpec extends Specification {
         1 * metrics.recordConsumerRetry("client-1", "prices-v1", "group-a")
         1 * metrics.recordBatchSize(2)
         1 * stateService.setPendingOffset(deliveryKey, 5L)
-        1 * stateService.setFromOffset(deliveryKey, 0L)
+        1 * stateService.setFromOffset(deliveryKey, 4L)
         1 * stateService.recordTraceId(deliveryKey, _ as String)
         1 * metrics.startPendingAck("prices-v1", "group-a")
         1 * stateService.recordBatchSendTime(deliveryKey, _ as Long)

@@ -770,6 +770,56 @@ class RefreshCoordinatorSpec extends Specification {
         coordinator.shutdown()
     }
 
+    def "concurrent startRefresh for the same topic cancels the in-progress refresh and starts a new one"() {
+        given: "a real initiator so the coordinator actually puts a context into activeRefreshes"
+        def remoteConsumers = Stub(ConsumerRegistry) {
+            getGroupTopicIdentifiers(_ as String) >> (["groupA:topic"] as Set)
+            broadcastResetToTopic(_ as String) >> { }
+        }
+        def pipeConnector = Mock(PipeConnector)
+        def metrics = Mock(DataRefreshMetrics) {
+            resetMetricsForNewRefresh() >> { }
+            recordRefreshStarted(_ as String, _ as String, _ as String) >> { }
+            recordResetSent(_ as String, _ as String, _ as String) >> { }
+        }
+        def stateStore = Mock(RefreshStateStore) {
+            loadAllRefreshes() >> ([:] as Map)
+            saveState(_ as RefreshContext) >> { }
+        }
+        def refreshLogger = Mock(RefreshEventLogger)
+
+        def stateMachine = new RefreshStateMachine()
+        def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
+        def ackStoreMock = Mock(RocksDbAckStore)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
+        def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
+        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
+        def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
+
+        def gatePolicy = Mock(RefreshGatePolicy)
+        def batchDeliveryService = Mock(BatchDeliveryService)
+        def coordinator = new RefreshCoordinator(initiationService, resetService, replayService, readyService, recoveryService, stateMachine, gatePolicy, batchDeliveryService, remoteConsumers)
+
+        and: "first refresh is started and sits in RESET_SENT"
+        def firstResult = coordinator.startRefresh("topic").get(2, TimeUnit.SECONDS)
+        def firstRefreshId = coordinator.getRefreshIdForTopic("topic")
+        assert firstResult.state == RefreshState.RESET_SENT
+
+        when: "startRefresh is called again for the same topic while still in RESET_SENT"
+        def secondResult = coordinator.startRefresh("topic").get(2, TimeUnit.SECONDS)
+
+        then: "the second call succeeds and replaces the first — new context is in RESET_SENT"
+        secondResult.isSuccess()
+        secondResult.state == RefreshState.RESET_SENT
+        coordinator.getRefreshStatus("topic") != null
+
+        and: "the refresh is still active (new context installed) and the coordinator is not left with stale state"
+        coordinator.isRefreshActive("topic")
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
     def "shutdown with no active refreshes completes cleanly"() {
         given:
         def coordinator = new RefreshCoordinator(
