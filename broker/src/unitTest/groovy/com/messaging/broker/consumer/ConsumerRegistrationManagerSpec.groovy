@@ -52,7 +52,7 @@ class ConsumerRegistrationManagerSpec extends Specification {
 
     def "registerConsumer clamps offset above storage head"() {
         given:
-        // Use a fresh mock for storage so it returns 100 for this test without fighting setup()
+        // restoredOffset=999 is strictly beyond storageHead+1 (101), so it is clamped.
         def localStorage = Mock(com.messaging.common.api.StorageEngine) {
             getCurrentOffset("prices-v1", 0) >> 100L
         }
@@ -69,6 +69,30 @@ class ConsumerRegistrationManagerSpec extends Specification {
         result.isNew()
         result.consumer().currentOffset == 100L
         1 * localTracker.updateOffset(_, 100L)
+    }
+
+    def "registerConsumer does NOT clamp offset when consumer is exactly caught up to storage head"() {
+        // Regression test: consumer offsets use "next-to-deliver" semantics (lastProcessed + 1).
+        // If storageHead=5 (last stored offset), a committed consumer offset of 6 is valid —
+        // the consumer has processed everything and is waiting for the next record.
+        // Before the fix, 6 > 5 triggered clamping to 5, causing re-delivery of offset 5.
+        given:
+        def localStorage = Mock(com.messaging.common.api.StorageEngine) {
+            getCurrentOffset("prices-v1", 0) >> 5L   // last stored offset = 5
+        }
+        def localTracker = Mock(ConsumerOffsetTracker) {
+            getOffset(_) >> 6L   // nextOffset = lastProcessed(5) + 1 — fully caught up
+        }
+        def localManager = new ConsumerRegistrationManager(
+                new InMemoryConsumerSessionStore(), localTracker, localStorage, metrics, consumerLogger)
+
+        when:
+        def result = localManager.registerConsumer("client-1", "prices-v1", "group-a", false, "trace-1")
+
+        then:
+        result.isNew()
+        result.consumer().currentOffset == 6L   // NOT clamped — 6 > 5+1 is false
+        0 * localTracker.updateOffset(_, _)     // no correction written
     }
 
     def "registerConsumer corrects negative offset to earliest available offset"() {

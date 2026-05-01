@@ -8,6 +8,9 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
+import java.util.Map;
+
 /**
  * Tracks and persists consumer offsets to disk.
  */
@@ -51,6 +54,22 @@ public class ConsumerOffsetTracker {
      */
     public void updateOffset(String consumerId, long offset) {
         repository.put(consumerId, String.valueOf(offset));
+    }
+
+    /**
+     * Return all committed offsets keyed by "group:topic".
+     */
+    public Map<String, Long> getAllOffsets() {
+        Map<String, String> raw = repository.getAll();
+        Map<String, Long> result = new HashMap<>(raw.size());
+        for (Map.Entry<String, String> e : raw.entrySet()) {
+            try {
+                result.put(e.getKey(), Long.parseLong(e.getValue()));
+            } catch (NumberFormatException ignored) {
+                // skip malformed entries
+            }
+        }
+        return result;
     }
 
     /**

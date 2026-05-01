@@ -173,6 +173,89 @@ class SegmentManagerSpec extends Specification {
         manager?.close()
     }
 
+    // ── Edge cases and missing branches ─────────────────────────────────────
+
+    def "getCurrentOffset returns -1 when manager has no segments"() {
+        // Branch: active == null and segments.isEmpty() → return -1
+        given: "a fresh segment manager with no data"
+        def manager = newManager("empty-offset-topic", 10 * 1024 * 1024L)
+
+        expect:
+        manager.getCurrentOffset() == -1L
+
+        cleanup:
+        manager?.close()
+    }
+
+    def "getEarliestOffset returns 0 when no segments exist"() {
+        // Branch: segments.isEmpty() → return 0
+        given:
+        def manager = newManager("empty-earliest-topic", 10 * 1024 * 1024L)
+
+        expect:
+        manager.getEarliestOffset() == 0L
+
+        cleanup:
+        manager?.close()
+    }
+
+    def "getBatch returns empty batch when fromOffset is beyond storage head"() {
+        // Branch: fromOffset > storageHead → return empty BatchFileRegion
+        given:
+        def manager = newManager("beyond-head-topic", 10 * 1024 * 1024L)
+        manager.append(createRecord(0L, "key", "data"))
+
+        when:
+        def batch = manager.getBatch(9999L, 1024 * 1024L)
+
+        then:
+        batch.getRecordCount() == 0
+
+        cleanup:
+        batch?.close()
+        manager?.close()
+    }
+
+    def "getBatch resets fromOffset to earliestBase when consumer is behind compacted data"() {
+        // Branch: fromOffset < earliestBase → log warning and reset fromOffset to earliestBase,
+        // then continue delivering from that position (does NOT return empty).
+        given:
+        def logRecordSize = calculateLogRecordSize("k", "d")
+        def maxSize = (LOG_HEADER_SIZE + (logRecordSize * 3)) as long
+        def manager = newManager("before-earliest-topic", maxSize)
+
+        and: "force rollover so the first segment base offset is > 0"
+        10.times { i -> manager.append(createRecord((long) i, "k", "d")) }
+        def earliestBase = manager.getEarliestOffset()
+
+        when: "request a batch from offset = -1, which is below earliestBase"
+        def batch = manager.getBatch(-1L, 1024 * 1024L)
+
+        then: "batch starts from earliestBase (not -1), data is returned"
+        batch.getFirstOffset() >= earliestBase   // reset to earliest, not empty
+        batch.getRecordCount() > 0
+
+        cleanup:
+        batch?.close()
+        manager?.close()
+    }
+
+    def "read returns empty list when fromOffset is beyond all stored data"() {
+        // Branch: active != null && fromOffset >= active.getNextOffset() → "No data at or after this offset"
+        given:
+        def manager = newManager("beyond-data-topic", 10 * 1024 * 1024L)
+        manager.append(createRecord(0L, "only-key", "data"))
+
+        when:
+        def records = manager.read(9999L, 10)
+
+        then:
+        records.isEmpty()
+
+        cleanup:
+        manager?.close()
+    }
+
     private SegmentManager newManager(String topic, long maxSize) {
         def partitionDir = tempDir.resolve(topic).resolve("partition-0")
         def metadataStore = new SegmentMetadataStore(tempDir.resolve(topic))

@@ -332,7 +332,6 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
             metrics.recordConsumerFailure(consumer.getClientId(), consumer.getTopic(), consumer.getGroup());
             inFlight.set(false);
-            stateService.clearFromOffset(deliveryKey);  // clear regardless of permanent/transient failure
 
             // Revert offset reservation on error
             consumer.setCurrentOffset(startOffset);
@@ -344,6 +343,9 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             boolean isPermanentFailure = consumer.getConsecutiveFailures() >= MAX_CONSECUTIVE_FAILURES;
 
             if (isPermanentFailure) {
+                // Permanent failure: clear both pendingOffset and fromOffset.
+                // The consumer will be unregistered; no ACK can arrive.
+                stateService.clearFromOffset(deliveryKey);
                 stateService.clearPendingOffset(deliveryKey);
                 stateService.recordBatchSendTime(deliveryKey, 0);
                 stateService.clearTraceId(deliveryKey);

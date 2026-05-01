@@ -101,6 +101,15 @@ abstract class BrokerSystemTestSupport extends Specification {
             'data-refresh.enabled'                   : 'false',
             // Suppress test-consumer beans (GenericConsumerHandler/@Consumer) in broker context
             'consumer.legacy.enabled'                : 'true',
+            // Explicitly configure legacy-clients so the broker context has the right mapping
+            // regardless of which application.yml is loaded first from the multi-module classpath.
+            'legacy-clients.enabled'                                : 'true',
+            'legacy-clients.service-topics.price-quote-service[0]' : 'prices-v1',
+            'legacy-clients.service-topics.price-quote-service[1]' : 'reference-data-v5',
+            'legacy-clients.service-topics.price-quote-service[2]' : 'non-promotable-products',
+            'legacy-clients.service-topics.price-quote-service[3]' : 'prices-v4',
+            'legacy-clients.service-topics.price-quote-service[4]' : 'minimum-price',
+            'legacy-clients.service-topics.price-quote-service[5]' : 'deposit',
         ]
     }
 

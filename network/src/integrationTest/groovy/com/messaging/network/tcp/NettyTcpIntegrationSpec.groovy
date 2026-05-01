@@ -509,6 +509,7 @@ class NettyTcpIntegrationSpec extends Specification {
             @Override String  getTopic()       { topic }
             @Override int     getRecordCount() { rc }
             @Override long    getTotalBytes()  { bytes.length }
+            @Override long    getFirstOffset() { 0L }
             @Override long    getLastOffset()  { rc - 1L }
             @Override boolean isEmpty()        { rc == 0 }
             @Override

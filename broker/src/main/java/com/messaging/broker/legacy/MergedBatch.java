@@ -43,6 +43,7 @@ public class MergedBatch {
      * Add a message to the batch and track its topic's max offset
      */
     public void add(String topic, MessageRecord msg) {
+        msg.setTopic(topic);  // ensure topic survives into BatchAckService.handleLegacyBatchAck()
         messages.add(msg);
         long msgBytes = estimateMessageSize(msg);
         totalBytes += msgBytes;

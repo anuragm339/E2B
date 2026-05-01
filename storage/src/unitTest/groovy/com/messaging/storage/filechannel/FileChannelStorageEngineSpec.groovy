@@ -185,6 +185,86 @@ class FileChannelStorageEngineSpec extends Specification {
         engine?.close()
     }
 
+    // ── Null-manager branches (no data written for that topic) ───────────────
+
+    def "read returns empty list when no segments exist for topic"() {
+        given:
+        def engine = newEngine(tempDir, 1024 * 1024L)
+
+        when:
+        def records = engine.read('unknown-topic', 0, 0L, 10)
+
+        then:
+        records.isEmpty()
+
+        cleanup:
+        engine?.close()
+    }
+
+    def "getBatch returns empty batch when no segments exist for topic"() {
+        given:
+        def engine = newEngine(tempDir, 1024 * 1024L)
+
+        when:
+        def batch = engine.getBatch('unknown-topic', 0, 0L, 1024)
+
+        then:
+        batch != null
+        batch.recordCount == 0
+
+        cleanup:
+        engine?.close()
+    }
+
+    def "getCurrentOffset returns -1 when no segments exist for topic"() {
+        given:
+        def engine = newEngine(tempDir, 1024 * 1024L)
+
+        expect:
+        engine.getCurrentOffset('unknown-topic', 0) == -1L
+
+        cleanup:
+        engine?.close()
+    }
+
+    def "getEarliestOffset returns 0 when no segments exist for topic"() {
+        given:
+        def engine = newEngine(tempDir, 1024 * 1024L)
+
+        expect:
+        engine.getEarliestOffset('unknown-topic', 0) == 0L
+
+        cleanup:
+        engine?.close()
+    }
+
+    def "getMaxOffsetFromMetadata returns -1 when no segments exist for topic"() {
+        given:
+        def engine = newEngine(tempDir, 1024 * 1024L)
+
+        expect:
+        engine.getMaxOffsetFromMetadata('unknown-topic', 0) == -1L
+
+        cleanup:
+        engine?.close()
+    }
+
+    def "recover creates data directory when it does not exist"() {
+        given:
+        def nonExistentDir = tempDir.resolve('new-data-dir')
+        def engine = newEngine(nonExistentDir, 1024 * 1024L)
+
+        when:
+        engine.recover()
+
+        then:
+        noExceptionThrown()
+        nonExistentDir.toFile().exists()
+
+        cleanup:
+        engine?.close()
+    }
+
     private static FileChannelStorageEngine newEngine(Path dataDir, long maxSegmentSize) {
         def watermarkTracker = new StorageWatermarkTracker()
         def metadataFactory = new SegmentMetadataStoreFactory(dataDir.toString())

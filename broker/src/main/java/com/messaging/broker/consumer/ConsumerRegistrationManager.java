@@ -95,7 +95,12 @@ public class ConsumerRegistrationManager implements ConsumerRegistrationService 
         try {
             long storageHead = storage.getCurrentOffset(deliveryKey.topic(), 0);
 
-            if (restoredOffset > storageHead) {
+            // Consumer offsets use "next-to-deliver" semantics (lastProcessed + 1), while
+            // getCurrentOffset() returns the LAST stored offset. A restored offset equal to
+            // storageHead + 1 means the consumer is fully caught up — this is valid and must
+            // NOT be clamped. Only clamp when the restored offset is strictly beyond the next
+            // writable position (storageHead + 1), which would indicate a corrupted offset file.
+            if (restoredOffset > storageHead + 1) {
                 LogContext context = LogContext.builder()
                         .traceId(traceId)
                         .topic(deliveryKey.topic())

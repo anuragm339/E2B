@@ -156,14 +156,20 @@ public class BatchAckService implements ConsumerAckService {
             offsetTracker.updateOffset(group + ":" + topic, committedOffset);
         }
 
-        // Clear in-flight status
+        // Capture fromOffset BEFORE clearing in-flight to prevent race: once clearInFlight() fires,
+        // the delivery scheduler can immediately start the next batch and overwrite fromOffset via
+        // setFromOffset(). Capturing first ensures we read this batch's window, not the next one's.
+        Long capturedFromOffset = stateService.getFromOffset(deliveryKey);
+        stateService.clearFromOffset(deliveryKey);  // clear before async task to prevent leak
+
+        // Clear in-flight status (opens the delivery race window — fromOffset already captured above)
         stateService.recordBatchSendTime(deliveryKey, 0);
         stateService.clearInFlight(deliveryKey);
         stateService.clearTraceId(deliveryKey);
 
-        // Async RocksDB write: re-read batch from storage to extract msgKeys
-        Long capturedFromOffset = stateService.getFromOffset(deliveryKey);
-        stateService.clearFromOffset(deliveryKey);  // clear before async task to prevent leak
+        // Async RocksDB write: re-read batch from storage to extract msgKeys.
+        // Uses a loop in chunks of 500 because storage.read() has a 1MB internal size limit —
+        // a single read call may return fewer records than the batch contains when records are large.
         if (capturedFromOffset != null) {
             final long fromOffsetSnap = capturedFromOffset;
             final long toOffsetSnap = committedOffset;
@@ -171,23 +177,29 @@ public class BatchAckService implements ConsumerAckService {
             final String groupSnap = group;
             final long ackReceiveTimeSnap = ackReceiveTime;
             storageExecutor.execute(() -> {
-                int maxRecords = (int) Math.min(toOffsetSnap - fromOffsetSnap, 10_000);
-                if (maxRecords <= 0) return;
+                if (toOffsetSnap <= fromOffsetSnap) return;
                 try {
-                    List<MessageRecord> records = storage.read(topicSnap, 0, fromOffsetSnap, maxRecords);
-                    if (records.isEmpty()) return;
+                    List<String> topicList = new ArrayList<>();
+                    List<String> groupList = new ArrayList<>();
+                    List<String> keyList = new ArrayList<>();
+                    List<AckRecord> ackList = new ArrayList<>();
 
-                    List<String> topicList = new ArrayList<>(records.size());
-                    List<String> groupList = new ArrayList<>(records.size());
-                    List<String> keyList = new ArrayList<>(records.size());
-                    List<AckRecord> ackList = new ArrayList<>(records.size());
+                    long currentOffset = fromOffsetSnap;
+                    while (currentOffset < toOffsetSnap) {
+                        int chunkSize = (int) Math.min(toOffsetSnap - currentOffset, 500);
+                        List<MessageRecord> chunk = storage.read(topicSnap, 0, currentOffset, chunkSize);
+                        if (chunk.isEmpty()) break;
 
-                    for (MessageRecord r : records) {
-                        if (r.getMsgKey() == null) continue;
-                        topicList.add(topicSnap);
-                        groupList.add(groupSnap);
-                        keyList.add(r.getMsgKey());
-                        ackList.add(new AckRecord(r.getOffset(), ackReceiveTimeSnap));
+                        for (MessageRecord r : chunk) {
+                            if (r.getOffset() >= toOffsetSnap) break;
+                            if (r.getMsgKey() == null) continue;
+                            topicList.add(topicSnap);
+                            groupList.add(groupSnap);
+                            keyList.add(r.getMsgKey());
+                            ackList.add(new AckRecord(r.getOffset(), ackReceiveTimeSnap));
+                        }
+
+                        currentOffset = chunk.get(chunk.size() - 1).getOffset() + 1;
                     }
 
                     if (!topicList.isEmpty()) {

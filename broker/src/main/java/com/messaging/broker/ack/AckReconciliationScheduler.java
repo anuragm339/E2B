@@ -1,5 +1,6 @@
 package com.messaging.broker.ack;
 
+import com.messaging.broker.consumer.ConsumerOffsetTracker;
 import com.messaging.broker.consumer.ConsumerRegistrationService;
 import com.messaging.broker.consumer.RemoteConsumer;
 import com.messaging.broker.monitoring.BrokerMetrics;
@@ -32,6 +33,7 @@ public class AckReconciliationScheduler {
     private final StorageEngine storage;
     private final RocksDbAckStore ackStore;
     private final BrokerMetrics metrics;
+    private final ConsumerOffsetTracker offsetTracker;
     private final boolean enabled;
     private final boolean autoSyncEnabled;
 
@@ -40,19 +42,21 @@ public class AckReconciliationScheduler {
             StorageEngine storage,
             RocksDbAckStore ackStore,
             BrokerMetrics metrics,
+            ConsumerOffsetTracker offsetTracker,
             @Value("${ack-store.reconciliation.enabled:true}") boolean enabled,
             @Value("${ack-store.reconciliation.auto-sync-enabled:false}") boolean autoSyncEnabled) {
         this.registrationService = registrationService;
         this.storage = storage;
         this.ackStore = ackStore;
         this.metrics = metrics;
+        this.offsetTracker = offsetTracker;
         this.enabled = enabled;
         this.autoSyncEnabled = autoSyncEnabled;
     }
 
     @Scheduled(
-            fixedDelay  = "${ack-store.reconciliation.interval:5m}",
-            initialDelay = "${ack-store.reconciliation.initial-delay:2m}")
+            fixedDelay  = "${ack-store.reconciliation.interval:14m}",
+            initialDelay = "${ack-store.reconciliation.initial-delay:10m}")
     public void reconcile() {
         if (!enabled) {
             return;
@@ -72,28 +76,36 @@ public class AckReconciliationScheduler {
 
         for (Map.Entry<String, Set<String>> entry : topicToGroups.entrySet()) {
             String topic = entry.getKey();
-
-            // Determine range: earliest offset → current head (exclusive, i.e., active segment boundary)
             long earliestOffset = storage.getEarliestOffset(topic, 0);
-            long headOffset = storage.getCurrentOffset(topic, 0);
-            if (headOffset <= earliestOffset) {
-                continue;  // no sealed data
-            }
 
             for (String group : entry.getValue()) {
-                reconcileTopicGroup(topic, group, earliestOffset, headOffset);
+                // Use the consumer's committed offset as the upper scan bound.
+                // Records at or after committedOffset are either in-flight or undelivered —
+                // they cannot be expected to have ACK entries yet.
+                long committedOffset = offsetTracker.getOffset(group + ":" + topic);
+                if (committedOffset <= earliestOffset) {
+                    continue;  // consumer has not consumed anything yet
+                }
+                reconcileTopicGroup(topic, group, earliestOffset, committedOffset);
             }
         }
     }
 
-    private void reconcileTopicGroup(String topic, String group, long earliestOffset, long headOffset) {
+    private void reconcileTopicGroup(String topic, String group, long earliestOffset, long committedOffset) {
         long missingCount = 0;
         long minMissingOffset = Long.MAX_VALUE;
         long maxMissingOffset = Long.MIN_VALUE;
         long offset = earliestOffset;
 
+        // Collect missing records for backfill (only populated when autoSyncEnabled)
+        List<String> backfillTopics  = autoSyncEnabled ? new ArrayList<>() : null;
+        List<String> backfillGroups  = autoSyncEnabled ? new ArrayList<>() : null;
+        List<String> backfillKeys    = autoSyncEnabled ? new ArrayList<>() : null;
+        List<AckRecord> backfillAcks = autoSyncEnabled ? new ArrayList<>() : null;
+        long now = System.currentTimeMillis();
+
         outer:
-        while (offset < headOffset) {
+        while (offset < committedOffset) {
             List<MessageRecord> records;
             try {
                 records = storage.read(topic, 0, offset, BATCH_SIZE);
@@ -110,8 +122,8 @@ public class AckReconciliationScheduler {
                 if (r.getMsgKey() == null) {
                     continue;
                 }
-                if (r.getOffset() >= headOffset) {
-                    // Reached active segment boundary — stop
+                if (r.getOffset() >= committedOffset) {
+                    // Past the committed boundary — consumer hasn't ACKed these yet
                     break outer;
                 }
                 AckRecord ackRecord = ackStore.get(topic, group, r.getMsgKey());
@@ -119,6 +131,12 @@ public class AckReconciliationScheduler {
                     missingCount++;
                     if (r.getOffset() < minMissingOffset) minMissingOffset = r.getOffset();
                     if (r.getOffset() > maxMissingOffset) maxMissingOffset = r.getOffset();
+                    if (autoSyncEnabled) {
+                        backfillTopics.add(topic);
+                        backfillGroups.add(group);
+                        backfillKeys.add(r.getMsgKey());
+                        backfillAcks.add(new AckRecord(r.getOffset(), now));
+                    }
                 }
             }
 
@@ -133,9 +151,18 @@ public class AckReconciliationScheduler {
             metrics.updateReconciliationGapOffsets(topic, group, minMissingOffset, maxMissingOffset);
             log.warn("Reconciliation WARNING: topic={} group={} missing={} offsetRange=[{}, {}]",
                     topic, group, missingCount, minMissingOffset, maxMissingOffset);
-            if (autoSyncEnabled) {
-                // TODO: trigger re-delivery of missing keys (future iteration)
-                log.debug("Auto-sync is enabled but not yet implemented for topic={} group={}", topic, group);
+            if (autoSyncEnabled && !backfillKeys.isEmpty()) {
+                try {
+                    ackStore.putBatch(
+                            backfillTopics.toArray(new String[0]),
+                            backfillGroups.toArray(new String[0]),
+                            backfillKeys.toArray(new String[0]),
+                            backfillAcks.toArray(new AckRecord[0]));
+                    log.info("Reconciliation auto-sync: backfilled {} missing keys for topic={} group={}",
+                            backfillKeys.size(), topic, group);
+                } catch (Exception e) {
+                    log.warn("Reconciliation auto-sync: backfill write failed for topic={} group={}", topic, group, e);
+                }
             }
         } else {
             // Consistent — clear the gap markers back to sentinel -1
