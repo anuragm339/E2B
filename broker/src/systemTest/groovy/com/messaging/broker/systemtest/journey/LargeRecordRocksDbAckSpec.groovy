@@ -102,9 +102,9 @@ class LargeRecordRocksDbAckSpec extends BrokerSystemTestSupport {
         """
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 20, delay: 0.5).eventually {
-            assert ackStore.get('prices-v1', 'system-test-group', 'lrg-a') != null, 'lrg-a missing from RocksDB'
-            assert ackStore.get('prices-v1', 'system-test-group', 'lrg-b') != null, 'lrg-b missing from RocksDB'
-            assert ackStore.get('prices-v1', 'system-test-group', 'lrg-c') != null, 'lrg-c missing from RocksDB'
+            assert ackStore.get('prices-v1', 'system-test-group', 7000L) != null, 'offset 7000 (lrg-a) missing from RocksDB'
+            assert ackStore.get('prices-v1', 'system-test-group', 7001L) != null, 'offset 7001 (lrg-b) missing from RocksDB'
+            assert ackStore.get('prices-v1', 'system-test-group', 7002L) != null, 'offset 7002 (lrg-c) missing from RocksDB'
         }
     }
 }

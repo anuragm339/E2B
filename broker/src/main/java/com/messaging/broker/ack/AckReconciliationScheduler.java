@@ -16,7 +16,7 @@ import java.util.*;
 
 /**
  * Periodically scans sealed-segment data and compares against the RocksDB ACK store
- * to surface any msgKeys that have never been acknowledged by a consumer.
+ * to surface any offsets that have never been acknowledged by a consumer.
  *
  * Results are exposed as a Prometheus gauge:
  *   ack_reconciliation_missing_keys{topic="...", group="..."}
@@ -100,7 +100,6 @@ public class AckReconciliationScheduler {
         // Collect missing records for backfill (only populated when autoSyncEnabled)
         List<String> backfillTopics  = autoSyncEnabled ? new ArrayList<>() : null;
         List<String> backfillGroups  = autoSyncEnabled ? new ArrayList<>() : null;
-        List<String> backfillKeys    = autoSyncEnabled ? new ArrayList<>() : null;
         List<AckRecord> backfillAcks = autoSyncEnabled ? new ArrayList<>() : null;
         long now = System.currentTimeMillis();
 
@@ -119,14 +118,11 @@ public class AckReconciliationScheduler {
             }
 
             for (MessageRecord r : records) {
-                if (r.getMsgKey() == null) {
-                    continue;
-                }
                 if (r.getOffset() >= committedOffset) {
                     // Past the committed boundary — consumer hasn't ACKed these yet
                     break outer;
                 }
-                AckRecord ackRecord = ackStore.get(topic, group, r.getMsgKey());
+                AckRecord ackRecord = ackStore.get(topic, group, r.getOffset());
                 if (ackRecord == null) {
                     missingCount++;
                     if (r.getOffset() < minMissingOffset) minMissingOffset = r.getOffset();
@@ -134,7 +130,6 @@ public class AckReconciliationScheduler {
                     if (autoSyncEnabled) {
                         backfillTopics.add(topic);
                         backfillGroups.add(group);
-                        backfillKeys.add(r.getMsgKey());
                         backfillAcks.add(new AckRecord(r.getOffset(), now));
                     }
                 }
@@ -151,15 +146,14 @@ public class AckReconciliationScheduler {
             metrics.updateReconciliationGapOffsets(topic, group, minMissingOffset, maxMissingOffset);
             log.warn("Reconciliation WARNING: topic={} group={} missing={} offsetRange=[{}, {}]",
                     topic, group, missingCount, minMissingOffset, maxMissingOffset);
-            if (autoSyncEnabled && !backfillKeys.isEmpty()) {
+            if (autoSyncEnabled && !backfillAcks.isEmpty()) {
                 try {
                     ackStore.putBatch(
                             backfillTopics.toArray(new String[0]),
                             backfillGroups.toArray(new String[0]),
-                            backfillKeys.toArray(new String[0]),
                             backfillAcks.toArray(new AckRecord[0]));
-                    log.info("Reconciliation auto-sync: backfilled {} missing keys for topic={} group={}",
-                            backfillKeys.size(), topic, group);
+                    log.info("Reconciliation auto-sync: backfilled {} missing offsets for topic={} group={}",
+                            backfillAcks.size(), topic, group);
                 } catch (Exception e) {
                     log.warn("Reconciliation auto-sync: backfill write failed for topic={} group={}", topic, group, e);
                 }

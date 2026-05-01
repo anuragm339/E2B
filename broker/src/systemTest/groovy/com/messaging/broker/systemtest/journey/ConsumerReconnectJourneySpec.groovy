@@ -54,10 +54,10 @@ class ConsumerReconnectJourneySpec extends BrokerSystemTestSupport {
             assert Long.parseLong(props.getProperty('system-test-group:prices-v1', '0')) > 0
         }
 
-        and: "first batch msgKeys (rec-1 through rec-3) are in RocksDB ack-store"
+        and: "first batch offsets (1-3) are in RocksDB ack-store"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert (1..3).every { i -> ackStore.get('prices-v1', 'system-test-group', "rec-${i}") != null }
+            assert (1..3).every { i -> ackStore.get('prices-v1', 'system-test-group', (long) i) != null }
         }
 
         when: "consumer disconnects"
@@ -100,9 +100,9 @@ class ConsumerReconnectJourneySpec extends BrokerSystemTestSupport {
         freshByKey['rec-5'].data == '{"i":5}'
         freshByKey['rec-6'].data == '{"i":6}'
 
-        and: "second batch msgKeys (rec-4 through rec-6) are written to RocksDB after fresh consumer ACK"
+        and: "second batch offsets (4-6) are written to RocksDB after fresh consumer ACK"
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert (4..6).every { i -> ackStore.get('prices-v1', 'system-test-group', "rec-${i}") != null }
+            assert (4..6).every { i -> ackStore.get('prices-v1', 'system-test-group', (long) i) != null }
         }
 
         cleanup:

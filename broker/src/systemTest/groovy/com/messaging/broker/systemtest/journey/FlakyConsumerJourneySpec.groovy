@@ -175,19 +175,19 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
             assert offsetTracker.getOffset('group-b:prices-v1') >= 9
         }
 
-        and: "RocksDB ack-store has all 9 records for group-b across all restart cycles"
+        and: "RocksDB ack-store has all 9 offsets for group-b across all restart cycles"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert (1..3).every { i -> ackStore.get('prices-v1', 'group-b', "init-${i}")   != null }
-            assert (4..6).every { i -> ackStore.get('prices-v1', 'group-b', "crash1-${i}") != null }
-            assert (7..9).every { i -> ackStore.get('prices-v1', 'group-b', "crash2-${i}") != null }
+            assert (1..3).every { i -> ackStore.get('prices-v1', 'group-b', (long) i) != null }   // init-1..3
+            assert (4..6).every { i -> ackStore.get('prices-v1', 'group-b', (long) i) != null }   // crash1-4..6
+            assert (7..9).every { i -> ackStore.get('prices-v1', 'group-b', (long) i) != null }   // crash2-7..9
         }
 
-        and: "group-a also has RocksDB entries for all 9 records (fan-out — A received everything)"
+        and: "group-a also has RocksDB entries for all 9 offsets (fan-out — A received everything)"
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert (1..3).every { i -> ackStore.get('prices-v1', 'group-a', "init-${i}")   != null }
-            assert (4..6).every { i -> ackStore.get('prices-v1', 'group-a', "crash1-${i}") != null }
-            assert (7..9).every { i -> ackStore.get('prices-v1', 'group-a', "crash2-${i}") != null }
+            assert (1..3).every { i -> ackStore.get('prices-v1', 'group-a', (long) i) != null }   // init-1..3
+            assert (4..6).every { i -> ackStore.get('prices-v1', 'group-a', (long) i) != null }   // crash1-4..6
+            assert (7..9).every { i -> ackStore.get('prices-v1', 'group-a', (long) i) != null }   // crash2-7..9
         }
     }
 

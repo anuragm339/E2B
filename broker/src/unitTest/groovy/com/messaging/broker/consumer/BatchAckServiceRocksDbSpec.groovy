@@ -43,7 +43,7 @@ class BatchAckServiceRocksDbSpec extends Specification {
 
     // ── Modern ACK path ───────────────────────────────────────────────────────
 
-    def "modern ACK path calls ackStore.putBatch with correct msgKeys"() {
+    def "modern ACK path calls ackStore.putBatch with correct offsets for all records"() {
         given:
         def deliveryKey = DeliveryKey.of("group1", "prices-v1")
         stateService.getTraceId(deliveryKey) >> "trace-1"
@@ -56,22 +56,21 @@ class BatchAckServiceRocksDbSpec extends Specification {
         consumer.getCurrentOffset() >> 5L
         registrationService.getConsumer(consumerKey) >> Optional.of(consumer)
 
-        // storage.read returns 3 messages starting at offset 2
+        // storage.read returns 3 messages starting at offset 2 (including null-msgKey record)
         def msg1 = new MessageRecord(2L, "prices-v1", 0, "key-A", null, null, Instant.now())
         def msg2 = new MessageRecord(3L, "prices-v1", 0, "key-B", null, null, Instant.now())
-        def msg3 = new MessageRecord(4L, "prices-v1", 0, null, null, null, Instant.now()) // null msgKey
+        def msg3 = new MessageRecord(4L, "prices-v1", 0, null,    null, null, Instant.now()) // null msgKey still written
         storage.read("prices-v1", 0, 2L, 3) >> [msg1, msg2, msg3]
         storage.getCurrentOffset("prices-v1", 0) >> 5L
 
         when:
         service.handleModernBatchAck("client-1", "prices-v1", "group1")
 
-        then:
+        then: "all 3 records (including null-msgKey) are written keyed by offset"
         1 * ackStore.putBatch(
-                { String[] t -> t.length == 2 && t[0] == "prices-v1" && t[1] == "prices-v1" },
-                { String[] g -> g[0] == "group1" && g[1] == "group1" },
-                { String[] k -> k[0] == "key-A" && k[1] == "key-B" },
-                { AckRecord[] r -> r[0].offset == 2L && r[1].offset == 3L }
+                { String[] t -> t.length == 3 && t.every { it == "prices-v1" } },
+                { String[] g -> g.length == 3 && g.every { it == "group1" } },
+                { AckRecord[] r -> r.length == 3 && r[0].offset == 2L && r[1].offset == 3L && r[2].offset == 4L }
         )
     }
 
@@ -96,21 +95,18 @@ class BatchAckServiceRocksDbSpec extends Specification {
         0 * ackStore.putBatch(*_)
     }
 
-    def "modern ACK path skips null msgKey without error"() {
-        given:
+    def "modern ACK path with no pending offset (late ACK) writes nothing to RocksDB"() {
+        given: "removePendingOffset returns null — simulates a late ACK or double ACK"
         def deliveryKey = DeliveryKey.of("group1", "prices-v1")
         stateService.getTraceId(deliveryKey) >> "trace-1"
         stateService.getBatchSendTime(deliveryKey) >> 1000L
-        stateService.getPendingOffset(deliveryKey) >> 3L
+        stateService.removePendingOffset(deliveryKey) >> null   // late ACK — method returns early
         stateService.getFromOffset(deliveryKey) >> 2L
 
         def consumerKey = ConsumerKey.of("client-1", "prices-v1", "group1")
         def consumer = Mock(RemoteConsumer)
         consumer.getCurrentOffset() >> 3L
         registrationService.getConsumer(consumerKey) >> Optional.of(consumer)
-
-        def msgNullKey = new MessageRecord(2L, "prices-v1", 0, null, null, null, Instant.now())
-        storage.read("prices-v1", 0, 2L, 1) >> [msgNullKey]
         storage.getCurrentOffset("prices-v1", 0) >> 3L
 
         when:
@@ -155,23 +151,18 @@ class BatchAckServiceRocksDbSpec extends Specification {
         when:
         service.handleModernBatchAck("client-large", "prices-v1", "group-large")
 
-        then: "putBatch is called exactly once with all 101 msgKeys from both storage reads"
+        then: "putBatch is called exactly once with all 101 AckRecords from both storage reads"
         1 * ackStore.putBatch(
             { String[] t -> t.length == 101 && t.every { it == "prices-v1" } },
             { String[] g -> g.length == 101 && g.every { it == "group-large" } },
-            { String[] k ->
-                // Verify keys from both chunks are present: first chunk ends at lk-1059,
-                // second chunk starts at lk-1060 — a single storage.read() would miss lk-1060..lk-1100
-                k.length == 101 &&
-                k[0]   == 'lk-1000' &&   // first key from first chunk
-                k[59]  == 'lk-1059' &&   // last key from first chunk (1MB cut-off point)
-                k[60]  == 'lk-1060' &&   // first key from second chunk — proves loop ran
-                k[100] == 'lk-1100'      // last key from second chunk
-            },
             { AckRecord[] r ->
+                // Offsets from both chunks must be present: first chunk ends at 1059,
+                // second chunk starts at 1060 — a single storage.read() would miss 1060..1100
                 r.length == 101 &&
-                r[0].offset   == 1000L &&
-                r[100].offset == 1100L
+                r[0].offset   == 1000L &&  // first record from first chunk
+                r[59].offset  == 1059L &&  // last record from first chunk (1MB cut-off point)
+                r[60].offset  == 1060L &&  // first record from second chunk — proves loop ran
+                r[100].offset == 1100L     // last record from second chunk
             }
         )
     }
@@ -204,7 +195,6 @@ class BatchAckServiceRocksDbSpec extends Specification {
         1 * ackStore.putBatch(
             { String[] t -> t.length == 2 },
             { String[] g -> g.length == 2 },
-            { String[] k -> k as Set == ['in-batch-1', 'in-batch-2'] as Set },
             { AckRecord[] r -> r.length == 2 && r[0].offset == 7L && r[1].offset == 8L }
         )
     }
@@ -231,16 +221,12 @@ class BatchAckServiceRocksDbSpec extends Specification {
         1 * ackStore.putBatch(
                 { String[] t -> t.length == 2 },
                 { String[] g -> g[0] == "price-quote-group" && g[1] == "price-quote-group" },
-                { String[] k -> k as Set == ["prod-001", "prod-002"] as Set },
-                _
+                { AckRecord[] r -> r.length == 2 && r[0].offset == 10L && r[1].offset == 11L }
         )
     }
 
-    def "legacy ACK path skips null msgKey without error"() {
-        given:
-        // Use a real message with a non-null key to add it to the batch,
-        // then verify the null check in our ACK code is exercised by testing
-        // that a batch with only null-key messages writes nothing to ackStore.
+    def "legacy ACK path writes all messages to RocksDB regardless of msgKey"() {
+        given: "a batch with a single null-msgKey message — still written to RocksDB keyed by offset"
         def batch = Mock(MergedBatch)
         def msgNullKey = new MessageRecord(10L, "prices-v1", 0, null, null, null, Instant.now())
         batch.getMessages() >> [msgNullKey]
@@ -259,8 +245,12 @@ class BatchAckServiceRocksDbSpec extends Specification {
         when:
         service.handleLegacyBatchAck("client-legacy", "price-quote-group")
 
-        then:
+        then: "the null-msgKey record is still written to RocksDB keyed by its offset"
         noExceptionThrown()
-        0 * ackStore.putBatch(*_)
+        1 * ackStore.putBatch(
+                { String[] t -> t.length == 1 && t[0] == "prices-v1" },
+                { String[] g -> g.length == 1 && g[0] == "price-quote-group" },
+                { AckRecord[] r -> r.length == 1 && r[0].offset == 10L }
+        )
     }
 }

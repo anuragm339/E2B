@@ -117,13 +117,13 @@ class GappedOffsetJourneySpec extends BrokerSystemTestSupport {
             assert r.data == '{"i":50000}'
         }
 
-        and: "RocksDB ack-store contains all four records — gapped batch writes now traverse gaps correctly (BUG-1 fixed)"
+        and: "RocksDB ack-store contains all four offsets — gapped batch writes now traverse gaps correctly (BUG-1 fixed)"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert ackStore.get('prices-v1', 'system-test-group', 'sparse-1')     != null
-            assert ackStore.get('prices-v1', 'system-test-group', 'sparse-100')   != null
-            assert ackStore.get('prices-v1', 'system-test-group', 'sparse-1000')  != null
-            assert ackStore.get('prices-v1', 'system-test-group', 'sparse-50000') != null
+            assert ackStore.get('prices-v1', 'system-test-group', 1L)     != null   // sparse-1
+            assert ackStore.get('prices-v1', 'system-test-group', 100L)   != null   // sparse-100
+            assert ackStore.get('prices-v1', 'system-test-group', 1000L)  != null   // sparse-1000
+            assert ackStore.get('prices-v1', 'system-test-group', 50000L) != null   // sparse-50000
         }
 
         cleanup:
