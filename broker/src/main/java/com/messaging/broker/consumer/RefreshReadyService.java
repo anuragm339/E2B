@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.ack.AckReconciliationScheduler;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.monitoring.RefreshEventLogger;
 import com.messaging.broker.consumer.ConsumerRegistry;
@@ -27,6 +28,7 @@ public class RefreshReadyService implements ReadyPhase {
     private final DataRefreshMetrics metrics;
     private final RefreshStateStore stateStore;
     private final RefreshEventLogger refreshLogger;
+    private final AckReconciliationScheduler reconciliationScheduler;
 
     // Shared state - injected by coordinator
     private Map<String, RefreshContext> activeRefreshes;
@@ -37,12 +39,14 @@ public class RefreshReadyService implements ReadyPhase {
             PipeConnector pipeConnector,
             DataRefreshMetrics metrics,
             RefreshStateStore stateStore,
-            RefreshEventLogger refreshLogger) {
+            RefreshEventLogger refreshLogger,
+            AckReconciliationScheduler reconciliationScheduler) {
         this.remoteConsumers = remoteConsumers;
         this.pipeConnector = pipeConnector;
         this.metrics = metrics;
         this.stateStore = stateStore;
         this.refreshLogger = refreshLogger;
+        this.reconciliationScheduler = reconciliationScheduler;
     }
 
     /**
@@ -192,5 +196,10 @@ public class RefreshReadyService implements ReadyPhase {
         // Clear state for this topic only
         stateStore.clearState(topic);
         log.info("Refresh state cleared for topic: {}", topic);
+
+        // Resume reconciliation for this topic now that RocksDB is fully re-populated.
+        // The checkpoint was cleared when the refresh started (pauseForTopic), so the
+        // first post-refresh run will do a full scan to verify all replayed ACK entries.
+        reconciliationScheduler.resumeForTopic(topic);
     }
 }
