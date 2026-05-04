@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.ack.AckReconciliationScheduler;
 import com.messaging.broker.ack.RocksDbAckStore;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.monitoring.RefreshEventLogger;
@@ -24,22 +25,30 @@ public class RefreshResetService implements ResetPhase {
     private final RefreshStateStore stateStore;
     private final RefreshEventLogger refreshLogger;
     private final RocksDbAckStore ackStore;
+    private final AckReconciliationScheduler reconciliationScheduler;
 
     public RefreshResetService(
             ConsumerRegistry remoteConsumers,
             DataRefreshMetrics metrics,
             RefreshStateStore stateStore,
             RefreshEventLogger refreshLogger,
-            RocksDbAckStore ackStore) {
+            RocksDbAckStore ackStore,
+            AckReconciliationScheduler reconciliationScheduler) {
         this.remoteConsumers = remoteConsumers;
         this.metrics = metrics;
         this.stateStore = stateStore;
         this.refreshLogger = refreshLogger;
         this.ackStore = ackStore;
+        this.reconciliationScheduler = reconciliationScheduler;
     }
 
     @Override
     public void sendReset(String topic, RefreshContext context) {
+        // Pause the reconciliation scheduler before wiping RocksDB so it never runs
+        // against a partially-cleared store. Checkpoints for this topic are also cleared
+        // so the first post-refresh run performs a full verification from scratch.
+        reconciliationScheduler.pauseForTopic(topic);
+
         // Clear RocksDB ACK records for all (group, topic) pairs being refreshed so stale
         // ACK data does not survive into the consumer state wipe / replay.
         for (String groupTopic : context.getExpectedConsumers()) {

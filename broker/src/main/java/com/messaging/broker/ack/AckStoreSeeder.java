@@ -41,7 +41,7 @@ public class AckStoreSeeder {
 
     /**
      * Scan sealed segments up to each consumer's committed offset and write
-     * synthetic ACK entries for any msgKey that has no existing RocksDB entry.
+     * synthetic ACK entries for any offset that has no existing RocksDB entry.
      *
      * Safe to call multiple times — existing entries are never overwritten.
      */
@@ -100,19 +100,17 @@ public class AckStoreSeeder {
 
             List<String> topics = new ArrayList<>();
             List<String> groups = new ArrayList<>();
-            List<String> keys = new ArrayList<>();
             List<AckRecord> acks = new ArrayList<>();
             long syntheticAckTime = System.currentTimeMillis();
 
             for (MessageRecord r : records) {
-                if (r.getMsgKey() == null || r.getOffset() >= committedOffset) {
+                if (r.getOffset() >= committedOffset) {
                     continue;
                 }
                 // Only backfill if no entry exists — never overwrite a real ACK
-                if (ackStore.get(topic, group, r.getMsgKey()) == null) {
+                if (ackStore.get(topic, group, r.getOffset()) == null) {
                     topics.add(topic);
                     groups.add(group);
-                    keys.add(r.getMsgKey());
                     acks.add(new AckRecord(r.getOffset(), syntheticAckTime));
                     seeded++;
                 }
@@ -122,7 +120,6 @@ public class AckStoreSeeder {
                 ackStore.putBatch(
                         topics.toArray(new String[0]),
                         groups.toArray(new String[0]),
-                        keys.toArray(new String[0]),
                         acks.toArray(new AckRecord[0]));
             }
 

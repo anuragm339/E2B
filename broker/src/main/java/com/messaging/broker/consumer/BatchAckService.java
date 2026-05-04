@@ -181,7 +181,6 @@ public class BatchAckService implements ConsumerAckService {
                 try {
                     List<String> topicList = new ArrayList<>();
                     List<String> groupList = new ArrayList<>();
-                    List<String> keyList = new ArrayList<>();
                     List<AckRecord> ackList = new ArrayList<>();
 
                     long currentOffset = fromOffsetSnap;
@@ -192,10 +191,8 @@ public class BatchAckService implements ConsumerAckService {
 
                         for (MessageRecord r : chunk) {
                             if (r.getOffset() >= toOffsetSnap) break;
-                            if (r.getMsgKey() == null) continue;
                             topicList.add(topicSnap);
                             groupList.add(groupSnap);
-                            keyList.add(r.getMsgKey());
                             ackList.add(new AckRecord(r.getOffset(), ackReceiveTimeSnap));
                         }
 
@@ -206,7 +203,6 @@ public class BatchAckService implements ConsumerAckService {
                         ackStore.putBatch(
                                 topicList.toArray(new String[0]),
                                 groupList.toArray(new String[0]),
-                                keyList.toArray(new String[0]),
                                 ackList.toArray(new AckRecord[0]));
                     }
                 } catch (Exception ex) {
@@ -246,27 +242,21 @@ public class BatchAckService implements ConsumerAckService {
             log.debug("Legacy batch ACK committed for clientId={}, group={}, topics={}",
                     clientId, group, batch.getMaxOffsetPerTopic());
 
-            // Write per-msgKey ACK records to RocksDB (no async needed — already on ackExecutor)
+            // Write per-offset ACK records to RocksDB (no async needed — already on ackExecutor)
             List<MessageRecord> messages = batch.getMessages();
             if (!messages.isEmpty()) {
                 List<String> topicList = new ArrayList<>(messages.size());
                 List<String> groupList = new ArrayList<>(messages.size());
-                List<String> keyList = new ArrayList<>(messages.size());
                 List<AckRecord> ackList = new ArrayList<>(messages.size());
                 for (MessageRecord r : messages) {
-                    if (r.getMsgKey() == null) continue;
                     topicList.add(r.getTopic());
                     groupList.add(group);
-                    keyList.add(r.getMsgKey());
                     ackList.add(new AckRecord(r.getOffset(), ackReceiveTime));
                 }
-                if (!topicList.isEmpty()) {
-                    ackStore.putBatch(
-                            topicList.toArray(new String[0]),
-                            groupList.toArray(new String[0]),
-                            keyList.toArray(new String[0]),
-                            ackList.toArray(new AckRecord[0]));
-                }
+                ackStore.putBatch(
+                        topicList.toArray(new String[0]),
+                        groupList.toArray(new String[0]),
+                        ackList.toArray(new AckRecord[0]));
             }
 
             // Record metrics for messages and bytes sent (NOW that ACK is received)

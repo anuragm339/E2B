@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer
 
+import com.messaging.broker.ack.AckReconciliationScheduler
 import com.messaging.broker.monitoring.DataRefreshMetrics
 import com.messaging.broker.monitoring.RefreshEventLogger
 import com.messaging.common.api.PipeConnector
@@ -7,15 +8,16 @@ import spock.lang.Specification
 
 class RefreshReadyServiceSpec extends Specification {
 
-    ConsumerRegistry remoteConsumers = Mock()
-    PipeConnector pipeConnector = Mock()
-    DataRefreshMetrics metrics = Mock()
-    RefreshStateStore stateStore = Mock()
-    RefreshEventLogger refreshLogger = Mock()
+    ConsumerRegistry           remoteConsumers         = Mock()
+    PipeConnector              pipeConnector           = Mock()
+    DataRefreshMetrics         metrics                 = Mock()
+    RefreshStateStore          stateStore              = Mock()
+    RefreshEventLogger         refreshLogger           = Mock()
+    AckReconciliationScheduler reconciliationScheduler = Mock()
     Map<String, RefreshContext> activeRefreshes = [:]
 
     RefreshReadyService service = new RefreshReadyService(
-            remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
+            remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger, reconciliationScheduler)
 
     def setup() {
         service.setSharedState(activeRefreshes, "batch-1")
@@ -109,6 +111,7 @@ class RefreshReadyServiceSpec extends Specification {
         1 * stateStore.clearState("prices-v1")
         1 * metrics.recordRefreshCompleted("prices-v1", "LOCAL", "SUCCESS", "batch-1", first)
         1 * refreshLogger.logRefreshCompleted(_)
+        1 * reconciliationScheduler.resumeForTopic("prices-v1")
         0 * pipeConnector.resumePipeCalls()
         0 * refreshLogger.logPipeResumed(_)
 
@@ -118,8 +121,25 @@ class RefreshReadyServiceSpec extends Specification {
 
         then:
         sibling.state == RefreshState.COMPLETED
+        1 * reconciliationScheduler.resumeForTopic("orders-v1")
         1 * pipeConnector.resumePipeCalls()
         1 * refreshLogger.logPipeResumed(_)
+    }
+
+    def "completeRefresh resumes reconciliation for the completed topic regardless of sibling state"() {
+        given: "a solo refresh with no sibling topics in the batch"
+        def ctx = context("prices-v1", ["group-a:prices-v1"] as Set, "batch-solo")
+        ctx.setResetSentTime(ctx.startTime)
+        activeRefreshes.put("prices-v1", ctx)
+
+        when:
+        service.completeRefresh("prices-v1", ctx)
+
+        then: "reconciliation resumed for prices-v1 (RocksDB fully re-populated by replay)"
+        1 * reconciliationScheduler.resumeForTopic("prices-v1")
+
+        and: "pipe is also resumed since this was the only topic in the batch"
+        1 * pipeConnector.resumePipeCalls()
     }
 
     private static RefreshContext context(String topic, Set<String> consumers, String refreshId) {

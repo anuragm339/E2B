@@ -76,11 +76,11 @@ class MessageDeliveryJourneySpec extends BrokerSystemTestSupport {
             assert Long.parseLong(props.getProperty('system-test-group:prices-v1', '0')) > 0
         }
 
-        and: "all 5 msgKeys are written to RocksDB ack-store (async, after ACK)"
+        and: "all 5 offsets are written to RocksDB ack-store (async, after ACK)"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             assert (1..5).every { i ->
-                def ack = ackStore.get('prices-v1', 'system-test-group', "key-${i}")
+                def ack = ackStore.get('prices-v1', 'system-test-group', (long) i)
                 ack != null && ack.offset == i
             }
         }
@@ -119,12 +119,12 @@ class MessageDeliveryJourneySpec extends BrokerSystemTestSupport {
             assert offsetTracker2.getOffset('system-test-group:prices-v1') > 0
         }
 
-        and: "all 3 msgKeys from both batches are written to RocksDB ack-store"
+        and: "all 3 offsets from both batches are written to RocksDB ack-store"
         def ackStore2 = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert ackStore2.get('prices-v1', 'system-test-group', 'batch1-a') != null
-            assert ackStore2.get('prices-v1', 'system-test-group', 'batch1-b') != null
-            assert ackStore2.get('prices-v1', 'system-test-group', 'batch2-a') != null
+            assert ackStore2.get('prices-v1', 'system-test-group', 10L) != null   // batch1-a
+            assert ackStore2.get('prices-v1', 'system-test-group', 11L) != null   // batch1-b
+            assert ackStore2.get('prices-v1', 'system-test-group', 12L) != null   // batch2-a
         }
     }
 
@@ -169,11 +169,11 @@ class MessageDeliveryJourneySpec extends BrokerSystemTestSupport {
             assert offsetTracker3.getOffset('system-test-group:prices-v1') > 0
         }
 
-        and: "both DELETE and MESSAGE msgKeys are written to RocksDB ack-store"
+        and: "both DELETE and MESSAGE offsets are written to RocksDB ack-store"
         def ackStore3 = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert ackStore3.get('prices-v1', 'system-test-group', 'del-key') != null
-            assert ackStore3.get('prices-v1', 'system-test-group', 'msg-key') != null
+            assert ackStore3.get('prices-v1', 'system-test-group', 20L) != null   // del-key
+            assert ackStore3.get('prices-v1', 'system-test-group', 21L) != null   // msg-key
         }
     }
 }

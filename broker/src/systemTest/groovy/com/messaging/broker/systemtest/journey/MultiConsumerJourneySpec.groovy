@@ -87,26 +87,26 @@ class MultiConsumerJourneySpec extends BrokerSystemTestSupport {
         and: "there is no cross-group contamination — group-b offset for prices-v1 is zero (never delivered)"
         offsetTracker.getOffset('group-b:prices-v1') == 0
 
-        and: "prices-v1 msgKeys are written to RocksDB under group-a (not group-b)"
+        and: "prices-v1 offsets are written to RocksDB under group-a (not group-b)"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert ackStore.get('prices-v1',  'group-a', 'p-1') != null
-            assert ackStore.get('prices-v1',  'group-a', 'p-2') != null
+            assert ackStore.get('prices-v1',  'group-a', 1L) != null   // p-1 at offset 1
+            assert ackStore.get('prices-v1',  'group-a', 2L) != null   // p-2 at offset 2
         }
 
-        and: "ref-data-v5 msgKeys are written to RocksDB under group-b (not group-a)"
+        and: "ref-data-v5 offsets are written to RocksDB under group-b (not group-a)"
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert ackStore.get('ref-data-v5', 'group-b', 'r-1') != null
-            assert ackStore.get('ref-data-v5', 'group-b', 'r-2') != null
-            assert ackStore.get('ref-data-v5', 'group-b', 'r-3') != null
+            assert ackStore.get('ref-data-v5', 'group-b', 3L) != null   // r-1 at offset 3
+            assert ackStore.get('ref-data-v5', 'group-b', 4L) != null   // r-2 at offset 4
+            assert ackStore.get('ref-data-v5', 'group-b', 5L) != null   // r-3 at offset 5
         }
 
         and: "cross-group RocksDB keys are absent — group-b did not ACK prices-v1"
-        ackStore.get('prices-v1', 'group-b', 'p-1') == null
-        ackStore.get('prices-v1', 'group-b', 'p-2') == null
+        ackStore.get('prices-v1', 'group-b', 1L) == null
+        ackStore.get('prices-v1', 'group-b', 2L) == null
 
         and: "cross-group RocksDB keys are absent — group-a did not ACK ref-data-v5"
-        ackStore.get('ref-data-v5', 'group-a', 'r-1') == null
+        ackStore.get('ref-data-v5', 'group-a', 3L) == null
     }
 
     private static int findFreePort() {

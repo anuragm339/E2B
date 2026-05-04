@@ -26,8 +26,8 @@ class RocksDbAckStoreSpec extends Specification {
         def record = new AckRecord(42L, 1000L)
 
         when:
-        store.put("prices-v1", "price-group", "key-001", record)
-        def result = store.get("prices-v1", "price-group", "key-001")
+        store.put("prices-v1", "price-group", 42L, record)
+        def result = store.get("prices-v1", "price-group", 42L)
 
         then:
         result != null
@@ -35,21 +35,21 @@ class RocksDbAckStoreSpec extends Specification {
         result.ackedAtMs == 1000L
     }
 
-    def "get returns null for absent key"() {
+    def "get returns null for absent offset"() {
         expect:
-        store.get("prices-v1", "price-group", "non-existent") == null
+        store.get("prices-v1", "price-group", 999L) == null
     }
 
     def "put overwrites existing entry (latest wins)"() {
         given:
-        store.put("prices-v1", "price-group", "key-001", new AckRecord(10L, 100L))
+        store.put("prices-v1", "price-group", 10L, new AckRecord(10L, 100L))
 
         when:
-        store.put("prices-v1", "price-group", "key-001", new AckRecord(99L, 999L))
-        def result = store.get("prices-v1", "price-group", "key-001")
+        store.put("prices-v1", "price-group", 10L, new AckRecord(10L, 999L))
+        def result = store.get("prices-v1", "price-group", 10L)
 
         then:
-        result.offset == 99L
+        result.offset == 10L
         result.ackedAtMs == 999L
     }
 
@@ -71,47 +71,46 @@ class RocksDbAckStoreSpec extends Specification {
         given:
         def topics   = ["t1", "t1", "t2"] as String[]
         def groups   = ["g1", "g1", "g1"] as String[]
-        def msgKeys  = ["k1", "k2", "k3"] as String[]
         def records  = [new AckRecord(1L, 10L), new AckRecord(2L, 20L), new AckRecord(3L, 30L)] as AckRecord[]
 
         when:
-        store.putBatch(topics, groups, msgKeys, records)
+        store.putBatch(topics, groups, records)
 
         then:
-        store.get("t1", "g1", "k1").offset == 1L
-        store.get("t1", "g1", "k2").offset == 2L
-        store.get("t2", "g1", "k3").offset == 3L
+        store.get("t1", "g1", 1L).offset == 1L
+        store.get("t1", "g1", 2L).offset == 2L
+        store.get("t2", "g1", 3L).offset == 3L
     }
 
-    def "putBatch silently skips null msgKeys"() {
+    def "putBatch writes all records — no null-offset filtering"() {
         given:
         def topics   = ["t1", "t1"] as String[]
         def groups   = ["g1", "g1"] as String[]
-        def msgKeys  = [null, "k2"] as String[]
-        def records  = [new AckRecord(1L, 10L), new AckRecord(2L, 20L)] as AckRecord[]
+        def records  = [new AckRecord(0L, 10L), new AckRecord(1L, 20L)] as AckRecord[]
 
         when:
-        store.putBatch(topics, groups, msgKeys, records)
+        store.putBatch(topics, groups, records)
 
         then:
         noExceptionThrown()
-        store.get("t1", "g1", "k2").offset == 2L
+        store.get("t1", "g1", 0L).offset == 0L
+        store.get("t1", "g1", 1L).offset == 1L
     }
 
     def "clearByTopicAndGroup deletes only matching entries and leaves others intact"() {
         given:
-        store.put("t1", "g1", "k1", new AckRecord(1L, 10L))
-        store.put("t1", "g1", "k2", new AckRecord(2L, 20L))
-        store.put("t1", "g2", "k3", new AckRecord(3L, 30L))   // different group
-        store.put("t2", "g1", "k4", new AckRecord(4L, 40L))   // different topic
+        store.put("t1", "g1", 1L, new AckRecord(1L, 10L))
+        store.put("t1", "g1", 2L, new AckRecord(2L, 20L))
+        store.put("t1", "g2", 3L, new AckRecord(3L, 30L))   // different group
+        store.put("t2", "g1", 4L, new AckRecord(4L, 40L))   // different topic
 
         when:
         store.clearByTopicAndGroup("t1", "g1")
 
         then:
-        store.get("t1", "g1", "k1") == null
-        store.get("t1", "g1", "k2") == null
-        store.get("t1", "g2", "k3") != null   // preserved — different group
-        store.get("t2", "g1", "k4") != null   // preserved — different topic
+        store.get("t1", "g1", 1L) == null
+        store.get("t1", "g1", 2L) == null
+        store.get("t1", "g2", 3L) != null   // preserved — different group
+        store.get("t2", "g1", 4L) != null   // preserved — different topic
     }
 }

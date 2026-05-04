@@ -18,8 +18,8 @@ import java.time.Instant
 
 /**
  * Integration tests for the ACK package:
- *   - RocksDbAckStore: put/get, putBatch, clearByTopicAndGroup, null-msgKey skip
- *   - AckReconciliationScheduler: missing-key detection and consistent-state reporting
+ *   - RocksDbAckStore: put/get, putBatch, clearByTopicAndGroup
+ *   - AckReconciliationScheduler: missing-offset detection and consistent-state reporting
  *
  * Uses a fresh temp directory; each test uses unique topic/group names.
  */
@@ -56,30 +56,30 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
         def record = new AckRecord(42L, 1_000_000L)
 
         when:
-        ackStore.put('ack-topic-1', 'ack-group-1', 'key-1', record)
+        ackStore.put('ack-topic-1', 'ack-group-1', 42L, record)
 
         then:
-        def fetched = ackStore.get('ack-topic-1', 'ack-group-1', 'key-1')
+        def fetched = ackStore.get('ack-topic-1', 'ack-group-1', 42L)
         fetched != null
         fetched.offset == 42L
         fetched.ackedAtMs == 1_000_000L
     }
 
-    def "get returns null for unknown key"() {
+    def "get returns null for unknown offset"() {
         expect:
-        ackStore.get('no-topic', 'no-group', 'no-key') == null
+        ackStore.get('no-topic', 'no-group', 999L) == null
     }
 
     def "put overwrites existing record with latest value"() {
         given:
-        ackStore.put('ack-topic-2', 'ack-group-2', 'key-ow', new AckRecord(10L, 100L))
+        ackStore.put('ack-topic-2', 'ack-group-2', 0L, new AckRecord(0L, 100L))
 
         when:
-        ackStore.put('ack-topic-2', 'ack-group-2', 'key-ow', new AckRecord(20L, 200L))
+        ackStore.put('ack-topic-2', 'ack-group-2', 0L, new AckRecord(0L, 200L))
 
         then:
-        def fetched = ackStore.get('ack-topic-2', 'ack-group-2', 'key-ow')
-        fetched.offset == 20L
+        def fetched = ackStore.get('ack-topic-2', 'ack-group-2', 0L)
+        fetched.offset == 0L
         fetched.ackedAtMs == 200L
     }
 
@@ -91,7 +91,6 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
         given:
         def topics  = ['bt-topic', 'bt-topic', 'bt-topic'] as String[]
         def groups  = ['bt-group', 'bt-group', 'bt-group'] as String[]
-        def keys    = ['k1', 'k2', 'k3'] as String[]
         def records = [
             new AckRecord(0L, 1L),
             new AckRecord(1L, 2L),
@@ -99,34 +98,34 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
         ] as AckRecord[]
 
         when:
-        ackStore.putBatch(topics, groups, keys, records)
+        ackStore.putBatch(topics, groups, records)
 
         then:
-        ackStore.get('bt-topic', 'bt-group', 'k1').offset == 0L
-        ackStore.get('bt-topic', 'bt-group', 'k2').offset == 1L
-        ackStore.get('bt-topic', 'bt-group', 'k3').offset == 2L
+        ackStore.get('bt-topic', 'bt-group', 0L).offset == 0L
+        ackStore.get('bt-topic', 'bt-group', 1L).offset == 1L
+        ackStore.get('bt-topic', 'bt-group', 2L).offset == 2L
     }
 
-    def "putBatch silently skips null msgKeys"() {
+    def "putBatch writes all records — no null-offset filtering needed"() {
         given:
         def topics  = ['null-topic', 'null-topic'] as String[]
         def groups  = ['null-group', 'null-group'] as String[]
-        def keys    = [null, 'valid-key'] as String[]
         def records = [
             new AckRecord(0L, 1L),
             new AckRecord(1L, 2L)
         ] as AckRecord[]
 
         when:
-        ackStore.putBatch(topics, groups, keys, records)
+        ackStore.putBatch(topics, groups, records)
 
-        then: "valid key stored, null key silently skipped (no exception)"
-        ackStore.get('null-topic', 'null-group', 'valid-key') != null
+        then: "both records stored — no filtering based on msgKey (key is offset)"
+        ackStore.get('null-topic', 'null-group', 0L) != null
+        ackStore.get('null-topic', 'null-group', 1L) != null
     }
 
     def "putBatch on empty arrays is a no-op"() {
         when:
-        ackStore.putBatch([] as String[], [] as String[], [] as String[], [] as AckRecord[])
+        ackStore.putBatch([] as String[], [] as String[], [] as AckRecord[])
 
         then:
         true  // no exception
@@ -138,19 +137,19 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
 
     def "clearByTopicAndGroup removes all records for the given topic+group"() {
         given:
-        ackStore.put('clear-topic', 'clear-group', 'ck1', new AckRecord(0L, 1L))
-        ackStore.put('clear-topic', 'clear-group', 'ck2', new AckRecord(1L, 2L))
-        ackStore.put('clear-topic', 'other-group', 'ck3', new AckRecord(2L, 3L))
+        ackStore.put('clear-topic', 'clear-group', 0L, new AckRecord(0L, 1L))
+        ackStore.put('clear-topic', 'clear-group', 1L, new AckRecord(1L, 2L))
+        ackStore.put('clear-topic', 'other-group', 2L, new AckRecord(2L, 3L))
 
         when:
         ackStore.clearByTopicAndGroup('clear-topic', 'clear-group')
 
         then:
-        ackStore.get('clear-topic', 'clear-group', 'ck1') == null
-        ackStore.get('clear-topic', 'clear-group', 'ck2') == null
+        ackStore.get('clear-topic', 'clear-group', 0L) == null
+        ackStore.get('clear-topic', 'clear-group', 1L) == null
 
         and: "records for a different group are untouched"
-        ackStore.get('clear-topic', 'other-group', 'ck3') != null
+        ackStore.get('clear-topic', 'other-group', 2L) != null
     }
 
     def "clearByTopicAndGroup on non-existent prefix is safe"() {
@@ -179,7 +178,7 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
                 it.topic == 'recon-topic' && it.group == 'recon-group'
             }
         }
-        assert ackStore.get('recon-topic', 'recon-group', 'recon-key') == null
+        assert ackStore.get('recon-topic', 'recon-group', 0L) == null
 
         when: "reconciliation runs manually (scheduled is disabled)"
         reconciliationScheduler.reconcile()
@@ -203,7 +202,7 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
                 it.topic == 'consist-topic' && it.group == 'consist-group'
             }
         }
-        ackStore.put('consist-topic', 'consist-group', 'consist-key',
+        ackStore.put('consist-topic', 'consist-group', 0L,
             new AckRecord(0L, System.currentTimeMillis()))
 
         when:
