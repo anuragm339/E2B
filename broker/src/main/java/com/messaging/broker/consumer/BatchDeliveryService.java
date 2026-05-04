@@ -192,7 +192,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             long nextOffset = batch.getLastOffset() + 1;
             consumer.setCurrentOffset(nextOffset);
             stateService.setPendingOffset(deliveryKey, nextOffset);
-            stateService.setFromOffset(deliveryKey, startOffset);  // persisted for ACK-time msgKey lookup
+            stateService.setFromOffset(deliveryKey, batch.getFirstOffset());  // actual first record offset, used for ACK-time RocksDB write
 
             LogContext startedContext = LogContext.builder()
                     .traceId(traceId)
@@ -225,10 +225,14 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
             ScheduledFuture<?> timeoutFuture = scheduler.schedule(() -> {
                 String timeoutTraceId = stateService.getTraceId(deliveryKey);
-                if (stateService.getPendingOffset(deliveryKey) != null) {
-                    stateService.clearPendingOffset(deliveryKey);
+                // Atomically claim ownership of the pending offset.
+                // removePendingOffset() returns non-null only once — whichever thread (ACK handler
+                // or this timeout) calls it first wins. The other gets null and is a no-op, preventing
+                // the double-revert / double-advance race between concurrent ACK and timeout paths.
+                Long claimedOffset = stateService.removePendingOffset(deliveryKey);
+                if (claimedOffset != null) {
                     stateService.clearFromOffset(deliveryKey);
-                    stateService.recordBatchSendTime(deliveryKey, 0); // Clear timestamp
+                    stateService.recordBatchSendTime(deliveryKey, 0);
 
                     long pendingDuration = System.currentTimeMillis() - pendingStartTime;
                     log.warn("event=batch_delivery.ack_timeout deliveryKey={} pendingMs={} revertFrom={} revertTo={} traceId={}",
@@ -328,7 +332,6 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
             metrics.recordConsumerFailure(consumer.getClientId(), consumer.getTopic(), consumer.getGroup());
             inFlight.set(false);
-            stateService.clearFromOffset(deliveryKey);  // clear regardless of permanent/transient failure
 
             // Revert offset reservation on error
             consumer.setCurrentOffset(startOffset);
@@ -340,6 +343,9 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             boolean isPermanentFailure = consumer.getConsecutiveFailures() >= MAX_CONSECUTIVE_FAILURES;
 
             if (isPermanentFailure) {
+                // Permanent failure: clear both pendingOffset and fromOffset.
+                // The consumer will be unregistered; no ACK can arrive.
+                stateService.clearFromOffset(deliveryKey);
                 stateService.clearPendingOffset(deliveryKey);
                 stateService.recordBatchSendTime(deliveryKey, 0);
                 stateService.clearTraceId(deliveryKey);

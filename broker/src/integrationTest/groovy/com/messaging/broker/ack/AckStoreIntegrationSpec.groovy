@@ -1,7 +1,7 @@
 package com.messaging.broker.ack
 
 import com.messaging.broker.consumer.ConsumerRegistry
-import com.messaging.broker.support.ModernConsumerHarness
+import com.messaging.broker.support.ModernConsumerClient
 import com.messaging.common.api.StorageEngine
 import com.messaging.common.model.BrokerMessage
 import com.messaging.common.model.MessageRecord
@@ -168,7 +168,7 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
     def "reconciliation detects missing ACK records for registered consumers"() {
         given: "a record in storage with no corresponding ACK entry"
         def conditions = new PollingConditions(timeout: 5)
-        def recon = ModernConsumerHarness.connect('127.0.0.1', tcpPort)
+        def recon = ModernConsumerClient.connect('127.0.0.1', tcpPort)
         recon.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 9001L,
             '{"msg_key":"recon-key","event_type":"MESSAGE","data":{"v":1},"topic":"recon-topic"}'
                 .getBytes('UTF-8')))
@@ -192,7 +192,7 @@ class AckStoreIntegrationSpec extends Specification implements TestPropertyProvi
     def "reconciliation reports consistent when all records are ACKed"() {
         given:
         def conditions = new PollingConditions(timeout: 5)
-        def consist = ModernConsumerHarness.connect('127.0.0.1', tcpPort)
+        def consist = ModernConsumerClient.connect('127.0.0.1', tcpPort)
         consist.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 9002L,
             '{"msg_key":"consist-key","event_type":"MESSAGE","data":{"v":1},"topic":"consist-topic"}'
                 .getBytes('UTF-8')))

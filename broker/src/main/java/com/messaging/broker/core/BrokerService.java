@@ -1,5 +1,6 @@
 package com.messaging.broker.core;
 
+import com.messaging.broker.ack.AckStoreSeeder;
 import com.messaging.broker.handler.DisconnectHandler;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.handler.MessageHandlerRegistry;
@@ -45,6 +46,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final MessageHandlerRegistry handlerRegistry;
     private final DisconnectHandler disconnectHandler;
     private final ExecutorService ackExecutor;
+    private final AckStoreSeeder ackStoreSeeder;
     private final int serverPort;
 
     @Inject
@@ -58,6 +60,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             MessageHandlerRegistry handlerRegistry,
             DisconnectHandler disconnectHandler,
             @Named("ackExecutor") ExecutorService ackExecutor,
+            AckStoreSeeder ackStoreSeeder,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
@@ -69,6 +72,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.handlerRegistry = handlerRegistry;
         this.disconnectHandler = disconnectHandler;
         this.ackExecutor = ackExecutor;
+        this.ackStoreSeeder = ackStoreSeeder;
         this.serverPort = serverPort;
 
         log.info("BrokerService initialized with handler registry");
@@ -92,6 +96,15 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 "Storage recovery failed during broker initialization", e);
             // Framework limitation: Wrap in RuntimeException to fail application startup
             throw new RuntimeException("Storage recovery failed - see cause for details", storageEx);
+        }
+
+        // Backfill RocksDB ACK entries for records consumed before ACK tracking existed.
+        // Must run after storage.recover() so segment data is available.
+        // Runs before reconciler's first scheduled execution (2-min initial delay).
+        try {
+            ackStoreSeeder.seed();
+        } catch (Exception e) {
+            log.warn("AckStoreSeeder failed — continuing startup without backfill", e);
         }
 
         // Register message handler

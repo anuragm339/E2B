@@ -4,6 +4,7 @@ import com.messaging.common.annotation.Consumer;
 import com.messaging.common.api.ErrorHandler;
 import com.messaging.common.api.MessageHandler;
 import io.micronaut.context.ApplicationContext;
+import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
 import jakarta.inject.Inject;
@@ -19,6 +20,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Scans for @Consumer annotated classes and registers them
  */
 @Singleton
+@Requires(property = "broker.network.type")
 public class ConsumerAnnotationProcessor implements ApplicationEventListener<ServerStartupEvent> {
     private static final Logger log = LoggerFactory.getLogger(ConsumerAnnotationProcessor.class);
 

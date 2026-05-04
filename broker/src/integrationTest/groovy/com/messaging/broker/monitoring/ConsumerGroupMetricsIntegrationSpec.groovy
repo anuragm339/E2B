@@ -2,6 +2,8 @@ package com.messaging.broker.monitoring
 
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
+import io.micronaut.test.extensions.spock.annotation.MicronautTest
+
 import spock.lang.Specification
 
 /**
@@ -10,6 +12,7 @@ import spock.lang.Specification
  * This test shows why sum(broker_consumer_bytes_sent_total) inflates the byte count
  * when multiple consumer groups read the same topic.
  */
+@MicronautTest(startApplication = false)
 class ConsumerGroupMetricsIntegrationSpec extends Specification {
 
     MeterRegistry registry

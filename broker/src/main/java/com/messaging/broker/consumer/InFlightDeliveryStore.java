@@ -59,6 +59,17 @@ public interface InFlightDeliveryStore {
     void clearPendingOffset(DeliveryKey key);
 
     /**
+     * Atomically remove and return the pending offset.
+     * Only the thread that receives a non-null value should treat itself as the owner.
+     * This prevents the ACK handler and the ACK-timeout handler from both acting on
+     * the same offset (check-then-clear is not atomic; remove() is).
+     *
+     * @param key Delivery key
+     * @return The pending offset that was removed, or null if none was set
+     */
+    Long removePendingOffset(DeliveryKey key);
+
+    /**
      * Record batch send timestamp.
      *
      * @param key Delivery key

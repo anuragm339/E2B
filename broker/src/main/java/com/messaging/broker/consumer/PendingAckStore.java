@@ -19,6 +19,16 @@ public interface PendingAckStore {
     void putPendingBatch(String clientId, MergedBatch batch);
 
     /**
+     * Atomically store batch only if no batch is already pending for this client.
+     * Used to replace the synchronized gate check without holding a lock during network I/O.
+     *
+     * @param clientId Client connection identifier
+     * @param batch    Merged batch to store
+     * @return true if the batch was stored (slot was free), false if a batch was already pending
+     */
+    boolean putPendingBatchIfAbsent(String clientId, MergedBatch batch);
+
+    /**
      * Get pending legacy batch.
      *
      * @param clientId Client connection identifier

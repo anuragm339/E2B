@@ -113,8 +113,11 @@ public class RefreshResetService implements ResetPhase {
         // Persist state after each ACK
         stateStore.saveState(context);
 
-        // Return true if this was the first RESET ACK (should transition to REPLAYING)
-        return context.getReceivedResetAcks().size() == 1;
+        // Atomically claim the REPLAYING transition right.
+        // Replaces the racy size()==1 check: ConcurrentHashSet.add() + size() is not atomic,
+        // so two simultaneous ACKs could both see size()==2 and neither trigger the transition,
+        // leaving the refresh stuck in RESET_SENT forever.
+        return context.markFirstResetAck();
     }
 
     @Override

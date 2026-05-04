@@ -171,7 +171,7 @@ ack-store:
     interval: ${ACK_RECONCILIATION_INTERVAL:5m}
     initial-delay: ${ACK_RECONCILIATION_INITIAL_DELAY:2m}
     enabled: ${ACK_RECONCILIATION_ENABLED:true}
-    auto-sync-enabled: ${ACK_RECONCILIATION_AUTO_SYNC:false}   # future feature, default off
+    auto-sync-enabled: ${ACK_RECONCILIATION_AUTO_SYNC:false}
 
 logger:
   levels:

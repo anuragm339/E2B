@@ -1,0 +1,14 @@
+broker:
+  network:
+    type: tcp
+  pipe:
+    min-poll-interval-ms: 200
+    max-poll-interval-ms: 1000
+    poll-limit: 20
+
+data-refresh:
+  enabled: false
+
+micronaut:
+  server:
+    port: 0

@@ -9,6 +9,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 /**
@@ -25,6 +26,11 @@ public class InMemoryConsumerSessionStore implements ConsumerSessionStore {
     @Override
     public void put(ConsumerKey key, RemoteConsumer consumer) {
         consumers.put(key, consumer);
+    }
+
+    @Override
+    public Optional<RemoteConsumer> putIfAbsent(ConsumerKey key, RemoteConsumer consumer) {
+        return Optional.ofNullable(consumers.putIfAbsent(key, consumer));
     }
 
     @Override
@@ -68,12 +74,18 @@ public class InMemoryConsumerSessionStore implements ConsumerSessionStore {
 
     @Override
     public int removeByClientId(String clientId) {
-        List<ConsumerKey> toRemove = consumers.entrySet().stream()
-            .filter(entry -> entry.getValue().getClientId().equals(clientId))
-            .map(entry -> entry.getKey())
-            .collect(Collectors.toList());
-
-        toRemove.forEach(consumers::remove);
-        return toRemove.size();
+        // ConcurrentHashMap.entrySet().removeIf() removes each matching entry atomically using
+        // the internal remove(key, value) operation, avoiding the snapshot-then-delete TOCTOU
+        // where a re-subscribing client could arrive between the stream snapshot and the removes
+        // and either have its new entry deleted or leave a stale entry in the map.
+        AtomicInteger count = new AtomicInteger(0);
+        consumers.entrySet().removeIf(entry -> {
+            if (entry.getValue().getClientId().equals(clientId)) {
+                count.incrementAndGet();
+                return true;
+            }
+            return false;
+        });
+        return count.get();
     }
 }

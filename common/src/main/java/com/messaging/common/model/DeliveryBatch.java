@@ -32,6 +32,9 @@ public interface DeliveryBatch extends AutoCloseable {
 
     // ── Broker ACK tracking ────────────────────────────────────────────────────
 
+    /** First message offset in this batch. Used by BatchAckService to re-read batch from storage. */
+    long getFirstOffset();
+
     /** Last message offset in this batch. Broker uses this to advance consumer offset after ACK. */
     long getLastOffset();
 

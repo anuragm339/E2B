@@ -5,7 +5,7 @@ import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.consumer.ConsumerRegistry
 import com.messaging.broker.consumer.RefreshCoordinator
 import com.messaging.broker.consumer.RefreshState
-import com.messaging.broker.support.ModernConsumerHarness
+import com.messaging.broker.support.ModernConsumerClient
 import com.messaging.common.api.StorageEngine
 import com.messaging.common.model.BrokerMessage
 import com.messaging.common.model.EventType
@@ -37,10 +37,10 @@ class BrokerServiceIntegrationSpec extends Specification {
 
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper()
 
-    ModernConsumerHarness consumer
+    ModernConsumerClient consumer
 
     def setup() {
-        consumer = ModernConsumerHarness.connect('127.0.0.1', tcpPort)
+        consumer = ModernConsumerClient.connect('127.0.0.1', tcpPort)
     }
 
     def cleanup() {

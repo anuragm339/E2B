@@ -395,9 +395,11 @@ class NettyTcpIntegrationSpec extends Specification {
 
         when:
         connection.send(brokerMsg(BrokerMessage.MessageType.DATA, 8888L, "payload".getBytes()))
+        boolean received = serverMessageLatch.await(5, TimeUnit.SECONDS)
         boolean acked = connection.waitForAck(8888L, 5000L)
 
         then:
+        received
         acked
 
         cleanup:
@@ -507,6 +509,7 @@ class NettyTcpIntegrationSpec extends Specification {
             @Override String  getTopic()       { topic }
             @Override int     getRecordCount() { rc }
             @Override long    getTotalBytes()  { bytes.length }
+            @Override long    getFirstOffset() { 0L }
             @Override long    getLastOffset()  { rc - 1L }
             @Override boolean isEmpty()        { rc == 0 }
             @Override

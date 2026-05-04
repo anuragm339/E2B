@@ -4,7 +4,7 @@ import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.consumer.ConsumerRegistry
 import com.messaging.broker.consumer.RefreshCoordinator
 import com.messaging.broker.consumer.RefreshState
-import com.messaging.broker.support.LegacyConsumerHarness
+import com.messaging.broker.support.LegacyConsumerClient
 import com.messaging.common.api.StorageEngine
 import com.messaging.network.legacy.events.BatchEvent
 import com.messaging.network.legacy.events.ReadyEvent
@@ -45,10 +45,10 @@ class BrokerLegacyConsumerIntegrationSpec extends Specification implements TestP
     @Value('${broker.network.port}')
     int tcpPort
 
-    LegacyConsumerHarness legacy
+    LegacyConsumerClient legacy
 
     def setup() {
-        legacy = LegacyConsumerHarness.connect('127.0.0.1', tcpPort, 'price-quote-service')
+        legacy = LegacyConsumerClient.connect('127.0.0.1', tcpPort, 'price-quote-service')
     }
 
     def cleanup() {
@@ -60,7 +60,7 @@ class BrokerLegacyConsumerIntegrationSpec extends Specification implements TestP
         def conditions = new PollingConditions(timeout: 8, delay: 0.1)
 
         and: "seed a message on prices-v1"
-        def fakeModern = com.messaging.broker.support.ModernConsumerHarness.connect('127.0.0.1', tcpPort)
+        def fakeModern = com.messaging.broker.support.ModernConsumerClient.connect('127.0.0.1', tcpPort)
         try {
             def payload = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString([
                 msg_key: 'legacy-key-1', event_type: 'MESSAGE', data: [value: 'legacy-v1'], topic: 'prices-v1'

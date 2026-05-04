@@ -89,7 +89,7 @@ public class MMapStorageEngine implements StorageEngine, BatchReadableStorage {
         SegmentManager manager = managers.get(new TopicPartition(topic, partition));
         if (manager == null) {
             log.debug("No segment manager for topic={}, partition={}", topic, partition);
-            return new Segment.BatchFileRegion(topic, null, 0, 0L, 0L, fromOffset);
+            return new Segment.BatchFileRegion(topic, null, 0, 0L, -1L, 0L, fromOffset);
         }
         return manager.getBatch(fromOffset, maxBytes);
     }

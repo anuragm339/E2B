@@ -30,6 +30,11 @@ public class InMemoryPendingAckStore implements PendingAckStore {
     }
 
     @Override
+    public boolean putPendingBatchIfAbsent(String clientId, MergedBatch batch) {
+        return pendingLegacyBatches.putIfAbsent(clientId, batch) == null;
+    }
+
+    @Override
     public MergedBatch getPendingBatch(String clientId) {
         return pendingLegacyBatches.get(clientId);
     }

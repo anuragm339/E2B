@@ -1,0 +1,30 @@
+plugins {
+    id 'io.micronaut.application' version '4.2.1'
+}
+
+micronaut {
+    version = '4.2.1'
+    runtime('netty')
+}
+
+java { sourceCompatibility = JavaVersion.VERSION_17 }
+
+dependencies {
+    // Live project references — no stale JARs
+    implementation project(':common')
+    implementation project(':network')
+    implementation project(':client')
+    runtimeOnly("org.yaml:snakeyaml")
+    implementation 'io.micronaut:micronaut-inject'
+    implementation 'io.micronaut:micronaut-runtime'
+    implementation 'io.micronaut:micronaut-http-server-netty'
+    implementation 'io.micronaut:micronaut-http-client'
+    implementation 'io.micronaut.micrometer:micronaut-micrometer-core'
+    implementation 'io.micronaut.micrometer:micronaut-micrometer-registry-prometheus'
+    implementation 'org.xerial:sqlite-jdbc:3.44.1.0'
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'
+    runtimeOnly 'ch.qos.logback:logback-classic'
+    annotationProcessor 'io.micronaut:micronaut-inject-java'
+}
+
+application { mainClass = 'com.example.consumer.ConsumerApplication' }
