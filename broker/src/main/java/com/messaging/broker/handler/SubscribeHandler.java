@@ -102,9 +102,35 @@ public class SubscribeHandler implements MessageHandler {
             // Send ACK (modern client)
             sendSubscribeAck(clientId, message, false, traceId);
 
-            // Send READY to start delivery (modern consumers deliver only after READY_ACK)
+            // Send READY to start delivery (modern consumers deliver only after READY_ACK).
+            // When a refresh is active we must NOT send startup READY — the consumer's READY_ACK
+            // would be misidentified as a refresh READY_ACK by ReadyAckHandler (which checks
+            // isRefreshActive at ACK time). Instead, mirror the legacy path: bypass the startup
+            // handshake and mark the consumer ready directly.
             if (isNew) {
-                remoteConsumers.sendStartupReadyToModernConsumer(clientId, topic, group);
+                RefreshContext refreshContext = refreshCoordinator.getRefreshStatus(topic);
+                if (refreshContext != null) {
+                    RefreshState state = refreshContext.getState();
+                    String groupTopic = group + ":" + topic;
+                    if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
+                        // Refresh in progress — bypass startup READY, mark consumer ready directly
+                        // and register as late joiner so refresh READY is sent on replay completion.
+                        remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
+                        refreshCoordinator.registerLateJoiningConsumer(topic, groupTopic);
+                        log.info("event=subscribe.ready_bypass mode=modern clientId={} topic={} group={} reason=refresh_active state={} traceId={}",
+                                clientId, topic, group, state, traceId);
+                    } else if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
+                        // Replay is done but READY not yet fully ACKed — send refresh READY directly
+                        remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
+                        log.info("event=subscribe.refresh_ready_sent mode=modern clientId={} topic={} traceId={}",
+                                clientId, topic, traceId);
+                    } else {
+                        remoteConsumers.sendStartupReadyToModernConsumer(clientId, topic, group);
+                    }
+                } else {
+                    // No refresh active — standard startup READY handshake
+                    remoteConsumers.sendStartupReadyToModernConsumer(clientId, topic, group);
+                }
             }
 
         } catch (IllegalArgumentException e) {
