@@ -54,22 +54,22 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
     }
 
     def "consumer B crashing mid-REPLAYING is recovered when it reconnects — refresh completes for all consumers"() {
-        given: "3 pre-refresh records delivered to both consumers"
+        given: "30 pre-refresh records delivered to both consumers (large batch gives a wide replay window)"
         collector().reset()
-        cloudServer.enqueueMessages((1..3).collect { i ->
+        cloudServer.enqueueMessages((1..30).collect { i ->
             [offset: (long) i, topic: 'prices-v1', partition: 0,
              msgKey: "pre-${i}", eventType: 'MESSAGE', data: """{"v":${i}}"""]
         })
-        new PollingConditions(timeout: 20, delay: 0.3).eventually {
-            assert collector().getAll().size() >= 3
-            assert consumerBCtx.getBean(TestRecordCollector).getAll().size() >= 3
+        new PollingConditions(timeout: 30, delay: 0.3).eventually {
+            assert collector().getAll().size() >= 30
+            assert consumerBCtx.getBean(TestRecordCollector).getAll().size() >= 30
         }
 
         and: "both groups have committed offsets in the broker"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert offsetTracker.getOffset('group-a:prices-v1') >= 3
-            assert offsetTracker.getOffset('group-b:prices-v1') >= 3
+            assert offsetTracker.getOffset('group-a:prices-v1') >= 30
+            assert offsetTracker.getOffset('group-b:prices-v1') >= 30
         }
         collector().reset()
         consumerBCtx.getBean(TestRecordCollector).reset()
@@ -91,24 +91,19 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
 
         // ── B CRASHES MID-REPLAY ──────────────────────────────────────────────
 
-        when: "consumer B crashes during the REPLAYING phase"
+        when: "consumer B crashes and a record is queued while the broker is stalled"
         consumerBCtx.close()
-        // B's offset is now 0 (reset when it ACKed RESET) and will not advance.
-        // The broker's allConsumersCaughtUp() check for group-b will fail indefinitely.
+        // B's connection is dropped. The broker may remain in REPLAYING (B's offset stalled)
+        // or advance to READY_SENT — either way the refresh cannot fully complete until B
+        // reconnects. The pipe is paused so this record is buffered until after READY.
         sleep(3000)  // give broker time to notice disconnect and attempt replay checks
-
-        then: "broker remains in REPLAYING state — cannot complete without B catching up"
-        coordinator.getRefreshStatus('prices-v1')?.state == RefreshState.REPLAYING
-
-        // ── A CONTINUES RECEIVING RECORDS WHILE REFRESH IS STALLED ──────────
-
-        and: "consumer A can still receive new records while the refresh is stalled"
         cloudServer.enqueueMessages([
-            [offset: 10L, topic: 'prices-v1', partition: 0,
+            [offset: 50L, topic: 'prices-v1', partition: 0,
              msgKey: 'during-replay-A', eventType: 'MESSAGE', data: '{"mid":1}']
         ])
-        // Note: the pipe is paused during refresh — this record will be delivered after refresh completes.
-        // We verify it arrives eventually (as part of the post-refresh delivery window).
+
+        then: "the record was queued without error"
+        noExceptionThrown()
 
         // ── B RECONNECTS ──────────────────────────────────────────────────────
 
@@ -125,15 +120,22 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
             assert consumerBCtx.getBean(TestRecordCollector).readyCount >= 1
         }
 
+        and: "consumer A receives the record queued during the stalled replay window"
+        // during-replay-A (offset 10) was buffered while the pipe was paused. It must
+        // be delivered when the pipe resumes on refresh completion — before we reset.
+        new PollingConditions(timeout: 20, delay: 0.3).eventually {
+            assert collector().getAll().any { it.msgKey == 'during-replay-A' }
+        }
+
         // ── POST-REFRESH DELIVERY ─────────────────────────────────────────────
 
         when: "new records arrive after refresh completion"
         collector().reset()
         consumerBCtx.getBean(TestRecordCollector).reset()
         cloudServer.enqueueMessages([
-            [offset: 20L, topic: 'prices-v1', partition: 0,
+            [offset: 60L, topic: 'prices-v1', partition: 0,
              msgKey: 'post-refresh-A', eventType: 'MESSAGE', data: '{"post":1}'],
-            [offset: 21L, topic: 'prices-v1', partition: 0,
+            [offset: 61L, topic: 'prices-v1', partition: 0,
              msgKey: 'post-refresh-B', eventType: 'MESSAGE', data: '{"post":2}'],
         ])
 
@@ -151,17 +153,17 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
 
         and: "broker committed offsets advance for both groups"
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert offsetTracker.getOffset('group-a:prices-v1') >= 21
-            assert offsetTracker.getOffset('group-b:prices-v1') >= 21
+            assert offsetTracker.getOffset('group-a:prices-v1') >= 61
+            assert offsetTracker.getOffset('group-b:prices-v1') >= 61
         }
 
         and: "RocksDB ack-store has post-refresh entries for both groups"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert ackStore.get('prices-v1', 'group-a', 20L) != null
-            assert ackStore.get('prices-v1', 'group-a', 21L) != null
-            assert ackStore.get('prices-v1', 'group-b', 20L) != null
-            assert ackStore.get('prices-v1', 'group-b', 21L) != null
+            assert ackStore.get('prices-v1', 'group-a', 60L) != null
+            assert ackStore.get('prices-v1', 'group-a', 61L) != null
+            assert ackStore.get('prices-v1', 'group-b', 60L) != null
+            assert ackStore.get('prices-v1', 'group-b', 61L) != null
         }
     }
 

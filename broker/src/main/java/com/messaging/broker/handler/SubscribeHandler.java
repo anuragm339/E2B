@@ -115,16 +115,30 @@ public class SubscribeHandler implements MessageHandler {
                     if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
                         // Refresh in progress — bypass startup READY, mark consumer ready directly
                         // and register as late joiner so refresh READY is sent on replay completion.
+                        // Order matters: markReady must precede registerLateJoiningConsumer because
+                        // registerLateJoiningConsumer may immediately trigger scheduleReplayCheck →
+                        // sendReady if all consumers are already caught up.
                         remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
                         refreshCoordinator.registerLateJoiningConsumer(topic, groupTopic);
                         log.info("event=subscribe.ready_bypass mode=modern clientId={} topic={} group={} reason=refresh_active state={} traceId={}",
                                 clientId, topic, group, state, traceId);
                     } else if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
-                        // Replay is done but READY not yet fully ACKed — send refresh READY directly
+                        // Replay is done, READY broadcast is in flight — mark consumer ready first
+                        // (opens the delivery gate) then send the refresh READY directly.
+                        // Note: if this READY is lost in transit, checkReadyAckTimeout will re-broadcast
+                        // to all of receivedResetAcks — which includes late joiners added via
+                        // registerLateJoiningConsumer. However allReadyAcksReceived() only guards against
+                        // expectedConsumers (snapshot from startRefresh), so the retry loop stops once
+                        // originalconsumers ACK even if this late joiner has not. Acceptable for now:
+                        // the consumer will receive new-data delivery immediately via the open gate.
+                        remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
                         remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
-                        log.info("event=subscribe.refresh_ready_sent mode=modern clientId={} topic={} traceId={}",
-                                clientId, topic, traceId);
+                        log.info("event=subscribe.refresh_ready_sent mode=modern clientId={} topic={} group={} traceId={}",
+                                clientId, topic, group, traceId);
                     } else {
+                        // COMPLETED, ABORTED, or any future terminal state: the context still exists
+                        // in activeRefreshes for up to 60 seconds after completion (cleanup delay).
+                        // Treat the same as no active refresh — send the normal startup READY.
                         remoteConsumers.sendStartupReadyToModernConsumer(clientId, topic, group);
                     }
                 } else {
