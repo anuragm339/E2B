@@ -206,8 +206,4 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
         ] as Map<String, Object>)
     }
 
-    private static int findFreePort() {
-        def s = new ServerSocket(0)
-        try { s.localPort } finally { s.close() }
-    }
 }

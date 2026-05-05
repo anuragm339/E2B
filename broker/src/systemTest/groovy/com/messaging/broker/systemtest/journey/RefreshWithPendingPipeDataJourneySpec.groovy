@@ -65,6 +65,9 @@ class RefreshWithPendingPipeDataJourneySpec extends BrokerSystemTestSupport {
             assert collector().resetCount >= 1
         }
 
+        and: "no during-refresh records have arrived yet — pipe is paused"
+        collector().getAll().size() == 0
+
         and: "consumer receives READY — full refresh lifecycle completed"
         new PollingConditions(timeout: 30, delay: 0.5).eventually {
             assert collector().readyCount >= 1

@@ -43,13 +43,14 @@ public class SubscribeHandler implements MessageHandler {
             ConsumerRegistry remoteConsumers,
             BrokerMetrics metrics,
             LegacyClientConfig legacyClientConfig,
-            RefreshCoordinator refreshCoordinator) {
+            RefreshCoordinator refreshCoordinator,
+            ObjectMapper objectMapper) {
         this.server = server;
         this.remoteConsumers = remoteConsumers;
         this.metrics = metrics;
         this.legacyClientConfig = legacyClientConfig;
         this.refreshCoordinator = refreshCoordinator;
-        this.objectMapper = new ObjectMapper();
+        this.objectMapper = objectMapper;
     }
 
     @Override
@@ -120,8 +121,18 @@ public class SubscribeHandler implements MessageHandler {
                         // sendReady if all consumers are already caught up.
                         remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
                         refreshCoordinator.registerLateJoiningConsumer(topic, groupTopic);
-                        log.info("event=subscribe.ready_bypass mode=modern clientId={} topic={} group={} reason=refresh_active state={} traceId={}",
-                                clientId, topic, group, state, traceId);
+                        // Guard against the scheduler advancing state to READY_SENT between our read
+                        // and registerLateJoiningConsumer's own re-read (which silently no-ops for
+                        // READY_SENT). Re-check state and fall back to sending READY directly.
+                        RefreshContext currentCtx = refreshCoordinator.getRefreshStatus(topic);
+                        if (currentCtx != null && currentCtx.getState() == RefreshState.READY_SENT) {
+                            remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
+                            log.info("event=subscribe.late_joiner_ready_fallback mode=modern clientId={} topic={} group={} traceId={}",
+                                    clientId, topic, group, traceId);
+                        } else {
+                            log.info("event=subscribe.ready_bypass mode=modern clientId={} topic={} group={} reason=refresh_active state={} traceId={}",
+                                    clientId, topic, group, state, traceId);
+                        }
                     } else if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
                         // Replay is done, READY broadcast is in flight — mark consumer ready first
                         // (opens the delivery gate) then send the refresh READY directly.
@@ -219,7 +230,13 @@ public class SubscribeHandler implements MessageHandler {
                     RefreshState state = refreshContext.getState();
 
                     if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
-                        // Already past replay — send refresh READY directly
+                        // Already past replay — send refresh READY directly.
+                        // Note: if this READY is lost in transit, checkReadyAckTimeout re-broadcasts to
+                        // all of receivedResetAcks (which includes late joiners added via
+                        // registerLateJoiningConsumer). However allReadyAcksReceived() only guards against
+                        // expectedConsumers (snapshot from startRefresh), so the retry loop stops once
+                        // original consumers ACK even if this late joiner has not. Acceptable for now:
+                        // the consumer receives new-data delivery immediately via the open gate.
                         log.info("event=subscribe.refresh_ready_sent clientId={} topic={} traceId={}",
                                 clientId, topic, traceId);
                         remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
@@ -284,6 +301,12 @@ public class SubscribeHandler implements MessageHandler {
                 String.format("Field '%s' is null from client %s", fieldName, clientId)
             );
         }
-        return field.asText();
+        String value = field.asText();
+        if (value.isBlank()) {
+            throw new IllegalArgumentException(
+                String.format("Field '%s' is blank from client %s", fieldName, clientId)
+            );
+        }
+        return value;
     }
 }

@@ -58,7 +58,6 @@ class ConcurrentRefreshJourneySpec extends BrokerSystemTestSupport {
         latch.countDown()   // release both threads at the same instant
         thread1.get(10, TimeUnit.SECONDS)
         thread2.get(10, TimeUnit.SECONDS)
-        pool.shutdown()
 
         then: "neither thread threw an exception"
         errors.get() == 0
@@ -71,8 +70,8 @@ class ConcurrentRefreshJourneySpec extends BrokerSystemTestSupport {
         and: "the refresh converges to a terminal state — no stuck REPLAYING or RESET_SENT"
         new PollingConditions(timeout: 30, delay: 0.5).eventually {
             def status = coordinator.getRefreshStatus('prices-v1')
-            // Either the context is null (COMPLETED and cleaned up) or in COMPLETED/ABORTED
-            assert status == null || status.state in [RefreshState.COMPLETED, RefreshState.ABORTED]
+            // Either the context is null (COMPLETED and cleaned up) or explicitly COMPLETED
+            assert status == null || status.state == RefreshState.COMPLETED
         }
 
         and: "consumer received at least one READY — refresh did complete (not just aborted)"
@@ -91,5 +90,8 @@ class ConcurrentRefreshJourneySpec extends BrokerSystemTestSupport {
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
             assert collector().getAll().any { it.msgKey == 'post-concurrent' }
         }
+
+        cleanup:
+        pool?.shutdownNow()
     }
 }

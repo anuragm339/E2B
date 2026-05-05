@@ -30,7 +30,7 @@ import spock.util.concurrent.PollingConditions
  */
 class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
 
-    @Shared ApplicationContext consumerBCtx
+    @Shared ApplicationContext consumerBCtx  // reassigned in the feature method to simulate reconnect
 
     // Consumer A uses the default context from BrokerSystemTestSupport (group-a)
     @Override protected String defaultGroup() { 'group-a' }
@@ -121,7 +121,7 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
         }
 
         and: "consumer A receives the record queued during the stalled replay window"
-        // during-replay-A (offset 10) was buffered while the pipe was paused. It must
+        // during-replay-A (offset 50) was buffered while the pipe was paused. It must
         // be delivered when the pipe resumes on refresh completion — before we reset.
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
             assert collector().getAll().any { it.msgKey == 'during-replay-A' }
@@ -182,8 +182,4 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
         ] as Map<String, Object>)
     }
 
-    private static int findFreePort() {
-        def s = new ServerSocket(0)
-        try { s.localPort } finally { s.close() }
-    }
 }

@@ -216,7 +216,7 @@ abstract class BrokerSystemTestSupport extends Specification {
         }
     }
 
-    private static int findFreePort() {
+    protected static int findFreePort() {
         def s = new ServerSocket(0)
         try { s.localPort } finally { s.close() }
     }

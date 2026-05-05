@@ -109,8 +109,4 @@ class MultiConsumerJourneySpec extends BrokerSystemTestSupport {
         ackStore.get('ref-data-v5', 'group-a', 3L) == null
     }
 
-    private static int findFreePort() {
-        def s = new ServerSocket(0)
-        try { s.localPort } finally { s.close() }
-    }
 }

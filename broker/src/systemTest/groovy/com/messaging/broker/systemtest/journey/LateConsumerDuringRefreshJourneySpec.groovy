@@ -95,9 +95,9 @@ class LateConsumerDuringRefreshJourneySpec extends BrokerSystemTestSupport {
         collector().reset()
         consumerBCtx.getBean(TestRecordCollector).reset()
         cloudServer.enqueueMessages([
-            [offset: 10L, topic: 'prices-v1', partition: 0,
+            [offset: 6L, topic: 'prices-v1', partition: 0,
              msgKey: 'post-late-1', eventType: 'MESSAGE', data: '{"post":1}'],
-            [offset: 11L, topic: 'prices-v1', partition: 0,
+            [offset: 7L, topic: 'prices-v1', partition: 0,
              msgKey: 'post-late-2', eventType: 'MESSAGE', data: '{"post":2}'],
         ])
 
@@ -115,16 +115,12 @@ class LateConsumerDuringRefreshJourneySpec extends BrokerSystemTestSupport {
 
         and: "both groups have advancing committed offsets"
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert offsetTracker.getOffset('system-test-group:prices-v1') >= 11
-            assert offsetTracker.getOffset('group-b:prices-v1') >= 11
+            assert offsetTracker.getOffset('system-test-group:prices-v1') >= 7
+            assert offsetTracker.getOffset('group-b:prices-v1') >= 7
         }
 
         cleanup:
         consumerBCtx?.close()
     }
 
-    private static int findFreePort() {
-        def s = new ServerSocket(0)
-        try { s.localPort } finally { s.close() }
-    }
 }
