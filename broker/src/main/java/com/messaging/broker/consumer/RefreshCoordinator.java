@@ -23,6 +23,8 @@ public class RefreshCoordinator {
     private static final long REPLAY_CHECK_INTERVAL_MS = 1000;
     private static final long RESET_RETRY_INTERVAL_MS = 5000;
     private static final long REFRESH_ABORT_TIMEOUT_MS = 600000; // 10 minutes
+    private static final java.util.concurrent.atomic.AtomicInteger THREAD_COUNTER =
+            new java.util.concurrent.atomic.AtomicInteger(0);
 
     // Services
     private final RefreshStarter initiationService;
@@ -39,6 +41,7 @@ public class RefreshCoordinator {
     private final Map<String, RefreshContext> activeRefreshes;
     private final Map<String, ScheduledFuture<?>> replayCheckTasks;
     private final Map<String, ScheduledFuture<?>> resetRetryTasks;
+    private final Map<String, ScheduledFuture<?>> abortWatchdogTasks;
     private final ScheduledExecutorService scheduler;
 
     public RefreshCoordinator(
@@ -63,12 +66,14 @@ public class RefreshCoordinator {
 
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r);
-            t.setName("RefreshCoordinator");
+            t.setName("RefreshCoordinator-" + THREAD_COUNTER.incrementAndGet());
+            t.setDaemon(true);
             return t;
         });
         this.activeRefreshes = new ConcurrentHashMap<>();
         this.replayCheckTasks = new ConcurrentHashMap<>();
         this.resetRetryTasks = new ConcurrentHashMap<>();
+        this.abortWatchdogTasks = new ConcurrentHashMap<>();
 
         // Inject shared state into services
         wireServices();
@@ -81,7 +86,7 @@ public class RefreshCoordinator {
         // Initiation service needs task maps for cancellation
         if (initiationService instanceof RefreshInitiator) {
             ((RefreshInitiator) initiationService).setSharedState(
-                    activeRefreshes, resetRetryTasks, replayCheckTasks);
+                    activeRefreshes, resetRetryTasks, replayCheckTasks, abortWatchdogTasks);
         }
 
         // Ready service needs activeRefreshes for batch completion check
@@ -129,17 +134,34 @@ public class RefreshCoordinator {
         }
 
         // Schedule abort watchdog: if the refresh is still in a non-terminal state after 10 minutes, abort it.
-        scheduler.schedule(() -> abortRefreshIfStuck(topic), REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        // Capture refreshId at scheduling time so an orphaned watchdog from a previous refresh cannot
+        // fire against a new refresh context for the same topic.
+        if (context != null) {
+            String refreshId = context.getRefreshId();
+            ScheduledFuture<?> watchdog = scheduler.schedule(
+                    () -> abortRefreshIfStuck(topic, refreshId),
+                    REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            abortWatchdogTasks.put(topic, watchdog);
+        }
 
         return result;
     }
 
     /**
      * Abort a refresh that has not completed within the timeout window.
+     *
+     * @param expectedRefreshId guards against firing against a different refresh that started
+     *                          for the same topic after the one that scheduled this watchdog.
      */
-    private void abortRefreshIfStuck(String topic) {
+    private void abortRefreshIfStuck(String topic, String expectedRefreshId) {
         RefreshContext context = activeRefreshes.get(topic);
         if (context == null) return;
+
+        if (!expectedRefreshId.equals(context.getRefreshId())) {
+            log.debug("Abort watchdog for refreshId={} fired but current refreshId={} — skipping",
+                    expectedRefreshId, context.getRefreshId());
+            return;
+        }
 
         RefreshState state = context.getState();
         if (stateMachine.isTerminalState(state)) return;
@@ -246,6 +268,8 @@ public class RefreshCoordinator {
 
     /**
      * Schedule periodic replay check task.
+     * Uses putIfAbsent to prevent duplicate tasks from concurrent callers
+     * (e.g., handleResetAck and registerLateJoiningConsumer racing).
      */
     private void scheduleReplayCheck(String topic) {
         ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
@@ -254,8 +278,14 @@ public class RefreshCoordinator {
                 REPLAY_CHECK_INTERVAL_MS,
                 TimeUnit.MILLISECONDS
         );
-        replayCheckTasks.put(topic, task);
-        log.info("Scheduled replay check task for topic {}", topic);
+        ScheduledFuture<?> existing = replayCheckTasks.putIfAbsent(topic, task);
+        if (existing != null) {
+            // Another task already registered — cancel ours to avoid duplicate progress checks
+            task.cancel(false);
+            log.debug("Replay check already scheduled for topic {}, cancelled duplicate", topic);
+        } else {
+            log.info("Scheduled replay check task for topic {}", topic);
+        }
     }
 
     /**
@@ -395,9 +425,9 @@ public class RefreshCoordinator {
      * Treat it as having ACKed RESET so it is included when sendReady() fires at the end of replay.
      * No-op if the refresh is already in READY_SENT or COMPLETED state (handled separately).
      */
-    public void registerLateJoiningConsumer(String topic, String groupTopic) {
+    public boolean registerLateJoiningConsumer(String topic, String groupTopic) {
         RefreshContext context = activeRefreshes.get(topic);
-        if (context == null) return;
+        if (context == null) return false;
 
         RefreshState state = context.getState();
         if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
@@ -425,7 +455,9 @@ public class RefreshCoordinator {
                             topic);
                 }
             }
+            return true;
         }
+        return false;
     }
 
     @PreDestroy
@@ -437,6 +469,8 @@ public class RefreshCoordinator {
         resetRetryTasks.clear();
         replayCheckTasks.values().forEach(task -> task.cancel(false));
         replayCheckTasks.clear();
+        abortWatchdogTasks.values().forEach(task -> task.cancel(false));
+        abortWatchdogTasks.clear();
 
         // Record shutdown time for all active refreshes
         if (!activeRefreshes.isEmpty()) {

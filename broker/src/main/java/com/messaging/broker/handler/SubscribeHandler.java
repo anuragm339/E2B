@@ -65,7 +65,15 @@ public class SubscribeHandler implements MessageHandler {
             JsonNode json = objectMapper.readTree(payload);
 
             // Check if this is a legacy client
-            boolean isLegacy = json.has("isLegacy") && json.get("isLegacy").asBoolean();
+            boolean isLegacy = false;
+            if (json.has("isLegacy")) {
+                JsonNode isLegacyNode = json.get("isLegacy");
+                if (!isLegacyNode.isBoolean()) {
+                    log.warn("event=subscribe.invalid_field clientId={} field=isLegacy expected=boolean got={} traceId={}",
+                            clientId, isLegacyNode.getNodeType(), traceId);
+                }
+                isLegacy = isLegacyNode.asBoolean();
+            }
 
             if (isLegacy) {
                 handleLegacySubscribe(clientId, message, json, traceId);
@@ -114,21 +122,23 @@ public class SubscribeHandler implements MessageHandler {
                     RefreshState state = refreshContext.getState();
                     String groupTopic = group + ":" + topic;
                     if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
-                        // Refresh in progress — bypass startup READY, mark consumer ready directly
-                        // and register as late joiner so refresh READY is sent on replay completion.
-                        // Order matters: markReady must precede registerLateJoiningConsumer because
-                        // registerLateJoiningConsumer may immediately trigger scheduleReplayCheck →
-                        // sendReady if all consumers are already caught up.
+                        // Register as late joiner BEFORE opening the delivery gate. This ensures
+                        // that if the scheduler fires checkReplayProgress between these two calls,
+                        // our consumer is already in receivedResetAcks and will receive READY from
+                        // the scheduler's sendReady broadcast rather than missing it.
+                        boolean registered = refreshCoordinator.registerLateJoiningConsumer(topic, groupTopic);
+                        // Open delivery gate only after registration is complete.
                         remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
-                        refreshCoordinator.registerLateJoiningConsumer(topic, groupTopic);
-                        // Guard against the scheduler advancing state to READY_SENT between our read
-                        // and registerLateJoiningConsumer's own re-read (which silently no-ops for
-                        // READY_SENT). Re-check state and fall back to sending READY directly.
-                        RefreshContext currentCtx = refreshCoordinator.getRefreshStatus(topic);
-                        if (currentCtx != null && currentCtx.getState() == RefreshState.READY_SENT) {
-                            remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
-                            log.info("event=subscribe.late_joiner_ready_fallback mode=modern clientId={} topic={} group={} traceId={}",
-                                    clientId, topic, group, traceId);
+                        if (!registered) {
+                            // registerLateJoiningConsumer no-oped because state advanced to READY_SENT
+                            // between our initial read and its internal re-read. Send READY directly.
+                            // Using boolean return avoids the double-READY race of a plain re-check.
+                            RefreshContext currentCtx = refreshCoordinator.getRefreshStatus(topic);
+                            if (currentCtx != null && currentCtx.getState() == RefreshState.READY_SENT) {
+                                remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
+                                log.info("event=subscribe.late_joiner_ready_fallback mode=modern clientId={} topic={} group={} traceId={}",
+                                        clientId, topic, group, traceId);
+                            }
                         } else {
                             log.info("event=subscribe.ready_bypass mode=modern clientId={} topic={} group={} reason=refresh_active state={} traceId={}",
                                     clientId, topic, group, state, traceId);
@@ -209,24 +219,35 @@ public class SubscribeHandler implements MessageHandler {
 
         // Send READY to start delivery (legacy consumers deliver only after READY_ACK)
         if (newRegistrations > 0) {
-            // Check if any of this consumer's topics have an active refresh in progress.
-            // If so, skip the startup READY handshake: mark the consumer ready immediately
-            // (so data can flow) and let the refresh workflow send READY when replay is done.
-            // Only send the startup READY when no refresh is active.
+            // isRefreshActive returns true for up to 60s after COMPLETED (cleanup delay), so
+            // we must inspect the per-topic state inside the loop rather than relying on this flag alone.
             boolean anyRefreshActive = topics.stream()
                     .anyMatch(t -> refreshCoordinator.isRefreshActive(t));
 
             if (anyRefreshActive) {
-                // Refresh in progress — bypass startup READY, mark consumer ready directly
+                // PASS 1: Register all late joiners BEFORE opening the delivery gate.
+                // This ensures the scheduler's sendReady snapshot includes this consumer
+                // if checkReplayProgress fires between registration and gate-open.
+                for (String topic : topics) {
+                    RefreshContext refreshContext = refreshCoordinator.getRefreshStatus(topic);
+                    if (refreshContext == null) continue;
+                    RefreshState state = refreshContext.getState();
+                    if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
+                        refreshCoordinator.registerLateJoiningConsumer(topic, serviceName + ":" + topic);
+                    }
+                }
+
+                // Open delivery gate only after all registrations are complete.
                 remoteConsumers.markLegacyConsumerReady(clientId);
                 log.info("event=subscribe.ready_bypass clientId={} reason=refresh_active traceId={}",
                         clientId, traceId);
 
+                // PASS 2: Send READY signals; detect if all contexts are in terminal states.
+                boolean anyActiveRefreshHandled = false;
                 for (String topic : topics) {
+                    // Re-read state — may have advanced since PASS 1.
                     RefreshContext refreshContext = refreshCoordinator.getRefreshStatus(topic);
                     if (refreshContext == null) continue;
-
-                    String groupTopic = serviceName + ":" + topic;
                     RefreshState state = refreshContext.getState();
 
                     if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
@@ -240,10 +261,27 @@ public class SubscribeHandler implements MessageHandler {
                         log.info("event=subscribe.refresh_ready_sent clientId={} topic={} traceId={}",
                                 clientId, topic, traceId);
                         remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
+                        anyActiveRefreshHandled = true;
                     } else if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
-                        // Still replaying — register as late joiner so refresh READY is sent when replay completes
-                        refreshCoordinator.registerLateJoiningConsumer(topic, groupTopic);
+                        // Registered in PASS 1. Check for the race where state advanced to
+                        // READY_SENT during registerLateJoiningConsumer's internal re-read (no-op).
+                        RefreshContext currentCtx = refreshCoordinator.getRefreshStatus(topic);
+                        if (currentCtx != null && currentCtx.getState() == RefreshState.READY_SENT) {
+                            remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
+                            log.info("event=subscribe.late_joiner_ready_fallback clientId={} topic={} traceId={}",
+                                    clientId, topic, traceId);
+                        }
+                        anyActiveRefreshHandled = true;
                     }
+                    // COMPLETED/ABORTED: context still in map for up to 60s (cleanup delay).
+                    // Do not treat as active refresh — fall through to startup READY below.
+                }
+
+                if (!anyActiveRefreshHandled) {
+                    // All topics' contexts were COMPLETED or ABORTED (60s cleanup window).
+                    // Treat identically to no active refresh — send normal startup READY.
+                    log.info("event=subscribe.startup_ready_after_completed clientId={} traceId={}", clientId, traceId);
+                    remoteConsumers.sendStartupReadyToLegacyConsumer(clientId);
                 }
             } else {
                 // No refresh active — standard startup READY handshake

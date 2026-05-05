@@ -44,6 +44,7 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
     }
 
     def setupSpec() {
+        // super.setupSpec() is invoked automatically by the Spock framework before this method.
         consumerBCtx = newConsumerB()
         triggerConsumerManagerStartup(consumerBCtx)
         sleep(2000)
@@ -51,6 +52,7 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
 
     def cleanupSpec() {
         consumerBCtx?.close()
+        // super.cleanupSpec() is invoked automatically by the Spock framework after this method.
     }
 
     def "consumer B crashing mid-REPLAYING is recovered when it reconnects — refresh completes for all consumers"() {
