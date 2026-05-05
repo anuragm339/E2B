@@ -130,13 +130,20 @@ public class SubscribeHandler implements MessageHandler {
                         // Open delivery gate only after registration is complete.
                         remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
                         if (!registered) {
-                            // registerLateJoiningConsumer no-oped because state advanced to READY_SENT
-                            // between our initial read and its internal re-read. Send READY directly.
-                            // Using boolean return avoids the double-READY race of a plain re-check.
+                            // State advanced past REPLAYING while registerLateJoiningConsumer ran
+                            // (C2 post-recordResetAck re-read detected the race). Check current state:
+                            //  • READY_SENT → send refresh READY directly; consumer is in receivedResetAcks
+                            //    so checkReadyAckTimeout retries will also reach it.
+                            //  • COMPLETED/ABORTED/null → refresh is done; send normal startup READY.
                             RefreshContext currentCtx = refreshCoordinator.getRefreshStatus(topic);
                             if (currentCtx != null && currentCtx.getState() == RefreshState.READY_SENT) {
                                 remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
                                 log.info("event=subscribe.late_joiner_ready_fallback mode=modern clientId={} topic={} group={} traceId={}",
+                                        clientId, topic, group, traceId);
+                            } else {
+                                // Terminal state or context cleaned up — treat as no active refresh.
+                                remoteConsumers.sendStartupReadyToModernConsumer(clientId, topic, group);
+                                log.info("event=subscribe.startup_ready_after_completed mode=modern clientId={} topic={} group={} traceId={}",
                                         clientId, topic, group, traceId);
                             }
                         } else {
@@ -144,14 +151,12 @@ public class SubscribeHandler implements MessageHandler {
                                     clientId, topic, group, state, traceId);
                         }
                     } else if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
-                        // Replay is done, READY broadcast is in flight — mark consumer ready first
-                        // (opens the delivery gate) then send the refresh READY directly.
-                        // Note: if this READY is lost in transit, checkReadyAckTimeout will re-broadcast
-                        // to all of receivedResetAcks — which includes late joiners added via
-                        // registerLateJoiningConsumer. However allReadyAcksReceived() only guards against
-                        // expectedConsumers (snapshot from startRefresh), so the retry loop stops once
-                        // originalconsumers ACK even if this late joiner has not. Acceptable for now:
-                        // the consumer will receive new-data delivery immediately via the open gate.
+                        // Replay is done, READY broadcast is in flight.
+                        // C1: Register in receivedResetAcks BEFORE opening gate so checkReadyAckTimeout
+                        // re-broadcasts include this consumer if the direct send below is lost in transit.
+                        // registerLateJoiningConsumer returns false for READY_SENT (no-op on state machine)
+                        // but still records the ack — that is all we need here.
+                        refreshCoordinator.registerLateJoiningConsumer(topic, groupTopic);
                         remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
                         remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
                         log.info("event=subscribe.refresh_ready_sent mode=modern clientId={} topic={} group={} traceId={}",
@@ -217,6 +222,11 @@ public class SubscribeHandler implements MessageHandler {
         log.info("event=subscribe.legacy_registered clientId={} service={} topicCount={} traceId={}",
                 clientId, topics.size(), serviceName, traceId);
 
+        // Send ACK before READY logic — matches modern path ordering. Legacy protocol does not
+        // send an ACK on the wire (sendSubscribeAck is a no-op for isLegacy=true), but keeping
+        // the ordering consistent avoids surprises if the protocol is extended.
+        sendSubscribeAck(clientId, message, true, traceId);
+
         // Send READY to start delivery (legacy consumers deliver only after READY_ACK)
         if (newRegistrations > 0) {
             // isRefreshActive returns true for up to 60s after COMPLETED (cleanup delay), so
@@ -228,11 +238,13 @@ public class SubscribeHandler implements MessageHandler {
                 // PASS 1: Register all late joiners BEFORE opening the delivery gate.
                 // This ensures the scheduler's sendReady snapshot includes this consumer
                 // if checkReplayProgress fires between registration and gate-open.
+                // C1: also register for READY_SENT topics so checkReadyAckTimeout retries reach us.
                 for (String topic : topics) {
                     RefreshContext refreshContext = refreshCoordinator.getRefreshStatus(topic);
                     if (refreshContext == null) continue;
                     RefreshState state = refreshContext.getState();
-                    if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
+                    if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING
+                            || state == RefreshState.READY_SENT) {
                         refreshCoordinator.registerLateJoiningConsumer(topic, serviceName + ":" + topic);
                     }
                 }
@@ -252,29 +264,33 @@ public class SubscribeHandler implements MessageHandler {
 
                     if (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived()) {
                         // Already past replay — send refresh READY directly.
-                        // Note: if this READY is lost in transit, checkReadyAckTimeout re-broadcasts to
-                        // all of receivedResetAcks (which includes late joiners added via
-                        // registerLateJoiningConsumer). However allReadyAcksReceived() only guards against
-                        // expectedConsumers (snapshot from startRefresh), so the retry loop stops once
-                        // original consumers ACK even if this late joiner has not. Acceptable for now:
-                        // the consumer receives new-data delivery immediately via the open gate.
+                        // C1: Consumer was registered in receivedResetAcks in PASS 1, so any future
+                        // checkReadyAckTimeout re-broadcast will also reach it if this send is lost.
                         log.info("event=subscribe.refresh_ready_sent clientId={} topic={} traceId={}",
                                 clientId, topic, traceId);
                         remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
                         anyActiveRefreshHandled = true;
                     } else if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING) {
-                        // Registered in PASS 1. Check for the race where state advanced to
-                        // READY_SENT during registerLateJoiningConsumer's internal re-read (no-op).
+                        // Registered in PASS 1. Check for the C2 race where state advanced to
+                        // READY_SENT during registerLateJoiningConsumer's post-recordResetAck re-read.
+                        // Do NOT set anyActiveRefreshHandled=true if the re-read shows COMPLETED/ABORTED
+                        // — that would block the startup READY fallback (M2 fix).
                         RefreshContext currentCtx = refreshCoordinator.getRefreshStatus(topic);
                         if (currentCtx != null && currentCtx.getState() == RefreshState.READY_SENT) {
                             remoteConsumers.sendRefreshReadyToConsumer(clientId, topic);
                             log.info("event=subscribe.late_joiner_ready_fallback clientId={} topic={} traceId={}",
                                     clientId, topic, traceId);
+                            anyActiveRefreshHandled = true;
+                        } else if (currentCtx != null
+                                && (currentCtx.getState() == RefreshState.RESET_SENT
+                                        || currentCtx.getState() == RefreshState.REPLAYING)) {
+                            // Still in an active non-terminal state — READY will arrive via broadcast.
+                            anyActiveRefreshHandled = true;
                         }
-                        anyActiveRefreshHandled = true;
+                        // COMPLETED/ABORTED: do NOT set anyActiveRefreshHandled — fall through to
+                        // the startup READY below so the consumer is not left without a READY signal.
                     }
-                    // COMPLETED/ABORTED: context still in map for up to 60s (cleanup delay).
-                    // Do not treat as active refresh — fall through to startup READY below.
+                    // COMPLETED/ABORTED seen in the PASS 2 initial read: also do not set the flag.
                 }
 
                 if (!anyActiveRefreshHandled) {
@@ -288,9 +304,6 @@ public class SubscribeHandler implements MessageHandler {
                 remoteConsumers.sendStartupReadyToLegacyConsumer(clientId);
             }
         }
-
-        // Send ACK
-        sendSubscribeAck(clientId, message, true, traceId);
     }
 
     /**

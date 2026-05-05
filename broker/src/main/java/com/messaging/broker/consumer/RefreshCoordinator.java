@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Central coordinator for the refresh workflow.
@@ -23,8 +24,7 @@ public class RefreshCoordinator {
     private static final long REPLAY_CHECK_INTERVAL_MS = 1000;
     private static final long RESET_RETRY_INTERVAL_MS = 5000;
     private static final long REFRESH_ABORT_TIMEOUT_MS = 600000; // 10 minutes
-    private static final java.util.concurrent.atomic.AtomicInteger THREAD_COUNTER =
-            new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final AtomicInteger THREAD_COUNTER = new AtomicInteger(0);
 
     // Services
     private final RefreshStarter initiationService;
@@ -141,7 +141,13 @@ public class RefreshCoordinator {
             ScheduledFuture<?> watchdog = scheduler.schedule(
                     () -> abortRefreshIfStuck(topic, refreshId),
                     REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            abortWatchdogTasks.put(topic, watchdog);
+            // compute() atomically replaces any previous watchdog entry, cancelling the old one.
+            // This prevents a stale watchdog from a rapid force-cancel + restart sequence leaking
+            // into the new refresh — consistent with the putIfAbsent pattern in scheduleReplayCheck.
+            abortWatchdogTasks.compute(topic, (k, old) -> {
+                if (old != null) old.cancel(false);
+                return watchdog;
+            });
         }
 
         return result;
@@ -178,6 +184,10 @@ public class RefreshCoordinator {
 
             ScheduledFuture<?> replayTask = replayCheckTasks.remove(topic);
             if (replayTask != null) replayTask.cancel(false);
+
+            // Remove our own map entry — prevents a stale ScheduledFuture reference
+            // from accumulating indefinitely for topics that abort and are never refreshed again.
+            abortWatchdogTasks.remove(topic);
 
             activeRefreshes.remove(topic);
             log.info("Refresh aborted and cleaned up for topic: {}", topic);
@@ -421,9 +431,18 @@ public class RefreshCoordinator {
     /**
      * Register a consumer that connected after the refresh started (late joiner).
      *
-     * When a consumer subscribes during RESET_SENT or REPLAYING, it missed the RESET broadcast.
-     * Treat it as having ACKed RESET so it is included when sendReady() fires at the end of replay.
-     * No-op if the refresh is already in READY_SENT or COMPLETED state (handled separately).
+     * <p>When a consumer subscribes during RESET_SENT or REPLAYING, it missed the RESET broadcast.
+     * Recording it in {@code receivedResetAcks} ensures it is included in {@code sendReady()}'s
+     * broadcast at the end of replay AND in {@code checkReadyAckTimeout} re-broadcasts.
+     *
+     * <p>When state is READY_SENT the consumer also needs to be in {@code receivedResetAcks} so
+     * that any future {@code checkReadyAckTimeout} re-broadcast reaches it if the direct READY send
+     * is lost. We record the ack and return {@code false} so the caller sends READY immediately.
+     *
+     * <p>Returns {@code true} if the consumer was registered and the READY will arrive via the
+     * normal broadcast path (caller should NOT send READY directly).
+     * Returns {@code false} in all other cases — state has advanced past REPLAYING, so the caller
+     * must send READY directly (or fall back to startup READY for terminal states).
      */
     public boolean registerLateJoiningConsumer(String topic, String groupTopic) {
         RefreshContext context = activeRefreshes.get(topic);
@@ -434,6 +453,17 @@ public class RefreshCoordinator {
             context.recordResetAck(groupTopic);
             log.info("Late-joining consumer {} registered for topic {} in state {} - will receive refresh READY",
                     groupTopic, topic, state);
+
+            // C2: Re-read state after recording the ack. If checkReplayProgress() ran concurrently
+            // and advanced state to READY_SENT (calling sendReady() before our recordResetAck),
+            // this consumer was not in the broadcast snapshot. Return false so the caller sends
+            // READY directly rather than waiting for a re-broadcast that may not arrive.
+            RefreshState stateAfter = context.getState();
+            if (stateAfter != RefreshState.RESET_SENT && stateAfter != RefreshState.REPLAYING) {
+                log.debug("State advanced to {} after recordResetAck for {}/{} — returning false for caller to send READY directly",
+                        stateAfter, topic, groupTopic);
+                return false;
+            }
 
             // If this ACK completes the set and we are still in RESET_SENT, drive the transition
             // to REPLAYING ourselves — handleResetAck() was never called for this consumer so the
@@ -456,6 +486,15 @@ public class RefreshCoordinator {
                 }
             }
             return true;
+        }
+
+        if (state == RefreshState.READY_SENT) {
+            // C1: Consumer joined during the READY broadcast phase. Record in receivedResetAcks so
+            // checkReadyAckTimeout re-broadcasts include this consumer if the direct READY send is lost.
+            context.recordResetAck(groupTopic);
+            log.info("Late-joining consumer {} registered for topic {} in READY_SENT — caller will send READY directly",
+                    groupTopic, topic);
+            // Return false: caller must send READY immediately; it cannot wait for the next retry.
         }
         return false;
     }

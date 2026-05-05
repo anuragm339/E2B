@@ -185,12 +185,10 @@ public class RefreshInitiator implements RefreshStarter {
         }
 
         // Cancel existing abort watchdog
-        if (abortWatchdogTasks != null) {
-            ScheduledFuture<?> oldWatchdog = abortWatchdogTasks.remove(topic);
-            if (oldWatchdog != null) {
-                oldWatchdog.cancel(false);
-                log.info("Cancelled orphaned abort watchdog for topic: {}", topic);
-            }
+        ScheduledFuture<?> oldWatchdog = abortWatchdogTasks.remove(topic);
+        if (oldWatchdog != null) {
+            oldWatchdog.cancel(false);
+            log.info("Cancelled orphaned abort watchdog for topic: {}", topic);
         }
 
         // Remove old context
