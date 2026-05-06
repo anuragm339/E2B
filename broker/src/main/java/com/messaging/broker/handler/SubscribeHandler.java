@@ -244,7 +244,7 @@ public class SubscribeHandler implements MessageHandler {
                     if (refreshContext == null) continue;
                     RefreshState state = refreshContext.getState();
                     if (state == RefreshState.RESET_SENT || state == RefreshState.REPLAYING
-                            || state == RefreshState.READY_SENT) {
+                            || (state == RefreshState.READY_SENT && !refreshContext.allReadyAcksReceived())) {
                         refreshCoordinator.registerLateJoiningConsumer(topic, serviceName + ":" + topic);
                     }
                 }

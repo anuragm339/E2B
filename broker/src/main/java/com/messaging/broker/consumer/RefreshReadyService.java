@@ -61,6 +61,11 @@ public class RefreshReadyService implements ReadyPhase {
 
     @Override
     public void sendReady(String topic, RefreshContext context) {
+        // Snapshot receivedResetAcks BEFORE making READY_SENT state visible to other threads.
+        // registerLateJoiningConsumer (Netty thread) does a volatile re-read of state after
+        // recordResetAck: any entry that observes READY_SENT is guaranteed to have missed this
+        // snapshot, so it returns false and the caller sends READY directly — no duplicate.
+        Set<String> readySnapshot = new HashSet<>(context.getReceivedResetAcks());
         context.setState(RefreshState.READY_SENT);
         context.setReadySentTime(Instant.now());
 
@@ -69,13 +74,12 @@ public class RefreshReadyService implements ReadyPhase {
             metrics.recordReadySent(topic, consumer, context.getRefreshId());
         }
 
-        // Only send READY to consumers that have ACKed RESET
-        remoteConsumers.sendReadyToAckedConsumers(topic, context.getReceivedResetAcks());
+        remoteConsumers.sendReadyToAckedConsumers(topic, readySnapshot);
 
         LogContext readyContext = LogContext.builder()
                 .topic(topic)
                 .custom("refreshId", context.getRefreshId())
-                .custom("consumerCount", context.getReceivedResetAcks().size())
+                .custom("consumerCount", readySnapshot.size())
                 .build();
         refreshLogger.logReadySent(readyContext);
 
@@ -133,7 +137,10 @@ public class RefreshReadyService implements ReadyPhase {
             !context.allReadyAcksReceived()) {
             Set<String> missing = getMissingReadyAcks(context);
             log.warn("READY ACK timeout for topic {} - missing ACKs from: {}", topic, missing);
-            sendReady(topic, context);
+            // Retry: use the live set (not a snapshot) so late joiners registered after the
+            // initial sendReady broadcast are included in this re-broadcast.
+            remoteConsumers.sendReadyToAckedConsumers(topic, context.getReceivedResetAcks());
+            stateStore.saveState(context);
         }
     }
 

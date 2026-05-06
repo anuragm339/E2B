@@ -42,6 +42,7 @@ public class RefreshCoordinator {
     private final Map<String, ScheduledFuture<?>> replayCheckTasks;
     private final Map<String, ScheduledFuture<?>> resetRetryTasks;
     private final Map<String, ScheduledFuture<?>> abortWatchdogTasks;
+    private final Map<String, ScheduledFuture<?>> readyTimeoutTasks;
     private final ScheduledExecutorService scheduler;
 
     public RefreshCoordinator(
@@ -74,6 +75,7 @@ public class RefreshCoordinator {
         this.replayCheckTasks = new ConcurrentHashMap<>();
         this.resetRetryTasks = new ConcurrentHashMap<>();
         this.abortWatchdogTasks = new ConcurrentHashMap<>();
+        this.readyTimeoutTasks = new ConcurrentHashMap<>();
 
         // Inject shared state into services
         wireServices();
@@ -264,6 +266,8 @@ public class RefreshCoordinator {
 
     /**
      * Schedule periodic RESET retry task.
+     * Uses putIfAbsent to prevent duplicate tasks if called concurrently during recovery,
+     * consistent with the pattern in scheduleReplayCheck.
      */
     private void scheduleResetRetry(String topic) {
         ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
@@ -272,8 +276,13 @@ public class RefreshCoordinator {
                 RESET_RETRY_INTERVAL_MS,
                 TimeUnit.MILLISECONDS
         );
-        resetRetryTasks.put(topic, task);
-        log.info("Scheduled RESET retry task for topic {}", topic);
+        ScheduledFuture<?> existing = resetRetryTasks.putIfAbsent(topic, task);
+        if (existing != null) {
+            task.cancel(false);
+            log.debug("RESET retry already scheduled for topic {}, cancelled duplicate", topic);
+        } else {
+            log.info("Scheduled RESET retry task for topic {}", topic);
+        }
     }
 
     /**
@@ -300,13 +309,15 @@ public class RefreshCoordinator {
 
     /**
      * Schedule READY ACK timeout check.
+     * Stores the future so @PreDestroy can cancel pending timeouts before teardown.
      */
     private void scheduleReadyTimeout(String topic) {
-        scheduler.schedule(
+        ScheduledFuture<?> task = scheduler.schedule(
                 () -> checkReadyAckTimeout(topic),
                 READY_ACK_TIMEOUT_MS,
                 TimeUnit.MILLISECONDS
         );
+        readyTimeoutTasks.put(topic, task);
         log.debug("Scheduled READY timeout check for topic {}", topic);
     }
 
@@ -510,6 +521,8 @@ public class RefreshCoordinator {
         replayCheckTasks.clear();
         abortWatchdogTasks.values().forEach(task -> task.cancel(false));
         abortWatchdogTasks.clear();
+        readyTimeoutTasks.values().forEach(task -> task.cancel(false));
+        readyTimeoutTasks.clear();
 
         // Record shutdown time for all active refreshes
         if (!activeRefreshes.isEmpty()) {
