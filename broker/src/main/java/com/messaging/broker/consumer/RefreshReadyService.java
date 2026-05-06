@@ -32,7 +32,6 @@ public class RefreshReadyService implements ReadyPhase {
 
     // Shared state - injected by coordinator
     private Map<String, RefreshContext> activeRefreshes;
-    private volatile String currentRefreshId;
 
     public RefreshReadyService(
             ConsumerRegistry remoteConsumers,
@@ -52,11 +51,8 @@ public class RefreshReadyService implements ReadyPhase {
     /**
      * Inject shared state from coordinator.
      */
-    public void setSharedState(
-            Map<String, RefreshContext> activeRefreshes,
-            String currentRefreshId) {
+    public void setSharedState(Map<String, RefreshContext> activeRefreshes) {
         this.activeRefreshes = activeRefreshes;
-        this.currentRefreshId = currentRefreshId;
     }
 
     @Override
@@ -65,6 +61,12 @@ public class RefreshReadyService implements ReadyPhase {
         // registerLateJoiningConsumer (Netty thread) does a volatile re-read of state after
         // recordResetAck: any entry that observes READY_SENT is guaranteed to have missed this
         // snapshot, so it returns false and the caller sends READY directly — no duplicate.
+        //
+        // Residual T1-T3 window: a recordResetAck call (e.g. from handleResetAck on a late
+        // network RESET ACK) that lands between snapshot construction (T1) and setState (T3)
+        // will be in receivedResetAcks but miss this snapshot. That consumer will receive READY
+        // on the next checkReadyAckTimeout retry (up to READY_ACK_TIMEOUT_MS later). This is an
+        // intentional trade-off — the retry path uses the live set and self-corrects.
         Set<String> readySnapshot = new HashSet<>(context.getReceivedResetAcks());
         context.setState(RefreshState.READY_SENT);
         context.setReadySentTime(Instant.now());

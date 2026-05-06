@@ -93,8 +93,7 @@ public class RefreshCoordinator {
 
         // Ready service needs activeRefreshes for batch completion check
         if (readyService instanceof RefreshReadyService) {
-            ((RefreshReadyService) readyService).setSharedState(
-                    activeRefreshes, null);
+            ((RefreshReadyService) readyService).setSharedState(activeRefreshes);
         }
 
         // Recovery service needs task maps and scheduling callbacks
@@ -190,6 +189,11 @@ public class RefreshCoordinator {
             // Remove our own map entry — prevents a stale ScheduledFuture reference
             // from accumulating indefinitely for topics that abort and are never refreshed again.
             abortWatchdogTasks.remove(topic);
+
+            // Cancel any pending READY timeout — state is now ABORTED, the task would exit
+            // harmlessly but leaving it in the map is inconsistent with all other task maps.
+            ScheduledFuture<?> readyTask = readyTimeoutTasks.remove(topic);
+            if (readyTask != null) readyTask.cancel(false);
 
             activeRefreshes.remove(topic);
             log.info("Refresh aborted and cleaned up for topic: {}", topic);
@@ -310,6 +314,8 @@ public class RefreshCoordinator {
     /**
      * Schedule READY ACK timeout check.
      * Stores the future so @PreDestroy can cancel pending timeouts before teardown.
+     * Uses cancel-on-replace so a previously completed entry is explicitly released,
+     * making the map lifecycle consistent with all other task maps.
      */
     private void scheduleReadyTimeout(String topic) {
         ScheduledFuture<?> task = scheduler.schedule(
@@ -317,7 +323,10 @@ public class RefreshCoordinator {
                 READY_ACK_TIMEOUT_MS,
                 TimeUnit.MILLISECONDS
         );
-        readyTimeoutTasks.put(topic, task);
+        ScheduledFuture<?> previous = readyTimeoutTasks.put(topic, task);
+        if (previous != null && !previous.isDone()) {
+            previous.cancel(false);
+        }
         log.debug("Scheduled READY timeout check for topic {}", topic);
     }
 
@@ -499,9 +508,11 @@ public class RefreshCoordinator {
             return true;
         }
 
-        if (state == RefreshState.READY_SENT) {
+        if (state == RefreshState.READY_SENT && !context.allReadyAcksReceived()) {
             // C1: Consumer joined during the READY broadcast phase. Record in receivedResetAcks so
             // checkReadyAckTimeout re-broadcasts include this consumer if the direct READY send is lost.
+            // Guard: skip if all original consumers have already ACKed — no re-broadcast will fire,
+            // so adding to receivedResetAcks would only write misleading replay-tracking state.
             context.recordResetAck(groupTopic);
             log.info("Late-joining consumer {} registered for topic {} in READY_SENT — caller will send READY directly",
                     groupTopic, topic);
