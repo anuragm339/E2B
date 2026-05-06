@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer
 
+import com.messaging.broker.ack.AckReconciliationScheduler
 import com.messaging.broker.ack.RocksDbAckStore
 import com.messaging.broker.monitoring.RefreshEventLogger
 import com.messaging.broker.consumer.ConsumerRegistry
@@ -58,9 +59,10 @@ class RefreshCoordinatorSpec extends Specification {
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
         def ackStoreMock = Mock(RocksDbAckStore)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
+        def reconciliationScheduler = Mock(AckReconciliationScheduler)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock, reconciliationScheduler)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
-        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
+        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger, reconciliationScheduler)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
@@ -97,9 +99,10 @@ class RefreshCoordinatorSpec extends Specification {
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
         def ackStoreMock = Mock(RocksDbAckStore)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
+        def reconciliationScheduler = Mock(AckReconciliationScheduler)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock, reconciliationScheduler)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
-        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
+        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger, reconciliationScheduler)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
@@ -145,9 +148,10 @@ class RefreshCoordinatorSpec extends Specification {
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
         def ackStoreMock = Mock(RocksDbAckStore)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
+        def reconciliationScheduler = Mock(AckReconciliationScheduler)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock, reconciliationScheduler)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
-        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
+        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger, reconciliationScheduler)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
@@ -224,9 +228,10 @@ class RefreshCoordinatorSpec extends Specification {
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
         def ackStoreMock = Mock(RocksDbAckStore)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
+        def reconciliationScheduler = Mock(AckReconciliationScheduler)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock, reconciliationScheduler)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
-        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
+        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger, reconciliationScheduler)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(com.messaging.broker.consumer.RefreshGatePolicy)
@@ -333,7 +338,9 @@ class RefreshCoordinatorSpec extends Specification {
         coordinator.shutdown()
     }
 
-    def "late joining consumer in replaying state is recorded and ready sent state is ignored"() {
+    def "late joining consumer is recorded in receivedResetAcks for both REPLAYING and READY_SENT"() {
+        // C1 fix: consumers joining in READY_SENT must be in receivedResetAcks so that
+        // checkReadyAckTimeout re-broadcasts reach them if the direct READY send is lost.
         given:
         def coordinator = new RefreshCoordinator(
                 Mock(RefreshStarter),
@@ -359,7 +366,8 @@ class RefreshCoordinatorSpec extends Specification {
 
         then:
         replaying.receivedResetAcks.contains("groupA:topic")
-        !readySent.receivedResetAcks.contains("groupA:other")
+        // READY_SENT: consumer is recorded so checkReadyAckTimeout retry re-broadcasts reach it
+        readySent.receivedResetAcks.contains("groupA:other")
 
         cleanup:
         coordinator.shutdown()
@@ -438,7 +446,7 @@ class RefreshCoordinatorSpec extends Specification {
         coordinator.getCurrentRefreshContext() == context
 
         when:
-        invokePrivate(coordinator, "abortRefreshIfStuck", "topic")
+        invokePrivate(coordinator, "abortRefreshIfStuck", "topic", "refresh-1")
 
         then:
         !coordinator.isRefreshActive("topic")
@@ -456,7 +464,7 @@ class RefreshCoordinatorSpec extends Specification {
                 Mock(BatchDeliveryService), Mock(ConsumerRegistry))
 
         when:
-        invokePrivate(coordinator, "abortRefreshIfStuck", "missing-topic")
+        invokePrivate(coordinator, "abortRefreshIfStuck", "missing-topic", "any-refresh-id")
 
         then:
         noExceptionThrown()
@@ -473,13 +481,14 @@ class RefreshCoordinatorSpec extends Specification {
                 Mock(BatchDeliveryService), Mock(ConsumerRegistry))
         def context = new RefreshContext("topic", ["groupA:topic"] as Set)
         context.setState(RefreshState.COMPLETED)
+        context.setRefreshId("refresh-term")
         coordinator.@activeRefreshes.put("topic", context)
 
         when:
-        invokePrivate(coordinator, "abortRefreshIfStuck", "topic")
+        invokePrivate(coordinator, "abortRefreshIfStuck", "topic", "refresh-term")
 
         then:
-        coordinator.isRefreshActive("topic")  // context was NOT removed
+        coordinator.isRefreshActive("topic")  // context was NOT removed — terminal state guard fired
 
         cleanup:
         coordinator.shutdown()
@@ -493,11 +502,12 @@ class RefreshCoordinatorSpec extends Specification {
                 Mock(BatchDeliveryService), Mock(ConsumerRegistry))
         def context = new RefreshContext("topic", ["groupA:topic"] as Set)
         context.setState(RefreshState.REPLAYING)
+        context.setRefreshId("refresh-abort")
         coordinator.@activeRefreshes.put("topic", context)
         // deliberately NO entries in resetRetryTasks or replayCheckTasks
 
         when:
-        invokePrivate(coordinator, "abortRefreshIfStuck", "topic")
+        invokePrivate(coordinator, "abortRefreshIfStuck", "topic", "refresh-abort")
 
         then:
         !coordinator.isRefreshActive("topic")
@@ -791,9 +801,10 @@ class RefreshCoordinatorSpec extends Specification {
         def stateMachine = new RefreshStateMachine()
         def initiationService = new RefreshInitiator(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
         def ackStoreMock = Mock(RocksDbAckStore)
-        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock)
+        def reconciliationScheduler = Mock(AckReconciliationScheduler)
+        def resetService = new RefreshResetService(remoteConsumers, metrics, stateStore, refreshLogger, ackStoreMock, reconciliationScheduler)
         def replayService = new RefreshReplayService(remoteConsumers, metrics, refreshLogger)
-        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger)
+        def readyService = new RefreshReadyService(remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger, reconciliationScheduler)
         def recoveryService = new RefreshRecoveryService(remoteConsumers, pipeConnector, metrics, stateStore, resetService, refreshLogger)
 
         def gatePolicy = Mock(RefreshGatePolicy)

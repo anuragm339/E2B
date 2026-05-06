@@ -88,7 +88,7 @@ public class RefreshCoordinator {
         // Initiation service needs task maps for cancellation
         if (initiationService instanceof RefreshInitiator) {
             ((RefreshInitiator) initiationService).setSharedState(
-                    activeRefreshes, resetRetryTasks, replayCheckTasks, abortWatchdogTasks);
+                    activeRefreshes, resetRetryTasks, replayCheckTasks, abortWatchdogTasks, readyTimeoutTasks);
         }
 
         // Ready service needs activeRefreshes for batch completion check
@@ -254,6 +254,10 @@ public class RefreshCoordinator {
 
             if (transition.isSuccess()) {
                 readyService.completeRefresh(topic, context);
+
+                // Cancel the READY timeout — no more retries needed now that all ACKs are in.
+                ScheduledFuture<?> readyTask = readyTimeoutTasks.remove(topic);
+                if (readyTask != null) readyTask.cancel(false);
 
                 // Cleanup after delay
                 final String completedRefreshId = context.getRefreshId();

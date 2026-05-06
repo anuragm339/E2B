@@ -13,6 +13,7 @@ import java.time.Instant;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledFuture;
 
@@ -35,6 +36,7 @@ public class RefreshInitiator implements RefreshStarter {
     private Map<String, ScheduledFuture<?>> resetRetryTasks;
     private Map<String, ScheduledFuture<?>> replayCheckTasks;
     private Map<String, ScheduledFuture<?>> abortWatchdogTasks;
+    private Map<String, ScheduledFuture<?>> readyTimeoutTasks;
     private volatile String currentRefreshId;
 
     public RefreshInitiator(
@@ -59,11 +61,13 @@ public class RefreshInitiator implements RefreshStarter {
             Map<String, RefreshContext> activeRefreshes,
             Map<String, ScheduledFuture<?>> resetRetryTasks,
             Map<String, ScheduledFuture<?>> replayCheckTasks,
-            Map<String, ScheduledFuture<?>> abortWatchdogTasks) {
+            Map<String, ScheduledFuture<?>> abortWatchdogTasks,
+            Map<String, ScheduledFuture<?>> readyTimeoutTasks) {
         this.activeRefreshes = activeRefreshes;
         this.resetRetryTasks = resetRetryTasks;
         this.replayCheckTasks = replayCheckTasks;
         this.abortWatchdogTasks = abortWatchdogTasks;
+        this.readyTimeoutTasks = readyTimeoutTasks;
     }
 
     /**
@@ -152,7 +156,9 @@ public class RefreshInitiator implements RefreshStarter {
 
     @Override
     public String generateRefreshId() {
-        return String.valueOf(System.currentTimeMillis());
+        // UUID guarantees uniqueness across rapid successive refreshes; millisecond timestamps
+        // can collide under high load, which would invalidate the refreshId guard in abortRefreshIfStuck.
+        return UUID.randomUUID().toString();
     }
 
     @Override
@@ -189,6 +195,15 @@ public class RefreshInitiator implements RefreshStarter {
         if (oldWatchdog != null) {
             oldWatchdog.cancel(false);
             log.info("Cancelled orphaned abort watchdog for topic: {}", topic);
+        }
+
+        // Cancel existing READY timeout — the old refresh may have reached READY_SENT and
+        // scheduled a timeout before being force-cancelled. Cancel it so the stale task
+        // doesn't fire against the new refresh context.
+        ScheduledFuture<?> oldReadyTimeout = readyTimeoutTasks.remove(topic);
+        if (oldReadyTimeout != null) {
+            oldReadyTimeout.cancel(false);
+            log.info("Cancelled orphaned READY timeout task for topic: {}", topic);
         }
 
         // Remove old context

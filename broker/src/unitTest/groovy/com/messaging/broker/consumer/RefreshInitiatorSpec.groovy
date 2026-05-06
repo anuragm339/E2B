@@ -22,14 +22,16 @@ class RefreshInitiatorSpec extends Specification {
     RefreshInitiator initiator
 
     // Shared state maps wired into the initiator (as the coordinator would do)
-    Map<String, RefreshContext>       activeRefreshes  = new ConcurrentHashMap<>()
-    Map<String, ScheduledFuture<?>>   resetRetryTasks  = new ConcurrentHashMap<>()
-    Map<String, ScheduledFuture<?>>   replayCheckTasks = new ConcurrentHashMap<>()
+    Map<String, RefreshContext>       activeRefreshes   = new ConcurrentHashMap<>()
+    Map<String, ScheduledFuture<?>>   resetRetryTasks   = new ConcurrentHashMap<>()
+    Map<String, ScheduledFuture<?>>   replayCheckTasks  = new ConcurrentHashMap<>()
+    Map<String, ScheduledFuture<?>>   abortWatchdogTasks = new ConcurrentHashMap<>()
+    Map<String, ScheduledFuture<?>>   readyTimeoutTasks  = new ConcurrentHashMap<>()
 
     def setup() {
         initiator = new RefreshInitiator(
                 remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
-        initiator.setSharedState(activeRefreshes, resetRetryTasks, replayCheckTasks)
+        initiator.setSharedState(activeRefreshes, resetRetryTasks, replayCheckTasks, abortWatchdogTasks, readyTimeoutTasks)
 
         // Default stubs
         remoteConsumers.getGroupTopicIdentifiers("prices-v1")  >> (["group-a:prices-v1"] as Set)
@@ -62,13 +64,17 @@ class RefreshInitiatorSpec extends Specification {
         0 * pipeConnector.pausePipeCalls()
     }
 
-    def "cancelExistingRefresh removes old context and cancels scheduled tasks"() {
+    def "cancelExistingRefresh removes old context and cancels all scheduled tasks"() {
         given:
         initiator.startRefresh("prices-v1").get()
-        def mockReset  = Mock(ScheduledFuture) { isDone() >> false }
-        def mockReplay = Mock(ScheduledFuture) { isDone() >> false }
-        resetRetryTasks["prices-v1"]  = mockReset
-        replayCheckTasks["prices-v1"] = mockReplay
+        def mockReset    = Mock(ScheduledFuture) { isDone() >> false }
+        def mockReplay   = Mock(ScheduledFuture) { isDone() >> false }
+        def mockWatchdog = Mock(ScheduledFuture) { isDone() >> false }
+        def mockReady    = Mock(ScheduledFuture) { isDone() >> false }
+        resetRetryTasks["prices-v1"]    = mockReset
+        replayCheckTasks["prices-v1"]   = mockReplay
+        abortWatchdogTasks["prices-v1"] = mockWatchdog
+        readyTimeoutTasks["prices-v1"]  = mockReady
 
         when:
         initiator.cancelExistingRefresh("prices-v1", "test")
@@ -77,6 +83,8 @@ class RefreshInitiatorSpec extends Specification {
         !activeRefreshes.containsKey("prices-v1")
         1 * mockReset.cancel(false)
         1 * mockReplay.cancel(false)
+        1 * mockWatchdog.cancel(false)
+        1 * mockReady.cancel(false)
     }
 
     // ── Concurrency: Fix 7 ───────────────────────────────────────────────────
