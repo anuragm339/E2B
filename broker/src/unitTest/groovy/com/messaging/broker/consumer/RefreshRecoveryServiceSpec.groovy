@@ -23,6 +23,7 @@ class RefreshRecoveryServiceSpec extends Specification {
     List<String> resetRetryTopics = []
     List<String> replayTopics = []
     List<String> readyTimeoutTopics = []
+    List<String> abortWatchdogTopics = []
 
     RefreshRecoveryService service = new RefreshRecoveryService(
             remoteConsumers, pipeConnector, metrics, stateStore, resetPhase, refreshLogger)
@@ -32,7 +33,8 @@ class RefreshRecoveryServiceSpec extends Specification {
         service.setSchedulingCallbacks(
                 { topic -> resetRetryTopics << topic },
                 { topic -> replayTopics << topic },
-                { topic -> readyTimeoutTopics << topic }
+                { topic -> readyTimeoutTopics << topic },
+                { topic -> abortWatchdogTopics << topic }
         )
     }
 
@@ -160,6 +162,8 @@ class RefreshRecoveryServiceSpec extends Specification {
         then:
         replayTopics == ["prices-v1"]
         readyTimeoutTopics == ["orders-v1"]
+        abortWatchdogTopics.containsAll(["prices-v1", "orders-v1"])
+        abortWatchdogTopics.size() == 2
         !activeRefreshes.containsKey("users-v1")
         1 * stateStore.clearState("users-v1")
         1 * metrics.recordResetAckDuration("prices-v1", "group-a:prices-v1", "refresh-3", _)

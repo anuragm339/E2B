@@ -65,12 +65,20 @@ public class RefreshReadyService implements ReadyPhase {
         context.setState(RefreshState.READY_SENT);                                  // T3
         context.setReadySentTime(Instant.now());
 
+        // Record READY sent metrics for each expected consumer
+        for (String consumer : context.getExpectedConsumers()) {
+            metrics.recordReadySent(topic, consumer, context.getRefreshId());
+        }
+
+        // P1-3: Primary broadcast first — consumers that were in the set at T1.
+        remoteConsumers.sendReadyToAckedConsumers(topic, readySnapshot);
+
         // T1-T3 supplemental send: consumers whose recordResetAck landed between T1 and T3 are
         // in the live set but not in readySnapshot. They called registerLateJoiningConsumer,
         // whose C2 re-read still saw REPLAYING (T3 not yet visible), so it returned true — but
-        // they missed the broadcast. Diff the live set against the snapshot and send READY
-        // directly so they don't wait READY_ACK_TIMEOUT_MS for the first checkReadyAckTimeout
-        // retry. Any consumer joining after this second snapshot will be covered by the retry.
+        // they missed the primary broadcast. Diff the live set against the snapshot and send READY
+        // so they don't wait READY_ACK_TIMEOUT_MS for the first checkReadyAckTimeout retry.
+        // Sent after the primary broadcast so primary consumers are not delayed by this path.
         Set<String> liveAcks = new HashSet<>(context.getReceivedResetAcks());
         liveAcks.removeAll(readySnapshot);
         if (!liveAcks.isEmpty()) {
@@ -78,13 +86,6 @@ public class RefreshReadyService implements ReadyPhase {
                     liveAcks.size(), topic);
             remoteConsumers.sendReadyToAckedConsumers(topic, liveAcks);
         }
-
-        // Record READY sent metrics for each expected consumer
-        for (String consumer : context.getExpectedConsumers()) {
-            metrics.recordReadySent(topic, consumer, context.getRefreshId());
-        }
-
-        remoteConsumers.sendReadyToAckedConsumers(topic, readySnapshot);
 
         LogContext readyContext = LogContext.builder()
                 .topic(topic)

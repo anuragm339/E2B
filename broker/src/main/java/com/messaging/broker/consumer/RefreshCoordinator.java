@@ -103,7 +103,8 @@ public class RefreshCoordinator {
             impl.setSchedulingCallbacks(
                     this::scheduleResetRetry,
                     this::scheduleReplayCheck,
-                    this::scheduleReadyTimeout
+                    this::scheduleReadyTimeout,
+                    this::scheduleAbortWatchdog
             );
         }
     }
@@ -161,6 +162,10 @@ public class RefreshCoordinator {
      *                          for the same topic after the one that scheduled this watchdog.
      */
     private void abortRefreshIfStuck(String topic, String expectedRefreshId) {
+        abortRefreshIfStuck(topic, expectedRefreshId, false);
+    }
+
+    private void abortRefreshIfStuck(String topic, String expectedRefreshId, boolean allowAbortFromReadySent) {
         RefreshContext context = activeRefreshes.get(topic);
         if (context == null) return;
 
@@ -172,6 +177,34 @@ public class RefreshCoordinator {
 
         RefreshState state = context.getState();
         if (stateMachine.isTerminalState(state)) return;
+
+        // H2-2: Do not abort on the first watchdog fire once READY messages are already in flight.
+        // Aborting immediately would leave consumers in a ready state while the broker considers
+        // the refresh ABORTED, causing the pipe to never resume.
+        // H1-NEW-1: Re-arm the watchdog for one more window so that a permanently stuck READY_SENT
+        // (all consumers disconnected, READY ACK retry path unresponsive) is eventually aborted.
+        // The re-armed call passes allowAbortFromReadySent=true and will not re-arm again.
+        if (state == RefreshState.READY_SENT && !allowAbortFromReadySent) {
+            log.warn("Abort watchdog fired for topic={} in READY_SENT — re-arming for one more window; "
+                    + "READY ACK retry path has {} more ms to resolve",
+                    topic, REFRESH_ABORT_TIMEOUT_MS);
+            String rearmRefreshId = context.getRefreshId();
+            ScheduledFuture<?> rearm = scheduler.schedule(
+                    () -> abortRefreshIfStuck(topic, rearmRefreshId, true),
+                    REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            // NEW-P2: Verify the context is still active before installing — handleReadyAck may
+            // have completed the refresh between our state check and here, leaving a stale entry.
+            RefreshContext current = activeRefreshes.get(topic);
+            if (current != null && rearmRefreshId.equals(current.getRefreshId())) {
+                abortWatchdogTasks.compute(topic, (k, old) -> {
+                    if (old != null) old.cancel(false);
+                    return rearm;
+                });
+            } else {
+                rearm.cancel(false);
+            }
+            return;
+        }
 
         log.error("Refresh timeout after {}ms for topic={}, state={}, refreshId={} — aborting",
                 REFRESH_ABORT_TIMEOUT_MS, topic, state, context.getRefreshId());
@@ -248,6 +281,16 @@ public class RefreshCoordinator {
         boolean allReceived = readyService.handleReadyAck(consumerGroupTopic, topic, context, traceId);
 
         if (allReceived) {
+            // NEW-P1: CAS guard prevents two concurrent final READY_ACKs from both driving
+            // completeRefresh — mirroring the markFirstResetAck() pattern for the REPLAYING
+            // transition. Without this, containsAll() is not atomic and two threads can both
+            // observe allReadyAcksReceived()==true and call resumePipeCalls/clearState twice.
+            if (!context.markFirstReadyComplete()) {
+                log.debug("Duplicate completion signal for topic {} — another thread already claimed transition",
+                        topic);
+                return;
+            }
+
             // Transition to COMPLETED state
             RefreshWorkflow.StateTransitionResult transition =
                     stateMachine.transition(context.getState(), RefreshState.COMPLETED);
@@ -258,6 +301,10 @@ public class RefreshCoordinator {
                 // Cancel the READY timeout — no more retries needed now that all ACKs are in.
                 ScheduledFuture<?> readyTask = readyTimeoutTasks.remove(topic);
                 if (readyTask != null) readyTask.cancel(false);
+
+                // P1-1: Cancel the abort watchdog — refresh completed normally; no need to fire.
+                ScheduledFuture<?> watchdogTask = abortWatchdogTasks.remove(topic);
+                if (watchdogTask != null) watchdogTask.cancel(false);
 
                 // Cleanup after delay
                 final String completedRefreshId = context.getRefreshId();
@@ -322,6 +369,13 @@ public class RefreshCoordinator {
      * making the map lifecycle consistent with all other task maps.
      */
     private void scheduleReadyTimeout(String topic) {
+        // P2-1: Guard against inserting an orphaned task after handleReadyAck already completed
+        // the refresh. Without this check, the self-reschedule in checkReadyAckTimeout can race
+        // with the readyTimeoutTasks.remove() in handleReadyAck and insert a new entry that has
+        // no owner to cancel it until @PreDestroy.
+        RefreshContext guard = activeRefreshes.get(topic);
+        if (guard == null || stateMachine.isTerminalState(guard.getState())) return;
+
         ScheduledFuture<?> task = scheduler.schedule(
                 () -> checkReadyAckTimeout(topic),
                 READY_ACK_TIMEOUT_MS,
@@ -332,6 +386,25 @@ public class RefreshCoordinator {
             previous.cancel(false);
         }
         log.debug("Scheduled READY timeout check for topic {}", topic);
+    }
+
+    /**
+     * Schedule an abort watchdog for a topic. Used by the recovery service when resuming
+     * an in-progress refresh after restart — ensures the abort safety net is always armed
+     * regardless of whether the refresh was started or recovered.
+     */
+    private void scheduleAbortWatchdog(String topic) {
+        RefreshContext context = activeRefreshes.get(topic);
+        if (context == null) return;
+        String refreshId = context.getRefreshId();
+        ScheduledFuture<?> watchdog = scheduler.schedule(
+                () -> abortRefreshIfStuck(topic, refreshId),
+                REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        abortWatchdogTasks.compute(topic, (k, old) -> {
+            if (old != null) old.cancel(false);
+            return watchdog;
+        });
+        log.info("Scheduled abort watchdog for topic {} (recovered refresh, refreshId={})", topic, refreshId);
     }
 
     /**
@@ -489,12 +562,20 @@ public class RefreshCoordinator {
                 return false;
             }
 
-            // If this ACK completes the set and we are still in RESET_SENT, drive the transition
-            // to REPLAYING ourselves — handleResetAck() was never called for this consumer so the
-            // normal transition path was bypassed.
-            if (state == RefreshState.RESET_SENT && context.allResetAcksReceived()) {
+            // P1-2: If this ACK completes the set and we are still in RESET_SENT, drive the
+            // transition to REPLAYING ourselves — handleResetAck() was never called for this consumer
+            // so the normal transition path was bypassed. Use stateAfter (post-recordResetAck re-read)
+            // rather than the stale pre-ack state variable. Also claim the markFirstResetAck() CAS so
+            // a concurrent handleResetAck cannot drive the same transition simultaneously — without
+            // this guard, both threads could independently attempt setState(REPLAYING) and
+            // scheduleReplayCheck, producing a duplicate replay-check task.
+            if (stateAfter == RefreshState.RESET_SENT && context.allResetAcksReceived()
+                    && context.markFirstResetAck()) {
+                // NEW-P1: Use stateAfter (not context.getState()) — consistent with the guard above
+                // and avoids a spurious REPLAYING→REPLAYING idempotent transition if the volatile
+                // field was updated between the guard read and this call.
                 RefreshWorkflow.StateTransitionResult transition =
-                        stateMachine.transition(context.getState(), RefreshState.REPLAYING);
+                        stateMachine.transition(stateAfter, RefreshState.REPLAYING);
                 if (transition.isSuccess()) {
                     context.setState(RefreshState.REPLAYING);
 
@@ -513,11 +594,12 @@ public class RefreshCoordinator {
         }
 
         if (state == RefreshState.READY_SENT && !context.allReadyAcksReceived()) {
-            // C1: Consumer joined during the READY broadcast phase. Record in receivedResetAcks so
+            // C1: Consumer joined during the READY broadcast phase. Add to receivedResetAcks so
             // checkReadyAckTimeout re-broadcasts include this consumer if the direct READY send is lost.
-            // Guard: skip if all original consumers have already ACKed — no re-broadcast will fire,
-            // so adding to receivedResetAcks would only write misleading replay-tracking state.
-            context.recordResetAck(groupTopic);
+            // P2-2: Use direct set addition instead of recordResetAck() to avoid the replay-tracking
+            // side effects (consumerReplaying=true, consumerOffsets=0) that are incorrect for a
+            // consumer that never participated in the replay phase.
+            context.getReceivedResetAcks().add(groupTopic);
             log.info("Late-joining consumer {} registered for topic {} in READY_SENT — caller will send READY directly",
                     groupTopic, topic);
             // Return false: caller must send READY immediately; it cannot wait for the next retry.
