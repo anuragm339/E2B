@@ -281,6 +281,15 @@ public class RefreshCoordinator {
         boolean allReceived = readyService.handleReadyAck(consumerGroupTopic, topic, context, traceId);
 
         if (allReceived) {
+            // NEW2-P2: Snapshot state BEFORE the CAS — the abort watchdog can race between
+            // markFirstReadyComplete() returning true and the stateMachine.transition() call:
+            // the watchdog sets context.setState(ABORTED) so the volatile re-read of
+            // context.getState() would return ABORTED, making transition(ABORTED, COMPLETED)
+            // fail and leaving the pipe permanently paused. Using the pre-CAS snapshot
+            // (always READY_SENT when allReadyAcksReceived() == true) guarantees a valid
+            // READY_SENT → COMPLETED path regardless of concurrent abort timing.
+            RefreshState stateAtCompletion = context.getState();
+
             // NEW-P1: CAS guard prevents two concurrent final READY_ACKs from both driving
             // completeRefresh — mirroring the markFirstResetAck() pattern for the REPLAYING
             // transition. Without this, containsAll() is not atomic and two threads can both
@@ -291,9 +300,9 @@ public class RefreshCoordinator {
                 return;
             }
 
-            // Transition to COMPLETED state
+            // Transition to COMPLETED state using the pre-CAS snapshot
             RefreshWorkflow.StateTransitionResult transition =
-                    stateMachine.transition(context.getState(), RefreshState.COMPLETED);
+                    stateMachine.transition(stateAtCompletion, RefreshState.COMPLETED);
 
             if (transition.isSuccess()) {
                 readyService.completeRefresh(topic, context);
