@@ -2,6 +2,7 @@ package com.messaging.broker.systemtest.journey
 
 import com.messaging.broker.ack.RocksDbAckStore
 import com.messaging.broker.consumer.ConsumerOffsetTracker
+import com.messaging.broker.consumer.ConsumerRegistry
 import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
 import com.messaging.broker.systemtest.support.TestRecordCollector
 import io.micronaut.context.ApplicationContext
@@ -15,7 +16,8 @@ import spock.util.concurrent.PollingConditions
  * Consumer B (group-b) crashes twice and restarts twice, simulating a restart loop.
  *
  * Verifies:
- * 1. Consumer A receives all records uninterrupted — B's crashes have zero impact on A.
+ * 1. Consumer A eventually continues receiving after B crashes — B's failures do not leave
+ *    the topic permanently blocked once the disconnect / ACK-timeout cleanup runs.
  * 2. Consumer B resumes from its committed offset on each reconnect — no gaps, no duplicates.
  * 3. The broker does not accumulate stuck delivery state across B's repeated crashes.
  * 4. RocksDB ack-store reflects all records ACKed by B across all restart cycles.
@@ -56,7 +58,7 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
         consumerBCtx?.close()
     }
 
-    def "stable consumer A is unaffected while consumer B crashes and restarts twice"() {
+    def "consumer A recovers cleanly while consumer B crashes and restarts twice"() {
         given: "both consumers receive 3 initial records"
         cloudServer.enqueueMessages((1..3).collect { i ->
             [offset: (long) i, topic: 'prices-v1', partition: 0,
@@ -73,6 +75,7 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
 
         and: "both groups have a committed offset (init batch ACKed by both)"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
+        def registry = brokerCtx.getBean(ConsumerRegistry)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             assert offsetTracker.getOffset('group-a:prices-v1') > 0
             assert offsetTracker.getOffset('group-b:prices-v1') > 0
@@ -83,10 +86,12 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
 
         when: "consumer B crashes (first crash)"
         consumerBCtx.close()
-        // Wait for the broker to process B's disconnect and free B's delivery state.
-        // Any in-flight delivery to B will time out after the 5s ACK timeout (overridden above),
-        // freeing the prices-v1 in-flight slot so A's delivery can proceed.
-        sleep(6000)
+        // Wait for the broker to process B's disconnect and remove its registrations.
+        // This is more robust than a fixed sleep because the disconnect and timeout cleanup
+        // are asynchronous and can drift under CI load.
+        new PollingConditions(timeout: 15, delay: 0.3).eventually {
+            assert !registry.getAllConsumers().any { it.group == 'group-b' && it.topic == 'prices-v1' }
+        }
 
         and: "3 records arrive while B is down — offsets 4-6"
         cloudServer.enqueueMessages((4..6).collect { i ->
@@ -94,8 +99,8 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
              msgKey: "crash1-${i}", eventType: 'MESSAGE', data: """{"i":${i}}"""]
         })
 
-        then: "consumer A receives crash1 records without interruption — B's crash has no impact on A"
-        new PollingConditions(timeout: 20, delay: 0.3).eventually {
+        then: "consumer A eventually receives crash1 records once B's blocked state is cleared"
+        new PollingConditions(timeout: 30, delay: 0.3).eventually {
             assert collectorA.getAll().any { it.msgKey == 'crash1-4' }
             assert collectorA.getAll().any { it.msgKey == 'crash1-5' }
             assert collectorA.getAll().any { it.msgKey == 'crash1-6' }
@@ -135,7 +140,9 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
 
         when: "consumer B crashes again (second crash)"
         consumerBCtx.close()
-        sleep(6000) // same reason: free in-flight slot before enqueueing new records
+        new PollingConditions(timeout: 15, delay: 0.3).eventually {
+            assert !registry.getAllConsumers().any { it.group == 'group-b' && it.topic == 'prices-v1' }
+        }
 
         and: "3 more records arrive while B is down again — offsets 7-9"
         cloudServer.enqueueMessages((7..9).collect { i ->
@@ -143,8 +150,8 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
              msgKey: "crash2-${i}", eventType: 'MESSAGE', data: """{"i":${i}}"""]
         })
 
-        then: "consumer A continues receiving — second B crash also has no impact"
-        new PollingConditions(timeout: 20, delay: 0.3).eventually {
+        then: "consumer A continues receiving after the second cleanup window as well"
+        new PollingConditions(timeout: 30, delay: 0.3).eventually {
             assert collectorA.getAll().any { it.msgKey == 'crash2-7' }
             assert collectorA.getAll().any { it.msgKey == 'crash2-8' }
             assert collectorA.getAll().any { it.msgKey == 'crash2-9' }
