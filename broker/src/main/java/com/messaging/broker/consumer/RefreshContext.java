@@ -63,6 +63,12 @@ public class RefreshContext {
     // two RESET_ACKs arrive simultaneously (add() + size()==1 is not atomic on a concurrent set).
     private final AtomicBoolean firstResetAckClaimed = new AtomicBoolean(false);
 
+    // Tracks whether the COMPLETED transition has already been claimed.
+    // CAS mirrors firstResetAckClaimed: two final READY_ACKs arriving simultaneously can both
+    // observe allReadyAcksReceived()==true (containsAll is not atomic with concurrent add),
+    // so exactly one thread must drive READY_SENT → COMPLETED and call completeRefresh.
+    private final AtomicBoolean firstReadyCompleteClaimed = new AtomicBoolean(false);
+
     // Refresh batch tracking
     private volatile String refreshId;  // Unique identifier for the refresh batch (survives broker restarts)
 
@@ -104,6 +110,14 @@ public class RefreshContext {
      */
     public boolean markFirstResetAck() {
         return firstResetAckClaimed.compareAndSet(false, true);
+    }
+
+    /**
+     * Atomically claim the right to drive the READY_SENT → COMPLETED transition.
+     * Returns true exactly once regardless of how many threads call it concurrently.
+     */
+    public boolean markFirstReadyComplete() {
+        return firstReadyCompleteClaimed.compareAndSet(false, true);
     }
 
     public boolean allReadyAcksReceived() {

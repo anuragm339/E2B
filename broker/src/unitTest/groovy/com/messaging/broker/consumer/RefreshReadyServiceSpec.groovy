@@ -20,7 +20,7 @@ class RefreshReadyServiceSpec extends Specification {
             remoteConsumers, pipeConnector, metrics, stateStore, refreshLogger, reconciliationScheduler)
 
     def setup() {
-        service.setSharedState(activeRefreshes, "batch-1")
+        service.setSharedState(activeRefreshes)
     }
 
     def "sendReady marks state records metrics and persists"() {
@@ -87,10 +87,11 @@ class RefreshReadyServiceSpec extends Specification {
         service.checkReadyAckTimeout("prices-v1", context)
 
         then:
+        // Retry path calls sendReadyToAckedConsumers directly (not sendReady) — no metrics/logger
         1 * remoteConsumers.sendReadyToAckedConsumers("prices-v1", context.receivedResetAcks)
-        1 * metrics.recordReadySent("prices-v1", "group-a:prices-v1", "batch-1")
-        1 * refreshLogger.logReadySent(_)
         1 * stateStore.saveState(context)
+        0 * metrics.recordReadySent(_, _, _)
+        0 * refreshLogger.logReadySent(_)
     }
 
     def "completeRefresh resumes pipe only when the batch is fully complete"() {

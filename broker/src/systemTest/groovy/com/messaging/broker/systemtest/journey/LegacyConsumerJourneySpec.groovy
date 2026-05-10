@@ -1,5 +1,6 @@
 package com.messaging.broker.systemtest.journey
 
+import com.messaging.broker.ack.RocksDbAckStore
 import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.consumer.ConsumerRegistry
 import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
@@ -91,12 +92,15 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
             assert legacyClient.received.any { it instanceof BatchEvent }
         }
 
-        and: "the batch contains the expected message keys (merged across topics)"
-        def allBatchKeys = legacyClient.received
-            .findAll { it instanceof BatchEvent }
-            .collectMany { (it as BatchEvent).messages*.key }
-            .toSet()
-        allBatchKeys.intersect(['legacy-price-1', 'legacy-ref-1']).size() > 0
+        and: "the received legacy batches cover both topic messages"
+        new PollingConditions(timeout: 20, delay: 0.3).eventually {
+            def allBatchKeys = legacyClient.received
+                .findAll { it instanceof BatchEvent }
+                .collectMany { (it as BatchEvent).messages*.key }
+                .toSet()
+            assert allBatchKeys.contains('legacy-price-1')
+            assert allBatchKeys.contains('legacy-ref-1')
+        }
 
         and: "no wire errors on the connection"
         legacyClient.errors.isEmpty()
@@ -104,13 +108,20 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         when: "legacy client ACKs all received batches"
         legacyClient.received.findAll { it instanceof BatchEvent }.each { legacyClient.sendAck() }
 
-        then: "offsets advance in ConsumerOffsetTracker for the delivered topics"
+        then: "offsets advance in ConsumerOffsetTracker for all delivered topics"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            // At least one of the two topics should have a committed offset > 0
             def priceOffset = offsetTracker.getOffset('price-quote-service:prices-v1')
             def refOffset   = offsetTracker.getOffset('price-quote-service:reference-data-v5')
-            assert priceOffset > 0 || refOffset > 0
+            assert priceOffset > 0
+            assert refOffset > 0
+        }
+
+        and: "RocksDB has ACK entries for both delivered legacy topic offsets"
+        def ackStore = brokerCtx.getBean(RocksDbAckStore)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert ackStore.get('prices-v1', 'price-quote-service', 1L) != null
+            assert ackStore.get('reference-data-v5', 'price-quote-service', 1L) != null
         }
     }
 

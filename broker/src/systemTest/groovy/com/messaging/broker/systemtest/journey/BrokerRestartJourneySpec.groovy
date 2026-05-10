@@ -131,8 +131,4 @@ class BrokerRestartJourneySpec extends BrokerSystemTestSupport {
         return props
     }
 
-    private static int findFreePort() {
-        def s = new ServerSocket(0)
-        try { s.localPort } finally { s.close() }
-    }
 }

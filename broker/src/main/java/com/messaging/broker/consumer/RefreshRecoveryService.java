@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.UUID;
 import java.util.concurrent.ScheduledFuture;
 import java.util.stream.Collectors;
 
@@ -38,6 +39,7 @@ public class RefreshRecoveryService implements RefreshRecovery {
     private ScheduleResetRetryCallback scheduleResetRetryCallback;
     private ScheduleReplayCheckCallback scheduleReplayCheckCallback;
     private ScheduleReadyTimeoutCallback scheduleReadyTimeoutCallback;
+    private ScheduleAbortWatchdogCallback scheduleAbortWatchdogCallback;
 
     public RefreshRecoveryService(
             ConsumerRegistry remoteConsumers,
@@ -72,10 +74,12 @@ public class RefreshRecoveryService implements RefreshRecovery {
     public void setSchedulingCallbacks(
             ScheduleResetRetryCallback resetRetry,
             ScheduleReplayCheckCallback replayCheck,
-            ScheduleReadyTimeoutCallback readyTimeout) {
+            ScheduleReadyTimeoutCallback readyTimeout,
+            ScheduleAbortWatchdogCallback abortWatchdog) {
         this.scheduleResetRetryCallback = resetRetry;
         this.scheduleReplayCheckCallback = replayCheck;
         this.scheduleReadyTimeoutCallback = readyTimeout;
+        this.scheduleAbortWatchdogCallback = abortWatchdog;
     }
 
     @Override
@@ -109,8 +113,10 @@ public class RefreshRecoveryService implements RefreshRecovery {
 
             String refreshId = context.getRefreshId();
             if (refreshId == null) {
-                // Backward compatibility: generate refresh_id if missing
-                refreshId = String.valueOf(System.currentTimeMillis());
+                // H2-3: Backward compatibility: generate refresh_id if missing from persisted state.
+                // Use UUID (not millis-timestamp) to match RefreshInitiator.generateRefreshId() and
+                // preserve the collision-safety guarantee required by the abort watchdog guard.
+                refreshId = UUID.randomUUID().toString();
                 context.setRefreshId(refreshId);
                 log.warn("No refresh_id found for topic {}, generating new one: {}", topic, refreshId);
             }
@@ -262,6 +268,11 @@ public class RefreshRecoveryService implements RefreshRecovery {
         if (scheduleResetRetryCallback != null) {
             scheduleResetRetryCallback.schedule(topic);
         }
+
+        // H1-NEW-2: Arm abort watchdog for recovered RESET_SENT refreshes.
+        if (scheduleAbortWatchdogCallback != null) {
+            scheduleAbortWatchdogCallback.schedule(topic);
+        }
     }
 
     private void resumeReplaying(String topic, RefreshContext context) {
@@ -274,6 +285,11 @@ public class RefreshRecoveryService implements RefreshRecovery {
         if (scheduleReplayCheckCallback != null) {
             scheduleReplayCheckCallback.schedule(topic);
         }
+
+        // H1-NEW-2: Arm abort watchdog for recovered REPLAYING refreshes.
+        if (scheduleAbortWatchdogCallback != null) {
+            scheduleAbortWatchdogCallback.schedule(topic);
+        }
     }
 
     private void resumeReadySent(String topic, RefreshContext context) {
@@ -285,6 +301,13 @@ public class RefreshRecoveryService implements RefreshRecovery {
         // Schedule timeout check
         if (scheduleReadyTimeoutCallback != null) {
             scheduleReadyTimeoutCallback.schedule(topic);
+        }
+
+        // H2-NEW-1: Arm the abort watchdog for recovered READY_SENT refreshes. Without this,
+        // a restart during the READY_SENT phase has no upper-bound safety net — the READY ACK
+        // retry loop runs indefinitely if consumers never reconnect, leaving the pipe paused.
+        if (scheduleAbortWatchdogCallback != null) {
+            scheduleAbortWatchdogCallback.schedule(topic);
         }
     }
 
@@ -307,6 +330,11 @@ public class RefreshRecoveryService implements RefreshRecovery {
 
     @FunctionalInterface
     public interface ScheduleReadyTimeoutCallback {
+        void schedule(String topic);
+    }
+
+    @FunctionalInterface
+    public interface ScheduleAbortWatchdogCallback {
         void schedule(String topic);
     }
 }

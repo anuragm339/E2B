@@ -32,7 +32,6 @@ public class RefreshReadyService implements ReadyPhase {
 
     // Shared state - injected by coordinator
     private Map<String, RefreshContext> activeRefreshes;
-    private volatile String currentRefreshId;
 
     public RefreshReadyService(
             ConsumerRegistry remoteConsumers,
@@ -52,16 +51,18 @@ public class RefreshReadyService implements ReadyPhase {
     /**
      * Inject shared state from coordinator.
      */
-    public void setSharedState(
-            Map<String, RefreshContext> activeRefreshes,
-            String currentRefreshId) {
+    public void setSharedState(Map<String, RefreshContext> activeRefreshes) {
         this.activeRefreshes = activeRefreshes;
-        this.currentRefreshId = currentRefreshId;
     }
 
     @Override
     public void sendReady(String topic, RefreshContext context) {
-        context.setState(RefreshState.READY_SENT);
+        // Snapshot receivedResetAcks BEFORE making READY_SENT state visible to other threads.
+        // registerLateJoiningConsumer (Netty thread) does a volatile re-read of state after
+        // recordResetAck: any entry that observes READY_SENT is guaranteed to have missed this
+        // snapshot, so it returns false and the caller sends READY directly — no duplicate.
+        Set<String> readySnapshot = new HashSet<>(context.getReceivedResetAcks());  // T1
+        context.setState(RefreshState.READY_SENT);                                  // T3
         context.setReadySentTime(Instant.now());
 
         // Record READY sent metrics for each expected consumer
@@ -69,13 +70,27 @@ public class RefreshReadyService implements ReadyPhase {
             metrics.recordReadySent(topic, consumer, context.getRefreshId());
         }
 
-        // Only send READY to consumers that have ACKed RESET
-        remoteConsumers.sendReadyToAckedConsumers(topic, context.getReceivedResetAcks());
+        // P1-3: Primary broadcast first — consumers that were in the set at T1.
+        remoteConsumers.sendReadyToAckedConsumers(topic, readySnapshot);
+
+        // T1-T3 supplemental send: consumers whose recordResetAck landed between T1 and T3 are
+        // in the live set but not in readySnapshot. They called registerLateJoiningConsumer,
+        // whose C2 re-read still saw REPLAYING (T3 not yet visible), so it returned true — but
+        // they missed the primary broadcast. Diff the live set against the snapshot and send READY
+        // so they don't wait READY_ACK_TIMEOUT_MS for the first checkReadyAckTimeout retry.
+        // Sent after the primary broadcast so primary consumers are not delayed by this path.
+        Set<String> liveAcks = new HashSet<>(context.getReceivedResetAcks());
+        liveAcks.removeAll(readySnapshot);
+        if (!liveAcks.isEmpty()) {
+            log.debug("Sending supplemental READY to {} T1-T3 window consumer(s) for topic {}",
+                    liveAcks.size(), topic);
+            remoteConsumers.sendReadyToAckedConsumers(topic, liveAcks);
+        }
 
         LogContext readyContext = LogContext.builder()
                 .topic(topic)
                 .custom("refreshId", context.getRefreshId())
-                .custom("consumerCount", context.getReceivedResetAcks().size())
+                .custom("consumerCount", readySnapshot.size())
                 .build();
         refreshLogger.logReadySent(readyContext);
 
@@ -133,7 +148,10 @@ public class RefreshReadyService implements ReadyPhase {
             !context.allReadyAcksReceived()) {
             Set<String> missing = getMissingReadyAcks(context);
             log.warn("READY ACK timeout for topic {} - missing ACKs from: {}", topic, missing);
-            sendReady(topic, context);
+            // Retry: use the live set (not a snapshot) so late joiners registered after the
+            // initial sendReady broadcast are included in this re-broadcast.
+            remoteConsumers.sendReadyToAckedConsumers(topic, context.getReceivedResetAcks());
+            stateStore.saveState(context);
         }
     }
 
@@ -169,12 +187,15 @@ public class RefreshReadyService implements ReadyPhase {
                 .build();
         refreshLogger.logRefreshCompleted(completeContext);
 
-        // Resume pipe calls only if NO other refreshes IN THE SAME BATCH are in progress
+        // Resume pipe calls only if NO other refreshes IN THE SAME BATCH are in progress.
+        // Exclude both COMPLETED and ABORTED: an aborted sibling topic is terminal and should
+        // not prevent the pipe from resuming when the remaining topics have completed.
         String batchId = context.getRefreshId();
         boolean otherRefreshesInBatchActive = activeRefreshes.values().stream()
                 .anyMatch(ctx -> !ctx.getTopic().equals(topic) &&
                                  ctx.getRefreshId().equals(batchId) &&
-                                 ctx.getState() != RefreshState.COMPLETED);
+                                 ctx.getState() != RefreshState.COMPLETED &&
+                                 ctx.getState() != RefreshState.ABORTED);
 
         if (!otherRefreshesInBatchActive) {
             pipeConnector.resumePipeCalls();
@@ -187,7 +208,8 @@ public class RefreshReadyService implements ReadyPhase {
         } else {
             long activeTopicsInBatch = activeRefreshes.values().stream()
                     .filter(ctx -> ctx.getRefreshId().equals(batchId) &&
-                                   ctx.getState() != RefreshState.COMPLETED)
+                                   ctx.getState() != RefreshState.COMPLETED &&
+                                   ctx.getState() != RefreshState.ABORTED)
                     .count();
             log.info("Pipe calls remain PAUSED ({} other topic(s) in batch {} still in progress)",
                     activeTopicsInBatch, batchId);

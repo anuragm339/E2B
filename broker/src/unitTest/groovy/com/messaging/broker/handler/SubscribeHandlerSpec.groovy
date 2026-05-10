@@ -23,7 +23,7 @@ class SubscribeHandlerSpec extends Specification {
     RefreshCoordinator refreshCoordinator = Mock()
 
     SubscribeHandler handler = new SubscribeHandler(
-            server, remoteConsumers, metrics, legacyClientConfig, refreshCoordinator)
+            server, remoteConsumers, metrics, legacyClientConfig, refreshCoordinator, OBJECT_MAPPER)
 
     def "modern subscribe registers new consumer sends ack and startup ready"() {
         given:
@@ -94,6 +94,8 @@ class SubscribeHandlerSpec extends Specification {
         2 * metrics.recordConsumerConnection()
         1 * remoteConsumers.markLegacyConsumerReady("legacy-client")
         1 * remoteConsumers.sendRefreshReadyToConsumer("legacy-client", "prices-v1")
+        // PASS 1 registers late joiners for ALL active states before opening the gate
+        1 * refreshCoordinator.registerLateJoiningConsumer("prices-v1", "svc:prices-v1")
         1 * refreshCoordinator.registerLateJoiningConsumer("orders-v1", "svc:orders-v1")
         0 * remoteConsumers.sendStartupReadyToLegacyConsumer(_)
         0 * server.send(_, _)

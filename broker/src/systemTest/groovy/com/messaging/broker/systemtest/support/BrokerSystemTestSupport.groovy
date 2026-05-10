@@ -146,7 +146,7 @@ abstract class BrokerSystemTestSupport extends Specification {
             def brokerService = ctx.getBean(brokerServiceClass)
             def embeddedServer = ctx.getBean(EmbeddedServer)
             def eventClass = Class.forName("io.micronaut.runtime.server.event.ServerStartupEvent")
-            def ctor = eventClass.getDeclaredConstructors()[0]
+            def ctor = eventClass.getDeclaredConstructor(EmbeddedServer)
             def event = ctor.newInstance(embeddedServer)
             brokerService.onApplicationEvent(event)
         } catch (Exception e) {
@@ -184,7 +184,7 @@ abstract class BrokerSystemTestSupport extends Specification {
             def pipeConnectorClass = Class.forName("com.messaging.common.api.PipeConnector")
             def pipeConnector = ctx.getBean(pipeConnectorClass)
 
-            pipeConnector.connectToParent(parentUrl).get()
+            pipeConnector.connectToParent(parentUrl).get(30, java.util.concurrent.TimeUnit.SECONDS)
             pipeConnector.onDataReceived(messageHandler)
         } catch (Exception e) {
             throw new RuntimeException("Failed to trigger pipe connection to ${parentUrl}: " + e.message, e)
@@ -207,7 +207,7 @@ abstract class BrokerSystemTestSupport extends Specification {
             if (!mgr.isConnected()) {
                 def embeddedServer = ctx.getBean(EmbeddedServer)
                 def eventClass = Class.forName("io.micronaut.runtime.server.event.ServerStartupEvent")
-                def ctor = eventClass.getDeclaredConstructors()[0]
+                def ctor = eventClass.getDeclaredConstructor(EmbeddedServer)
                 def event = ctor.newInstance(embeddedServer)
                 mgr.onApplicationEvent(event)
             }
@@ -216,7 +216,7 @@ abstract class BrokerSystemTestSupport extends Specification {
         }
     }
 
-    private static int findFreePort() {
+    protected static int findFreePort() {
         def s = new ServerSocket(0)
         try { s.localPort } finally { s.close() }
     }
