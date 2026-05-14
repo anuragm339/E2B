@@ -28,6 +28,8 @@ ack-store:
   reconciliation:
     enabled: false
     auto-sync-enabled: false
+compaction:
+  enabled: false
 data-refresh:
   enabled: false
 micronaut:

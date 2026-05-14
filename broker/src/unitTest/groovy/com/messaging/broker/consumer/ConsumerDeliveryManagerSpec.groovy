@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer
 
+import com.messaging.broker.compaction.RocksDbCompactionIndex
 import com.messaging.common.annotation.Consumer
 import com.messaging.common.annotation.RetryPolicy
 import com.messaging.common.api.ErrorHandler
@@ -18,7 +19,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def storage = Mock(StorageEngine)
         def processor = Mock(ConsumerAnnotationProcessor)
         def offsetTracker = Mock(ConsumerOffsetTracker)
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
 
         and:
         def annotation = stubConsumer("topic", "group")
@@ -44,7 +46,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def storage = Mock(StorageEngine)
         def processor = Mock(ConsumerAnnotationProcessor)
         def offsetTracker = Mock(ConsumerOffsetTracker)
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
 
         and:
         def annotation = stubConsumer("topic", "group")
@@ -69,7 +72,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def storage = Mock(StorageEngine)
         def processor = Mock(ConsumerAnnotationProcessor)
         def offsetTracker = Mock(ConsumerOffsetTracker)
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
 
         and:
         def annotation = stubConsumer("topic", "group")
@@ -99,7 +103,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def storage = Mock(StorageEngine)
         def processor = Mock(ConsumerAnnotationProcessor)
         def offsetTracker = Mock(ConsumerOffsetTracker)
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
 
         and:
         def annotation = stubConsumer("topic", "group")
@@ -132,7 +137,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def storage = Mock(StorageEngine)
         def processor = Mock(ConsumerAnnotationProcessor)
         def offsetTracker = Mock(ConsumerOffsetTracker)
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
         def errorHandler = Mock(ErrorHandler) {
             1 * onError(_, _ as Exception)
         }
@@ -166,7 +172,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def storage = Mock(StorageEngine)
         def processor = Mock(ConsumerAnnotationProcessor)
         def offsetTracker = Mock(ConsumerOffsetTracker)
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
         def errorHandler = Mock(ErrorHandler) {
             1 * onError(_, _ as Exception)
         }
@@ -199,7 +206,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def storage = Mock(StorageEngine)
         def processor = Mock(ConsumerAnnotationProcessor)
         def offsetTracker = Mock(ConsumerOffsetTracker)
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
         def errorHandler = Mock(ErrorHandler) {
             1 * onError(_, _ as Exception)
         }
@@ -239,7 +247,8 @@ class ConsumerDeliveryManagerSpec extends Specification {
         def offsetTracker = Stub(ConsumerOffsetTracker) {
             getOffset("consumer-1") >> 0L
         }
-        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker)
+        def compactionIndex = Mock(RocksDbCompactionIndex)
+        def manager = new ConsumerDeliveryManager(storage, processor, offsetTracker, compactionIndex)
         def context = new ConsumerContext("consumer-1", stubConsumer("topic", "group"), Mock(MessageHandler), new NoOpErrorHandler())
         processor.getAllConsumers() >> [context]
         processor.getConsumer("consumer-1") >> context

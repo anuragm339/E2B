@@ -436,23 +436,28 @@ public class SegmentManager {
      * Replace segments after compaction
      */
     public synchronized void replaceSegments(List<Segment> oldSegments, Segment newSegment) throws MessagingException {
-        // Remove old segments from map
+        // Remove old segments from map and persistent metadata
         for (Segment old : oldSegments) {
             segments.remove(old.getBaseOffset());
             old.close();
 
-            // Delete files
+            try {
+                metadataStore.deleteSegment(topic, partition, old.getBaseOffset());
+            } catch (Exception e) {
+                log.error("Failed to delete segment metadata for offset {}", old.getBaseOffset(), e);
+            }
+
             try {
                 Files.deleteIfExists(old.getLogPath());
                 Files.deleteIfExists(old.getIndexPath());
             } catch (IOException e) {
                 log.error("Failed to delete segment files for offset {}", old.getBaseOffset(), e);
-                // Continue with other segments even if delete fails
             }
         }
 
-        // Add new compacted segment
+        // Add new compacted segment and persist its metadata
         segments.put(newSegment.getBaseOffset(), newSegment);
+        saveSegmentMetadata(newSegment);
 
         log.info("Replaced {} segments with compacted segment at offset {}",
                 oldSegments.size(), newSegment.getBaseOffset());
@@ -513,5 +518,13 @@ public class SegmentManager {
 
     public int getPartition() {
         return partition;
+    }
+
+    public Path getDataDir() {
+        return dataDir;
+    }
+
+    public long getMaxSegmentSize() {
+        return maxSegmentSize;
     }
 }

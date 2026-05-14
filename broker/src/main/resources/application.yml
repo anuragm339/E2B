@@ -166,12 +166,20 @@ executor:
 ack-store:
   rocksdb:
     path: ${DATA_DIR}/ack-store
-    block-cache-bytes: ${ACK_STORE_BLOCK_CACHE_BYTES:33554432}   # 32MB default
+    block-cache-bytes: ${ACK_STORE_BLOCK_CACHE_BYTES:33554432}   # 32MB — shared by ack store + compaction index
   reconciliation:
     interval: ${ACK_RECONCILIATION_INTERVAL:5m}
     initial-delay: ${ACK_RECONCILIATION_INITIAL_DELAY:2m}
     enabled: ${ACK_RECONCILIATION_ENABLED:true}
     auto-sync-enabled: ${ACK_RECONCILIATION_AUTO_SYNC:false}
+
+compaction:
+  enabled: ${COMPACTION_ENABLED:true}
+  tombstone-retention-days: ${COMPACTION_RETENTION_DAYS:7}
+  window-size: ${COMPACTION_WINDOW_SIZE:10}  # Max sealed segments per compaction run (incremental)
+  schedule:
+    interval: ${COMPACTION_INTERVAL:24h}
+    initial-delay: ${COMPACTION_INITIAL_DELAY:5m}
 
 logger:
   levels:

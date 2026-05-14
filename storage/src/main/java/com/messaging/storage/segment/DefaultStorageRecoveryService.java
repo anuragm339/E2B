@@ -30,7 +30,9 @@ import java.util.stream.Stream;
 @Singleton
 public class DefaultStorageRecoveryService implements StorageRecoveryService {
     private static final Logger log = LoggerFactory.getLogger(DefaultStorageRecoveryService.class);
-    private static final Pattern SEGMENT_PATTERN = Pattern.compile("(\\d{20})\\.log");
+    // Matches both regular segments (00000000000000000000.log) and compacted segments
+    // (00000000000000000000.compacted.log) produced by CompactionRewriter.
+    private static final Pattern SEGMENT_PATTERN = Pattern.compile("(\\d{20})(?:\\.compacted)?\\.log");
 
     @Override
     public RecoveryResult recoverSegments(Path dataDir, String topic, int partition, long maxSegmentSize)
@@ -71,7 +73,7 @@ public class DefaultStorageRecoveryService implements StorageRecoveryService {
 
             try {
                 long baseOffset = extractOffsetFromFilename(logPath.getFileName().toString());
-                Path indexPath = dataDir.resolve(String.format("%020d.index", baseOffset));
+                Path indexPath = dataDir.resolve(logPath.getFileName().toString().replace(".log", ".index"));
 
                 // Note: SegmentMetadataStore is not injected here to avoid coupling
                 // The caller (SegmentManager) should pass it when creating segments

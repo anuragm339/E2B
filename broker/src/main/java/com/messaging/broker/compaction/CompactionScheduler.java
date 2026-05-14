@@ -1,0 +1,137 @@
+package com.messaging.broker.compaction;
+
+import com.messaging.broker.monitoring.BrokerMetrics;
+import com.messaging.common.api.StorageEngine;
+import com.messaging.storage.segment.Segment;
+import com.messaging.storage.segment.SegmentAccess;
+import com.messaging.storage.segment.SegmentManager;
+import io.micrometer.core.instrument.Timer;
+import io.micronaut.context.annotation.Value;
+import io.micronaut.scheduling.annotation.Scheduled;
+import jakarta.inject.Inject;
+import jakarta.inject.Singleton;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Scheduled background job that drives Kafka-style incremental log compaction.
+ *
+ * <p>Each run iterates all known topics, loads the last checkpoint, selects the next
+ * dirty window via {@link CompactionPlanner}, rewrites it via {@link CompactionRewriter},
+ * advances the checkpoint, and records metrics. Per-topic failures are caught so one bad
+ * topic cannot block compaction of the rest.
+ */
+@Singleton
+public class CompactionScheduler {
+
+    private static final Logger log = LoggerFactory.getLogger(CompactionScheduler.class);
+
+    private final StorageEngine storage;
+    private final SegmentAccess segmentAccess;
+    private final CompactionCheckpointStore checkpointStore;
+    private final CompactionPlanner planner;
+    private final CompactionRewriter rewriter;
+    private final RocksDbCompactionIndex compactionIndex;
+    private final BrokerMetrics metrics;
+    private final boolean enabled;
+    private final int tombstoneRetentionDays;
+    private final int windowSize;
+
+    @Inject
+    public CompactionScheduler(
+            StorageEngine storage,
+            SegmentAccess segmentAccess,
+            CompactionCheckpointStore checkpointStore,
+            CompactionPlanner planner,
+            CompactionRewriter rewriter,
+            RocksDbCompactionIndex compactionIndex,
+            BrokerMetrics metrics,
+            @Value("${compaction.enabled:true}") boolean enabled,
+            @Value("${compaction.tombstone-retention-days:7}") int tombstoneRetentionDays,
+            @Value("${compaction.window-size:10}") int windowSize) {
+        this.storage               = storage;
+        this.segmentAccess         = segmentAccess;
+        this.checkpointStore       = checkpointStore;
+        this.planner               = planner;
+        this.rewriter              = rewriter;
+        this.compactionIndex       = compactionIndex;
+        this.metrics               = metrics;
+        this.enabled               = enabled;
+        this.tombstoneRetentionDays = tombstoneRetentionDays;
+        this.windowSize            = windowSize;
+    }
+
+    @Scheduled(
+        fixedDelay   = "${compaction.schedule.interval:24h}",
+        initialDelay = "${compaction.schedule.initial-delay:5m}")
+    public void compact() {
+        if (!enabled) {
+            log.debug("Compaction disabled, skipping");
+            return;
+        }
+
+        Timer.Sample runTimer = metrics.startCompactionTimer();
+
+        Set<String> topics = storage.getTopicNames();
+        log.info("Compaction run started: {} topics", topics.size());
+
+        for (String topic : topics) {
+            try {
+                compactTopic(topic, 0);
+            } catch (Exception e) {
+                log.error("Compaction failed for topic={}", topic, e);
+            }
+        }
+
+        metrics.stopCompactionTimer(runTimer);
+        log.info("Compaction run finished");
+    }
+
+    private void compactTopic(String topic, int partition) throws Exception {
+        SegmentManager segmentManager = segmentAccess.getSegmentManager(topic, partition);
+        if (segmentManager == null) {
+            log.debug("No segment manager for topic={}, skipping", topic);
+            return;
+        }
+
+        long lastCheckpoint = checkpointStore.loadCheckpoint(topic, partition);
+        List<Segment> sealedSegments = segmentManager.getInactiveSegments();
+        List<Segment> window = planner.selectDirtyWindow(sealedSegments, lastCheckpoint, windowSize);
+
+        if (window.isEmpty()) {
+            log.debug("No dirty segments for topic={} since checkpoint={}", topic, lastCheckpoint);
+            return;
+        }
+
+        log.info("Compacting topic={} partition={}: {} segments (checkpoint={})",
+                topic, partition, window.size(), lastCheckpoint);
+
+        CompactionRewriter.CompactionResult result = rewriter.rewrite(
+                window, topic, partition, segmentManager, compactionIndex, tombstoneRetentionDays);
+
+        // Only advance the checkpoint when no live tombstones were left behind.
+        // If tombstones are still within their retention window, the same window must be
+        // re-selected on the next run so they can be removed once they age out.
+        long newCheckpoint = lastCheckpoint;
+        if (!result.hadUnexpiredTombstones) {
+            newCheckpoint = window.stream()
+                    .mapToLong(Segment::getBaseOffset)
+                    .max()
+                    .orElse(lastCheckpoint);
+            checkpointStore.saveCheckpoint(topic, partition, newCheckpoint);
+        } else {
+            log.debug("Skipping checkpoint advancement for topic={} partition={}: unexpired tombstones remain",
+                    topic, partition);
+        }
+
+        metrics.recordCompactionRun();
+        metrics.recordCompactionRecordsRemoved(topic, result.recordsRemoved);
+        metrics.recordCompactionBytesReclaimed(topic, result.bytesReclaimed);
+
+        log.info("Compacted topic={}: removed={} records, reclaimed={}B, newCheckpoint={}",
+                topic, result.recordsRemoved, result.bytesReclaimed, newCheckpoint);
+    }
+}

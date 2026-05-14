@@ -80,6 +80,12 @@ public class BrokerMetrics {
     private final DistributionSummary messageSizeBytes;
     private final DistributionSummary batchSize;
 
+    // Compaction metrics
+    private final Counter compactionRunsTotal;
+    private final Timer compactionDuration;
+    private final ConcurrentHashMap<String, Counter> compactionRecordsRemoved = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionBytesReclaimed = new ConcurrentHashMap<>();
+
     public BrokerMetrics(MeterRegistry registry) {
         this.registry = registry;
 
@@ -171,6 +177,16 @@ public class BrokerMetrics {
 
         this.batchSize = DistributionSummary.builder("broker.batch.size")
             .description("Distribution of batch sizes")
+            .register(registry);
+
+        // Compaction counters/timers
+        this.compactionRunsTotal = Counter.builder("broker.compaction.runs.total")
+            .description("Total number of compaction runs")
+            .register(registry);
+
+        this.compactionDuration = Timer.builder("broker.compaction.duration.seconds")
+            .description("Duration of each compaction run")
+            .publishPercentiles(0.5, 0.95, 0.99)
             .register(registry);
 
         log.info("Broker metrics initialized and registered with Prometheus");
@@ -756,5 +772,37 @@ public class BrokerMetrics {
             return -1; // No ACK yet
         }
         return (System.currentTimeMillis() - lastTime.get()) / 1000; // Return seconds
+    }
+
+    // ── Compaction metrics ────────────────────────────────────────────────────
+
+    public void recordCompactionRun() {
+        compactionRunsTotal.increment();
+    }
+
+    public void recordCompactionRecordsRemoved(String topic, int count) {
+        compactionRecordsRemoved.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.records.removed")
+                        .description("Records physically removed during compaction")
+                        .tag("topic", t)
+                        .register(registry)
+        ).increment(count);
+    }
+
+    public void recordCompactionBytesReclaimed(String topic, long bytes) {
+        compactionBytesReclaimed.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.bytes.reclaimed")
+                        .description("Bytes reclaimed during compaction")
+                        .tag("topic", t)
+                        .register(registry)
+        ).increment(bytes);
+    }
+
+    public Timer.Sample startCompactionTimer() {
+        return Timer.start(registry);
+    }
+
+    public void stopCompactionTimer(Timer.Sample sample) {
+        sample.stop(compactionDuration);
     }
 }

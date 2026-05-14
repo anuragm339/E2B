@@ -1,6 +1,7 @@
 package com.messaging.broker.core;
 
 import com.messaging.broker.ack.AckStoreSeeder;
+import com.messaging.broker.compaction.RocksDbCompactionIndex;
 import com.messaging.broker.handler.DisconnectHandler;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.handler.MessageHandlerRegistry;
@@ -47,6 +48,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final DisconnectHandler disconnectHandler;
     private final ExecutorService ackExecutor;
     private final AckStoreSeeder ackStoreSeeder;
+    private final RocksDbCompactionIndex compactionIndex;
     private final int serverPort;
 
     @Inject
@@ -61,6 +63,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             DisconnectHandler disconnectHandler,
             @Named("ackExecutor") ExecutorService ackExecutor,
             AckStoreSeeder ackStoreSeeder,
+            RocksDbCompactionIndex compactionIndex,
             @Value("${broker.network.port:9092}") int serverPort) {
 
         this.storage = storage;
@@ -73,6 +76,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.disconnectHandler = disconnectHandler;
         this.ackExecutor = ackExecutor;
         this.ackStoreSeeder = ackStoreSeeder;
+        this.compactionIndex = compactionIndex;
         this.serverPort = serverPort;
 
         log.info("BrokerService initialized with handler registry");
@@ -171,6 +175,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             metrics.recordMessageStored();
             metrics.recordTopicLastMessageTime(topic);
+
+            compactionIndex.updateKey(topic, record.getMsgKey(), offset,
+                    record.getCreatedAt().toEpochMilli());
 
             log.debug("Stored message from parent: topic={}, offset={}, key={}",
                     topic, offset, record.getMsgKey());

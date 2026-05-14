@@ -145,7 +145,7 @@ class BatchDeliveryServiceSpec extends Specification {
         consumer.consecutiveFailures > 0
         1 * metrics.stopStorageReadTimer(_ as Timer.Sample)
         1 * metrics.recordStorageRead()
-        1 * stateService.clearFromOffset(DeliveryKey.of("group-a", "prices-v1"))
+        0 * stateService.clearFromOffset(_)   // transient failure — clearFromOffset only called after 10 consecutive failures
         1 * metrics.recordConsumerTransferFailed("client-1", "prices-v1", "group-a", 1, 3)
         1 * metrics.recordConsumerFailure("client-1", "prices-v1", "group-a")
     }
