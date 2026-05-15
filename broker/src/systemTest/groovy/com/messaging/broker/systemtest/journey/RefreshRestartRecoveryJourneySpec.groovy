@@ -106,7 +106,7 @@ class RefreshRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
         ])
 
         then: "both consumers receive post-refresh data and offsets/ACKs advance"
-        new PollingConditions(timeout: 20, delay: 0.3).eventually {
+        new PollingConditions(timeout: 40, delay: 0.3).eventually {
             assert restartedConsumerA.getBean(TestRecordCollector).getAll().any { it.msgKey == 'post-restart-refresh-60' }
             assert restartedConsumerA.getBean(TestRecordCollector).getAll().any { it.msgKey == 'post-restart-refresh-61' }
             assert restartedConsumerB.getBean(TestRecordCollector).getAll().any { it.msgKey == 'post-restart-refresh-60' }

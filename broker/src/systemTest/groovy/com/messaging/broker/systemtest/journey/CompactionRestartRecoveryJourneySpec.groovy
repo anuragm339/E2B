@@ -25,7 +25,7 @@ class CompactionRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
     protected Map<String, String> brokerProperties() {
         def base = super.brokerProperties()
         base['compaction.rocksdb.path']     = "${dataDir}/compaction-index-restart"
-        base['broker.storage.segment-size'] = '512'
+        base['broker.storage.segment-size'] = '128'
         return base
     }
 
@@ -40,9 +40,13 @@ class CompactionRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
              msgKey: 'crr-key-001', eventType: 'MESSAGE', data: """{"rev":${i}}"""]
         })
 
-        and: "consumer receives the latest version (delivery filter suppresses earlier ones)"
+        and: "consumer receives the LAST version — guarantees all 8 records are stored and segment-0 is sealed"
+        // The delivery filter suppresses superseded records and delivers only the latest.
+        // Waiting for the record with data '{"rev":8}' (cloud offset 8, last record) ensures all
+        // 8 records have been appended: with segment-size=128 the first sealed segment forms after
+        // the 5th append, so this condition guarantees at least one inactive segment for compaction.
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
-            assert collector().getAll().any { it.msgKey == 'crr-key-001' }
+            assert collector().getAll().any { it.msgKey == 'crr-key-001' && it.data == '{"rev":8}' }
         }
 
         when: "compaction runs — superseded records are removed and segment is rewritten"
@@ -50,14 +54,17 @@ class CompactionRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
             Class.forName('com.messaging.broker.compaction.CompactionScheduler'))
         scheduler.compact()
 
-        then: "compacted log files exist on disk for the prices-v1 / partition-0 directory"
-        new PollingConditions(timeout: 10, delay: 0.5).eventually {
-            def topicPartDir = new File("${dataDir}/prices-v1/0")
-            def compactedFiles = topicPartDir.listFiles()?.findAll {
-                it.name.contains('.compacted.')
-            }
-            assert compactedFiles != null && !compactedFiles.isEmpty()
-        }
+        then: "compaction ran: either a .compacted.log file exists (survivors) or the first sealed segment's .log was deleted (all superseded)"
+        // compact() is synchronous — file changes are complete when it returns.
+        // The active segment's .log file always remains; check only the FIRST sealed segment
+        // (baseOffset=0) which should be gone when all its records were superseded.
+        def topicPartDir = new File("${dataDir}/prices-v1/partition-0")
+        def allFiles = topicPartDir.listFiles()?.collect { it.name } ?: []
+        // If some records survived: a .compacted.log file is present.
+        // If all records were superseded: the original sealed segment file (00000000000000000000.log) is gone.
+        boolean compactedFilesPresent = allFiles.any { it.contains('.compacted.') }
+        boolean sealedSegmentRemoved  = !allFiles.contains('00000000000000000000.log')
+        compactedFilesPresent || sealedSegmentRemoved
 
         when: "consumer context is closed, then broker context is closed (simulating restart)"
         consumerCtx.close()

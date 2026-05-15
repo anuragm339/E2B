@@ -94,15 +94,24 @@ class TombstoneLifecycleJourneySpec extends BrokerSystemTestSupport {
         given: "use a dedicated fresh collector to count precisely"
         collector().reset()
 
-        when: "pipe delivers MESSAGE then DELETE in sequence"
+        when: "pipe delivers the MESSAGE first"
         cloudServer.enqueueMessages([
             [offset: 50L, topic: 'prices-v1', partition: 0,
              msgKey: 'tlc-count-key', eventType: 'MESSAGE', data: '{"x":1}'],
+        ])
+
+        then: "consumer receives the MESSAGE before the DELETE is indexed"
+        new PollingConditions(timeout: 15, delay: 0.3).eventually {
+            assert collector().getAll().any { it.msgKey == 'tlc-count-key' }
+        }
+
+        when: "pipe delivers the DELETE — consumer offset has already advanced past the MESSAGE"
+        cloudServer.enqueueMessages([
             [offset: 51L, topic: 'prices-v1', partition: 0,
              msgKey: 'tlc-count-key', eventType: 'DELETE', data: null],
         ])
 
-        then: "exactly 2 records for that key are delivered (MESSAGE + DELETE)"
+        then: "exactly 2 records for that key are delivered (MESSAGE then DELETE)"
         new PollingConditions(timeout: 15, delay: 0.3).eventually {
             def forKey = collector().getAll().findAll { it.msgKey == 'tlc-count-key' }
             assert forKey.size() == 2

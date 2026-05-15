@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.compaction.RocksDbCompactionIndex;
 import com.messaging.broker.monitoring.ConsumerEventLogger;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.monitoring.TraceIds;
@@ -15,8 +16,10 @@ import com.messaging.broker.consumer.RefreshCoordinator;
 import com.messaging.common.api.BatchReadableStorage;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.model.ByteArrayDeliveryBatch;
 import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.BrokerMessage;
+import com.messaging.common.model.MessageRecord;
 import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Inject;
@@ -25,9 +28,14 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * Orchestrates batch delivery with flow control, zero-copy transfer, and error handling.
@@ -53,6 +61,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
     private final long sendTimeoutBaseSeconds;
     private final long sendTimeoutPerMbSeconds;
     private final ConsumerEventLogger consumerLogger;
+    private final RocksDbCompactionIndex compactionIndex;
 
     private volatile RefreshCoordinator dataRefreshCoordinator; // Lazy injection to avoid circular dependency
 
@@ -72,7 +81,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             @Value("${broker.consumer.ack-timeout}") long ackTimeoutMs,
             @Value("${broker.consumer.send-timeout-base-seconds:1}") long sendTimeoutBaseSeconds,
             @Value("${broker.consumer.send-timeout-per-mb-seconds:2}") long sendTimeoutPerMbSeconds,
-            ConsumerEventLogger consumerLogger) {
+            ConsumerEventLogger consumerLogger,
+            RocksDbCompactionIndex compactionIndex) {
         this.server = server;
         this.storage = storage;
         this.batchStorage = batchStorage;
@@ -88,6 +98,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         this.sendTimeoutBaseSeconds = sendTimeoutBaseSeconds;
         this.sendTimeoutPerMbSeconds = sendTimeoutPerMbSeconds;
         this.consumerLogger = consumerLogger;
+        this.compactionIndex = compactionIndex;
     }
 
     /**
@@ -182,17 +193,35 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                 return DeliveryResult.blocked("no-data");
             }
 
+            // Apply compaction delivery filter: drop superseded records so consumers never see
+            // stale versions. Physical compaction (segment rewrite) will eventually remove them,
+            // but until then we filter here on every delivery. Filtering only happens when the
+            // index has entries for this topic; otherwise the zero-copy path is used as-is.
+            long originalLastOffset = batch.getLastOffset();
+            long originalFirstOffset = batch.getFirstOffset(); // capture before filter (used for ACK store)
+            batch = applyCompactionFilter(consumer.getTopic(), batch, capturedOffset);
+            if (batch.isEmpty()) {
+                // All records in the batch were superseded — advance offset without sending.
+                try { batch.close(); } catch (IOException ignored) {}
+                consumer.setCurrentOffset(originalLastOffset + 1);
+                offsetTracker.updateOffset(consumer.getClientId(), originalLastOffset + 1);
+                inFlight.set(false);
+                return DeliveryResult.success();
+            }
+
             traceId = TraceIds.newTraceId();
 
             // ================= BATCH VISIBILITY =================
             metrics.recordBatchSize(batch.getRecordCount());
 
             // ================= OFFSET RESERVATION =================
+            // Advance past ALL records in the original batch (including compaction-filtered ones)
+            // so that superseded records are never re-read on the next delivery cycle.
             long originalOffset = startOffset;
-            long nextOffset = batch.getLastOffset() + 1;
+            long nextOffset = originalLastOffset + 1;
             consumer.setCurrentOffset(nextOffset);
             stateService.setPendingOffset(deliveryKey, nextOffset);
-            stateService.setFromOffset(deliveryKey, batch.getFirstOffset());  // actual first record offset, used for ACK-time RocksDB write
+            stateService.setFromOffset(deliveryKey, originalFirstOffset);  // original batch first offset covers all records (incl. compaction-filtered) for ACK-store write
 
             LogContext startedContext = LogContext.builder()
                     .traceId(traceId)
@@ -453,5 +482,93 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         metrics.recordConsumerFailure(consumer.getClientId(), consumer.getTopic(), consumer.getGroup());
         log.error("Delivery failure for {}: consecutiveFailures={}, nextBackoff={}ms",
                  deliveryKey, consumer.getConsecutiveFailures(), consumer.getBackoffDelay(), error);
+    }
+
+    /**
+     * Apply compaction delivery filter to {@code batch}.
+     *
+     * <p>If the compaction index has no entries for {@code topic} the original batch is returned
+     * unchanged (zero-copy path preserved). Otherwise the batch is decoded, superseded records are
+     * dropped, and a heap-backed {@link ByteArrayDeliveryBatch} carrying only the deliverable records
+     * is returned. The original batch is closed before this method returns.
+     *
+     * <p>If all records in the batch are superseded an empty (isEmpty()) batch is returned.
+     */
+    private DeliveryBatch applyCompactionFilter(String topic, DeliveryBatch batch, long fromOffset) {
+        // Fast-path: O(1) seek — no map allocation, no decoding overhead.
+        if (!compactionIndex.hasIndexedKeysForTopic(topic)) {
+            return batch;
+        }
+
+        // Capture offsets before any close() call; ByteArrayDeliveryBatch constructors need them
+        // and the original batch must not be touched after close().
+        long batchFirstOffset = batch.getFirstOffset();
+        long batchLastOffset  = batch.getLastOffset();
+        int  batchRecordCount = batch.getRecordCount();
+
+        try {
+            List<MessageRecord> decoded = storage.read(topic, 0, fromOffset, batchRecordCount);
+
+            // Partial-decode fail-open: if the storage read returned fewer records than the batch
+            // contains (e.g. 1MB size cap truncated the result), we cannot safely determine which
+            // records are superseded — return the original batch unchanged.
+            if (decoded.size() < batchRecordCount) {
+                return batch;
+            }
+
+            List<MessageRecord> deliverable = decoded.stream()
+                    .filter(r -> !compactionIndex.isSuperseded(topic, r.getMsgKey(), r.getOffset()))
+                    .collect(Collectors.toList());
+
+            if (deliverable.size() == decoded.size()) {
+                return batch; // nothing filtered — keep zero-copy batch
+            }
+
+            // Build the replacement BEFORE closing the original so that encoding errors
+            // never leave us with a closed-but-returned batch (which causes ClosedChannelException
+            // in Netty's zero-copy path).
+            DeliveryBatch replacement;
+            if (deliverable.isEmpty()) {
+                replacement = new ByteArrayDeliveryBatch(topic, new byte[0], 0, batchFirstOffset, batchLastOffset);
+            } else {
+                byte[] encoded = encodeToBinaryFormat(deliverable);
+                long firstOff = deliverable.get(0).getOffset();
+                long lastOff  = deliverable.get(deliverable.size() - 1).getOffset();
+                replacement = new ByteArrayDeliveryBatch(topic, encoded, deliverable.size(), firstOff, lastOff);
+            }
+
+            // Replacement is ready — safe to close the original file-backed batch.
+            try { batch.close(); } catch (IOException ignored) {}
+            return replacement;
+
+        } catch (Exception e) {
+            log.warn("Compaction filter failed for topic={}, delivering unfiltered batch: {}", topic, e.getMessage());
+            // batch is never closed in this path — caller can still use it safely.
+            return batch;
+        }
+    }
+
+    /**
+     * Encode a list of records into the unified segment log binary format:
+     * {@code [keyLen:4][key:var][eventType:1][dataLen:4][data:var][timestamp:8]}
+     */
+    private static byte[] encodeToBinaryFormat(List<MessageRecord> records) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        for (MessageRecord r : records) {
+            byte[] keyBytes  = r.getMsgKey() != null ? r.getMsgKey().getBytes(StandardCharsets.UTF_8) : new byte[0];
+            byte[] dataBytes = r.getData() != null ? r.getData().getBytes(StandardCharsets.UTF_8) : new byte[0];
+            ByteBuffer buf = ByteBuffer.allocate(4 + keyBytes.length + 1 + 4 + dataBytes.length + 8);
+            buf.putInt(keyBytes.length);
+            buf.put(keyBytes);
+            buf.put((byte) r.getEventType().getCode());
+            buf.putInt(dataBytes.length);
+            if (dataBytes.length > 0) buf.put(dataBytes);
+            buf.putLong(r.getCreatedAt().toEpochMilli());
+            buf.flip();
+            byte[] bytes = new byte[buf.remaining()];
+            buf.get(bytes);
+            baos.write(bytes);
+        }
+        return baos.toByteArray();
     }
 }

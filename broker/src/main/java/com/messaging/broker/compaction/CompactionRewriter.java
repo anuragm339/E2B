@@ -80,7 +80,17 @@ public class CompactionRewriter {
                 .orElseThrow();
 
         Path partitionDataDir = segmentManager.getDataDir();
-        long maxSegmentSize   = segmentManager.getMaxSegmentSize();
+
+        // The compacted segment must hold all survivors from potentially many source segments.
+        // Use the combined on-disk size of all candidates as the ceiling — survivors can never
+        // exceed the total input bytes, so this is always sufficient.
+        long compactedMaxSize = candidates.stream()
+                .mapToLong(Segment::getSize)
+                .sum();
+        // Guard against empty segments (size=0) — ensure at least the normal segment size.
+        if (compactedMaxSize <= 0) {
+            compactedMaxSize = segmentManager.getMaxSegmentSize();
+        }
 
         Path compactedLogPath   = partitionDataDir.resolve(String.format("%020d.compacted.log",   firstBaseOffset));
         Path compactedIndexPath = partitionDataDir.resolve(String.format("%020d.compacted.index", firstBaseOffset));
@@ -94,7 +104,7 @@ public class CompactionRewriter {
         }
 
         Segment compactedSegment = new Segment(compactedLogPath, compactedIndexPath,
-                firstBaseOffset, maxSegmentSize, topic, partition);
+                firstBaseOffset, compactedMaxSize, topic, partition);
 
         int removedCount             = 0;
         long reclaimedBytes          = 0L;
@@ -139,6 +149,24 @@ public class CompactionRewriter {
                     offset = actualOffset + 1;
                 }
             }
+            // All records eligible for deletion — installing an empty segment would stall consumers
+            // whose read offset equals the base offset (fromOffset > storageHead with 0 records).
+            // Remove the input segments from the manager without installing any replacement.
+            if (survivorCount == 0) {
+                try { compactedSegment.close(); } catch (Exception ignored) {}
+                try {
+                    Files.deleteIfExists(compactedLogPath);
+                    Files.deleteIfExists(compactedIndexPath);
+                } catch (IOException ioEx) {
+                    log.warn("Could not delete empty compacted segment files: {}", compactedLogPath, ioEx);
+                }
+                segmentManager.removeSegments(candidates);
+                log.info("Compacted topic={} partition={}: all {} input records were eligible for deletion, " +
+                         "removed {} source segment(s) without installing a replacement",
+                         topic, partition, removedCount, candidates.size());
+                return new CompactionResult(removedCount, reclaimedBytes, false);
+            }
+
             compactedSegment.seal();
         } catch (MessagingException e) {
             try { compactedSegment.close(); } catch (Exception ignored) {}
@@ -162,6 +190,9 @@ public class CompactionRewriter {
             MessageRecord record,
             RocksDbCompactionIndex compactionIndex,
             int tombstoneRetentionDays) {
+
+        // Null-keyed records are never indexed, so they are never eligible for deletion
+        if (msgKey == null) return false;
 
         // Single RocksDB lookup covers both supersession check and tombstone expiry check
         long[] latestInfo = compactionIndex.getLatestOffsetAndTimestamp(topic, msgKey);

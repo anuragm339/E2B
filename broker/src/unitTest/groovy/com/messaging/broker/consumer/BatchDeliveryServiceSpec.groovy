@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer
 
+import com.messaging.broker.compaction.RocksDbCompactionIndex
 import com.messaging.broker.model.DeliveryKey
 import com.messaging.broker.monitoring.BrokerMetrics
 import com.messaging.broker.monitoring.ConsumerEventLogger
@@ -34,11 +35,12 @@ class BatchDeliveryServiceSpec extends Specification {
     ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor()
     ExecutorService storageExecutor = Executors.newSingleThreadExecutor()
     ConsumerEventLogger consumerLogger = Mock()
+    RocksDbCompactionIndex compactionIndex = Mock()
 
     BatchDeliveryService service = new BatchDeliveryService(
             server, storage, batchStorage, stateService, readinessService, offsetTracker,
             metrics, dataRefreshMetrics, registrationService, scheduler, storageExecutor,
-            100, 1, 1, consumerLogger
+            100, 1, 1, consumerLogger, compactionIndex
     )
 
     def cleanup() {

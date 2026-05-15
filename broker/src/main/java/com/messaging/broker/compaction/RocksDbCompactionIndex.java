@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * RocksDB-backed compaction index tracking the latest offset and timestamp per (topic, msgKey).
@@ -32,6 +33,10 @@ public class RocksDbCompactionIndex {
     private final RocksDB db;
     private final ColumnFamilyHandle cf;
     private final WriteOptions writeOptions;
+    // Guards the read-then-write sequence in updateKey so two concurrent callers for the
+    // same (topic, msgKey) cannot both read the old value and then race to write, leaving
+    // the lower offset as the winner if the slower write fires last.
+    private final ReentrantLock updateLock = new ReentrantLock();
 
     public RocksDbCompactionIndex(SharedRocksDb sharedDb) {
         this.db           = sharedDb.getDb();
@@ -42,9 +47,15 @@ public class RocksDbCompactionIndex {
     /**
      * Record that {@code newOffset} is now the latest for {@code (topic, msgKey)}.
      * Only advances the index — an out-of-order call with a lower offset is ignored.
+     *
+     * <p>Synchronized via {@code updateLock} to prevent two concurrent callers for the same key
+     * from both reading the old value and then racing to write (the slower write would regress
+     * the index if it carries a lower offset).
      */
     public void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs) {
+        if (msgKey == null) return;  // records without a key are not tracked for compaction
         byte[] key = buildKey(topic, msgKey);
+        updateLock.lock();
         try {
             byte[] existing = db.get(cf, key);
             if (existing != null) {
@@ -56,14 +67,19 @@ public class RocksDbCompactionIndex {
             db.put(cf, writeOptions, key, encode(newOffset, newTimestampMs));
         } catch (RocksDBException e) {
             log.error("CompactionIndex updateKey failed for topic={} key={}", topic, msgKey, e);
+        } finally {
+            updateLock.unlock();
         }
     }
 
     /**
      * Returns {@code true} if a newer record exists for {@code (topic, msgKey)} — i.e. the record
      * at {@code recordOffset} has been superseded and must not be delivered to consumers.
+     *
+     * <p>Returns {@code false} for records without a key (msgKey == null) — they are never superseded.
      */
     public boolean isSuperseded(String topic, String msgKey, long recordOffset) {
+        if (msgKey == null) return false;
         byte[] key = buildKey(topic, msgKey);
         try {
             byte[] value = db.get(cf, key);
@@ -89,6 +105,23 @@ public class RocksDbCompactionIndex {
         } catch (RocksDBException e) {
             log.error("CompactionIndex getLatestOffsetAndTimestamp failed for topic={} key={}", topic, msgKey, e);
             return null;
+        }
+    }
+
+    /**
+     * O(1) check: returns {@code true} if the index contains at least one entry for {@code topic}.
+     *
+     * <p>Uses a single RocksDB seek + prefix comparison — no map allocation. Callers in the
+     * delivery hot-path should use this before deciding whether to decode the batch at all.
+     */
+    public boolean hasIndexedKeysForTopic(String topic) {
+        byte[] prefix = (topic + "|").getBytes(StandardCharsets.UTF_8);
+        try (RocksIterator iter = db.newIterator(cf)) {
+            iter.seek(prefix);
+            return iter.isValid() && startsWith(iter.key(), prefix);
+        } catch (Exception e) {
+            log.warn("CompactionIndex hasIndexedKeysForTopic failed for topic={}, assuming no entries: {}", topic, e.getMessage());
+            return false;
         }
     }
 

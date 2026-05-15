@@ -917,4 +917,8 @@ public class Segment {
     public Path getIndexPath() {
         return indexPath;
     }
+
+    public long getRecordCount() {
+        return recordCount;
+    }
 }

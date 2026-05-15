@@ -48,6 +48,12 @@ class BrokerServiceIntegrationSpec extends Specification {
     }
 
     def "app starts and accepts DATA messages over TCP"() {
+        given: "record the storage head before sending so we read only records written by this test"
+        // The data-dir is shared across test runs; capture the head offset now so
+        // leftover records from previous runs do not affect the assertion.
+        // getCurrentOffset returns the last written offset (-1 if none); +1 gives the next slot
+        long startOffset = storage.getCurrentOffset('topic-1', 0) + 1
+
         when:
         def payload = OBJECT_MAPPER.writeValueAsString([
             msg_key   : 'key-1',
@@ -64,7 +70,7 @@ class BrokerServiceIntegrationSpec extends Specification {
             assert consumer.received.any { it.type == BrokerMessage.MessageType.ACK && it.messageId == 1001L }
         }
         conditions.eventually {
-            def records = storage.read('topic-1', 0, 0, 10)
+            def records = storage.read('topic-1', 0, startOffset, 10)
             assert records.size() == 1
             assert records[0].msgKey == 'key-1'
             assert records[0].eventType == EventType.MESSAGE

@@ -127,8 +127,9 @@ public class ConsumerDeliveryManager {
             // Filter superseded records — deliver only the latest version of each key.
             // Offset must advance past the full batch (including filtered records) to avoid
             // re-reading superseded entries on every poll cycle.
+            String topic = context.getTopic();
             List<MessageRecord> deliverable = records.stream()
-                    .filter(r -> !compactionIndex.isSuperseded(r.getTopic(), r.getMsgKey(), r.getOffset()))
+                    .filter(r -> !compactionIndex.isSuperseded(topic, r.getMsgKey(), r.getOffset()))
                     .collect(Collectors.toList());
 
             boolean success = deliverable.isEmpty() || deliverBatch(context, deliverable);

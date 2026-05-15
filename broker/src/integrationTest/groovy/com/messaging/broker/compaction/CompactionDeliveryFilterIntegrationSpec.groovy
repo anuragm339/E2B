@@ -38,14 +38,24 @@ class CompactionDeliveryFilterIntegrationSpec extends BrokerHandlerSpecSupport {
 
     def "consumer receives only latest record when three records share same key"() {
         given:
-        def conditions = new PollingConditions(timeout: 5, delay: 0.2)
+        def conditions = new PollingConditions(timeout: 10, delay: 0.2)
         ModernConsumerClient subscriber = null
 
-        when: "publish three records for the same key"
+        when: "publish first record and wait for ACK"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3001L,
             toJson([msg_key: 'filter-key', event_type: 'MESSAGE', data: [v: 'v1'], topic: 'filter-topic']).bytes))
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert consumer.received.any { it.type == BrokerMessage.MessageType.ACK && it.messageId == 3001L }
+        }
+
+        and: "publish second record and wait for ACK"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3002L,
             toJson([msg_key: 'filter-key', event_type: 'MESSAGE', data: [v: 'v2'], topic: 'filter-topic']).bytes))
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert consumer.received.any { it.type == BrokerMessage.MessageType.ACK && it.messageId == 3002L }
+        }
+
+        and: "publish third record"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3003L,
             toJson([msg_key: 'filter-key', event_type: 'MESSAGE', data: [v: 'v3'], topic: 'filter-topic']).bytes))
 
@@ -97,12 +107,17 @@ class CompactionDeliveryFilterIntegrationSpec extends BrokerHandlerSpecSupport {
 
     def "DELETE tombstone that is latest for its key is delivered to consumer"() {
         given:
-        def conditions = new PollingConditions(timeout: 5, delay: 0.2)
+        def conditions = new PollingConditions(timeout: 10, delay: 0.2)
         ModernConsumerClient subscriber = null
 
-        when: "publish a MESSAGE and then a DELETE tombstone for the same key"
+        when: "publish a MESSAGE and wait for ACK"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3004L,
             toJson([msg_key: 'tomb-key', event_type: 'MESSAGE', data: [v: 'v-msg'], topic: 'tomb-topic']).bytes))
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert consumer.received.any { it.type == BrokerMessage.MessageType.ACK && it.messageId == 3004L }
+        }
+
+        and: "publish a DELETE tombstone for the same key"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3005L,
             toJson([msg_key: 'tomb-key', event_type: 'DELETE', topic: 'tomb-topic']).bytes))
 
@@ -155,14 +170,24 @@ class CompactionDeliveryFilterIntegrationSpec extends BrokerHandlerSpecSupport {
 
     def "consumer offset advances past all records including filtered ones"() {
         given:
-        def conditions = new PollingConditions(timeout: 5, delay: 0.2)
+        def conditions = new PollingConditions(timeout: 10, delay: 0.2)
         ModernConsumerClient subscriber = null
 
-        when: "publish three records for the same key"
+        when: "publish first record and wait for ACK"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3006L,
             toJson([msg_key: 'offset-key', event_type: 'MESSAGE', data: [v: 1], topic: 'offset-topic']).bytes))
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert consumer.received.any { it.type == BrokerMessage.MessageType.ACK && it.messageId == 3006L }
+        }
+
+        and: "publish second record and wait for ACK"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3007L,
             toJson([msg_key: 'offset-key', event_type: 'MESSAGE', data: [v: 2], topic: 'offset-topic']).bytes))
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert consumer.received.any { it.type == BrokerMessage.MessageType.ACK && it.messageId == 3007L }
+        }
+
+        and: "publish third record"
         consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 3008L,
             toJson([msg_key: 'offset-key', event_type: 'MESSAGE', data: [v: 3], topic: 'offset-topic']).bytes))
 

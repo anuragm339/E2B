@@ -84,6 +84,20 @@ The broker supports coordinated refresh via `RESET`, replay, and `READY`:
 
 For the exact class and method flow, including modern and legacy client behavior, see [`readme/C4_ARCHITECTURE.md`](readme/C4_ARCHITECTURE.md).
 
+### Log compaction
+
+The broker implements Kafka-style log compaction to suppress superseded records and reclaim disk space.
+
+**Two-phase design:**
+
+1. **Delivery filter (immediate)** — on every batch delivery, records whose `msgKey` has been superseded by a newer record at a higher offset are dropped before they reach the consumer. DELETE records that are the latest for their key pass through so consumers can remove the key from local state.
+
+2. **Physical deletion (scheduled, daily)** — `CompactionScheduler` rewrites sealed segments, permanently removing records that have been superseded for longer than the configured `tombstone-retention-days`. The active segment is never rewritten.
+
+**Key-tracking store:** `RocksDbCompactionIndex` persists the latest offset and timestamp for every `topic|msgKey` pair. Updated synchronously on every `append()`. The delivery filter uses a point-lookup (`isSuperseded`) against this store; the scheduler uses a prefix-scan (`getLatestOffsetsForTopic`) to find eligible records in each sealed segment.
+
+For the class-level flow see [`readme/C4_ARCHITECTURE.md`](readme/C4_ARCHITECTURE.md) Dynamic View K.
+
 ## Default Runtime Configuration
 
 Current defaults are defined in `broker/src/main/resources/application.yml`.
@@ -116,6 +130,16 @@ broker:
     min-poll-interval-ms: 500
     max-poll-interval-ms: 20000
     poll-limit: 5
+
+compaction:
+  enabled: ${COMPACTION_ENABLED:true}
+  tombstone-retention-days: ${COMPACTION_RETENTION_DAYS:7}
+  schedule:
+    interval: ${COMPACTION_INTERVAL:24h}
+    initial-delay: ${COMPACTION_INITIAL_DELAY:5m}
+  rocksdb:
+    path: ${DATA_DIR}/compaction-index
+    block-cache-bytes: ${COMPACTION_BLOCK_CACHE_BYTES:16777216}
 ```
 
 Notes:
@@ -222,6 +246,7 @@ The architecture/design document for flows and drilldowns is here:
 - Micronaut 4
 - Netty TCP transport
 - FileChannel-based segment storage
+- RocksDB (ACK store, compaction index)
 - SQLite metadata store
 - Prometheus metrics
 - Grafana dashboards
