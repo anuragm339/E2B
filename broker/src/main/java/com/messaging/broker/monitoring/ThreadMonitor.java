@@ -23,12 +23,25 @@ import java.util.stream.Collectors;
 public class ThreadMonitor {
     private static final Logger log = LoggerFactory.getLogger(ThreadMonitor.class);
     private static final int TOP_THREADS_TO_LOG = 5;
+    private static final List<String> TRACKED_CATEGORIES = List.of(
+            "Network I/O",
+            "Consumer Delivery",
+            "Storage",
+            "Pipe/Replication",
+            "HTTP Server",
+            "Data Refresh",
+            "Broker Management"
+    );
 
     private final ThreadMXBean threadMXBean;
     private final MeterRegistry meterRegistry;
     private final Map<Long, ThreadStats> previousStats;
     private final AtomicLong blockedThreadCount;
     private final AtomicLong waitingThreadCount;
+    private final AtomicLong deadlockedThreadCount;
+    private final ConcurrentHashMap<String, AtomicLong> categoryCpuTimeMs;
+    private final ConcurrentHashMap<String, AtomicLong> categoryAllocatedBytes;
+    private final ConcurrentHashMap<String, AtomicLong> categoryThreadCounts;
 
     public ThreadMonitor(MeterRegistry meterRegistry) {
         this.threadMXBean = ManagementFactory.getThreadMXBean();
@@ -36,6 +49,10 @@ public class ThreadMonitor {
         this.previousStats = new ConcurrentHashMap<>();
         this.blockedThreadCount = new AtomicLong(0);
         this.waitingThreadCount = new AtomicLong(0);
+        this.deadlockedThreadCount = new AtomicLong(0);
+        this.categoryCpuTimeMs = new ConcurrentHashMap<>();
+        this.categoryAllocatedBytes = new ConcurrentHashMap<>();
+        this.categoryThreadCounts = new ConcurrentHashMap<>();
 
         // Enable CPU time tracking
         if (threadMXBean.isThreadCpuTimeSupported()) {
@@ -54,137 +71,33 @@ public class ThreadMonitor {
                 .description("Number of waiting threads")
                 .register(meterRegistry);
 
-        Gauge.builder("broker.threads.deadlocked", this, ThreadMonitor::getDeadlockedThreadCount)
+        Gauge.builder("broker.threads.deadlocked", deadlockedThreadCount, AtomicLong::get)
                 .description("Number of deadlocked threads")
                 .register(meterRegistry);
 
-        // Register per-category resource metrics that are updated periodically
-        Gauge.builder("broker.threads.category.cpu_time_ms", this,
-                monitor -> getTopCategoryCpuTime("Network I/O"))
-                .description("CPU time in ms for Network I/O threads")
-                .tag("category", "Network I/O")
-                .register(meterRegistry);
+        // Register per-category resource metrics backed by cached values updated every 30s.
+        // This avoids walking all JVM threads on every Prometheus scrape.
+        for (String category : TRACKED_CATEGORIES) {
+            AtomicLong cpuMs = categoryCpuTimeMs.computeIfAbsent(category, ignored -> new AtomicLong(0));
+            AtomicLong allocatedBytes = categoryAllocatedBytes.computeIfAbsent(category, ignored -> new AtomicLong(0));
+            AtomicLong threadCount = categoryThreadCounts.computeIfAbsent(category, ignored -> new AtomicLong(0));
 
-        Gauge.builder("broker.threads.category.cpu_time_ms", this,
-                monitor -> getTopCategoryCpuTime("Consumer Delivery"))
-                .description("CPU time in ms for Consumer Delivery threads")
-                .tag("category", "Consumer Delivery")
-                .register(meterRegistry);
+            Gauge.builder("broker.threads.category.cpu_time_ms", cpuMs, AtomicLong::get)
+                    .description("CPU time in ms for thread category over the last sampling interval")
+                    .tag("category", category)
+                    .register(meterRegistry);
 
-        Gauge.builder("broker.threads.category.cpu_time_ms", this,
-                monitor -> getTopCategoryCpuTime("Storage"))
-                .description("CPU time in ms for Storage threads")
-                .tag("category", "Storage")
-                .register(meterRegistry);
+            Gauge.builder("broker.threads.category.memory_mb", allocatedBytes,
+                            bytes -> bytes.get() / (1024.0 * 1024.0))
+                    .description("Allocated memory in MB for thread category over the last sampling interval")
+                    .tag("category", category)
+                    .register(meterRegistry);
 
-        Gauge.builder("broker.threads.category.cpu_time_ms", this,
-                monitor -> getTopCategoryCpuTime("Pipe/Replication"))
-                .description("CPU time in ms for Pipe/Replication threads")
-                .tag("category", "Pipe/Replication")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.cpu_time_ms", this,
-                monitor -> getTopCategoryCpuTime("HTTP Server"))
-                .description("CPU time in ms for HTTP Server threads")
-                .tag("category", "HTTP Server")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.cpu_time_ms", this,
-                monitor -> getTopCategoryCpuTime("Data Refresh"))
-                .description("CPU time in ms for Data Refresh threads")
-                .tag("category", "Data Refresh")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.cpu_time_ms", this,
-                monitor -> getTopCategoryCpuTime("Broker Management"))
-                .description("CPU time in ms for Broker Management threads")
-                .tag("category", "Broker Management")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.memory_mb", this,
-                monitor -> getTopCategoryMemory("Network I/O"))
-                .description("Allocated memory in MB for Network I/O threads")
-                .tag("category", "Network I/O")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.memory_mb", this,
-                monitor -> getTopCategoryMemory("Consumer Delivery"))
-                .description("Allocated memory in MB for Consumer Delivery threads")
-                .tag("category", "Consumer Delivery")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.memory_mb", this,
-                monitor -> getTopCategoryMemory("Storage"))
-                .description("Allocated memory in MB for Storage threads")
-                .tag("category", "Storage")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.memory_mb", this,
-                monitor -> getTopCategoryMemory("Pipe/Replication"))
-                .description("Allocated memory in MB for Pipe/Replication threads")
-                .tag("category", "Pipe/Replication")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.memory_mb", this,
-                monitor -> getTopCategoryMemory("HTTP Server"))
-                .description("Allocated memory in MB for HTTP Server threads")
-                .tag("category", "HTTP Server")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.memory_mb", this,
-                monitor -> getTopCategoryMemory("Data Refresh"))
-                .description("Allocated memory in MB for Data Refresh threads")
-                .tag("category", "Data Refresh")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.memory_mb", this,
-                monitor -> getTopCategoryMemory("Broker Management"))
-                .description("Allocated memory in MB for Broker Management threads")
-                .tag("category", "Broker Management")
-                .register(meterRegistry);
-
-        // Register per-category thread counts
-        Gauge.builder("broker.threads.category.count", this,
-                monitor -> getCategoryThreadCount("Network I/O"))
-                .description("Thread count for Network I/O")
-                .tag("category", "Network I/O")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.count", this,
-                monitor -> getCategoryThreadCount("Consumer Delivery"))
-                .description("Thread count for Consumer Delivery")
-                .tag("category", "Consumer Delivery")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.count", this,
-                monitor -> getCategoryThreadCount("Storage"))
-                .description("Thread count for Storage")
-                .tag("category", "Storage")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.count", this,
-                monitor -> getCategoryThreadCount("Pipe/Replication"))
-                .description("Thread count for Pipe/Replication")
-                .tag("category", "Pipe/Replication")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.count", this,
-                monitor -> getCategoryThreadCount("HTTP Server"))
-                .description("Thread count for HTTP Server")
-                .tag("category", "HTTP Server")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.count", this,
-                monitor -> getCategoryThreadCount("Data Refresh"))
-                .description("Thread count for Data Refresh")
-                .tag("category", "Data Refresh")
-                .register(meterRegistry);
-
-        Gauge.builder("broker.threads.category.count", this,
-                monitor -> getCategoryThreadCount("Broker Management"))
-                .description("Thread count for Broker Management")
-                .tag("category", "Broker Management")
-                .register(meterRegistry);
+            Gauge.builder("broker.threads.category.count", threadCount, AtomicLong::get)
+                    .description("Thread count for thread category")
+                    .tag("category", category)
+                    .register(meterRegistry);
+        }
 
         // Enable thread memory allocation tracking if supported
         try {
@@ -213,6 +126,7 @@ public class ThreadMonitor {
         long[] allThreadIds = threadMXBean.getAllThreadIds();
         List<ThreadCpuUsage> cpuUsages = new ArrayList<>();
         Map<String, ThreadGroupStats> groupStats = new HashMap<>();
+        Map<String, Integer> categoryCounts = new HashMap<>();
 
         long totalBlocked = 0;
         long totalWaiting = 0;
@@ -229,6 +143,7 @@ public class ThreadMonitor {
             // Categorize thread by name pattern
             String threadName = info.getThreadName();
             String category = categorizeThread(threadName);
+            categoryCounts.merge(category, 1, Integer::sum);
 
             // Calculate CPU usage
             if (threadMXBean.isThreadCpuTimeSupported()) {
@@ -268,6 +183,7 @@ public class ThreadMonitor {
         // Update metrics
         blockedThreadCount.set(totalBlocked);
         waitingThreadCount.set(totalWaiting);
+        updateCategoryCaches(groupStats, categoryCounts);
 
         // Log top CPU-consuming threads
         if (!cpuUsages.isEmpty()) {
@@ -285,10 +201,22 @@ public class ThreadMonitor {
         }
 
         // Check for deadlocks
-        checkForDeadlocks();
+        deadlockedThreadCount.set(checkForDeadlocks());
 
         // Cleanup terminated threads from stats
         cleanupTerminatedThreads(allThreadIds);
+    }
+
+    private void updateCategoryCaches(Map<String, ThreadGroupStats> groupStats, Map<String, Integer> categoryCounts) {
+        for (String category : TRACKED_CATEGORIES) {
+            ThreadGroupStats stats = groupStats.get(category);
+            categoryCpuTimeMs.computeIfAbsent(category, ignored -> new AtomicLong(0))
+                    .set(stats != null ? stats.cpuTimeNanos / 1_000_000 : 0);
+            categoryAllocatedBytes.computeIfAbsent(category, ignored -> new AtomicLong(0))
+                    .set(stats != null ? stats.allocatedBytes : 0);
+            categoryThreadCounts.computeIfAbsent(category, ignored -> new AtomicLong(0))
+                    .set(categoryCounts.getOrDefault(category, 0));
+        }
     }
 
     /**
@@ -408,7 +336,7 @@ public class ThreadMonitor {
     /**
      * Check for deadlocked threads
      */
-    private void checkForDeadlocks() {
+    private int checkForDeadlocks() {
         long[] deadlockedThreads = threadMXBean.findDeadlockedThreads();
         if (deadlockedThreads != null && deadlockedThreads.length > 0) {
             log.error("🚨 DEADLOCK DETECTED! {} threads are deadlocked:", deadlockedThreads.length);
@@ -430,15 +358,9 @@ public class ThreadMonitor {
             }
 
             log.error("  Full thread dump saved to logs. Consider restarting broker!");
+            return deadlockedThreads.length;
         }
-    }
-
-    /**
-     * Get deadlocked thread count for metrics
-     */
-    private int getDeadlockedThreadCount() {
-        long[] deadlockedThreads = threadMXBean.findDeadlockedThreads();
-        return deadlockedThreads != null ? deadlockedThreads.length : 0;
+        return 0;
     }
 
     /**
@@ -607,27 +529,21 @@ public class ThreadMonitor {
      * Get CPU time for a specific category (for metrics)
      */
     private double getTopCategoryCpuTime(String category) {
-        Map<String, CategoryResourceInfo> categoryStats = getResourcesByCategory();
-        CategoryResourceInfo info = categoryStats.get(category);
-        return info != null ? info.getTotalCpuTimeNanos() / 1_000_000.0 : 0.0;
+        return categoryCpuTimeMs.getOrDefault(category, new AtomicLong(0)).get();
     }
 
     /**
      * Get memory allocation for a specific category (for metrics)
      */
     private double getTopCategoryMemory(String category) {
-        Map<String, CategoryResourceInfo> categoryStats = getResourcesByCategory();
-        CategoryResourceInfo info = categoryStats.get(category);
-        return info != null ? info.getTotalAllocatedBytes() / (1024.0 * 1024.0) : 0.0;
+        return categoryAllocatedBytes.getOrDefault(category, new AtomicLong(0)).get() / (1024.0 * 1024.0);
     }
 
     /**
      * Get thread count for a specific category (for metrics)
      */
     private int getCategoryThreadCount(String category) {
-        Map<String, CategoryResourceInfo> categoryStats = getResourcesByCategory();
-        CategoryResourceInfo info = categoryStats.get(category);
-        return info != null ? info.getThreadCount() : 0;
+        return (int) categoryThreadCounts.getOrDefault(category, new AtomicLong(0)).get();
     }
 
     /**

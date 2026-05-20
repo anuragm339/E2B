@@ -29,6 +29,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public class RocksDbCompactionIndex {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbCompactionIndex.class);
+    private static final String TOPIC_STALE_MAX_PREFIX = "__meta__|stale|";
 
     private final RocksDB db;
     private final ColumnFamilyHandle cf;
@@ -63,6 +64,7 @@ public class RocksDbCompactionIndex {
                 if (newOffset <= existingOffset) {
                     return;  // out-of-order — do not regress the index
                 }
+                recordSupersededOffset(topic, existingOffset);
             }
             db.put(cf, writeOptions, key, encode(newOffset, newTimestampMs));
         } catch (RocksDBException e) {
@@ -126,6 +128,49 @@ public class RocksDbCompactionIndex {
     }
 
     /**
+     * Returns {@code true} only when the requested delivery offset could still contain
+     * superseded records that have not yet been physically compacted away.
+     *
+     * <p>We track the highest offset that has become stale for each topic. Any delivery
+     * that starts strictly after that offset cannot contain an old version and can stay
+     * on the zero-copy path.
+     */
+    public boolean shouldFilterDelivery(String topic, long deliveryStartOffset) {
+        long maxSupersededOffset = getMaxSupersededOffset(topic);
+        return maxSupersededOffset >= 0 && deliveryStartOffset <= maxSupersededOffset;
+    }
+
+    /**
+     * Mark all stale offsets up to {@code compactedThroughOffset} as physically removed.
+     * When the compaction sweep has covered the highest known stale offset for the topic,
+     * the delivery-time filter can be disabled again until a newer duplicate arrives.
+     */
+    public void markCompactedThrough(String topic, long compactedThroughOffset) {
+        if (compactedThroughOffset < 0) {
+            return;
+        }
+
+        updateLock.lock();
+        try {
+            byte[] metaKey = buildTopicStaleKey(topic);
+            byte[] existing = db.get(cf, metaKey);
+            if (existing == null) {
+                return;
+            }
+
+            long maxSupersededOffset = decodeLong(existing);
+            if (maxSupersededOffset <= compactedThroughOffset) {
+                db.delete(cf, writeOptions, metaKey);
+            }
+        } catch (RocksDBException e) {
+            log.error("CompactionIndex markCompactedThrough failed for topic={} compactedThrough={}",
+                    topic, compactedThroughOffset, e);
+        } finally {
+            updateLock.unlock();
+        }
+    }
+
+    /**
      * Prefix-scans the compaction column family and returns all entries for {@code topic}.
      *
      * @return map of {@code msgKey -> [latestOffset, latestTimestampMs]}
@@ -155,6 +200,10 @@ public class RocksDbCompactionIndex {
         return (topic + "|" + msgKey).getBytes(StandardCharsets.UTF_8);
     }
 
+    private byte[] buildTopicStaleKey(String topic) {
+        return (TOPIC_STALE_MAX_PREFIX + topic).getBytes(StandardCharsets.UTF_8);
+    }
+
     private byte[] encode(long offset, long timestampMs) {
         ByteBuffer buf = ByteBuffer.allocate(16);
         buf.putLong(offset);
@@ -162,9 +211,41 @@ public class RocksDbCompactionIndex {
         return buf.array();
     }
 
+    private byte[] encodeLong(long value) {
+        ByteBuffer buf = ByteBuffer.allocate(Long.BYTES);
+        buf.putLong(value);
+        return buf.array();
+    }
+
     private long[] decode(byte[] value) {
         ByteBuffer buf = ByteBuffer.wrap(value);
         return new long[]{ buf.getLong(), buf.getLong() };
+    }
+
+    private long decodeLong(byte[] value) {
+        return ByteBuffer.wrap(value).getLong();
+    }
+
+    private long getMaxSupersededOffset(String topic) {
+        try {
+            byte[] value = db.get(cf, buildTopicStaleKey(topic));
+            return value == null ? -1L : decodeLong(value);
+        } catch (RocksDBException e) {
+            log.error("CompactionIndex getMaxSupersededOffset failed for topic={}", topic, e);
+            return -1L;
+        }
+    }
+
+    private void recordSupersededOffset(String topic, long staleOffset) throws RocksDBException {
+        byte[] metaKey = buildTopicStaleKey(topic);
+        byte[] existing = db.get(cf, metaKey);
+        if (existing != null) {
+            long currentMax = decodeLong(existing);
+            if (staleOffset <= currentMax) {
+                return;
+            }
+        }
+        db.put(cf, writeOptions, metaKey, encodeLong(staleOffset));
     }
 
     private boolean startsWith(byte[] key, byte[] prefix) {

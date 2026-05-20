@@ -84,7 +84,7 @@ class CompactionSchedulerSpec extends Specification {
         }
         def rewriter = Mock(CompactionRewriter) {
             rewrite([segment], "prices-v1", 0, segmentManager, compactionIndex, 7) >>
-                    new CompactionRewriter.CompactionResult(5, 200L, false)
+                    new CompactionRewriter.CompactionResult(5, 2, 1024L, 800L, 224L, 1, false)
         }
         def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
 
@@ -98,11 +98,12 @@ class CompactionSchedulerSpec extends Specification {
         then:
         1 * planner.selectDirtyWindow([segment], -1L, 10) >> [segment]
         1 * rewriter.rewrite([segment], "prices-v1", 0, segmentManager, compactionIndex, 7) >>
-                new CompactionRewriter.CompactionResult(5, 200L, false)
+                new CompactionRewriter.CompactionResult(5, 2, 1024L, 800L, 224L, 1, false)
         1 * checkpointStore.saveCheckpoint("prices-v1", 0, 0L)
         1 * metrics.recordCompactionRun()
-        1 * metrics.recordCompactionRecordsRemoved("prices-v1", 5)
-        1 * metrics.recordCompactionBytesReclaimed("prices-v1", 200L)
+        1 * metrics.recordCompactionTopicRun("prices-v1", 5, 2, 1024L, 800L, 224L, 1)
+        1 * metrics.markCompactionActive("prices-v1")
+        1 * metrics.markCompactionComplete("prices-v1")
     }
 
     def "compact() continues to next topic when one topic throws"() {

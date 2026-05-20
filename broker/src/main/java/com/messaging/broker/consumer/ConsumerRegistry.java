@@ -24,6 +24,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
@@ -33,6 +35,8 @@ import java.util.stream.Collectors;
 public class ConsumerRegistry {
 
     private static final Logger log = LoggerFactory.getLogger(ConsumerRegistry.class);
+    private static final long LEGACY_PENDING_ACK_WARN_THRESHOLD_MS = 5_000L;
+    private static final long LEGACY_BLOCKED_WARN_INTERVAL_MS = 10_000L;
 
     private final ConsumerRegistrationService registrationService;
     private final ConsumerReadinessService readinessService;
@@ -48,6 +52,7 @@ public class ConsumerRegistry {
     private final ScheduledExecutorService consumerScheduler;
     private final long legacyAckTimeoutMs;
     private final ObjectMapper objectMapper;
+    private final ConcurrentHashMap<String, AtomicLong> legacyBlockedWarnTime = new ConcurrentHashMap<>();
 
     private volatile AdaptiveBatchDeliveryManager adaptiveDeliveryManager; // Lazy injection
     private volatile RefreshCoordinator refreshCoordinator; // Lazy injection (avoids circular dep)
@@ -196,14 +201,17 @@ public class ConsumerRegistry {
      */
     public boolean deliverMergedBatchToLegacy(String clientId, String consumerGroup, long maxBytes) {
         if (!readinessService.isLegacyConsumerReady(clientId)) {
+            metrics.recordLegacyDeliveryBlocked(consumerGroup, "not_ready");
             log.debug("Legacy delivery blocked until READY_ACK: clientId={}, group={}", clientId, consumerGroup);
             return false;
         }
 
         // Non-atomic fast-path: if a batch is already pending, skip building the next one.
         // The authoritative gate is putPendingBatchIfAbsent() below.
-        if (pendingAckStore.getPendingBatch(clientId) != null) {
-            log.debug("Legacy delivery blocked by pending ACK: clientId={}, group={}", clientId, consumerGroup);
+        MergedBatch pendingBatch = pendingAckStore.getPendingBatch(clientId);
+        if (pendingBatch != null) {
+            metrics.recordLegacyDeliveryBlocked(consumerGroup, "pending_ack");
+            logLegacyPendingAckBlocked(clientId, consumerGroup, "pending_ack", pendingBatch);
             return false;
         }
 
@@ -213,6 +221,7 @@ public class ConsumerRegistry {
                 .toList();
 
         if (topics.isEmpty()) {
+            metrics.recordLegacyDeliveryBlocked(consumerGroup, "no_topics");
             log.debug("Legacy delivery skipped: no legacy topics registered for clientId={}, group={}",
                     clientId, consumerGroup);
             return false;
@@ -221,6 +230,9 @@ public class ConsumerRegistry {
         try {
             MergedBatch batch = legacyDeliveryManager.buildMergedBatch(topics, consumerGroup, maxBytes);
             if (batch.isEmpty()) {
+                metrics.recordLegacyDeliveryBlocked(consumerGroup, "empty_batch");
+                log.info("event=legacy_delivery.empty_merged_batch clientId={} group={} topicsRequested={} maxBytes={}",
+                        clientId, consumerGroup, topics.size(), maxBytes);
                 return false;
             }
 
@@ -237,13 +249,15 @@ public class ConsumerRegistry {
             // ensures only one thread proceeds to the network send even without a method-level lock.
             // Must happen BEFORE the send so an early ACK finds the pending batch in the store.
             if (!pendingAckStore.putPendingBatchIfAbsent(clientId, batch)) {
-                log.debug("Legacy delivery slot already taken for clientId={}, group={} — skipping",
-                        clientId, consumerGroup);
+                metrics.recordLegacyDeliveryBlocked(consumerGroup, "slot_taken");
+                logLegacyPendingAckBlocked(clientId, consumerGroup, "slot_taken",
+                        pendingAckStore.getPendingBatch(clientId));
                 return false;
             }
             pendingAckStore.recordSendTime(clientId, System.currentTimeMillis());
             pendingAckStore.startTimer(clientId, deliverySample);
             metrics.recordBatchSize(batch.getMessageCount());
+            metrics.recordLegacyBatchSent(consumerGroup, batch.getMessageCount(), batch.getMaxOffsetPerTopic().size());
 
             for (String topic : batch.getMaxOffsetPerTopic().keySet()) {
                 metrics.startPendingAck(topic, consumerGroup);
@@ -256,6 +270,10 @@ public class ConsumerRegistry {
                 pendingAckStore.removePendingBatch(clientId);
                 pendingAckStore.removeTimer(clientId);
                 pendingAckStore.removeClient(clientId);
+                metrics.clearLegacyPendingBatch(consumerGroup);
+                log.warn("event=legacy_batch.send_failed clientId={} group={} messageCount={} bytes={} topicOffsets={} error={}",
+                        clientId, consumerGroup, batch.getMessageCount(), batch.getTotalBytes(),
+                        batch.getMaxOffsetPerTopic(), sendEx.toString());
                 throw sendEx;
             }
 
@@ -267,8 +285,11 @@ public class ConsumerRegistry {
                 if (pendingAckStore.getSendTime(clientId) == batchSendTime) {
                     MergedBatch pending = pendingAckStore.getPendingBatch(clientId);
                     if (pending != null) {
-                        log.warn("event=legacy_batch.ack_timeout clientId={} group={} action=clear_pending_batch",
-                                clientId, consumerGroup);
+                        long pendingAgeMs = Math.max(0, System.currentTimeMillis() - batchSendTime);
+                        log.warn("event=legacy_batch.ack_timeout clientId={} group={} pendingAckAgeMs={} messageCount={} topicCount={} topicOffsets={} action=clear_pending_batch",
+                                clientId, consumerGroup, pendingAgeMs, pending.getMessageCount(),
+                                pending.getMaxOffsetPerTopic().size(), pending.getMaxOffsetPerTopic());
+                        metrics.recordLegacyBatchTimeout(consumerGroup);
                         pendingAckStore.removeClient(clientId);
                         for (String t : pending.getMaxOffsetPerTopic().keySet()) {
                             metrics.completePendingAck(t, consumerGroup);
@@ -322,6 +343,35 @@ public class ConsumerRegistry {
      */
     public void handleLegacyBatchAck(String clientId, String group) {
         ackService.handleLegacyBatchAck(clientId, group);
+    }
+
+    private void logLegacyPendingAckBlocked(String clientId, String consumerGroup, String reason, MergedBatch pendingBatch) {
+        if (pendingBatch == null) {
+            log.debug("Legacy delivery blocked: clientId={}, group={}, reason={}, pendingBatch=null",
+                    clientId, consumerGroup, reason);
+            return;
+        }
+
+        long sendTime = pendingAckStore.getSendTime(clientId);
+        long pendingAgeMs = sendTime > 0 ? Math.max(0, System.currentTimeMillis() - sendTime) : -1L;
+        if (pendingAgeMs < LEGACY_PENDING_ACK_WARN_THRESHOLD_MS || !shouldWarnLegacyBlocked(consumerGroup)) {
+            log.debug("Legacy delivery blocked: clientId={}, group={}, reason={}, pendingAckAgeMs={}, messageCount={}, topicOffsets={}",
+                    clientId, consumerGroup, reason, pendingAgeMs,
+                    pendingBatch.getMessageCount(), pendingBatch.getMaxOffsetPerTopic());
+            return;
+        }
+
+        log.warn("event=legacy_delivery.blocked clientId={} group={} reason={} pendingAckAgeMs={} messageCount={} topicCount={} topicOffsets={}",
+                clientId, consumerGroup, reason, pendingAgeMs, pendingBatch.getMessageCount(),
+                pendingBatch.getMaxOffsetPerTopic().size(), pendingBatch.getMaxOffsetPerTopic());
+    }
+
+    private boolean shouldWarnLegacyBlocked(String consumerGroup) {
+        String key = consumerGroup == null || consumerGroup.isBlank() ? "unknown" : consumerGroup;
+        long now = System.currentTimeMillis();
+        AtomicLong lastLogged = legacyBlockedWarnTime.computeIfAbsent(key, ignored -> new AtomicLong(0));
+        long previous = lastLogged.get();
+        return now - previous >= LEGACY_BLOCKED_WARN_INTERVAL_MS && lastLogged.compareAndSet(previous, now);
     }
 
     // ==================== CONSUMER READINESS (READY_ACK) ====================

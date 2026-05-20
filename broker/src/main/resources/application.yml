@@ -48,7 +48,7 @@ broker:
   storage:
     type: filechannel  # FileChannel-based (no mmap) for true zero-copy via sendfile()
     dataDir: ${DATA_DIR:/Users/anuragmishra/Desktop/workspace/messaging/data/}
-    segment-size: 1073741824  # 1GB
+    segment-size: ${SEGMENT_SIZE:104857600}  # 1GB default; override via SEGMENT_SIZE env var (e.g. 10485760 = 10MB for testing)
 
   default-topic: ${DEFAULT_TOPIC:default-topic}
 
@@ -76,7 +76,7 @@ broker:
     # Raise per-mb-seconds for slow networks; raise base-seconds for high-latency links.
     send-timeout-base-seconds: ${SEND_TIMEOUT_BASE_SECONDS:1}
     send-timeout-per-mb-seconds: ${SEND_TIMEOUT_PER_MB_SECONDS:2}
-    max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:2097152}  # 2MB batches reduce delivery frequency
+    max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:262144}  # 256KB default; below G1 humongous threshold (512KB with 1MB regions)
     # DEPRECATED: max-batch-size-per-consumer no longer used (size-only batching now)
     # max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}
 
@@ -91,9 +91,9 @@ broker:
       max-in-flight-per-topic: 1  # Serialize per-topic delivery to reduce parallel work
 
   pipe:
-    min-poll-interval-ms: 500   # Low-CPU profile: less frequent upstream polling
-    max-poll-interval-ms: 20000
-    poll-limit: 5
+    min-poll-interval-ms: ${PIPE_MIN_POLL_INTERVAL_MS:500}   # Low-CPU profile: less frequent upstream polling
+    max-poll-interval-ms: ${PIPE_MAX_POLL_INTERVAL_MS:20000}
+    poll-limit: ${PIPE_POLL_LIMIT:5}
 
 # Legacy Client Configuration
 # Maps legacy serviceName (from RegisterEvent) to list of topics
@@ -158,15 +158,21 @@ legacy-clients:
 executor:
   ack:
     threads: ${EXECUTOR_ACK_THREADS:2}
+  ack-storage:
+    threads: ${EXECUTOR_ACK_STORAGE_THREADS:2}
   consumer-scheduler:
     threads: ${EXECUTOR_CONSUMER_SCHEDULER_THREADS:2}
   storage:
     threads: ${EXECUTOR_STORAGE_THREADS:2}
 
 ack-store:
+  live-replay:
+    enabled: ${ACK_STORE_LIVE_REPLAY_ENABLED:true}
+  seed-on-startup:
+    enabled: ${ACK_STORE_SEED_ON_STARTUP_ENABLED:true}
   rocksdb:
     path: ${DATA_DIR}/ack-store
-    block-cache-bytes: ${ACK_STORE_BLOCK_CACHE_BYTES:33554432}   # 32MB — shared by ack store + compaction index
+    block-cache-bytes: ${ACK_STORE_BLOCK_CACHE_BYTES:16777216}   # 16MB total — single LRUCache shared by both CFs (was 2×32MB=64MB)
   reconciliation:
     interval: ${ACK_RECONCILIATION_INTERVAL:5m}
     initial-delay: ${ACK_RECONCILIATION_INITIAL_DELAY:2m}
@@ -177,6 +183,10 @@ compaction:
   enabled: ${COMPACTION_ENABLED:true}
   tombstone-retention-days: ${COMPACTION_RETENTION_DAYS:7}
   window-size: ${COMPACTION_WINDOW_SIZE:10}  # Max sealed segments per compaction run (incremental)
+  max-topics-per-run: ${COMPACTION_MAX_TOPICS_PER_RUN:2147483647}  # Use env to cap full-sweep breadth in constrained environments
+  min-segments-per-topic: ${COMPACTION_MIN_SEGMENTS_PER_TOPIC:1}  # Avoid rewriting single sealed segments unless explicitly enabled
+  max-process-cpu-usage: ${COMPACTION_MAX_PROCESS_CPU_USAGE:1.0}  # Skip compaction when broker CPU is already hot
+  max-heap-usage: ${COMPACTION_MAX_HEAP_USAGE:1.0}  # Skip compaction when heap pressure is already high
   schedule:
     interval: ${COMPACTION_INTERVAL:24h}
     initial-delay: ${COMPACTION_INITIAL_DELAY:5m}
@@ -189,5 +199,7 @@ logger:
     com.messaging.broker.consumer: INFO  # Consumer lifecycle, timeouts, failures; hot-path batch logs stay DEBUG
     com.messaging.broker.handler: INFO  # Subscribe / READY_ACK / RESET_ACK lifecycle events
     com.messaging.broker.legacy: INFO  # Legacy consumer lifecycle; merge internals stay DEBUG
+    com.messaging.broker.compaction: INFO  # Compaction run lifecycle, per-topic results, heap stats
     com.messaging.pipe: INFO  # Pipe connect/pause/resume and failures; poll traffic stays DEBUG
+    com.messaging.storage.segment: INFO  # Segment replace/remove events with offset and heap context
     io.netty: ERROR  # Only show Netty errors

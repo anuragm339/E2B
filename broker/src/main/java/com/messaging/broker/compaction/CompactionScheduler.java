@@ -13,7 +13,10 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.lang.management.ManagementFactory;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Set;
 
 /**
@@ -36,9 +39,15 @@ public class CompactionScheduler {
     private final CompactionRewriter rewriter;
     private final RocksDbCompactionIndex compactionIndex;
     private final BrokerMetrics metrics;
+    private final com.messaging.broker.monitoring.MemoryMonitor memoryMonitor;
     private final boolean enabled;
     private final int tombstoneRetentionDays;
     private final int windowSize;
+    private final int maxTopicsPerRun;
+    private final int minSegmentsPerTopic;
+    private final double maxProcessCpuUsage;
+    private final double maxHeapUsage;
+    private final com.sun.management.OperatingSystemMXBean osBean;
 
     @Inject
     public CompactionScheduler(
@@ -49,9 +58,14 @@ public class CompactionScheduler {
             CompactionRewriter rewriter,
             RocksDbCompactionIndex compactionIndex,
             BrokerMetrics metrics,
+            com.messaging.broker.monitoring.MemoryMonitor memoryMonitor,
             @Value("${compaction.enabled:true}") boolean enabled,
             @Value("${compaction.tombstone-retention-days:7}") int tombstoneRetentionDays,
-            @Value("${compaction.window-size:10}") int windowSize) {
+            @Value("${compaction.window-size:10}") int windowSize,
+            @Value("${compaction.max-topics-per-run:2147483647}") int maxTopicsPerRun,
+            @Value("${compaction.min-segments-per-topic:1}") int minSegmentsPerTopic,
+            @Value("${compaction.max-process-cpu-usage:1.0}") double maxProcessCpuUsage,
+            @Value("${compaction.max-heap-usage:1.0}") double maxHeapUsage) {
         this.storage               = storage;
         this.segmentAccess         = segmentAccess;
         this.checkpointStore       = checkpointStore;
@@ -59,9 +73,18 @@ public class CompactionScheduler {
         this.rewriter              = rewriter;
         this.compactionIndex       = compactionIndex;
         this.metrics               = metrics;
+        this.memoryMonitor         = memoryMonitor;
         this.enabled               = enabled;
         this.tombstoneRetentionDays = tombstoneRetentionDays;
         this.windowSize            = windowSize;
+        this.maxTopicsPerRun       = maxTopicsPerRun;
+        this.minSegmentsPerTopic   = minSegmentsPerTopic;
+        this.maxProcessCpuUsage    = maxProcessCpuUsage;
+        this.maxHeapUsage          = maxHeapUsage;
+        java.lang.management.OperatingSystemMXBean rawBean = ManagementFactory.getOperatingSystemMXBean();
+        this.osBean = rawBean instanceof com.sun.management.OperatingSystemMXBean
+                ? (com.sun.management.OperatingSystemMXBean) rawBean
+                : null;
     }
 
     @Scheduled(
@@ -73,44 +96,92 @@ public class CompactionScheduler {
             return;
         }
 
+        if (!canRunCompaction("run_start", null)) {
+            return;
+        }
+
         Timer.Sample runTimer = metrics.startCompactionTimer();
 
         Set<String> topics = storage.getTopicNames();
-        log.info("Compaction run started: {} topics", topics.size());
+        List<String> orderedTopics = new ArrayList<>(topics);
+        Collections.sort(orderedTopics);
+        Runtime rt = Runtime.getRuntime();
+        long heapUsedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long heapMaxMB  = rt.maxMemory() / (1024 * 1024);
+        log.info("event=compaction_run_start topics={} heap={}/{}MB", topics.size(), heapUsedMB, heapMaxMB);
 
-        for (String topic : topics) {
+        int compactedTopics = 0;
+        for (String topic : orderedTopics) {
+            if (compactedTopics >= maxTopicsPerRun) {
+                log.info("event=compaction_run_budget_exhausted compactedTopics={} maxTopicsPerRun={}",
+                        compactedTopics, maxTopicsPerRun);
+                break;
+            }
+            if (!canRunCompaction("before_topic", topic)) {
+                break;
+            }
             try {
-                compactTopic(topic, 0);
+                if (compactTopic(topic, 0)) {
+                    compactedTopics++;
+                }
             } catch (Exception e) {
                 log.error("Compaction failed for topic={}", topic, e);
+                metrics.markCompactionComplete(topic);   // ensure active flag is cleared on error
+                metrics.recordCompactionError(topic);
             }
         }
 
-        metrics.stopCompactionTimer(runTimer);
-        log.info("Compaction run finished");
+        if (compactedTopics > 0) {
+            metrics.stopCompactionTimer(runTimer);
+            metrics.recordCompactionRun();
+        }
+        long heapUsedAfterMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        log.info("event=compaction_run_finish compactedTopics={} heap={}/{}MB", compactedTopics, heapUsedAfterMB, heapMaxMB);
     }
 
-    private void compactTopic(String topic, int partition) throws Exception {
+    private boolean compactTopic(String topic, int partition) throws Exception {
         SegmentManager segmentManager = segmentAccess.getSegmentManager(topic, partition);
         if (segmentManager == null) {
             log.debug("No segment manager for topic={}, skipping", topic);
-            return;
+            return false;
         }
 
         long lastCheckpoint = checkpointStore.loadCheckpoint(topic, partition);
         List<Segment> sealedSegments = segmentManager.getInactiveSegments();
+        if (sealedSegments.size() < minSegmentsPerTopic) {
+            log.debug("Compaction skipped for topic={} partition={} sealedSegments={} minSegmentsPerTopic={}",
+                    topic, partition, sealedSegments.size(), minSegmentsPerTopic);
+            return false;
+        }
         List<Segment> window = planner.selectDirtyWindow(sealedSegments, lastCheckpoint, windowSize);
 
         if (window.isEmpty()) {
             log.debug("No dirty segments for topic={} since checkpoint={}", topic, lastCheckpoint);
-            return;
+            return false;
         }
 
-        log.info("Compacting topic={} partition={}: {} segments (checkpoint={})",
-                topic, partition, window.size(), lastCheckpoint);
+        String windowOffsets = window.stream()
+                .map(s -> String.valueOf(s.getBaseOffset()))
+                .reduce((a, b) -> a + "," + b).orElse("none");
+        log.info("event=compaction_topic_start topic={} partition={} segments={} " +
+                 "checkpoint={} windowOffsets=[{}]",
+                 topic, partition, window.size(), lastCheckpoint, windowOffsets);
 
-        CompactionRewriter.CompactionResult result = rewriter.rewrite(
-                window, topic, partition, segmentManager, compactionIndex, tombstoneRetentionDays);
+        long topicStartMs = System.currentTimeMillis();
+        long compactedThroughOffset = window.stream()
+                .mapToLong(s -> s.getNextOffset() - 1)
+                .max()
+                .orElse(-1L);
+        metrics.markCompactionActive(topic);
+        CompactionRewriter.CompactionResult result;
+        try {
+            result = rewriter.rewrite(
+                    window, topic, partition, segmentManager, compactionIndex, tombstoneRetentionDays);
+        } finally {
+            metrics.markCompactionComplete(topic);
+        }
+
+        compactionIndex.markCompactedThrough(topic, compactedThroughOffset);
 
         // Only advance the checkpoint when no live tombstones were left behind.
         // If tombstones are still within their retention window, the same window must be
@@ -127,11 +198,48 @@ public class CompactionScheduler {
                     topic, partition);
         }
 
-        metrics.recordCompactionRun();
-        metrics.recordCompactionRecordsRemoved(topic, result.recordsRemoved);
-        metrics.recordCompactionBytesReclaimed(topic, result.bytesReclaimed);
+        metrics.recordCompactionTopicRun(
+                topic,
+                result.recordsRemoved,
+                result.tombstonesRemoved,
+                result.bytesRead,
+                result.bytesWritten,
+                result.bytesReclaimed,
+                result.segmentsReplaced);
 
-        log.info("Compacted topic={}: removed={} records, reclaimed={}B, newCheckpoint={}",
-                topic, result.recordsRemoved, result.bytesReclaimed, newCheckpoint);
+        long topicElapsedMs = System.currentTimeMillis() - topicStartMs;
+        log.info("event=compaction_topic_finish topic={} removed={} records (tombstones={}) " +
+                 "bytesRead={} bytesWritten={} reclaimed={}B segments={} newCheckpoint={} elapsedMs={}",
+                topic, result.recordsRemoved, result.tombstonesRemoved,
+                result.bytesRead, result.bytesWritten, result.bytesReclaimed,
+                result.segmentsReplaced, newCheckpoint, topicElapsedMs);
+        return true;
+    }
+
+    private boolean canRunCompaction(String phase, String topic) {
+        double heapUsage = memoryMonitor.getHeapUsagePercent();
+        double processCpu = getProcessCpuUsage();
+
+        if (heapUsage >= maxHeapUsage || memoryMonitor.isMemoryPressureHigh()) {
+            log.info("event=compaction_run_skipped phase={} topic={} reason=memory_pressure heapUsage={} maxHeapUsage={} warning={}",
+                    phase, topic, heapUsage, maxHeapUsage, memoryMonitor.isMemoryPressureHigh());
+            return false;
+        }
+
+        if (processCpu >= 0 && processCpu >= maxProcessCpuUsage) {
+            log.info("event=compaction_run_skipped phase={} topic={} reason=cpu_pressure processCpuUsage={} maxProcessCpuUsage={}",
+                    phase, topic, processCpu, maxProcessCpuUsage);
+            return false;
+        }
+
+        return true;
+    }
+
+    private double getProcessCpuUsage() {
+        if (osBean == null) {
+            return -1;
+        }
+        double load = osBean.getProcessCpuLoad();
+        return load >= 0 ? load : -1;
     }
 }

@@ -49,11 +49,30 @@ public class DefaultStorageRecoveryService implements StorageRecoveryService {
                     "Path is not a directory: " + dataDir);
         }
 
+        // Delete any leftover .compacting.{log,index} files from a previous crashed compaction run.
+        // These are incomplete staging files — they are never valid segments.
+        // CompactionRewriter also cleans them up at the start of the next run, but doing it here
+        // ensures they never cause spurious "invalid segment filename" errors during startup.
+        try (Stream<Path> paths = Files.list(dataDir)) {
+            paths.filter(p -> p.getFileName().toString().contains(".compacting"))
+                 .forEach(p -> {
+                     try {
+                         Files.deleteIfExists(p);
+                         log.warn("Deleted leftover compaction staging file: {}", p);
+                     } catch (IOException e) {
+                         log.warn("Could not delete compaction staging file {}: {}", p, e.getMessage());
+                     }
+                 });
+        } catch (IOException e) {
+            log.warn("Could not scan for leftover compaction staging files in {}: {}", dataDir, e.getMessage());
+        }
+
         List<Path> logFiles = new ArrayList<>();
 
-        // Collect all log files
+        // Collect only files that match the segment filename pattern.
+        // This naturally excludes .compacting.log (staging) files and any other non-segment files.
         try (Stream<Path> paths = Files.list(dataDir)) {
-            paths.filter(path -> path.toString().endsWith(".log"))
+            paths.filter(p -> SEGMENT_PATTERN.matcher(p.getFileName().toString()).matches())
                     .forEach(logFiles::add);
         } catch (IOException e) {
             throw new StorageException(ErrorCode.STORAGE_IO_ERROR,

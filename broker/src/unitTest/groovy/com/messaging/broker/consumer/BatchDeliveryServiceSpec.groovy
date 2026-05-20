@@ -147,7 +147,10 @@ class BatchDeliveryServiceSpec extends Specification {
         consumer.consecutiveFailures > 0
         1 * metrics.stopStorageReadTimer(_ as Timer.Sample)
         1 * metrics.recordStorageRead()
-        0 * stateService.clearFromOffset(_)   // transient failure — clearFromOffset only called after 10 consecutive failures
+        // sendBatchToConsumer() threw before the ACK timeout was scheduled — pending state must be
+        // cleared immediately so Gate 2 does not permanently block all future delivery attempts.
+        1 * stateService.clearFromOffset(_)
+        1 * stateService.clearPendingOffset(_)
         1 * metrics.recordConsumerTransferFailed("client-1", "prices-v1", "group-a", 1, 3)
         1 * metrics.recordConsumerFailure("client-1", "prices-v1", "group-a")
     }

@@ -25,6 +25,12 @@ import java.util.List;
  *
  * Existing installations that have a single-CF DB are migrated automatically:
  * {@code setCreateMissingColumnFamilies(true)} creates the {@code compaction} CF on first open.
+ *
+ * <h2>Block cache sharing</h2>
+ * <p>A <em>single</em> {@link LRUCache} instance is shared across both column families.
+ * The original code created one independent cache per CF, silently doubling the configured
+ * size (2 × 32 MB = 64 MB).  With a shared cache the total cost equals exactly
+ * {@code blockCacheBytes} (default 16 MB — see {@code application.yml}).
  */
 @Singleton
 public class SharedRocksDb {
@@ -41,10 +47,12 @@ public class SharedRocksDb {
     private WriteOptions writeOptions;
     private DBOptions dbOptions;
     private List<ColumnFamilyOptions> cfOptionsList;
+    // Single shared cache — closed explicitly in @PreDestroy to release off-heap memory promptly.
+    private LRUCache sharedBlockCache;
 
     public SharedRocksDb(
             @Value("${ack-store.rocksdb.path}") String dbPath,
-            @Value("${ack-store.rocksdb.block-cache-bytes:33554432}") long blockCacheBytes) {
+            @Value("${ack-store.rocksdb.block-cache-bytes:16777216}") long blockCacheBytes) {
         this.dbPath = dbPath;
         this.blockCacheBytes = blockCacheBytes;
     }
@@ -53,10 +61,13 @@ public class SharedRocksDb {
     public void init() throws RocksDBException {
         RocksDB.loadLibrary();
 
+        // One LRUCache shared by both CFs — prevents the "two independent caches" memory doubling.
+        sharedBlockCache = new LRUCache(blockCacheBytes);
+
         cfOptionsList = new ArrayList<>();
 
-        ColumnFamilyOptions defaultCfOptions = buildCfOptions();
-        ColumnFamilyOptions compactionCfOptions = buildCfOptions();
+        ColumnFamilyOptions defaultCfOptions    = buildCfOptions(sharedBlockCache);
+        ColumnFamilyOptions compactionCfOptions = buildCfOptions(sharedBlockCache);
         cfOptionsList.add(defaultCfOptions);
         cfOptionsList.add(compactionCfOptions);
 
@@ -80,7 +91,8 @@ public class SharedRocksDb {
 
         writeOptions = new WriteOptions().setSync(false).setDisableWAL(false);
 
-        log.info("SharedRocksDb opened at {} with column families: default, compaction", dbPath);
+        log.info("SharedRocksDb opened at {} with column families: default, compaction " +
+                 "(shared block cache: {} MB)", dbPath, blockCacheBytes / (1024 * 1024));
     }
 
     @PreDestroy
@@ -91,6 +103,8 @@ public class SharedRocksDb {
         if (writeOptions     != null) writeOptions.close();
         if (dbOptions        != null) dbOptions.close();
         if (cfOptionsList    != null) cfOptionsList.forEach(ColumnFamilyOptions::close);
+        // Release off-heap block cache memory promptly — important inside a 600 MB container.
+        if (sharedBlockCache != null) sharedBlockCache.close();
         log.info("SharedRocksDb closed");
     }
 
@@ -99,13 +113,18 @@ public class SharedRocksDb {
     public ColumnFamilyHandle getCompactionHandle() { return compactionHandle; }
     public WriteOptions getWriteOptions()           { return writeOptions; }
 
-    private ColumnFamilyOptions buildCfOptions() {
+    /**
+     * Build {@link ColumnFamilyOptions} that reference the provided shared block cache.
+     * Using a shared cache ensures that the total cache footprint is bounded by
+     * {@code blockCacheBytes} regardless of how many CFs are opened.
+     */
+    private ColumnFamilyOptions buildCfOptions(LRUCache sharedCache) {
         BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
-                .setBlockCache(new LRUCache(blockCacheBytes))
+                .setBlockCache(sharedCache)
                 .setFilterPolicy(new BloomFilter(10, false));
 
         return new ColumnFamilyOptions()
-                .setWriteBufferSize(16 * 1024 * 1024)
+                .setWriteBufferSize(8 * 1024 * 1024)   // 8 MB per CF (was 16 MB) — saves ~16 MB
                 .setMaxWriteBufferNumber(2)
                 .setCompressionType(CompressionType.LZ4_COMPRESSION)
                 .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION)

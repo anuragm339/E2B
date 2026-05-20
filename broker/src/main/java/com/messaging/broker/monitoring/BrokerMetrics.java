@@ -25,6 +25,8 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, Counter> consumerAcks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> consumerFailures = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> consumerRetries = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerDeliveryBlocked = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> topicMessagesStored = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicLong> consumerOffsets = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicLong> consumerLag = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Timer> consumerDeliveryLatency = new ConcurrentHashMap<>();
@@ -40,6 +42,16 @@ public class BrokerMetrics {
     // Pending ACK age tracking - how long current ACK has been pending (milliseconds since epoch)
     private final ConcurrentHashMap<String, AtomicLong> pendingAckStartTime = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Gauge> pendingAckAgeGauges = new ConcurrentHashMap<>();
+
+    // Legacy merged-batch observability - per legacy consumer group
+    private final ConcurrentHashMap<String, AtomicLong> legacyLastBatchSendTime = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> legacyLastBatchAckTime = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> legacyPendingBatchStartTime = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> legacyPendingBatchMessages = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> legacyPendingBatchTopics = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> legacyPendingBatchAgeGauges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> legacyDeliveryBlocked = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> legacyBatchEvents = new ConcurrentHashMap<>();
 
     // ACK reconciliation: number of msgKeys in sealed segments with no RocksDB ACK record
     private final ConcurrentHashMap<String, AtomicLong> reconciliationMissingKeys = new ConcurrentHashMap<>();
@@ -80,11 +92,27 @@ public class BrokerMetrics {
     private final DistributionSummary messageSizeBytes;
     private final DistributionSummary batchSize;
 
-    // Compaction metrics
+    // Compaction metrics — global
     private final Counter compactionRunsTotal;
     private final Timer compactionDuration;
-    private final ConcurrentHashMap<String, Counter> compactionRecordsRemoved = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Counter> compactionBytesReclaimed = new ConcurrentHashMap<>();
+
+    // Compaction metrics — per-topic
+    private final ConcurrentHashMap<String, Counter> compactionRunsByTopic        = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionErrorsByTopic      = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionRecordsRemoved     = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionTombstonesRemoved  = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionBytesRead          = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionBytesWritten       = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionBytesReclaimed     = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionSegmentsReplaced   = new ConcurrentHashMap<>();
+
+    // Compaction gauges — per-topic (epoch seconds of last run; 0 = never)
+    private final ConcurrentHashMap<String, AtomicLong> compactionLastRunTimestamp = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge>      compactionLastRunGauges    = new ConcurrentHashMap<>();
+
+    // Compaction active flag — per-topic (1 = compaction in progress, 0 = idle)
+    private final ConcurrentHashMap<String, AtomicLong> compactionActiveFlag  = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge>      compactionActiveGauges = new ConcurrentHashMap<>();
 
     public BrokerMetrics(MeterRegistry registry) {
         this.registry = registry;
@@ -179,13 +207,13 @@ public class BrokerMetrics {
             .description("Distribution of batch sizes")
             .register(registry);
 
-        // Compaction counters/timers
+        // Compaction counters/timers — global (no topic tag)
         this.compactionRunsTotal = Counter.builder("broker.compaction.runs.total")
-            .description("Total number of compaction runs")
+            .description("Total number of compaction runs (all topics combined)")
             .register(registry);
 
         this.compactionDuration = Timer.builder("broker.compaction.duration.seconds")
-            .description("Duration of each compaction run")
+            .description("Wall-clock duration of each full compaction sweep across all topics")
             .publishPercentiles(0.5, 0.95, 0.99)
             .register(registry);
 
@@ -221,6 +249,23 @@ public class BrokerMetrics {
 
     public void recordMessageStored() {
         messagesStored.increment();
+    }
+
+    /**
+     * Record a stored message for a specific topic.
+     * This allows Grafana to compute a message-count backlog estimate that is
+     * independent of sparse offset spacing.
+     */
+    public void recordMessageStored(String topic) {
+        messagesStored.increment();
+
+        String topicLabel = (topic == null || topic.isBlank()) ? "unknown" : topic;
+        topicMessagesStored.computeIfAbsent(topicLabel, key ->
+                Counter.builder("broker.topic.messages.stored")
+                        .description("Messages stored by topic since broker start")
+                        .tag("topic", topicLabel)
+                        .register(registry)
+        ).increment();
     }
 
     /**
@@ -441,6 +486,21 @@ public class BrokerMetrics {
         counter.increment();
     }
 
+    public void recordConsumerDeliveryBlocked(String topic, String group, String reason) {
+        String groupLabel = group == null || group.isBlank() ? "unknown" : group;
+        String topicLabel = topic == null || topic.isBlank() ? "unknown" : topic;
+        String reasonLabel = reason == null || reason.isBlank() ? "unknown" : reason;
+        String key = groupLabel + ":" + topicLabel + ":" + reasonLabel;
+        consumerDeliveryBlocked.computeIfAbsent(key, k ->
+                Counter.builder("broker.consumer.delivery.blocked")
+                        .description("Number of delivery attempts blocked before a batch send")
+                        .tag("topic", topicLabel)
+                        .tag("group", groupLabel)
+                        .tag("reason", reasonLabel)
+                        .register(registry)
+        ).increment();
+    }
+
     /**
      * Update the current offset for a consumer group
      */
@@ -517,6 +577,7 @@ public class BrokerMetrics {
         consumerAcks.remove(key);
         consumerFailures.remove(key);
         consumerRetries.remove(key);
+        consumerDeliveryBlocked.entrySet().removeIf(entry -> entry.getKey().startsWith(key + ":"));
         consumerOffsets.remove(key);
         consumerLag.remove(key);
         consumerDeliveryLatency.remove(key);
@@ -608,6 +669,116 @@ public class BrokerMetrics {
             startTime.set(0);
             log.trace("Completed pending ACK tracking for topic={} group={}", topic, group);
         }
+    }
+
+    public void recordLegacyBatchSent(String group, int messageCount, int topicCount) {
+        String groupLabel = normalizeLegacyGroup(group);
+        long currentTime = System.currentTimeMillis();
+
+        legacyLastBatchSendTime.computeIfAbsent(groupLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            Gauge.builder("broker.legacy.batch.last_send_time_ms", atomic, AtomicLong::get)
+                    .description("Timestamp (epoch ms) of the last legacy merged batch send attempt")
+                    .tag("group", groupLabel)
+                    .register(registry);
+            return atomic;
+        }).set(currentTime);
+
+        legacyPendingBatchStartTime.computeIfAbsent(groupLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            legacyPendingBatchAgeGauges.computeIfAbsent(groupLabel, gaugeKey ->
+                    Gauge.builder("broker.legacy.batch.pending_age_seconds", () -> {
+                                AtomicLong startTime = legacyPendingBatchStartTime.get(gaugeKey);
+                                if (startTime == null || startTime.get() == 0) {
+                                    return 0.0;
+                                }
+                                return (System.currentTimeMillis() - startTime.get()) / 1000.0;
+                            })
+                            .description("Age of the current legacy merged batch awaiting ACK (0 if none pending)")
+                            .tag("group", groupLabel)
+                            .register(registry)
+            );
+            return atomic;
+        }).set(currentTime);
+
+        legacyPendingBatchMessages.computeIfAbsent(groupLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            Gauge.builder("broker.legacy.batch.pending_messages", atomic, AtomicLong::get)
+                    .description("Number of messages in the current pending legacy merged batch")
+                    .tag("group", groupLabel)
+                    .register(registry);
+            return atomic;
+        }).set(messageCount);
+
+        legacyPendingBatchTopics.computeIfAbsent(groupLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            Gauge.builder("broker.legacy.batch.pending_topics", atomic, AtomicLong::get)
+                    .description("Number of topics covered by the current pending legacy merged batch")
+                    .tag("group", groupLabel)
+                    .register(registry);
+            return atomic;
+        }).set(topicCount);
+
+        recordLegacyBatchEvent(groupLabel, "sent");
+    }
+
+    public void recordLegacyBatchAck(String group) {
+        String groupLabel = normalizeLegacyGroup(group);
+        long currentTime = System.currentTimeMillis();
+
+        legacyLastBatchAckTime.computeIfAbsent(groupLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            Gauge.builder("broker.legacy.batch.last_ack_time_ms", atomic, AtomicLong::get)
+                    .description("Timestamp (epoch ms) of the last ACK for a legacy merged batch")
+                    .tag("group", groupLabel)
+                    .register(registry);
+            return atomic;
+        }).set(currentTime);
+
+        clearLegacyPendingBatch(groupLabel);
+        recordLegacyBatchEvent(groupLabel, "acked");
+    }
+
+    public void recordLegacyBatchTimeout(String group) {
+        String groupLabel = normalizeLegacyGroup(group);
+        clearLegacyPendingBatch(groupLabel);
+        recordLegacyBatchEvent(groupLabel, "timeout");
+    }
+
+    public void clearLegacyPendingBatch(String group) {
+        String groupLabel = normalizeLegacyGroup(group);
+        legacyPendingBatchStartTime.computeIfAbsent(groupLabel, key -> new AtomicLong(0)).set(0);
+        legacyPendingBatchMessages.computeIfAbsent(groupLabel, key -> new AtomicLong(0)).set(0);
+        legacyPendingBatchTopics.computeIfAbsent(groupLabel, key -> new AtomicLong(0)).set(0);
+    }
+
+    public void recordLegacyDeliveryBlocked(String group, String reason) {
+        String groupLabel = normalizeLegacyGroup(group);
+        String reasonLabel = (reason == null || reason.isBlank()) ? "unknown" : reason;
+        String key = groupLabel + ":" + reasonLabel;
+        legacyDeliveryBlocked.computeIfAbsent(key, k ->
+                Counter.builder("broker.legacy.delivery.blocked")
+                        .description("Number of legacy merged-delivery attempts blocked before send")
+                        .tag("group", groupLabel)
+                        .tag("reason", reasonLabel)
+                        .register(registry)
+        ).increment();
+    }
+
+    private void recordLegacyBatchEvent(String group, String event) {
+        String eventLabel = (event == null || event.isBlank()) ? "unknown" : event;
+        String key = group + ":" + eventLabel;
+        legacyBatchEvents.computeIfAbsent(key, k ->
+                Counter.builder("broker.legacy.batch.events")
+                        .description("Legacy merged batch lifecycle events")
+                        .tag("group", group)
+                        .tag("event", eventLabel)
+                        .register(registry)
+        ).increment();
+    }
+
+    private String normalizeLegacyGroup(String group) {
+        return (group == null || group.isBlank()) ? "unknown" : group;
     }
 
     /**
@@ -776,10 +947,148 @@ public class BrokerMetrics {
 
     // ── Compaction metrics ────────────────────────────────────────────────────
 
+    /** Increment the global compaction run counter (called once per full sweep). */
     public void recordCompactionRun() {
         compactionRunsTotal.increment();
     }
 
+    /**
+     * Record a successful per-topic compaction run and update all associated counters/gauges.
+     *
+     * @param topic              topic that was compacted
+     * @param recordsRemoved     total records physically deleted (superseded + expired tombstones)
+     * @param tombstonesRemoved  subset of recordsRemoved that were DELETE tombstones
+     * @param bytesRead          total bytes read from all candidate segments before compaction
+     * @param bytesWritten       total bytes written to the resulting compacted segment
+     * @param bytesReclaimed     estimated bytes freed (bytesRead − bytesWritten approximation)
+     * @param segmentsReplaced   number of source segments replaced by the compacted output
+     */
+    public void recordCompactionTopicRun(
+            String topic,
+            int recordsRemoved,
+            int tombstonesRemoved,
+            long bytesRead,
+            long bytesWritten,
+            long bytesReclaimed,
+            int segmentsReplaced) {
+
+        // Per-topic run counter (status=success)
+        compactionRunsByTopic.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.topic.runs.total")
+                        .description("Per-topic successful compaction runs")
+                        .tag("topic", t)
+                        .tag("status", "success")
+                        .register(registry)
+        ).increment();
+
+        // All per-topic counters are registered unconditionally on first run so that
+        // the topic label appears in Prometheus immediately, even when nothing was removed.
+        // Grafana's $topic variable and every panel depend on these labels existing.
+        Counter recRemoved = compactionRecordsRemoved.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.records.removed")
+                        .description("Records physically removed during compaction (superseded + expired tombstones)")
+                        .tag("topic", t)
+                        .register(registry));
+        if (recordsRemoved > 0) recRemoved.increment(recordsRemoved);
+
+        Counter tombRemoved = compactionTombstonesRemoved.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.tombstones.removed")
+                        .description("Expired DELETE tombstones physically removed during compaction")
+                        .tag("topic", t)
+                        .register(registry));
+        if (tombstonesRemoved > 0) tombRemoved.increment(tombstonesRemoved);
+
+        Counter bRead = compactionBytesRead.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.bytes.read")
+                        .description("Bytes read from source segments during compaction")
+                        .tag("topic", t)
+                        .baseUnit("bytes")
+                        .register(registry));
+        if (bytesRead > 0) bRead.increment(bytesRead);
+
+        Counter bWritten = compactionBytesWritten.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.bytes.written")
+                        .description("Bytes written to compacted output segment")
+                        .tag("topic", t)
+                        .baseUnit("bytes")
+                        .register(registry));
+        if (bytesWritten > 0) bWritten.increment(bytesWritten);
+
+        Counter bReclaimed = compactionBytesReclaimed.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.bytes.reclaimed")
+                        .description("Estimated bytes reclaimed (freed) during compaction")
+                        .tag("topic", t)
+                        .baseUnit("bytes")
+                        .register(registry));
+        if (bytesReclaimed > 0) bReclaimed.increment(bytesReclaimed);
+
+        Counter segsReplaced = compactionSegmentsReplaced.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.segments.replaced")
+                        .description("Number of segments replaced by compacted output per run")
+                        .tag("topic", t)
+                        .register(registry));
+        if (segmentsReplaced > 0) segsReplaced.increment(segmentsReplaced);
+
+        // Last-run timestamp gauge (epoch seconds)
+        long nowSeconds = System.currentTimeMillis() / 1000;
+        AtomicLong tsHolder = compactionLastRunTimestamp.computeIfAbsent(topic, t -> {
+            AtomicLong atomic = new AtomicLong(0);
+            compactionLastRunGauges.computeIfAbsent(t, gk ->
+                    Gauge.builder("broker.compaction.last.run.timestamp", atomic, AtomicLong::get)
+                            .description("Epoch seconds of the last successful compaction run for this topic")
+                            .tag("topic", t)
+                            .register(registry)
+            );
+            return atomic;
+        });
+        tsHolder.set(nowSeconds);
+    }
+
+    /**
+     * Record a per-topic compaction error (used when compacting a topic throws an exception).
+     */
+    public void recordCompactionError(String topic) {
+        compactionErrorsByTopic.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.topic.runs.total")
+                        .description("Per-topic failed compaction runs")
+                        .tag("topic", t)
+                        .tag("status", "error")
+                        .register(registry)
+        ).increment();
+    }
+
+    /**
+     * Signal that compaction is actively running for a topic (set gauge to 1).
+     * Must be followed by a corresponding {@link #markCompactionComplete(String)} call.
+     */
+    public void markCompactionActive(String topic) {
+        AtomicLong flag = compactionActiveFlag.computeIfAbsent(topic, t -> {
+            AtomicLong atomic = new AtomicLong(0);
+            compactionActiveGauges.computeIfAbsent(t, gk ->
+                    Gauge.builder("broker.compaction.active", atomic, AtomicLong::get)
+                            .description("1 when compaction is actively running for this topic, 0 when idle")
+                            .tag("topic", t)
+                            .register(registry)
+            );
+            return atomic;
+        });
+        flag.set(1L);
+    }
+
+    /**
+     * Signal that compaction has finished for a topic (set gauge to 0).
+     */
+    public void markCompactionComplete(String topic) {
+        AtomicLong flag = compactionActiveFlag.get(topic);
+        if (flag != null) {
+            flag.set(0L);
+        }
+    }
+
+    // ── Legacy per-topic helpers (kept for backward compatibility) ────────────
+
+    /** @deprecated Use {@link #recordCompactionTopicRun} instead. */
+    @Deprecated
     public void recordCompactionRecordsRemoved(String topic, int count) {
         compactionRecordsRemoved.computeIfAbsent(topic, t ->
                 Counter.builder("broker.compaction.records.removed")
@@ -789,6 +1098,8 @@ public class BrokerMetrics {
         ).increment(count);
     }
 
+    /** @deprecated Use {@link #recordCompactionTopicRun} instead. */
+    @Deprecated
     public void recordCompactionBytesReclaimed(String topic, long bytes) {
         compactionBytesReclaimed.computeIfAbsent(topic, t ->
                 Counter.builder("broker.compaction.bytes.reclaimed")

@@ -50,6 +50,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final AckStoreSeeder ackStoreSeeder;
     private final RocksDbCompactionIndex compactionIndex;
     private final int serverPort;
+    private final boolean ackStoreSeedOnStartupEnabled;
 
     @Inject
     public BrokerService(
@@ -64,7 +65,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             @Named("ackExecutor") ExecutorService ackExecutor,
             AckStoreSeeder ackStoreSeeder,
             RocksDbCompactionIndex compactionIndex,
-            @Value("${broker.network.port:9092}") int serverPort) {
+            @Value("${broker.network.port:9092}") int serverPort,
+            @Value("${ack-store.seed-on-startup.enabled:true}") boolean ackStoreSeedOnStartupEnabled) {
 
         this.storage = storage;
         this.server = server;
@@ -78,6 +80,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.ackStoreSeeder = ackStoreSeeder;
         this.compactionIndex = compactionIndex;
         this.serverPort = serverPort;
+        this.ackStoreSeedOnStartupEnabled = ackStoreSeedOnStartupEnabled;
 
         log.info("BrokerService initialized with handler registry");
     }
@@ -105,10 +108,14 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         // Backfill RocksDB ACK entries for records consumed before ACK tracking existed.
         // Must run after storage.recover() so segment data is available.
         // Runs before reconciler's first scheduled execution (2-min initial delay).
-        try {
-            ackStoreSeeder.seed();
-        } catch (Exception e) {
-            log.warn("AckStoreSeeder failed — continuing startup without backfill", e);
+        if (ackStoreSeedOnStartupEnabled) {
+            try {
+                ackStoreSeeder.seed();
+            } catch (Exception e) {
+                log.warn("AckStoreSeeder failed — continuing startup without backfill", e);
+            }
+        } else {
+            log.info("AckStoreSeeder skipped at startup because ack-store.seed-on-startup.enabled=false");
         }
 
         // Register message handler
@@ -173,7 +180,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             long offset = storage.append(topic, 0, record);
             metrics.stopStorageWriteTimer(storageSample);
 
-            metrics.recordMessageStored();
+            metrics.recordMessageStored(topic);
             metrics.recordTopicLastMessageTime(topic);
 
             compactionIndex.updateKey(topic, record.getMsgKey(), offset,

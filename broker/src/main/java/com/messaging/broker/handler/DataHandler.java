@@ -85,7 +85,7 @@ public class DataHandler implements MessageHandler {
             long offset = storage.append(topic, 0, record);
             metrics.stopStorageWriteTimer(storageSample);
 
-            metrics.recordMessageStored();
+            metrics.recordMessageStored(topic);
             metrics.recordTopicLastMessageTime(topic);
 
             compactionIndex.updateKey(topic, msgKey, offset, record.getCreatedAt().toEpochMilli());

@@ -28,19 +28,15 @@ public class DefaultSegmentFactory implements SegmentFactory {
             String topic,
             int partition,
             long baseOffset,
+            long maxSegmentSize,
             SegmentMetadataStore metadataStore) throws StorageException {
 
         String filename = generateSegmentFilename(baseOffset);
         Path logPath = dataDir.resolve(filename);
         Path indexPath = dataDir.resolve(filename.replace(".log", ".index"));
 
-        log.info("Creating new segment: topic={}, partition={}, baseOffset={}, logPath={}",
-                topic, partition, baseOffset, logPath);
-
-        // Note: maxSegmentSize is passed to Segment constructor but not used during creation
-        // It's used later to determine when to roll segments
-        // We use a default value here since the factory doesn't need to know the max size
-        long maxSegmentSize = 1073741824L; // 1GB default
+        log.info("Creating new segment: topic={}, partition={}, baseOffset={}, maxSegmentSize={}MB, logPath={}",
+                topic, partition, baseOffset, maxSegmentSize / (1024 * 1024), logPath);
 
         return new Segment(logPath, indexPath, baseOffset, maxSegmentSize, topic, partition);
     }

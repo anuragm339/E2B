@@ -66,6 +66,26 @@ public class ExecutorFactory {
     }
 
     /**
+     * Create dedicated executor for async ACK replay / RocksDB persistence work.
+     *
+     * Keeping this separate from storageExecutor prevents post-ACK replay tasks from
+     * starving delivery reads. When both pools were shared, the delivery scheduler
+     * could block on Future.get() while all storage workers were busy replaying ACKs,
+     * freezing every consumer even though no pending ACK gate was active.
+     *
+     * @return ExecutorService for async ACK persistence tasks
+     */
+    @Singleton
+    @Named("ackStorageExecutor")
+    public ExecutorService ackStorageExecutor(
+            @Value("${executor.ack-storage.threads:2}") int threads) {
+        ExecutorService executor = Executors.newFixedThreadPool(threads,
+                createThreadFactory("Ack-Storage-Executor"));
+        log.info("Created ACK storage executor with {} threads", threads);
+        return executor;
+    }
+
+    /**
      * Create scheduled executor for the refresh coordinator.
      *
      * @return ScheduledExecutorService for data refresh tasks

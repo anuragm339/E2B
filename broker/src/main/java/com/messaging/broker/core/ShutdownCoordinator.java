@@ -27,6 +27,7 @@ public class ShutdownCoordinator {
     @Inject
     public ShutdownCoordinator(
             @Named("ackExecutor") ExecutorService ackExecutor,
+            @Named("ackStorageExecutor") ExecutorService ackStorageExecutor,
             @Named("storageExecutor") ExecutorService storageExecutor,
             @Named("consumerScheduler") ScheduledExecutorService consumerScheduler,
             @Named("dataRefreshScheduler") ScheduledExecutorService dataRefreshScheduler,
@@ -34,6 +35,7 @@ public class ShutdownCoordinator {
 
         // Register executors
         this.executors.add(ackExecutor);
+        this.executors.add(ackStorageExecutor);
         this.executors.add(storageExecutor);
 
         // Register schedulers (shutdown before executors)
