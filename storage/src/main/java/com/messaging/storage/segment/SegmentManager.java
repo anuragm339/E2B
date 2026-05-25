@@ -16,10 +16,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Manages multiple segments for a topic-partition (Phase 10: Refactored to use service layer)
@@ -36,6 +36,10 @@ public class SegmentManager {
     private final AtomicReference<Segment> activeSegment;
     private final SegmentMetadataStore metadataStore;
     private final AtomicLong appendsSinceMetadataUpdate; // Track appends for periodic metadata updates
+    // Read lock: held by readWithSizeLimit / getBatch during segment traversal.
+    // Write lock: held exclusively by replaceSegments to prevent readers from accessing
+    // a segment that is being closed mid-read (ClosedChannelException on logChannel).
+    private final ReentrantReadWriteLock segmentLock = new ReentrantReadWriteLock();
 
     // Phase 10: Service layer dependencies
     private final StorageRecoveryService recoveryService;
@@ -102,35 +106,85 @@ public class SegmentManager {
     public long append(MessageRecord record) throws MessagingException {
         Segment current = activeSegment.get();
 
-        // Check if we need to roll to a new segment
-        if (current.isFull(maxSegmentSize)) {
-            synchronized (this) {
+        // Check if we need to roll to a new segment — also checks that the specific
+        // record will fit, not just that logPosition hasn't hit maxSize yet
+        if (current.isFull(maxSegmentSize) || !current.hasSpaceFor(record)) {
+            segmentLock.writeLock().lock();
+            try {
                 current = activeSegment.get();
-                if (current.isFull(maxSegmentSize)) {
-                    rollSegment();
+                if (current.isFull(maxSegmentSize) || !current.hasSpaceFor(record)) {
+                    // Use the record's own offset for pipe records (sparse, pre-assigned).
+                    // For auto-assigned records (offset==0), use the segment's next sequential offset
+                    // so the new segment file doesn't collide with the just-sealed one at baseOffset=0.
+                    long newBase = record.getOffset() > 0 ? record.getOffset() : current.getNextOffset();
+                    rollSegment(newBase);
                     current = activeSegment.get();
                 }
+            } finally {
+                segmentLock.writeLock().unlock();
             }
         }
 
-        // Don't modify the record - topic and partition are not written to segment file
-        // The segment only stores: offset, msgKey, eventType, data, createdAt, crc32
+        // Auto-assign the next sequential offset when the record has no pre-set offset
+        // (offset==0 with nextOffset>0 means the caller is using the default unset value).
+        // Records arriving from the pipe already carry their parent-assigned offsets and
+        // must NOT be re-numbered — they are preserved unchanged.
+        long availableOffset = current.getNextOffset();
+        if (record.getOffset() == 0 && availableOffset > 0) {
+            record.setOffset(availableOffset);
+        }
 
-        long offset = current.append(record);
+        long offset;
+        try {
+            offset = current.append(record);
+        } catch (StorageException e) {
+            if (isSegmentFullCause(e)) {
+                // Safety net: hasSpaceFor() pre-check missed this (e.g. concurrent writer filled segment)
+                segmentLock.writeLock().lock();
+                try {
+                    rollSegment(record.getOffset());
+                } finally {
+                    segmentLock.writeLock().unlock();
+                }
+                log.info("event=segment_manager.roll_on_full topic={} partition={} base={}",
+                         topic, partition, record.getOffset());
+                offset = activeSegment.get().append(record);
+            } else {
+                throw e;
+            }
+        }
 
         // B4-4 fix: gate metadata save to every METADATA_UPDATE_INTERVAL appends instead of every single append.
         // Previously saveSegmentMetadata() was called unconditionally, causing one SQLite UPSERT per message.
         if (appendsSinceMetadataUpdate.incrementAndGet() % METADATA_UPDATE_INTERVAL == 0) {
-            saveSegmentMetadata(current);
+            saveSegmentMetadata(activeSegment.get());
         }
 
         return offset;
     }
 
+    private static boolean isSegmentFullCause(Throwable t) {
+        while (t != null) {
+            if (t instanceof IOException && "Segment full".equals(t.getMessage())) return true;
+            t = t.getCause();
+        }
+        return false;
+    }
+
     /**
-     * Roll to a new segment
+     * Roll to a new segment using the current segment's next sequential offset as base.
+     * Used by the isFull() pre-check path where offset ordering is sequential.
      */
-    private synchronized void rollSegment() throws StorageException {
+    private void rollSegment() throws StorageException {
+        rollSegment(activeSegment.get().getNextOffset());
+    }
+
+    /**
+     * Roll to a new segment with an explicit base offset.
+     * Used when rolling mid-batch (catch path) or with sparse pipe offsets
+     * where the next record's actual offset should be the new segment base.
+     */
+    private void rollSegment(long nextBaseOffset) throws StorageException {
         Segment current = activeSegment.get();
         if (current == null) {
             throw ExceptionLogger.logAndThrow(log,
@@ -152,17 +206,17 @@ public class SegmentManager {
         appendsSinceMetadataUpdate.set(0);
 
         // Create new active segment
-        createNewSegment(current.getNextOffset());
+        createNewSegment(nextBaseOffset);
 
         log.info("Rolled segment: topic={}, partition={}, newBaseOffset={}",
-                topic, partition, current.getNextOffset());
+                topic, partition, nextBaseOffset);
     }
 
     /**
      * Phase 10: Create a new segment using SegmentFactory
      */
     private void createNewSegment(long baseOffset) throws StorageException {
-        Segment segment = segmentFactory.createSegment(dataDir, topic, partition, baseOffset, metadataStore);
+        Segment segment = segmentFactory.createSegment(dataDir, topic, partition, baseOffset, maxSegmentSize, metadataStore);
         activeSegment.set(segment);
 
         log.info("Created new segment: topic={}, partition={}, baseOffset={}",
@@ -183,7 +237,15 @@ public class SegmentManager {
      */
     public List<MessageRecord> readWithSizeLimit(long fromOffset, int maxRecords, int maxBytes) throws MessagingException {
      //   log.info("SegmentManager.read() called: topic={}, partition={}, fromOffset={}, maxRecords={}, maxBytes={}", topic, partition, fromOffset, maxRecords, maxBytes);
+        segmentLock.readLock().lock();
+        try {
+        return readWithSizeLimitUnlocked(fromOffset, maxRecords, maxBytes);
+        } finally {
+            segmentLock.readLock().unlock();
+        }
+    }
 
+    private List<MessageRecord> readWithSizeLimitUnlocked(long fromOffset, int maxRecords, int maxBytes) throws MessagingException {
         List<MessageRecord> records = new ArrayList<>();
         int cumulativeSize = 0;
 
@@ -220,7 +282,7 @@ public class SegmentManager {
                             Segment active = activeSegment.get();
                             if (active != null && active != currentSegment) {
                                 currentSegment = active;
-                                currentOffset = active.getBaseOffset();
+                                currentOffset = Math.max(currentOffset, active.getBaseOffset());
                                 continue;
                             } else {
                                 break; // No more data
@@ -256,7 +318,7 @@ public class SegmentManager {
                         Segment active = activeSegment.get();
                         if (active != null && active != currentSegment) {
                             currentSegment = active;
-                            currentOffset = active.getBaseOffset();
+                            currentOffset = Math.max(currentOffset, active.getBaseOffset());
                         } else {
                             break; // No more data
                         }
@@ -285,6 +347,15 @@ public class SegmentManager {
      * @param maxBytes   maximum payload bytes
      */
     public DeliveryBatch getBatch(long fromOffset, long maxBytes) throws MessagingException {
+        segmentLock.readLock().lock();
+        try {
+            return getBatchUnlocked(fromOffset, maxBytes);
+        } finally {
+            segmentLock.readLock().unlock();
+        }
+    }
+
+    private DeliveryBatch getBatchUnlocked(long fromOffset, long maxBytes) throws MessagingException {
         // B6-2 fix: detect consumer offset below earliest available data.
         // This happens when segments have been deleted (compaction/wipe) while consumer was offline.
         // Without this check, getBatchFileRegion() returns empty silently and delivery stalls forever.
@@ -324,19 +395,36 @@ public class SegmentManager {
 
         Segment currentSegment = entry.getValue();
 
-        // Get zero-copy batch from segment (size-only batching)
-        Segment.BatchFileRegion result = currentSegment.getBatchFileRegion(fromOffset, maxBytes);
+        // Walk sealed segments in ascending order, then fall through to the active segment.
+        // Handles three cases that cause an empty result from the floorEntry segment:
+        //   • B6-1 (rollover boundary): fromOffset == sealed.nextOffset
+        //   • Sparse-offset gaps: fromOffset falls between two consecutive sealed segments
+        //   • Post-compaction gaps: fromOffset in the hole between compacted segment and active
+        //
+        // When the consumer offset is inside a gap left by compaction or sparse offsets, advance
+        // effectiveOffset to the segment's base so we read from the first available record there.
+        while (true) {
+            long effectiveOffset = Math.max(fromOffset, currentSegment.getBaseOffset());
+            Segment.BatchFileRegion result = currentSegment.getBatchFileRegion(effectiveOffset, maxBytes);
+            if (result != null && !result.isEmpty()) {
+                return result;
+            }
 
-        // B6-1 fix: if sealed segment returned empty (fromOffset == sealed.nextOffset i.e. exactly
-        // at the rollover boundary), fall through to the active segment.
-        // floorEntry() returns the OLD sealed segment even when fromOffset equals the new active
-        // segment's baseOffset, so without this check delivery stalls permanently at segment rollover.
-        if ((result == null || result.isEmpty()) && activeSegment.get() != null) {
-            // B6-1 fix: sealed segment returned empty at rollover boundary — fall through to active segment
-            result = activeSegment.get().getBatchFileRegion(fromOffset, maxBytes);
+            // Sealed segment exhausted — try the next sealed segment before falling back to active
+            var nextEntry = segments.higherEntry(currentSegment.getBaseOffset());
+            if (nextEntry != null) {
+                currentSegment = nextEntry.getValue();
+                continue;
+            }
+
+            // No more sealed segments — fall through to the active segment
+            Segment active = activeSegment.get();
+            if (active != null) {
+                long effectiveActiveOffset = Math.max(fromOffset, active.getBaseOffset());
+                return active.getBatchFileRegion(effectiveActiveOffset, maxBytes);
+            }
+            return new Segment.BatchFileRegion(topic, null, 0, 0L, -1L, 0L, fromOffset);
         }
-
-        return result;
     }
 
     /**
@@ -344,7 +432,8 @@ public class SegmentManager {
      */
     private int calculateRecordSize(MessageRecord record) {
         // Binary format: offset(8) + keyLen(4) + key + eventType(1) + dataLen(4) + data + timestamp(8) + crc(4)
-        int size = 8 + 4 + record.getMsgKey().getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 1 + 4 + 8 + 4;
+        byte[] keyBytes = record.getMsgKey() != null ? record.getMsgKey().getBytes(java.nio.charset.StandardCharsets.UTF_8) : new byte[0];
+        int size = 8 + 4 + keyBytes.length + 1 + 4 + 8 + 4;
         if (record.getData() != null) {
             size += record.getData().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
         }
@@ -433,29 +522,121 @@ public class SegmentManager {
     }
 
     /**
+     * Force-seal the current active segment and start a new one.
+     * Used by the admin HTTP trigger so compaction can run without waiting for the
+     * segment to fill to {@code maxSegmentSize} (useful during development/testing).
+     * No-op if there is no active segment or the active segment is empty.
+     */
+    public void forceRollActiveSegment() throws StorageException {
+        Segment active = activeSegment.get();
+        if (active == null || active.getSize() == 0) {
+            log.debug("forceRollActiveSegment: nothing to roll (topic={} partition={})", topic, partition);
+            return;
+        }
+        log.info("Force-rolling active segment: topic={} partition={} baseOffset={}",
+                topic, partition, active.getBaseOffset());
+        rollSegment();
+    }
+
+    /**
      * Replace segments after compaction
      */
-    public synchronized void replaceSegments(List<Segment> oldSegments, Segment newSegment) throws MessagingException {
-        // Remove old segments from map
-        for (Segment old : oldSegments) {
-            segments.remove(old.getBaseOffset());
-            old.close();
-
-            // Delete files
-            try {
-                Files.deleteIfExists(old.getLogPath());
-                Files.deleteIfExists(old.getIndexPath());
-            } catch (IOException e) {
-                log.error("Failed to delete segment files for offset {}", old.getBaseOffset(), e);
-                // Continue with other segments even if delete fails
+    public void replaceSegments(List<Segment> oldSegments, Segment newSegment) throws MessagingException {
+        // Keep the write-lock scope to the in-memory map mutation only.
+        // Once old segments are removed from the map, no new reader can reach them.
+        // Existing readers have already drained because they hold the read lock that blocks
+        // this write lock acquisition.
+        segmentLock.writeLock().lock();
+        try {
+            segments.put(newSegment.getBaseOffset(), newSegment);
+            for (Segment old : oldSegments) {
+                if (old.getBaseOffset() != newSegment.getBaseOffset()) {
+                    segments.remove(old.getBaseOffset());
+                }
             }
+        } finally {
+            segmentLock.writeLock().unlock();
         }
 
-        // Add new compacted segment
-        segments.put(newSegment.getBaseOffset(), newSegment);
+        saveSegmentMetadata(newSegment);
 
-        log.info("Replaced {} segments with compacted segment at offset {}",
-                oldSegments.size(), newSegment.getBaseOffset());
+        for (Segment old : oldSegments) {
+            cleanupDetachedSegment(old);
+        }
+
+        String closedOffsets = oldSegments.stream()
+                .map(s -> String.valueOf(s.getBaseOffset()))
+                .reduce((a, b) -> a + "," + b).orElse("none");
+        Runtime rt = Runtime.getRuntime();
+        long heapUsedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long heapMaxMB  = rt.maxMemory() / (1024 * 1024);
+        log.info("event=segment_replace topic={} partition={} closedOffsets=[{}] " +
+                 "newBaseOffset={} segments={} heap={}/{}MB",
+                 topic, partition, closedOffsets,
+                 newSegment.getBaseOffset(), oldSegments.size(), heapUsedMB, heapMaxMB);
+    }
+
+    /**
+     * Remove segments from this manager without installing a replacement.
+     *
+     * <p>Used by the compaction rewriter when an entire segment window contains only records
+     * eligible for deletion — there are no survivors to write, so no replacement segment is created.
+     * The write lock only covers removing the segments from the map. FileChannel close and file
+     * deletion happen after unlock to avoid blocking reads on filesystem work.
+     */
+    public void removeSegments(List<Segment> segments) throws MessagingException {
+        Segment active = activeSegment.get();
+        for (Segment s : segments) {
+            if (s == active) {
+                throw new StorageException(ErrorCode.STORAGE_WRITE_FAILED,
+                        "Cannot remove active segment baseOffset=" + s.getBaseOffset())
+                        .withTopic(topic).withPartition(partition);
+            }
+        }
+        segmentLock.writeLock().lock();
+        try {
+            for (Segment old : segments) {
+                this.segments.remove(old.getBaseOffset());
+            }
+        } finally {
+            segmentLock.writeLock().unlock();
+        }
+
+        for (Segment old : segments) {
+            cleanupDetachedSegment(old);
+        }
+
+        String deletedOffsets = segments.stream()
+                .map(s -> String.valueOf(s.getBaseOffset()))
+                .reduce((a, b) -> a + "," + b).orElse("none");
+        Runtime rt = Runtime.getRuntime();
+        long heapUsedMB = (rt.totalMemory() - rt.freeMemory()) / (1024 * 1024);
+        long heapMaxMB  = rt.maxMemory() / (1024 * 1024);
+        log.warn("event=segment_remove_no_replacement topic={} partition={} " +
+                 "deletedOffsets=[{}] segments={} heap={}/{}MB " +
+                 "— consumers committed inside this range will stall; check legacy delivery",
+                 topic, partition, deletedOffsets, segments.size(), heapUsedMB, heapMaxMB);
+    }
+
+    private void cleanupDetachedSegment(Segment old) {
+        try {
+            old.close();
+        } catch (MessagingException e) {
+            log.error("Failed to close detached segment at offset {}", old.getBaseOffset(), e);
+        }
+
+        try {
+            metadataStore.deleteSegment(topic, partition, old.getBaseOffset());
+        } catch (Exception e) {
+            log.error("Failed to delete segment metadata for offset {}", old.getBaseOffset(), e);
+        }
+
+        try {
+            Files.deleteIfExists(old.getLogPath());
+            Files.deleteIfExists(old.getIndexPath());
+        } catch (IOException e) {
+            log.error("Failed to delete segment files for offset {}", old.getBaseOffset(), e);
+        }
     }
 
     /**
@@ -463,10 +644,7 @@ public class SegmentManager {
      */
     private void saveSegmentMetadata(Segment segment) {
         try {
-            long recordCount = Optional.ofNullable(metadataStore.getSegments(topic, partition))
-                    .filter(list -> !list.isEmpty())
-                    .map(list -> list.get(0).getRecordCount())
-                    .orElse(0L) + 1;
+            long recordCount = segment.getRecordCount();
 
             SegmentMetadata metadata = SegmentMetadata.builder()
                     .topic(topic)
@@ -513,5 +691,13 @@ public class SegmentManager {
 
     public int getPartition() {
         return partition;
+    }
+
+    public Path getDataDir() {
+        return dataDir;
+    }
+
+    public long getMaxSegmentSize() {
+        return maxSegmentSize;
     }
 }

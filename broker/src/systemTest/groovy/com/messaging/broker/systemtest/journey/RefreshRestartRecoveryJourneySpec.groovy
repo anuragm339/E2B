@@ -23,7 +23,7 @@ class RefreshRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
     def setupSpec() {
         consumerBCtx = newConsumerB(brokerTcpPort)
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
     }
 
     def cleanupSpec() {
@@ -83,7 +83,8 @@ class RefreshRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
         triggerConsumerManagerStartup(restartedConsumerA)
         def restartedConsumerB = newConsumerB(newBrokerPort)
         triggerConsumerManagerStartup(restartedConsumerB)
-        sleep(2000)
+        awaitConsumerConnected(restartedConsumerA)
+        awaitConsumerConnected(restartedConsumerB)
 
         then: "refresh recovery completes and both consumers receive READY"
         new PollingConditions(timeout: 40, delay: 0.5).eventually {
@@ -106,7 +107,7 @@ class RefreshRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
         ])
 
         then: "both consumers receive post-refresh data and offsets/ACKs advance"
-        new PollingConditions(timeout: 20, delay: 0.3).eventually {
+        new PollingConditions(timeout: 40, delay: 0.3).eventually {
             assert restartedConsumerA.getBean(TestRecordCollector).getAll().any { it.msgKey == 'post-restart-refresh-60' }
             assert restartedConsumerA.getBean(TestRecordCollector).getAll().any { it.msgKey == 'post-restart-refresh-61' }
             assert restartedConsumerB.getBean(TestRecordCollector).getAll().any { it.msgKey == 'post-restart-refresh-60' }

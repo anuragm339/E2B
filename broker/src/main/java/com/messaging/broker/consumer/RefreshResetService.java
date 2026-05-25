@@ -129,6 +129,10 @@ public class RefreshResetService implements ResetPhase {
         return context.markFirstResetAck();
     }
 
+    void persistState(RefreshContext context) {
+        stateStore.saveState(context);
+    }
+
     @Override
     public Set<String> retryResetBroadcast(String topic, RefreshContext context) {
         if (context.getState() != RefreshState.RESET_SENT) {

@@ -50,10 +50,15 @@ public class ConsumerOffsetTracker {
     }
 
     /**
-     * Update offset for a consumer.
+     * Update offset for a consumer and flush immediately to disk.
+     * Synchronous flush prevents offset loss on unexpected JVM exit: if the background
+     * flush is blocked by EMFILE (too many open files from FD leaks), offsets written
+     * only to the in-memory cache are lost on restart, causing consumers to replay from
+     * offset 0 and inflating delivery metrics.
      */
     public void updateOffset(String consumerId, long offset) {
         repository.put(consumerId, String.valueOf(offset));
+        repository.flush();
     }
 
     /**

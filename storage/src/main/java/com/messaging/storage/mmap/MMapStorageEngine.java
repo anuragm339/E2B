@@ -25,14 +25,16 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Memory-mapped file based storage engine implementation
  */
 @Singleton
 @Requires(property = "broker.storage.type", value = "mmap")
-public class MMapStorageEngine implements StorageEngine, BatchReadableStorage {
+public class MMapStorageEngine implements StorageEngine, BatchReadableStorage, com.messaging.storage.segment.SegmentAccess {
     private static final Logger log = LoggerFactory.getLogger(MMapStorageEngine.class);
 
     private final Path dataDir;
@@ -122,6 +124,18 @@ public class MMapStorageEngine implements StorageEngine, BatchReadableStorage {
         }
 
         return manager.getEarliestOffset();
+    }
+
+    @Override
+    public Set<String> getTopicNames() {
+        return managers.keySet().stream()
+                .map(tp -> tp.topic)
+                .collect(Collectors.toSet());
+    }
+
+    @Override
+    public SegmentManager getSegmentManager(String topic, int partition) {
+        return managers.get(new TopicPartition(topic, partition));
     }
 
     @Override

@@ -4,6 +4,7 @@ import com.messaging.common.exception.MessagingException;
 import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.MessageRecord;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Storage abstraction interface.
@@ -57,6 +58,12 @@ public interface StorageEngine {
      * @return Earliest offset, or 0 if no segments exist
      */
     long getEarliestOffset(String topic, int partition);
+
+    /**
+     * Return the set of all topic names for which data has been written.
+     * Partition 0 is assumed throughout this system.
+     */
+    Set<String> getTopicNames();
 
     /**
      * Compact segments for a topic-partition

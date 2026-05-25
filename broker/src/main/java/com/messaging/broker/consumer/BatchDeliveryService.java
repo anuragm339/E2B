@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.compaction.RocksDbCompactionIndex;
 import com.messaging.broker.monitoring.ConsumerEventLogger;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.monitoring.TraceIds;
@@ -15,8 +16,10 @@ import com.messaging.broker.consumer.RefreshCoordinator;
 import com.messaging.common.api.BatchReadableStorage;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.model.ByteArrayDeliveryBatch;
 import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.BrokerMessage;
+import com.messaging.common.model.MessageRecord;
 import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Inject;
@@ -25,9 +28,15 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 /**
  * Orchestrates batch delivery with flow control, zero-copy transfer, and error handling.
@@ -37,6 +46,9 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
     private static final Logger log = LoggerFactory.getLogger(BatchDeliveryService.class);
     private static final int MAX_CONSECUTIVE_FAILURES = 10;
+    private static final long MODERN_PENDING_ACK_WARN_THRESHOLD_MS = 5_000L;
+    private static final long MODERN_BLOCKED_WARN_INTERVAL_MS = 10_000L;
+    private static final long SLOW_STORAGE_READ_MS = 250L;
 
     private final NetworkServer server;
     private final StorageEngine storage;
@@ -53,6 +65,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
     private final long sendTimeoutBaseSeconds;
     private final long sendTimeoutPerMbSeconds;
     private final ConsumerEventLogger consumerLogger;
+    private final RocksDbCompactionIndex compactionIndex;
+    private final ConcurrentHashMap<String, AtomicLong> blockedWarnTime = new ConcurrentHashMap<>();
 
     private volatile RefreshCoordinator dataRefreshCoordinator; // Lazy injection to avoid circular dependency
 
@@ -72,7 +86,8 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             @Value("${broker.consumer.ack-timeout}") long ackTimeoutMs,
             @Value("${broker.consumer.send-timeout-base-seconds:1}") long sendTimeoutBaseSeconds,
             @Value("${broker.consumer.send-timeout-per-mb-seconds:2}") long sendTimeoutPerMbSeconds,
-            ConsumerEventLogger consumerLogger) {
+            ConsumerEventLogger consumerLogger,
+            RocksDbCompactionIndex compactionIndex) {
         this.server = server;
         this.storage = storage;
         this.batchStorage = batchStorage;
@@ -88,6 +103,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         this.sendTimeoutBaseSeconds = sendTimeoutBaseSeconds;
         this.sendTimeoutPerMbSeconds = sendTimeoutPerMbSeconds;
         this.consumerLogger = consumerLogger;
+        this.compactionIndex = compactionIndex;
     }
 
     /**
@@ -105,6 +121,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
 
         if (!consumer.isLegacy() &&
                 !readinessService.isModernConsumerTopicReady(consumer.getClientId(), consumer.getTopic(), consumer.getGroup())) {
+            metrics.recordConsumerDeliveryBlocked(consumer.getTopic(), consumer.getGroup(), "not-ready");
             log.debug("deliverBatch: BLOCKED (waiting for READY_ACK) for {}", deliveryKeyStr);
             return DeliveryResult.blocked("not-ready");
         }
@@ -112,20 +129,25 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         // Gate 1: Check in-flight (per group:topic)
         AtomicBoolean inFlight = stateService.markInFlight(deliveryKey);
         if (!inFlight.compareAndSet(false, true)) {
+            metrics.recordConsumerDeliveryBlocked(consumer.getTopic(), consumer.getGroup(), "in-flight");
             log.debug("deliverBatch: Gate 1 BLOCKED (in-flight) for {}", deliveryKeyStr);
             return DeliveryResult.blocked("in-flight");
         }
 
         // Gate 2: Check pending ACK
-        if (stateService.getPendingOffset(deliveryKey) != null) {
+        Long pendingOffset = stateService.getPendingOffset(deliveryKey);
+        if (pendingOffset != null) {
+            metrics.recordConsumerDeliveryBlocked(consumer.getTopic(), consumer.getGroup(), "pending-ack");
+            maybeLogModernPendingAckBlocked(consumer, deliveryKey, pendingOffset);
             log.debug("deliverBatch: Gate 2 BLOCKED (pending ACK) for {}, pendingOffset={}",
-                     deliveryKeyStr, stateService.getPendingOffset(deliveryKey));
+                     deliveryKeyStr, pendingOffset);
             inFlight.set(false);
             return DeliveryResult.blocked("pending-ack");
         }
 
         // Gate 3: Check maximum consecutive failures
         if (consumer.getConsecutiveFailures() >= MAX_CONSECUTIVE_FAILURES) {
+            metrics.recordConsumerDeliveryBlocked(consumer.getTopic(), consumer.getGroup(), "max-failures");
             log.error("Consumer {} has exceeded max consecutive failures ({}), unregistering",
                      deliveryKeyStr, MAX_CONSECUTIVE_FAILURES);
             inFlight.set(false);
@@ -139,6 +161,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             long timeSinceLastFailure = System.currentTimeMillis() - consumer.getLastFailureTime();
             if (timeSinceLastFailure < backoffDelay) {
                 long remainingDelay = backoffDelay - timeSinceLastFailure;
+                metrics.recordConsumerDeliveryBlocked(consumer.getTopic(), consumer.getGroup(), "backoff");
                 log.debug("deliverBatch: Gate 4 BLOCKED (backoff) for {}, consecutiveFailures={}, remainingDelay={}ms",
                          deliveryKeyStr, consumer.getConsecutiveFailures(), remainingDelay);
                 inFlight.set(false);
@@ -154,6 +177,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         }
 
         long startOffset = consumer.getCurrentOffset();
+        boolean timeoutScheduled = false;
         Timer.Sample readSample = null;
         Timer.Sample deliverySample = null;
         DeliveryBatch batch = null;
@@ -162,24 +186,49 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         try {
             // ================= STORAGE READ METRICS =================
             readSample = metrics.startStorageReadTimer();
+            long storageReadStartMs = System.currentTimeMillis();
 
             // Read batch from storage (using storage executor to prevent deadlock)
             final long capturedOffset = startOffset;
             batch = storageExecutor.submit(() ->
                 batchStorage.getBatch(consumer.getTopic(), 0, capturedOffset, batchSizeBytes)
             ).get(10, TimeUnit.MINUTES);
+            long storageReadDurationMs = System.currentTimeMillis() - storageReadStartMs;
 
             metrics.stopStorageReadTimer(readSample);
             metrics.recordStorageRead();
+
+            if (storageReadDurationMs >= SLOW_STORAGE_READ_MS) {
+                log.warn("event=batch_delivery.storage_read_slow topic={} group={} clientId={} startOffset={} batchSizeBytes={} durationMs={} storageExecutor={}",
+                        consumer.getTopic(), consumer.getGroup(), consumer.getClientId(), capturedOffset,
+                        batchSizeBytes, storageReadDurationMs, describeExecutor(storageExecutor));
+            }
 
             log.debug("deliverBatch: Batch read complete for {}, recordCount={}",
                      deliveryKeyStr, batch.getRecordCount());
 
             if (batch.isEmpty()) {
+                metrics.recordConsumerDeliveryBlocked(consumer.getTopic(), consumer.getGroup(), "no-data");
                 log.debug("deliverBatch: EMPTY BATCH for {}, startOffset={}", deliveryKeyStr, startOffset);
                 try { batch.close(); } catch (IOException ignored) {}
                 inFlight.set(false);
                 return DeliveryResult.blocked("no-data");
+            }
+
+            // Apply compaction delivery filter: drop superseded records so consumers never see
+            // stale versions. Physical compaction (segment rewrite) will eventually remove them,
+            // but until then we filter here on every delivery. Filtering only happens when the
+            // index has entries for this topic; otherwise the zero-copy path is used as-is.
+            long originalLastOffset = batch.getLastOffset();
+            long originalFirstOffset = batch.getFirstOffset(); // capture before filter (used for ACK store)
+            batch = applyCompactionFilter(consumer.getTopic(), batch, capturedOffset);
+            if (batch.isEmpty()) {
+                // All records in the batch were superseded — advance offset without sending.
+                try { batch.close(); } catch (IOException ignored) {}
+                consumer.setCurrentOffset(originalLastOffset + 1);
+                offsetTracker.updateOffset(consumer.getClientId(), originalLastOffset + 1);
+                inFlight.set(false);
+                return DeliveryResult.success();
             }
 
             traceId = TraceIds.newTraceId();
@@ -188,11 +237,13 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             metrics.recordBatchSize(batch.getRecordCount());
 
             // ================= OFFSET RESERVATION =================
+            // Advance past ALL records in the original batch (including compaction-filtered ones)
+            // so that superseded records are never re-read on the next delivery cycle.
             long originalOffset = startOffset;
-            long nextOffset = batch.getLastOffset() + 1;
+            long nextOffset = originalLastOffset + 1;
             consumer.setCurrentOffset(nextOffset);
             stateService.setPendingOffset(deliveryKey, nextOffset);
-            stateService.setFromOffset(deliveryKey, batch.getFirstOffset());  // actual first record offset, used for ACK-time RocksDB write
+            stateService.setFromOffset(deliveryKey, originalFirstOffset);  // original batch first offset covers all records (incl. compaction-filtered) for ACK-store write
 
             LogContext startedContext = LogContext.builder()
                     .traceId(traceId)
@@ -250,6 +301,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             }, ackTimeoutMs, TimeUnit.MILLISECONDS);
 
             stateService.scheduleTimeout(deliveryKey, timeoutFuture);
+            timeoutScheduled = true;
 
             metrics.stopConsumerDeliveryTimer(
                     deliverySample,
@@ -339,12 +391,14 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             // Record failure for exponential backoff
             consumer.recordFailure();
 
-            // Only remove pending offset for PERMANENT failures
             boolean isPermanentFailure = consumer.getConsecutiveFailures() >= MAX_CONSECUTIVE_FAILURES;
 
             if (isPermanentFailure) {
-                // Permanent failure: clear both pendingOffset and fromOffset.
-                // The consumer will be unregistered; no ACK can arrive.
+                // Permanent failure: clear all state and unregister.
+                // Cancel the timeout if it was scheduled — the consumer is going away.
+                if (timeoutScheduled) {
+                    stateService.cancelTimeout(deliveryKey);
+                }
                 stateService.clearFromOffset(deliveryKey);
                 stateService.clearPendingOffset(deliveryKey);
                 stateService.recordBatchSendTime(deliveryKey, 0);
@@ -352,8 +406,20 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                 log.error("Permanent failure for {} (consecutiveFailures={}), removing pending offset and unregistering",
                          deliveryKeyStr, MAX_CONSECUTIVE_FAILURES);
                 registrationService.unregisterConsumer(consumer.getClientId());
+            } else if (!timeoutScheduled) {
+                // sendBatchToConsumer() threw before the ACK timeout was scheduled.
+                // No ACK is coming and nothing will ever clear pendingOffset — clear it now
+                // so Gate 2 does not permanently block all future delivery attempts.
+                stateService.clearFromOffset(deliveryKey);
+                stateService.clearPendingOffset(deliveryKey);
+                stateService.recordBatchSendTime(deliveryKey, 0);
+                stateService.clearTraceId(deliveryKey);
+                log.warn("event=batch_delivery.transient_failure deliveryKey={} pendingOffsetCleared=true ackTimeoutMs={} consecutiveFailures={}",
+                        deliveryKeyStr, ackTimeoutMs, consumer.getConsecutiveFailures());
             } else {
-                log.warn("event=batch_delivery.transient_failure deliveryKey={} pendingOffsetRetained=true ackTimeoutMs={} consecutiveFailures={}",
+                // Exception thrown after the ACK timeout was already scheduled (rare: post-send
+                // metrics/logging path). The timeout will fire and clear pendingOffset on its own.
+                log.warn("event=batch_delivery.transient_failure deliveryKey={} pendingOffsetRetained=true timeoutScheduled=true ackTimeoutMs={} consecutiveFailures={}",
                         deliveryKeyStr, ackTimeoutMs, consumer.getConsecutiveFailures());
             }
 
@@ -453,5 +519,127 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         metrics.recordConsumerFailure(consumer.getClientId(), consumer.getTopic(), consumer.getGroup());
         log.error("Delivery failure for {}: consecutiveFailures={}, nextBackoff={}ms",
                  deliveryKey, consumer.getConsecutiveFailures(), consumer.getBackoffDelay(), error);
+    }
+
+    /**
+     * Apply compaction delivery filter to {@code batch}.
+     *
+     * <p>If the batch starts beyond the topic's highest known stale offset, the original batch is
+     * returned unchanged and the zero-copy path is preserved. Otherwise the batch is decoded,
+     * superseded records are dropped, and a heap-backed {@link ByteArrayDeliveryBatch} carrying only
+     * the deliverable records is returned. The original batch is closed before this method returns.
+     *
+     * <p>If all records in the batch are superseded an empty (isEmpty()) batch is returned.
+     */
+    private DeliveryBatch applyCompactionFilter(String topic, DeliveryBatch batch, long fromOffset) {
+        // Capture offsets before any close() call; ByteArrayDeliveryBatch constructors need them
+        // and the original batch must not be touched after close().
+        long batchFirstOffset = batch.getFirstOffset();
+        long batchLastOffset  = batch.getLastOffset();
+        int  batchRecordCount = batch.getRecordCount();
+
+        // Fast-path: only filter batches whose offsets can still contain superseded records.
+        if (!compactionIndex.shouldFilterDelivery(topic, batchFirstOffset)) {
+            return batch;
+        }
+
+        try {
+            List<MessageRecord> decoded = storage.read(topic, 0, fromOffset, batchRecordCount);
+
+            // Partial-decode fail-open: if the storage read returned fewer records than the batch
+            // contains (e.g. 1MB size cap truncated the result), we cannot safely determine which
+            // records are superseded — return the original batch unchanged.
+            if (decoded.size() < batchRecordCount) {
+                return batch;
+            }
+
+            List<MessageRecord> deliverable = decoded.stream()
+                    .filter(r -> !compactionIndex.isSuperseded(topic, r.getMsgKey(), r.getOffset()))
+                    .collect(Collectors.toList());
+
+            if (deliverable.size() == decoded.size()) {
+                return batch; // nothing filtered — keep zero-copy batch
+            }
+
+            // Build the replacement BEFORE closing the original so that encoding errors
+            // never leave us with a closed-but-returned batch (which causes ClosedChannelException
+            // in Netty's zero-copy path).
+            DeliveryBatch replacement;
+            if (deliverable.isEmpty()) {
+                replacement = new ByteArrayDeliveryBatch(topic, new byte[0], 0, batchFirstOffset, batchLastOffset);
+            } else {
+                byte[] encoded = encodeToBinaryFormat(deliverable);
+                long firstOff = deliverable.get(0).getOffset();
+                long lastOff  = deliverable.get(deliverable.size() - 1).getOffset();
+                replacement = new ByteArrayDeliveryBatch(topic, encoded, deliverable.size(), firstOff, lastOff);
+            }
+
+            // Replacement is ready — safe to close the original file-backed batch.
+            try { batch.close(); } catch (IOException ignored) {}
+            return replacement;
+
+        } catch (Exception e) {
+            log.warn("Compaction filter failed for topic={}, delivering unfiltered batch: {}", topic, e.getMessage());
+            // batch is never closed in this path — caller can still use it safely.
+            return batch;
+        }
+    }
+
+    /**
+     * Encode a list of records into the unified segment log binary format:
+     * {@code [keyLen:4][key:var][eventType:1][dataLen:4][data:var][timestamp:8]}
+     */
+    private static byte[] encodeToBinaryFormat(List<MessageRecord> records) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        for (MessageRecord r : records) {
+            byte[] keyBytes  = r.getMsgKey() != null ? r.getMsgKey().getBytes(StandardCharsets.UTF_8) : new byte[0];
+            byte[] dataBytes = r.getData() != null ? r.getData().getBytes(StandardCharsets.UTF_8) : new byte[0];
+            ByteBuffer buf = ByteBuffer.allocate(4 + keyBytes.length + 1 + 4 + dataBytes.length + 8);
+            buf.putInt(keyBytes.length);
+            buf.put(keyBytes);
+            buf.put((byte) r.getEventType().getCode());
+            buf.putInt(dataBytes.length);
+            if (dataBytes.length > 0) buf.put(dataBytes);
+            buf.putLong(r.getCreatedAt().toEpochMilli());
+            buf.flip();
+            byte[] bytes = new byte[buf.remaining()];
+            buf.get(bytes);
+            baos.write(bytes);
+        }
+        return baos.toByteArray();
+    }
+
+    private void maybeLogModernPendingAckBlocked(RemoteConsumer consumer, DeliveryKey deliveryKey, long pendingOffset) {
+        Long sendTime = stateService.getBatchSendTime(deliveryKey);
+        long pendingAgeMs = sendTime != null && sendTime > 0
+                ? Math.max(0, System.currentTimeMillis() - sendTime)
+                : -1L;
+        if (pendingAgeMs < MODERN_PENDING_ACK_WARN_THRESHOLD_MS || !shouldWarnBlocked(consumer.getGroup(), consumer.getTopic())) {
+            return;
+        }
+
+        log.warn("event=batch_delivery.blocked topic={} group={} clientId={} reason=pending_ack pendingAckAgeMs={} pendingOffset={} consumerOffset={}",
+                consumer.getTopic(), consumer.getGroup(), consumer.getClientId(),
+                pendingAgeMs, pendingOffset, consumer.getCurrentOffset());
+    }
+
+    private String describeExecutor(ExecutorService executor) {
+        if (executor instanceof ThreadPoolExecutor pool) {
+            return String.format("poolSize=%d active=%d queued=%d completed=%d",
+                    pool.getPoolSize(),
+                    pool.getActiveCount(),
+                    pool.getQueue().size(),
+                    pool.getCompletedTaskCount());
+        }
+        return executor.getClass().getSimpleName();
+    }
+
+    private boolean shouldWarnBlocked(String group, String topic) {
+        String key = (group == null || group.isBlank() ? "unknown" : group) + ":" +
+                (topic == null || topic.isBlank() ? "unknown" : topic);
+        long now = System.currentTimeMillis();
+        AtomicLong lastLogged = blockedWarnTime.computeIfAbsent(key, ignored -> new AtomicLong(0));
+        long previous = lastLogged.get();
+        return now - previous >= MODERN_BLOCKED_WARN_INTERVAL_MS && lastLogged.compareAndSet(previous, now);
     }
 }

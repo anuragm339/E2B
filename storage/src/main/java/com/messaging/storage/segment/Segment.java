@@ -371,10 +371,11 @@ public class Segment {
         // 1. Filename offset (for loaded segments)
         // 2. Explicit parameter (for new segments)
 
-        this.nextOffset = offset + 1;
-
         // Write record using unified format (split log/index)
         writeRecord(record, offset);
+
+        // Only advance nextOffset after a successful write — no speculative advance
+        this.nextOffset = offset + 1;
 
         return offset;
     }
@@ -673,6 +674,8 @@ public class Segment {
         try {
             logChannel.force(true);
             indexChannel.force(true);
+            NativePageCache.dropCache(logChannel);
+            NativePageCache.dropCache(indexChannel);
         } catch (IOException e) {
             log.error("Error forcing channels to disk", e);
         }
@@ -781,17 +784,17 @@ public class Segment {
                 return new BatchFileRegion(topic, null, 0, 0L, -1L, 0L, startOffset);
             }
 
-            // 3. Open a read-only FileChannel for zero-copy transfer (Kafka-style sendfile)
-            // Calculate actual batch size: from first record start to last record end
+            // 3. Use the segment's own logChannel for zero-copy transfer (Kafka-style sendfile).
+            // FileChannel.transferTo() uses the explicit position argument and is safe for
+            // concurrent positioned reads even while the channel may still be open for writes
+            // (active segment). Opening a fresh FileChannel per batch was leaking one FD per
+            // batch delivery — with small segment sizes this exhausts the process FD table.
             long totalBytes = (lastLogPosition + lastRecordSize) - firstLogPosition;
-
-            // Open separate READ-ONLY channel to avoid interference with writes
-            FileChannel readChannel = FileChannel.open(logPath, StandardOpenOption.READ);
 
             log.debug("Created zero-copy batch: offset={}-{}, bytes={}, records={}, firstLogPos={}",
                       startOffset, lastOffset, totalBytes, recordCount, firstLogPosition);
 
-            return new BatchFileRegion(topic, readChannel, recordCount, totalBytes, firstEntry.offset, lastOffset, firstLogPosition);
+            return new BatchFileRegion(topic, logChannel, recordCount, totalBytes, firstEntry.offset, lastOffset, firstLogPosition);
         } catch (IOException | MessagingException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.readFailed(topic, partition, startOffset, e)
@@ -882,9 +885,9 @@ public class Segment {
 
         @Override
         public void close() throws IOException {
-            if (fileChannel != null && fileChannel.isOpen()) {
-                fileChannel.close();
-            }
+            // The FileChannel belongs to the Segment that created this batch — closing it
+            // here would close the segment's shared read/write channel. Lifecycle is managed
+            // by Segment.close(), not by individual batch deliveries.
         }
     }
 
@@ -910,11 +913,24 @@ public class Segment {
         return logPosition >= maxSize;
     }
 
+    public boolean hasSpaceFor(MessageRecord record) {
+        byte[] key = record.getMsgKey() != null
+                ? record.getMsgKey().getBytes(StandardCharsets.UTF_8) : new byte[0];
+        int dataLen = record.getData() != null
+                ? record.getData().getBytes(StandardCharsets.UTF_8).length : 0;
+        int logRecordSize = 4 + key.length + 1 + 4 + dataLen + 8;
+        return logPosition + logRecordSize <= maxSize;
+    }
+
     public Path getLogPath() {
         return logPath;
     }
 
     public Path getIndexPath() {
         return indexPath;
+    }
+
+    public long getRecordCount() {
+        return recordCount;
     }
 }

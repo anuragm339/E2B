@@ -31,6 +31,7 @@ public interface SegmentFactory {
             String topic,
             int partition,
             long baseOffset,
+            long maxSegmentSize,
             SegmentMetadataStore metadataStore) throws StorageException;
 
     /**

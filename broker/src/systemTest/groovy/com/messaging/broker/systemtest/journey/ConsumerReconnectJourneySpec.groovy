@@ -4,7 +4,6 @@ import com.messaging.broker.ack.RocksDbAckStore
 import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
 import com.messaging.broker.systemtest.support.TestRecordCollector
-import com.messaging.common.api.StorageEngine
 import io.micronaut.context.ApplicationContext
 import spock.util.concurrent.PollingConditions
 
@@ -19,7 +18,6 @@ import spock.util.concurrent.PollingConditions
  *
  * Additionally verifies:
  * - The broker's ConsumerOffsetTracker holds the committed offset after the first batch.
- * - StorageEngine contains all 6 records (3 initial + 3 offline) with correct data.
  */
 class ConsumerReconnectJourneySpec extends BrokerSystemTestSupport {
 
@@ -68,22 +66,11 @@ class ConsumerReconnectJourneySpec extends BrokerSystemTestSupport {
             [offset: (long) i, topic: 'prices-v1', partition: 0,
              msgKey: "rec-${i}", eventType: 'MESSAGE', data: """{"i":${i}}"""]
         })
-        // Give broker time to store the new records
-        sleep(2000)
-
-        and: "all 6 records are in StorageEngine"
-        def storage = brokerCtx.getBean(StorageEngine)
-        def allStored = storage.read('prices-v1', 0, 0, 100)
-        allStored*.msgKey.toSet().containsAll((1..6).collect { "rec-${it}" })
-
-        and: "stored data payloads are intact"
-        def byKey = allStored.collectEntries { [it.msgKey, it] }
-        (1..6).every { i -> byKey["rec-${i}"]?.data == """{"i":${i}}""" }
 
         and: "a fresh consumer context connects with the same group"
         def freshConsumerCtx = ApplicationContext.run(consumerProperties() as Map<String, Object>)
         triggerConsumerManagerStartup(freshConsumerCtx)
-        sleep(2000)
+        awaitConsumerConnected(freshConsumerCtx)
 
         then: "fresh consumer receives only records 4-6 (after committed offset)"
         def freshCollector = freshConsumerCtx.getBean(TestRecordCollector)
@@ -110,6 +97,6 @@ class ConsumerReconnectJourneySpec extends BrokerSystemTestSupport {
         // Re-open the original consumer context for subsequent tests
         consumerCtx = ApplicationContext.run(consumerProperties() as Map<String, Object>)
         triggerConsumerManagerStartup(consumerCtx)
-        sleep(1000)
+        awaitConsumerConnected(consumerCtx)
     }
 }

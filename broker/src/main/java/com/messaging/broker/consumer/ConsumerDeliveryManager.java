@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer;
 
+import com.messaging.broker.compaction.RocksDbCompactionIndex;
 import com.messaging.common.annotation.RetryPolicy;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.ConsumerRecord;
@@ -13,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 /**
  * Manages message delivery to local consumers
@@ -25,15 +27,18 @@ public class ConsumerDeliveryManager {
     private final StorageEngine storage;
     private final ConsumerAnnotationProcessor processor;
     private final ConsumerOffsetTracker offsetTracker;
+    private final RocksDbCompactionIndex compactionIndex;
     private final ScheduledExecutorService scheduler;
     private final Map<String, Future<?>> deliveryTasks;
 
     @Inject
     public ConsumerDeliveryManager(StorageEngine storage, ConsumerAnnotationProcessor processor,
-                                  ConsumerOffsetTracker offsetTracker) {
+                                  ConsumerOffsetTracker offsetTracker,
+                                  RocksDbCompactionIndex compactionIndex) {
         this.storage = storage;
         this.processor = processor;
         this.offsetTracker = offsetTracker;
+        this.compactionIndex = compactionIndex;
         int schedulerThreads = Math.min(4, Runtime.getRuntime().availableProcessors());
         this.scheduler = Executors.newScheduledThreadPool(schedulerThreads, r -> {
             Thread t = new Thread(r);
@@ -119,10 +124,17 @@ public class ConsumerDeliveryManager {
                 return;
             }
 
-            // Deliver entire batch at once
-            boolean success = deliverBatch(context, records);
+            // Filter superseded records — deliver only the latest version of each key.
+            // Offset must advance past the full batch (including filtered records) to avoid
+            // re-reading superseded entries on every poll cycle.
+            String topic = context.getTopic();
+            List<MessageRecord> deliverable = records.stream()
+                    .filter(r -> !compactionIndex.isSuperseded(topic, r.getMsgKey(), r.getOffset()))
+                    .collect(Collectors.toList());
+
+            boolean success = deliverable.isEmpty() || deliverBatch(context, deliverable);
             if (success) {
-                // Update offset to last message in batch + 1
+                // Advance offset using the full (unfiltered) batch
                 long lastOffset = records.get(records.size() - 1).getOffset();
                 long newOffset = lastOffset + 1L;
                 context.setCurrentOffset(newOffset);
@@ -130,14 +142,13 @@ public class ConsumerDeliveryManager {
                 offsetTracker.updateOffset(context.getConsumerId(), newOffset);
 
                 // Update average message size for adaptive batch sizing
-                int totalBytes = calculateBatchSize(records);
+                int totalBytes = calculateBatchSize(deliverable.isEmpty() ? records : deliverable);
                 context.updateAverageMessageSize(totalBytes, records.size());
 
                 log.debug("Delivered batch of {} messages to consumer {}, new offset={}, next batch size={}",
                          records.size(), context.getConsumerId(), newOffset, context.getCurrentBatchSize());
             } else {
-                // Handle batch failure
-                handleBatchFailure(context, records);
+                handleBatchFailure(context, deliverable);
             }
         } catch (Exception e) {
             log.error("Error in delivery loop for consumer: {}", context.getConsumerId(), e);

@@ -1,5 +1,6 @@
 package com.messaging.broker.consumer
 
+import com.messaging.broker.compaction.RocksDbCompactionIndex
 import com.messaging.broker.model.DeliveryKey
 import com.messaging.broker.monitoring.BrokerMetrics
 import com.messaging.broker.monitoring.ConsumerEventLogger
@@ -34,11 +35,12 @@ class BatchDeliveryServiceSpec extends Specification {
     ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor()
     ExecutorService storageExecutor = Executors.newSingleThreadExecutor()
     ConsumerEventLogger consumerLogger = Mock()
+    RocksDbCompactionIndex compactionIndex = Mock()
 
     BatchDeliveryService service = new BatchDeliveryService(
             server, storage, batchStorage, stateService, readinessService, offsetTracker,
             metrics, dataRefreshMetrics, registrationService, scheduler, storageExecutor,
-            100, 1, 1, consumerLogger
+            100, 1, 1, consumerLogger, compactionIndex
     )
 
     def cleanup() {
@@ -145,7 +147,10 @@ class BatchDeliveryServiceSpec extends Specification {
         consumer.consecutiveFailures > 0
         1 * metrics.stopStorageReadTimer(_ as Timer.Sample)
         1 * metrics.recordStorageRead()
-        1 * stateService.clearFromOffset(DeliveryKey.of("group-a", "prices-v1"))
+        // sendBatchToConsumer() threw before the ACK timeout was scheduled — pending state must be
+        // cleared immediately so Gate 2 does not permanently block all future delivery attempts.
+        1 * stateService.clearFromOffset(_)
+        1 * stateService.clearPendingOffset(_)
         1 * metrics.recordConsumerTransferFailed("client-1", "prices-v1", "group-a", 1, 3)
         1 * metrics.recordConsumerFailure("client-1", "prices-v1", "group-a")
     }

@@ -141,7 +141,9 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
 
         when: "ACK is sent and then no new messages are enqueued"
         legacyClient.received.findAll { it instanceof BatchEvent }.each { legacyClient.sendAck() }
-        sleep(2000)  // let broker attempt re-delivery if the bug were present
+        waitForStableValue(2000) {
+            legacyClient.received.findAll { it instanceof BatchEvent }.size()
+        }
 
         then: "no additional BatchEvents are received after the ACK"
         def afterAck = legacyClient.received.findAll { it instanceof BatchEvent }.size()

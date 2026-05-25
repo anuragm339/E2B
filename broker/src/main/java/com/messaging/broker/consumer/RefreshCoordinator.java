@@ -7,6 +7,7 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -188,22 +189,22 @@ public class RefreshCoordinator {
             log.warn("Abort watchdog fired for topic={} in READY_SENT — re-arming for one more window; "
                     + "READY ACK retry path has {} more ms to resolve",
                     topic, REFRESH_ABORT_TIMEOUT_MS);
-            String rearmRefreshId = context.getRefreshId();
-            ScheduledFuture<?> rearm = scheduler.schedule(
-                    () -> abortRefreshIfStuck(topic, rearmRefreshId, true),
-                    REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            // NEW-P2: Verify the context is still active before installing — handleReadyAck may
-            // have completed the refresh between our state check and here, leaving a stale entry.
-            RefreshContext current = activeRefreshes.get(topic);
-            if (current != null && rearmRefreshId.equals(current.getRefreshId())) {
-                abortWatchdogTasks.compute(topic, (k, old) -> {
-                    if (old != null) old.cancel(false);
-                    return rearm;
-                });
-            } else {
-                rearm.cancel(false);
-            }
+            rearmAbortWatchdog(topic, context.getRefreshId(), true);
             return;
+        }
+
+        if (state == RefreshState.REPLAYING) {
+            Instant lastProgress = context.getLastReplayProgressTime();
+            long idleMs = lastProgress == null
+                    ? Long.MAX_VALUE
+                    : Duration.between(lastProgress, Instant.now()).toMillis();
+            if (idleMs < REFRESH_ABORT_TIMEOUT_MS) {
+                log.warn("Abort watchdog fired for topic={} in REPLAYING but replay is still progressing; "
+                                + "lastProgress={} idleMs={} — re-arming watchdog",
+                        topic, lastProgress, idleMs);
+                rearmAbortWatchdog(topic, context.getRefreshId(), false);
+                return;
+            }
         }
 
         log.error("Refresh timeout after {}ms for topic={}, state={}, refreshId={} — aborting",
@@ -253,6 +254,9 @@ public class RefreshCoordinator {
 
             if (transition.isSuccess()) {
                 context.setState(RefreshState.REPLAYING);
+                if (resetService instanceof RefreshResetService) {
+                    ((RefreshResetService) resetService).persistState(context);
+                }
 
                 // Cancel RESET retry task
                 ScheduledFuture<?> resetTask = resetRetryTasks.remove(topic);
@@ -356,7 +360,13 @@ public class RefreshCoordinator {
      */
     private void scheduleReplayCheck(String topic) {
         ScheduledFuture<?> task = scheduler.scheduleWithFixedDelay(
-                () -> checkReplayProgress(topic),
+                () -> {
+                    try {
+                        checkReplayProgress(topic);
+                    } catch (Exception e) {
+                        log.error("Replay check failed for topic {}", topic, e);
+                    }
+                },
                 REPLAY_CHECK_INTERVAL_MS,
                 REPLAY_CHECK_INTERVAL_MS,
                 TimeUnit.MILLISECONDS
@@ -368,6 +378,21 @@ public class RefreshCoordinator {
             log.debug("Replay check already scheduled for topic {}, cancelled duplicate", topic);
         } else {
             log.info("Scheduled replay check task for topic {}", topic);
+        }
+    }
+
+    private void rearmAbortWatchdog(String topic, String refreshId, boolean allowAbortFromReadySent) {
+        ScheduledFuture<?> rearm = scheduler.schedule(
+                () -> abortRefreshIfStuck(topic, refreshId, allowAbortFromReadySent),
+                REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        RefreshContext current = activeRefreshes.get(topic);
+        if (current != null && refreshId.equals(current.getRefreshId())) {
+            abortWatchdogTasks.compute(topic, (k, old) -> {
+                if (old != null) old.cancel(false);
+                return rearm;
+            });
+        } else {
+            rearm.cancel(false);
         }
     }
 

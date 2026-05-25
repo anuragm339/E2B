@@ -74,10 +74,10 @@ class LateConsumerDuringRefreshJourneySpec extends BrokerSystemTestSupport {
             'broker.storage.dataDir' : "${dataDir}/consumer-b",
         ] as Map<String, Object>)
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(1500)  // let B complete subscribe handshake and be registered as late joiner
+        awaitConsumerConnected(consumerBCtx)
 
         // NOTE: We do NOT assert state == REPLAYING here — with a small record set (5 records)
-        // and fast adaptive delivery, B may catch up within the 1.5s window and the refresh
+        // and fast adaptive delivery, B may catch up within the connection window and the refresh
         // may already be in READY_SENT or COMPLETED when this then: block executes.
         // The essential behaviour (B receives READY and post-refresh data) is verified below.
 

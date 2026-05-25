@@ -256,6 +256,38 @@ class SegmentManagerSpec extends Specification {
         manager?.close()
     }
 
+    def "sparse-offset pipe records roll correctly across segment boundaries"() {
+        given: "a segment that holds exactly 1 record, simulating a near-full segment"
+        def key  = "sparse-key"
+        def data = "sparse-data"
+        def logRecordSize = calculateLogRecordSize(key, data)
+        def maxSize = (LOG_HEADER_SIZE + logRecordSize) as long
+        def manager = newManager("sparse-offset-topic", maxSize)
+
+        when: "three records with large sparse offsets arrive (pipe-style pre-assigned offsets)"
+        manager.append(createRecord(1000L,    key, data))
+        manager.append(createRecord(100000L,  key, data))
+        manager.append(createRecord(3000000L, key, data))
+
+        then: "no exception — all three stored without corruption"
+        noExceptionThrown()
+
+        and: "each record is readable at its exact original offset"
+        manager.read(1000L,    1).any { it.offset == 1000L    }
+        manager.read(100000L,  1).any { it.offset == 100000L  }
+        manager.read(3000000L, 1).any { it.offset == 3000000L }
+
+        and: "three distinct segment files exist (one record per segment)"
+        def segDir = tempDir.resolve("sparse-offset-topic").resolve("partition-0")
+        segDir.toFile().listFiles({ f -> f.name.endsWith(".log") } as java.io.FileFilter).length == 3
+
+        and: "the manager's current offset is the last written record offset"
+        manager.getCurrentOffset() == 3000000L
+
+        cleanup:
+        manager?.close()
+    }
+
     private SegmentManager newManager(String topic, long maxSize) {
         def partitionDir = tempDir.resolve(topic).resolve("partition-0")
         def metadataStore = new SegmentMetadataStore(tempDir.resolve(topic))

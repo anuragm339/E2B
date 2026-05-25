@@ -31,7 +31,7 @@ class DefaultSegmentFactorySpec extends Specification {
 
     def "should create segment with correct paths"() {
         when:
-        def segment = segmentFactory.createSegment(tempDir, "test-topic", 0, 100L, metadataStore)
+        def segment = segmentFactory.createSegment(tempDir, "test-topic", 0, 100L, 1024 * 1024L, metadataStore)
 
         then:
         segment != null
@@ -44,7 +44,7 @@ class DefaultSegmentFactorySpec extends Specification {
 
     def "should create segment at offset zero"() {
         when:
-        def segment = segmentFactory.createSegment(tempDir, "prices-v1", 0, 0L, metadataStore)
+        def segment = segmentFactory.createSegment(tempDir, "prices-v1", 0, 0L, 1024 * 1024L, metadataStore)
 
         then:
         segment != null
@@ -55,8 +55,8 @@ class DefaultSegmentFactorySpec extends Specification {
 
     def "should create segments for different partitions"() {
         when:
-        def segment0 = segmentFactory.createSegment(tempDir, "test-topic", 0, 100L, metadataStore)
-        def segment1 = segmentFactory.createSegment(tempDir, "test-topic", 1, 100L, metadataStore)
+        def segment0 = segmentFactory.createSegment(tempDir, "test-topic", 0, 100L, 1024 * 1024L, metadataStore)
+        def segment1 = segmentFactory.createSegment(tempDir, "test-topic", 1, 100L, 1024 * 1024L, metadataStore)
 
         then:
         segment0.partition == 0
@@ -67,9 +67,9 @@ class DefaultSegmentFactorySpec extends Specification {
 
     def "should create segments with different offsets"() {
         when:
-        def segment1 = segmentFactory.createSegment(tempDir, "test-topic", 0, 0L, metadataStore)
-        def segment2 = segmentFactory.createSegment(tempDir, "test-topic", 0, 1000L, metadataStore)
-        def segment3 = segmentFactory.createSegment(tempDir, "test-topic", 0, 2000L, metadataStore)
+        def segment1 = segmentFactory.createSegment(tempDir, "test-topic", 0, 0L, 1024 * 1024L, metadataStore)
+        def segment2 = segmentFactory.createSegment(tempDir, "test-topic", 0, 1000L, 1024 * 1024L, metadataStore)
+        def segment3 = segmentFactory.createSegment(tempDir, "test-topic", 0, 2000L, 1024 * 1024L, metadataStore)
 
         then:
         segment1.logPath.fileName.toString() == "00000000000000000000.log"

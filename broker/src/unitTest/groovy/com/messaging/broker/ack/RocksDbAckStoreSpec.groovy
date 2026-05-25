@@ -1,5 +1,6 @@
 package com.messaging.broker.ack
 
+import com.messaging.broker.compaction.SharedRocksDb
 import spock.lang.Specification
 import spock.lang.TempDir
 
@@ -10,15 +11,17 @@ class RocksDbAckStoreSpec extends Specification {
     @TempDir
     Path tempDir
 
+    SharedRocksDb sharedDb
     RocksDbAckStore store
 
     def setup() {
-        store = new RocksDbAckStore(tempDir.toString(), 8 * 1024 * 1024L)
-        store.init()
+        sharedDb = new SharedRocksDb(tempDir.toString(), 8 * 1024 * 1024L)
+        sharedDb.init()
+        store = new RocksDbAckStore(sharedDb)
     }
 
     def cleanup() {
-        store?.close()
+        sharedDb?.close()
     }
 
     def "put and get round-trip returns stored record"() {

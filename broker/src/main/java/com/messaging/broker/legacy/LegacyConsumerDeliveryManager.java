@@ -81,6 +81,8 @@ public class LegacyConsumerDeliveryManager {
 
         MergedBatch batch = new MergedBatch();
         List<TopicCursor> cursors = new ArrayList<>();
+        Map<String, String> topicStates = new LinkedHashMap<>();
+        Map<String, Long> committedOffsets = new HashMap<>();
 
         try {
             // 1. Initialize cursors for each topic
@@ -103,6 +105,7 @@ public class LegacyConsumerDeliveryManager {
                     long committedOffset = offsetTracker.getOffset(consumerGroup + ":" + topic);
                     long earliestOffset = storage.getEarliestOffset(topic, 0);
                     long currentOffset = storage.getCurrentOffset(topic, 0);
+                    committedOffsets.put(topic, committedOffset);
 
                     long startOffset;
                     if (committedOffset < 0) {
@@ -121,6 +124,8 @@ public class LegacyConsumerDeliveryManager {
 
                     // Validate offset range
                     if (currentOffset < 0) {
+                        topicStates.put(topic, String.format("no_data(committed=%d,earliest=%d,current=%d)",
+                                committedOffset, earliestOffset, currentOffset));
                         if (debugPriceQuote) {
                             log.debug("[PRICE-QUOTE] Topic {} - No data available (currentOffset: -1)", topic);
                         }
@@ -128,6 +133,8 @@ public class LegacyConsumerDeliveryManager {
                     }
 
                     if (startOffset > currentOffset) {
+                        topicStates.put(topic, String.format("caught_up(committed=%d,start=%d,current=%d)",
+                                committedOffset, startOffset, currentOffset));
                         if (debugPriceQuote) {
                             log.debug("[PRICE-QUOTE] Topic {} - startOffset ({}) beyond currentOffset ({}) - no new data",
                                     topic, startOffset, currentOffset);
@@ -142,6 +149,8 @@ public class LegacyConsumerDeliveryManager {
                     TopicCursor cursor = createCursor(topic, startOffset, debugPriceQuote);
 
                     if (cursor == null) {
+                        topicStates.put(topic, String.format("cursor_missing(committed=%d,start=%d,current=%d,earliest=%d)",
+                                committedOffset, startOffset, currentOffset, earliestOffset));
                         if (debugPriceQuote) {
                             log.debug("[PRICE-QUOTE] Topic {} - createCursor returned NULL (startOffset: {})", topic, startOffset);
                         }
@@ -154,12 +163,29 @@ public class LegacyConsumerDeliveryManager {
                     }
 
                     if (hasMore) {
+                        IndexEntry firstEntry = cursor.peek();
+                        if (firstEntry != null) {
+                            log.info("event=legacy_delivery.cursor_ready group={} topic={} startOffset={} " +
+                                     "firstCursorOffset={} committedOffset={} currentOffset={} earliestOffset={}",
+                                    consumerGroup, topic, startOffset, firstEntry.offset,
+                                    committedOffset, currentOffset, earliestOffset);
+                            if (firstEntry.offset < startOffset) {
+                                log.warn("event=legacy_delivery.cursor_before_start_offset group={} topic={} " +
+                                         "startOffset={} firstCursorOffset={} committedOffset={} currentOffset={} earliestOffset={}",
+                                        consumerGroup, topic, startOffset, firstEntry.offset,
+                                        committedOffset, currentOffset, earliestOffset);
+                            }
+                        }
                         cursors.add(cursor);
                         heap.add(cursor);
+                        topicStates.put(topic, String.format("eligible(committed=%d,start=%d,current=%d,earliest=%d)",
+                                committedOffset, startOffset, currentOffset, earliestOffset));
                         if (debugPriceQuote) {
                             log.debug("[PRICE-QUOTE] Added cursor: topic={}, startOffset={}", topic, startOffset);
                         }
                     } else {
+                        topicStates.put(topic, String.format("cursor_exhausted(committed=%d,start=%d,current=%d,earliest=%d)",
+                                committedOffset, startOffset, currentOffset, earliestOffset));
                         if (debugPriceQuote) {
                             log.debug("[PRICE-QUOTE] Topic {} - cursor.hasMore() returned false (startOffset: {}, current: {})",
                                     topic, startOffset, currentOffset);
@@ -173,14 +199,9 @@ public class LegacyConsumerDeliveryManager {
             }
 
             if (heap.isEmpty()) {
-                if (debugPriceQuote) {
-                    log.debug("[PRICE-QUOTE] EMPTY HEAP - No cursors available after processing {} topics (group: {}). " +
-                              "Check if: (1) startOffset > currentOffset, (2) createCursor() failed, " +
-                              "(3) cursor.hasMore() returned false",
-                              topics.size(), consumerGroup);
-                } else {
-                    log.debug("No cursors available - all topics exhausted");
-                }
+                log.warn("event=legacy_delivery.empty_batch group={} topicsRequested={} " +
+                         "reason=all_cursors_null_or_exhausted topicStates={} — no data will be sent to legacy consumer",
+                         consumerGroup, topics.size(), topicStates);
                 return batch;
             }
 
@@ -204,7 +225,46 @@ public class LegacyConsumerDeliveryManager {
                         if (nextEntry != null) {
                             List<MessageRecord> fetched =
                                     storage.read(topic, 0, nextEntry.offset, MSG_CHUNK);
-                            if (fetched != null) buf.addAll(fetched);
+                            if (fetched != null && !fetched.isEmpty()) {
+                                List<MessageRecord> filtered = fetched.stream()
+                                        .filter(record -> record.getOffset() >= nextEntry.offset)
+                                        .toList();
+                                MessageRecord firstFetched = fetched.get(0);
+                                MessageRecord lastFetched = fetched.get(fetched.size() - 1);
+                                log.info("event=legacy_delivery.prefetch group={} topic={} requestOffset={} " +
+                                         "fetchedCount={} firstFetchedOffset={} lastFetchedOffset={}",
+                                        consumerGroup, topic, nextEntry.offset, fetched.size(),
+                                        firstFetched.getOffset(), lastFetched.getOffset());
+                                if (firstFetched.getOffset() < nextEntry.offset) {
+                                    log.warn("event=legacy_delivery.prefetch_before_request group={} topic={} " +
+                                             "requestOffset={} firstFetchedOffset={} fetchedCount={}",
+                                            consumerGroup, topic, nextEntry.offset,
+                                            firstFetched.getOffset(), fetched.size());
+                                }
+                                if (filtered.isEmpty()) {
+                                    log.warn("event=legacy_delivery.prefetch_all_stale group={} topic={} " +
+                                             "requestOffset={} fetchedCount={} firstFetchedOffset={} lastFetchedOffset={}",
+                                            consumerGroup, topic, nextEntry.offset, fetched.size(),
+                                            firstFetched.getOffset(), lastFetched.getOffset());
+                                } else {
+                                    MessageRecord firstFiltered = filtered.get(0);
+                                    MessageRecord lastFiltered = filtered.get(filtered.size() - 1);
+                                    if (filtered.size() != fetched.size()) {
+                                        log.warn("event=legacy_delivery.prefetch_trimmed_stale group={} topic={} " +
+                                                 "requestOffset={} droppedCount={} firstFilteredOffset={} lastFilteredOffset={}",
+                                                consumerGroup, topic, nextEntry.offset,
+                                                fetched.size() - filtered.size(),
+                                                firstFiltered.getOffset(), lastFiltered.getOffset());
+                                    }
+                                    if (firstFiltered.getOffset() != nextEntry.offset) {
+                                        log.warn("event=legacy_delivery.prefetch_first_offset_mismatch group={} topic={} " +
+                                                 "requestOffset={} firstFilteredOffset={} filteredCount={}",
+                                                consumerGroup, topic, nextEntry.offset,
+                                                firstFiltered.getOffset(), filtered.size());
+                                    }
+                                    buf.addAll(filtered);
+                                }
+                            }
                         }
                     }
 
@@ -219,11 +279,30 @@ public class LegacyConsumerDeliveryManager {
                         // Fallback: gap or pre-fetch mismatch — single direct read
                         List<MessageRecord> messages = storage.read(topic, 0, entry.offset, 1);
                         if (messages != null && !messages.isEmpty()) {
-                            msg = messages.get(0);
+                            MessageRecord candidate = messages.get(0);
+                            if (candidate.getOffset() < entry.offset) {
+                                log.warn("event=legacy_delivery.single_read_before_request group={} topic={} " +
+                                         "requestOffset={} candidateOffset={}",
+                                        consumerGroup, topic, entry.offset, candidate.getOffset());
+                            } else {
+                                msg = candidate;
+                            }
                         }
                     }
 
                     if (msg != null) {
+                        if (msg.getOffset() != entry.offset) {
+                            log.warn("event=legacy_delivery.cursor_record_mismatch group={} topic={} " +
+                                     "cursorOffset={} recordOffset={} committedOffset={} msgKey={}",
+                                    consumerGroup, topic, entry.offset, msg.getOffset(),
+                                    committedOffsets.getOrDefault(topic, -1L), msg.getMsgKey());
+                        }
+                        long committedOffset = committedOffsets.getOrDefault(topic, -1L);
+                        if (msg.getOffset() <= committedOffset) {
+                            log.warn("event=legacy_delivery.skip_stale_record group={} topic={} committedOffset={} candidateOffset={} msgKey={}",
+                                    consumerGroup, topic, committedOffset, msg.getOffset(), msg.getMsgKey());
+                            continue;
+                        }
                         batch.add(topic, msg);
                         log.trace("Merged message: topic={}, offset={}, key={}",
                                 topic, msg.getOffset(), msg.getMsgKey());
@@ -245,6 +324,17 @@ public class LegacyConsumerDeliveryManager {
             log.debug("Merged batch complete: messages={}, bytes={}, topics={}",
                     batch.getMessageCount(), batch.getTotalBytes(), batch.getMaxOffsetPerTopic());
 
+            for (Map.Entry<String, Long> entry : batch.getMaxOffsetPerTopic().entrySet()) {
+                String topic = entry.getKey();
+                long committedOffset = committedOffsets.getOrDefault(topic, -1L);
+                long batchMaxOffset = entry.getValue();
+                if (batchMaxOffset <= committedOffset) {
+                    log.warn("event=legacy_delivery.non_monotonic_batch group={} topic={} committedOffset={} batchMaxOffset={} topicMessageCount={}",
+                            consumerGroup, topic, committedOffset, batchMaxOffset,
+                            batch.getMessageCountPerTopic().getOrDefault(topic, 0));
+                }
+            }
+
             return batch;
 
         } finally {
@@ -261,20 +351,36 @@ public class LegacyConsumerDeliveryManager {
 
     /**
      * Create a TopicCursor for reading index entries from a topic.
+     * Handles two edge cases:
+     * - Compacted index files (.compacted.index) must be recognized as valid segments.
+     * - Gap between compacted segment end and active segment base: if the floor-entry
+     *   index yields an immediately-exhausted cursor (no records >= startOffset), fall
+     *   back to the next segment (ceiling-entry).
      */
     private TopicCursor createCursor(String topic, long startOffset, boolean debugPriceQuote) throws IOException {
-        // Find the segment containing startOffset
-        // For simplicity, we'll use the active segment (partition 0)
-        // In production, we'd query SegmentManager for the correct segment
-
         if (debugPriceQuote) {
             log.debug("[PRICE-QUOTE] createCursor: topic={}, startOffset={}", topic, startOffset);
         }
         Path indexPath = findIndexPath(topic, startOffset, debugPriceQuote);
         if (indexPath == null) {
-            if (debugPriceQuote) {
-                log.debug("[PRICE-QUOTE] No index file found for topic: {}, startOffset={}", topic, startOffset);
+            // No segment covers startOffset — either the race window deleted it temporarily,
+            // or compaction removed the entire segment (survivorCount==0).
+            // Try falling back to the earliest available segment so the consumer can continue
+            // rather than stalling permanently when data has been compacted away.
+            Path earliestPath = findEarliestIndexPath(topic);
+            if (earliestPath != null) {
+                long earliestBase = parseIndexBaseOffset(earliestPath.getFileName().toString());
+                if (earliestBase > startOffset) {
+                    log.warn("event=legacy_delivery.offset_reset_to_earliest " +
+                             "topic={} staleOffset={} earliestBase={} " +
+                             "reason=segment_compacted_away — consumer skipped ahead to earliest available segment",
+                             topic, startOffset, earliestBase);
+                    return new TopicCursor(topic, earliestPath, earliestBase);
+                }
             }
+            log.warn("event=legacy_delivery.topic_dropped topic={} startOffset={} " +
+                     "reason=no_index_found — topic will be absent from this merged batch",
+                     topic, startOffset);
             return null;
         }
 
@@ -282,10 +388,118 @@ public class LegacyConsumerDeliveryManager {
             log.debug("[PRICE-QUOTE] Found index path: {}", indexPath);
         }
         TopicCursor cursor = new TopicCursor(topic, indexPath, startOffset);
+        IndexEntry initialEntry = cursor.peek();
+        if (initialEntry != null) {
+            log.info("event=legacy_delivery.cursor_created topic={} indexFile={} startOffset={} initialOffset={}",
+                    topic, indexPath.getFileName(), startOffset, initialEntry.offset);
+            if (initialEntry.offset < startOffset) {
+                log.warn("event=legacy_delivery.cursor_seek_mismatch topic={} indexFile={} startOffset={} initialOffset={}",
+                        topic, indexPath.getFileName(), startOffset, initialEntry.offset);
+            }
+        } else {
+            log.info("event=legacy_delivery.cursor_created_empty topic={} indexFile={} startOffset={}",
+                    topic, indexPath.getFileName(), startOffset);
+        }
+
+        // Gap fallback: if the floor-entry segment has no records >= startOffset
+        // (e.g. startOffset is in the hole between a compacted segment and the active segment),
+        // advance to the next segment rather than returning an immediately-exhausted cursor.
+        if (!cursor.hasMore()) {
+            cursor.close();
+            long floorBase = parseIndexBaseOffset(indexPath.getFileName().toString());
+            Path nextPath = findNextIndexPath(topic, floorBase, debugPriceQuote);
+            if (nextPath == null) {
+                if (debugPriceQuote) {
+                    log.debug("[PRICE-QUOTE] Gap fallback: no next segment after base={}", floorBase);
+                }
+                return null;
+            }
+            if (debugPriceQuote) {
+                log.debug("[PRICE-QUOTE] Gap fallback: advancing from base={} to {}", floorBase, nextPath.getFileName());
+            }
+            cursor = new TopicCursor(topic, nextPath, startOffset);
+            IndexEntry nextInitialEntry = cursor.peek();
+            if (nextInitialEntry != null) {
+                log.info("event=legacy_delivery.cursor_gap_fallback topic={} indexFile={} startOffset={} initialOffset={}",
+                        topic, nextPath.getFileName(), startOffset, nextInitialEntry.offset);
+                if (nextInitialEntry.offset < startOffset) {
+                    log.warn("event=legacy_delivery.cursor_gap_fallback_mismatch topic={} indexFile={} " +
+                             "startOffset={} initialOffset={}",
+                            topic, nextPath.getFileName(), startOffset, nextInitialEntry.offset);
+                }
+            } else {
+                log.info("event=legacy_delivery.cursor_gap_fallback_empty topic={} indexFile={} startOffset={}",
+                        topic, nextPath.getFileName(), startOffset);
+            }
+        }
+
         if (debugPriceQuote) {
             log.debug("[PRICE-QUOTE] TopicCursor created for topic: {}", topic);
         }
         return cursor;
+    }
+
+    /**
+     * Parse the base offset from an index filename.
+     * Handles both standard (NNNN.index) and compacted (NNNN.compacted.index) names.
+     */
+    private long parseIndexBaseOffset(String filename) {
+        String offsetStr;
+        if (filename.endsWith(".compacted.index")) {
+            offsetStr = filename.substring(0, filename.length() - ".compacted.index".length());
+        } else {
+            offsetStr = filename.substring(0, filename.length() - ".index".length());
+        }
+        try {
+            return Long.parseLong(offsetStr);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
+     * Find the index file with the smallest baseOffset in the partition directory.
+     * Used as a recovery fallback when the consumer's committed offset falls in a
+     * segment that was deleted by compaction (survivorCount==0 path).
+     */
+    private Path findEarliestIndexPath(String topic) {
+        Path topicDir = Paths.get(dataDir, topic, "partition-0");
+        java.io.File[] indexFiles = topicDir.toFile().listFiles(
+                f -> f.isFile() && f.getName().endsWith(".index"));
+        if (indexFiles == null) return null;
+
+        Path bestPath = null;
+        long bestBase = Long.MAX_VALUE;
+        for (java.io.File f : indexFiles) {
+            long base = parseIndexBaseOffset(f.getName());
+            if (base >= 0 && base < bestBase) {
+                bestBase = base;
+                bestPath = f.toPath();
+            }
+        }
+        return bestPath;
+    }
+
+    /**
+     * Find the index file for the next segment after afterBaseOffset (ceiling-entry).
+     * Returns the file with the smallest baseOffset that is strictly > afterBaseOffset.
+     */
+    private Path findNextIndexPath(String topic, long afterBaseOffset, boolean debugPriceQuote) {
+        Path topicDir = Paths.get(dataDir, topic, "partition-0");
+        java.io.File[] indexFiles = topicDir.toFile().listFiles(
+                f -> f.isFile() && f.getName().endsWith(".index"));
+        if (indexFiles == null) return null;
+
+        Path bestPath = null;
+        long bestBase = Long.MAX_VALUE;
+        for (java.io.File f : indexFiles) {
+            long base = parseIndexBaseOffset(f.getName());
+            if (base > afterBaseOffset && base < bestBase) {
+                bestBase = base;
+                bestPath = f.toPath();
+            }
+        }
+        return bestPath;
     }
 
     /**
@@ -332,23 +546,30 @@ public class LegacyConsumerDeliveryManager {
 
         for (java.io.File indexFile : indexFiles) {
             String name = indexFile.getName();
-            // Strip ".index" suffix to get the zero-padded base-offset string
-            String offsetStr = name.substring(0, name.length() - ".index".length());
-            try {
-                long baseOffset = Long.parseLong(offsetStr);
-                if (baseOffset <= startOffset && baseOffset > bestBaseOffset) {
-                    bestBaseOffset = baseOffset;
-                    bestIndexPath = indexFile.toPath();
-                }
-            } catch (NumberFormatException e) {
+            // Silently skip staging files written by CompactionRewriter mid-run (.compacting.*)
+            if (name.contains(".compacting.")) {
+                log.debug("event=legacy_delivery.skip_staging_index filename={}", name);
+                continue;
+            }
+            long baseOffset = parseIndexBaseOffset(name);
+            if (baseOffset < 0) {
                 log.warn("event=legacy_delivery.index_file_skipped filename={} reason=non_standard_name", name);
+                continue;
+            }
+            if (baseOffset <= startOffset && baseOffset > bestBaseOffset) {
+                bestBaseOffset = baseOffset;
+                bestIndexPath = indexFile.toPath();
             }
         }
 
         if (bestIndexPath == null) {
-            if (debugPriceQuote) {
-                log.debug("[PRICE-QUOTE] No index file covers startOffset={} in {}", startOffset, topicDir);
-            }
+            // Build a concise picture of what IS on disk to help diagnose race windows vs deleted segments
+            String presentFiles = java.util.Arrays.stream(indexFiles)
+                    .map(f -> f.getName() + "(" + formatFileSize(f.length()) + ")")
+                    .collect(java.util.stream.Collectors.joining(", "));
+            log.warn("event=legacy_delivery.no_covering_index topic={} startOffset={} " +
+                     "presentIndexFiles=[{}] — segment may have been deleted by compaction or race window active",
+                     topic, startOffset, presentFiles);
             return null;
         }
 
@@ -388,6 +609,19 @@ public class LegacyConsumerDeliveryManager {
             long maxOffset = entry.getValue();
 
             String offsetKey = consumerGroup + ":" + topic;
+            long currentOffset = offsetTracker.getOffset(offsetKey);
+            if (maxOffset < currentOffset) {
+                log.warn("event=legacy_batch_ack.stale_offset_ignored group={} topic={} currentOffset={} ackOffset={}",
+                        consumerGroup, topic, currentOffset, maxOffset);
+                continue;
+            }
+
+            if (maxOffset == currentOffset) {
+                log.debug("Legacy batch ACK offset unchanged: topic={}, group={}, offset={}",
+                        topic, consumerGroup, maxOffset);
+                continue;
+            }
+
             offsetTracker.updateOffset(offsetKey, maxOffset);
 
             log.debug("Updated offset: topic={}, group={}, offset={}",

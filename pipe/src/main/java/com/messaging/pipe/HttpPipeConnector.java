@@ -9,8 +9,6 @@ import com.messaging.pipe.metrics.PipeMetrics;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.micronaut.http.HttpRequest;
-import io.micronaut.http.HttpResponse;
 import io.micronaut.http.client.HttpClient;
 import io.micronaut.http.client.annotation.Client;
 import io.micrometer.core.instrument.Timer;
@@ -20,6 +18,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.net.URI;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.*;
 import java.util.Properties;
 import java.util.concurrent.*;
@@ -36,7 +37,8 @@ public class HttpPipeConnector implements PipeConnector {
 
     private static final String OFFSET_FILE = "pipe-offset.properties";
 
-    private final HttpClient httpClient;
+    private final HttpClient httpClient;  // kept for Micronaut injection only; not used in pollParent
+    private final java.net.http.HttpClient streamingHttpClient;
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
     private final Path offsetFilePath;
@@ -62,6 +64,9 @@ public class HttpPipeConnector implements PipeConnector {
             @Value("${broker.pipe.poll-limit:5}") int pollLimit,
             PipeMetrics metrics) throws StorageException {
         this.httpClient = httpClient;
+        this.streamingHttpClient = java.net.http.HttpClient.newBuilder()
+                .connectTimeout(java.time.Duration.ofSeconds(10))
+                .build();
 
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
@@ -204,53 +209,62 @@ public class HttpPipeConnector implements PipeConnector {
     }
 
     /**
-     * Poll parent broker using streaming InputStream
+     * Poll parent broker using a streaming InputStream — no byte[] buffer.
+     * The previous implementation used httpClient.toBlocking().exchange(request, byte[].class)
+     * which materialized the full response body as a byte[] before parsing. With message
+     * payloads from the 4.3 GB SQLite database, each poll response was 1-2 MB, creating a
+     * humongous G1 object every 500 ms and filling the heap in under 7 minutes (OOM exit 3).
+     * java.net.http.HttpClient.BodyHandlers.ofInputStream() streams directly into the JSON
+     * parser with no intermediate heap copy.
      */
     private int pollParent() throws IOException {
         if (!running || connection == null) return 0;
 
-        // Start timing the pipe fetch operation
         Timer.Sample sample = metrics.startFetchTimer();
 
         try {
             String parentUrl = normalizeUrl(connection.parentUrl);
             String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + pollLimit;
 
-            HttpRequest<?> request = HttpRequest.GET(pollUrl);
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(pollUrl))
+                    .timeout(java.time.Duration.ofSeconds(30))
+                    .GET()
+                    .build();
 
-            HttpResponse<byte[]> response =
-                    httpClient.toBlocking().exchange(request, byte[].class);
+            HttpResponse<InputStream> response;
+            try {
+                response = streamingHttpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return 0;
+            }
 
-            // Record latency after HTTP request completes
             metrics.recordFetchLatency(sample);
 
-            if (response.getStatus().getCode() == 200) {
-                byte[] body = response.body();
-                if (body == null || body.length == 0) {
-                    metrics.recordEmptyFetch();
-                    return 0;
-                }
-                try (InputStream is = new java.io.ByteArrayInputStream(body)) {
+            int statusCode = response.statusCode();
+            if (statusCode == 200) {
+                try (InputStream is = response.body()) {
                     int count = streamAndHandle(is);
-                    if (count == 0) {
-                        metrics.recordEmptyFetch();
-                    }
+                    if (count == 0) metrics.recordEmptyFetch();
                     return count;
                 }
             }
 
-            if (response.getStatus().getCode() == 204) {
-                // No content available - this is normal
-                metrics.recordEmptyFetch();
-            } else if (response.getStatus().getCode() != 204) {
-                log.warn("event=pipe_connector.poll_failed status={}", response.getStatus().getCode());
-                metrics.recordFetchError();
+            // Drain non-200 body to allow TCP connection reuse
+            try (InputStream is = response.body()) {
+                is.transferTo(OutputStream.nullOutputStream());
             }
 
+            if (statusCode == 204) {
+                metrics.recordEmptyFetch();
+            } else {
+                log.warn("event=pipe_connector.poll_failed status={}", statusCode);
+                metrics.recordFetchError();
+            }
             return 0;
 
         } catch (IOException e) {
-            // Record error metric before rethrowing
             metrics.recordFetchError();
             throw e;
         }

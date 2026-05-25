@@ -1,14 +1,11 @@
 package com.messaging.broker.ack;
 
-import io.micronaut.context.annotation.Value;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
+import com.messaging.broker.compaction.SharedRocksDb;
 import jakarta.inject.Singleton;
 import org.rocksdb.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -20,66 +17,24 @@ import java.nio.charset.StandardCharsets;
  * Offset is the true unique event identity in this system. Keying by offset prevents
  * duplicate msgKeys at different offsets from collapsing to a single row under RocksDB
  * LSM compaction. It also ensures records with null msgKey are tracked correctly.
+ *
+ * Uses the default column family of the shared {@link SharedRocksDb} instance.
+ * Lifecycle (open/close) is managed by {@link SharedRocksDb}.
  */
 @Singleton
 public class RocksDbAckStore {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbAckStore.class);
 
-    private final String dbPath;
-    private final long blockCacheBytes;
+    private final RocksDB db;
+    private final ColumnFamilyHandle cf;
+    private final WriteOptions writeOptions;
 
-    private RocksDB db;
-    private Options options;
-    private WriteOptions writeOptions;
-
-    public RocksDbAckStore(
-            @Value("${ack-store.rocksdb.path}") String dbPath,
-            @Value("${ack-store.rocksdb.block-cache-bytes:33554432}") long blockCacheBytes) {
-        this.dbPath = dbPath;
-        this.blockCacheBytes = blockCacheBytes;
-    }
-
-    @PostConstruct
-    public void init() throws RocksDBException {
-        RocksDB.loadLibrary();
-
-        // Block-based table config: LRU cache + Bloom filter for point lookups
-        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
-                .setBlockCache(new LRUCache(blockCacheBytes))
-                .setFilterPolicy(new BloomFilter(10, false));
-
-        options = new Options()
-                .setCreateIfMissing(true)
-                .setWriteBufferSize(16 * 1024 * 1024)          // 16 MB memtable
-                .setMaxWriteBufferNumber(2)                      // 1 active + 1 flushing
-                .setMaxBackgroundJobs(2)                         // 1 compaction + 1 flush
-                .setCompressionType(CompressionType.LZ4_COMPRESSION)       // L0-L5
-                .setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION) // L6
-                .setTableFormatConfig(tableConfig)
-                .optimizeForPointLookup(blockCacheBytes);
-
-        // Ensure parent directories exist
-        new File(dbPath).mkdirs();
-
-        writeOptions = new WriteOptions().setSync(false).setDisableWAL(false);
-
-        db = RocksDB.open(options, dbPath);
-        log.info("RocksDbAckStore opened at {}", dbPath);
-    }
-
-    @PreDestroy
-    public void close() {
-        if (db != null) {
-            db.close();
-            log.info("RocksDbAckStore closed");
-        }
-        if (writeOptions != null) {
-            writeOptions.close();
-        }
-        if (options != null) {
-            options.close();
-        }
+    public RocksDbAckStore(SharedRocksDb sharedDb) {
+        this.db           = sharedDb.getDb();
+        this.cf           = sharedDb.getDefaultHandle();
+        this.writeOptions = sharedDb.getWriteOptions();
+        log.info("RocksDbAckStore initialised (shared DB, default column family)");
     }
 
     // ── Single record operations ──────────────────────────────────────────────
@@ -90,7 +45,7 @@ public class RocksDbAckStore {
     public void put(String topic, String group, long offset, AckRecord record) {
         byte[] key = buildKey(topic, group, offset);
         try {
-            db.put(writeOptions, key, record.toBytes());
+            db.put(cf, writeOptions, key, record.toBytes());
         } catch (RocksDBException e) {
             log.error("RocksDB put failed for topic={} group={} offset={}", topic, group, offset, e);
         }
@@ -104,7 +59,7 @@ public class RocksDbAckStore {
     public AckRecord get(String topic, String group, long offset) {
         byte[] key = buildKey(topic, group, offset);
         try {
-            byte[] value = db.get(key);
+            byte[] value = db.get(cf, key);
             return value != null ? AckRecord.fromBytes(value) : null;
         } catch (RocksDBException e) {
             log.error("RocksDB get failed for topic={} group={} offset={}", topic, group, offset, e);
@@ -126,7 +81,7 @@ public class RocksDbAckStore {
         }
         try (WriteBatch batch = new WriteBatch()) {
             for (int i = 0; i < topics.length; i++) {
-                batch.put(buildKey(topics[i], groups[i], records[i].offset), records[i].toBytes());
+                batch.put(cf, buildKey(topics[i], groups[i], records[i].offset), records[i].toBytes());
             }
             db.write(writeOptions, batch);
             log.debug("RocksDB ACK: wrote {} records", topics.length);
@@ -147,7 +102,7 @@ public class RocksDbAckStore {
     public void clearByTopicAndGroup(String topic, String group) {
         byte[] prefix = (topic + "|" + group + "|").getBytes(StandardCharsets.UTF_8);
         try (WriteBatch batch = new WriteBatch();
-             RocksIterator iter = db.newIterator()) {
+             RocksIterator iter = db.newIterator(cf)) {
             iter.seek(prefix);
             int deleted = 0;
             while (iter.isValid()) {
@@ -155,7 +110,7 @@ public class RocksDbAckStore {
                 if (!startsWith(key, prefix)) {
                     break;
                 }
-                batch.delete(key);
+                batch.delete(cf, key);
                 deleted++;
                 iter.next();
             }

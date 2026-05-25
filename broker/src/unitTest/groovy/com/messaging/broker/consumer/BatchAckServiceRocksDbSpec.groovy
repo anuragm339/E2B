@@ -38,7 +38,7 @@ class BatchAckServiceRocksDbSpec extends Specification {
         service = new BatchAckService(
                 stateService, pendingAckStore, offsetTracker, metrics, storage,
                 registrationService, legacyDeliveryManager, consumerLogger,
-                ackStore, syncStorageExecutor)
+                ackStore, syncStorageExecutor, true)
     }
 
     // ── Modern ACK path ───────────────────────────────────────────────────────
@@ -151,19 +151,20 @@ class BatchAckServiceRocksDbSpec extends Specification {
         when:
         service.handleModernBatchAck("client-large", "prices-v1", "group-large")
 
-        then: "putBatch is called exactly once with all 101 AckRecords from both storage reads"
+        then: "putBatch is called once per storage chunk — first chunk (60 records) reaches RocksDB"
+        // Implementation flushes per-chunk to avoid OOM on large replay batches.
+        // First chunk: records 1000..1059 from the simulated 1MB cut-off read
         1 * ackStore.putBatch(
-            { String[] t -> t.length == 101 && t.every { it == "prices-v1" } },
-            { String[] g -> g.length == 101 && g.every { it == "group-large" } },
-            { AckRecord[] r ->
-                // Offsets from both chunks must be present: first chunk ends at 1059,
-                // second chunk starts at 1060 — a single storage.read() would miss 1060..1100
-                r.length == 101 &&
-                r[0].offset   == 1000L &&  // first record from first chunk
-                r[59].offset  == 1059L &&  // last record from first chunk (1MB cut-off point)
-                r[60].offset  == 1060L &&  // first record from second chunk — proves loop ran
-                r[100].offset == 1100L     // last record from second chunk
-            }
+            { String[] t -> t.length == 60 && t.every { it == "prices-v1" } },
+            { String[] g -> g.length == 60 && g.every { it == "group-large" } },
+            { AckRecord[] r -> r.length == 60 && r[0].offset == 1000L && r[59].offset == 1059L }
+        )
+
+        and: "second chunk (41 records) also reaches RocksDB — proves the loop iterated past the cut-off"
+        1 * ackStore.putBatch(
+            { String[] t -> t.length == 41 && t.every { it == "prices-v1" } },
+            { String[] g -> g.length == 41 && g.every { it == "group-large" } },
+            { AckRecord[] r -> r.length == 41 && r[0].offset == 1060L && r[40].offset == 1100L }
         )
     }
 

@@ -81,8 +81,6 @@ class GappedOffsetJourneySpec extends BrokerSystemTestSupport {
             [offset: 50000L, topic: 'prices-v1', partition: 0,
              msgKey: 'sparse-50000', eventType: 'MESSAGE', data: '{"i":50000}'],
         ])
-        // Give broker time to poll and persist the offline record
-        sleep(2000)
 
         and: "the offline record is persisted in StorageEngine at offset 50000"
         new PollingConditions(timeout: 5, delay: 0.2).eventually {
@@ -92,7 +90,7 @@ class GappedOffsetJourneySpec extends BrokerSystemTestSupport {
         and: "a fresh consumer context connects with the same group"
         def freshConsumerCtx = ApplicationContext.run(consumerProperties() as Map<String, Object>)
         triggerConsumerManagerStartup(freshConsumerCtx)
-        sleep(2000)
+        awaitConsumerConnected(freshConsumerCtx)
 
         then: "fresh consumer receives exactly the record at offset 50000 — resumed from committed offset 1001"
         // getBatchFileRegion() finds the first record ≥ 1001 via binary search → offset 50000
@@ -131,6 +129,6 @@ class GappedOffsetJourneySpec extends BrokerSystemTestSupport {
         // Restore the shared consumer context so the broker is not left connectionless
         consumerCtx = ApplicationContext.run(consumerProperties() as Map<String, Object>)
         triggerConsumerManagerStartup(consumerCtx)
-        sleep(1000)
+        awaitConsumerConnected(consumerCtx)
     }
 }
