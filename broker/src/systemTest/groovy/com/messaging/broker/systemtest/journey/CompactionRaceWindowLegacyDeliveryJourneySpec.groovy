@@ -3,6 +3,7 @@ package com.messaging.broker.systemtest.journey
 import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
 import com.messaging.broker.systemtest.support.LegacyConsumerClient
+import com.messaging.common.api.StorageEngine
 import com.messaging.network.legacy.events.BatchEvent
 import com.messaging.network.legacy.events.ReadyEvent
 import spock.util.concurrent.PollingConditions
@@ -100,7 +101,10 @@ class CompactionRaceWindowLegacyDeliveryJourneySpec extends BrokerSystemTestSupp
         and: "first compaction creates the .compacted.log + .compacted.index pair"
         def scheduler = brokerCtx.getBean(
             Class.forName('com.messaging.broker.compaction.CompactionScheduler'))
-        sleep(600)          // allow pipe records to be stored before compacting
+        def storage = brokerCtx.getBean(StorageEngine)
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert storage.read('prices-v1', 0, 6L, 1).any { it.msgKey == 'crw-D' }
+        }
         // Force-seal the active segment before compacting.  Records are ~29 B each, so all 6
         // fit comfortably in a 512 B segment without triggering a natural rollover.
         // compact() only processes SEALED (inactive) segments; without an explicit seal
@@ -109,7 +113,6 @@ class CompactionRaceWindowLegacyDeliveryJourneySpec extends BrokerSystemTestSupp
             Class.forName('com.messaging.storage.segment.SegmentAccess'))
         segmentAccess.getSegmentManager('prices-v1', 0)?.forceRollActiveSegment()
         scheduler.compact() // seals & compacts; crw-A v1/v2 removed, v3 + B/C/D survive
-        sleep(300)          // let SegmentManager install the new segment
 
         and: "connect legacy client AFTER compaction so the delivery-filter index is populated"
         // Connecting BEFORE Phase-1 compaction would let the broker deliver all 3 crw-A
@@ -146,7 +149,6 @@ class CompactionRaceWindowLegacyDeliveryJourneySpec extends BrokerSystemTestSupp
                 // opportunities.  Each run may create a new .compacted.* pair.
                 5.times {
                     scheduler.compact()
-                    sleep(80)
                 }
             } finally {
                 compactionDone.countDown()

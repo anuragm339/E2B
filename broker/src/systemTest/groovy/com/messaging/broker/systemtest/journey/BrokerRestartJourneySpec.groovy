@@ -74,7 +74,7 @@ class BrokerRestartJourneySpec extends BrokerSystemTestSupport {
         def restartedConsumerCtx = ApplicationContext.run(
                 restartedConsumerProperties(newBrokerPort) as Map<String, Object>)
         triggerConsumerManagerStartup(restartedConsumerCtx)
-        sleep(2000)
+        awaitConsumerConnected(restartedConsumerCtx)
 
         then: "consumer receives exactly the 3 post-restart records — no re-delivery"
         def freshCollector = restartedConsumerCtx.getBean(TestRecordCollector)

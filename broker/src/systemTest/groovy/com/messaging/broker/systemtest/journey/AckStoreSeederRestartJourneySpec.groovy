@@ -64,7 +64,7 @@ class AckStoreSeederRestartJourneySpec extends BrokerSystemTestSupport {
         def restartedConsumerCtx = ApplicationContext.run(
                 restartedConsumerProperties(newBrokerPort) as Map<String, Object>)
         triggerConsumerManagerStartup(restartedConsumerCtx)
-        sleep(2000)
+        awaitConsumerConnected(restartedConsumerCtx)
         cloudServer.enqueueMessages((6..7).collect { i ->
             [offset: (long) i, topic: 'prices-v1', partition: 0,
              msgKey: "post-seed-${i}", eventType: 'MESSAGE', data: """{"i":${i}}"""]

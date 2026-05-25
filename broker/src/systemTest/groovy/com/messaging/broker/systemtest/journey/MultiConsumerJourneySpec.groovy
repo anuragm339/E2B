@@ -33,7 +33,7 @@ class MultiConsumerJourneySpec extends BrokerSystemTestSupport {
             'broker.storage.dataDir' : "${dataDir}/consumer-b",
         ] as Map<String, Object>)
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
     }
 
     def cleanupSpec() {

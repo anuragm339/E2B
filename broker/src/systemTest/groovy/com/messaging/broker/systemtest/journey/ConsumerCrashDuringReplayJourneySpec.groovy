@@ -47,7 +47,7 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
         // super.setupSpec() is invoked automatically by the Spock framework before this method.
         consumerBCtx = newConsumerB()
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
     }
 
     def cleanupSpec() {
@@ -98,7 +98,6 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
         // B's connection is dropped. The broker may remain in REPLAYING (B's offset stalled)
         // or advance to READY_SENT — either way the refresh cannot fully complete until B
         // reconnects. The pipe is paused so this record is buffered until after READY.
-        sleep(3000)  // give broker time to notice disconnect and attempt replay checks
         cloudServer.enqueueMessages([
             [offset: 50L, topic: 'prices-v1', partition: 0,
              msgKey: 'during-replay-A', eventType: 'MESSAGE', data: '{"mid":1}']
@@ -112,7 +111,7 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
         when: "consumer B reconnects (POS terminal comes back online)"
         consumerBCtx = newConsumerB()
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
 
         then: "refresh completes — B registered as late-joiner, both groups caught up"
         new PollingConditions(timeout: 30, delay: 0.5).eventually {

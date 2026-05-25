@@ -87,7 +87,7 @@ class CompactionRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
         def restartedConsumerCtx = ApplicationContext.run(
             restartedConsumerProperties(newBrokerPort) as Map<String, Object>)
         triggerConsumerManagerStartup(restartedConsumerCtx)
-        sleep(2000)
+        awaitConsumerConnected(restartedConsumerCtx)
 
         then: "probe record arrives — recovery loaded compacted segments correctly"
         def freshCollector = restartedConsumerCtx.getBean(TestRecordCollector)

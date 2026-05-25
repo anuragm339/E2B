@@ -51,7 +51,7 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
         // Start consumer B — same topic as A, different group
         consumerBCtx = newConsumerB()
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
     }
 
     def cleanupSpec() {
@@ -117,7 +117,7 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
         when: "consumer B restarts (first restart)"
         consumerBCtx = newConsumerB()
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
         def collectorB1 = consumerBCtx.getBean(TestRecordCollector)
 
         then: "consumer B receives crash1-4..6 — resumed from its committed offset (3)"
@@ -163,7 +163,7 @@ class FlakyConsumerJourneySpec extends BrokerSystemTestSupport {
         when: "consumer B restarts a second time"
         consumerBCtx = newConsumerB()
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
         def collectorB2 = consumerBCtx.getBean(TestRecordCollector)
 
         then: "consumer B receives crash2-7..9 — resumed from committed offset 6"

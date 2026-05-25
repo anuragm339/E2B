@@ -3,6 +3,7 @@ package com.messaging.broker.systemtest.journey
 import com.messaging.broker.consumer.ConsumerOffsetTracker
 import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
 import com.messaging.broker.systemtest.support.LegacyConsumerClient
+import com.messaging.common.api.StorageEngine
 import com.messaging.network.legacy.events.BatchEvent
 import com.messaging.network.legacy.events.ReadyEvent
 import spock.util.concurrent.PollingConditions
@@ -106,7 +107,10 @@ class CompactionDeliveryRecoveryJourneySpec extends BrokerSystemTestSupport {
         and: "first compaction creates the .compacted.log + .compacted.index pair"
         def scheduler = brokerCtx.getBean(
             Class.forName('com.messaging.broker.compaction.CompactionScheduler'))
-        sleep(600)          // allow pipe records to be stored before compacting
+        def storage = brokerCtx.getBean(StorageEngine)
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert storage.read('prices-v1', 0, 6L, 1).any { it.msgKey == 'drv-F' }
+        }
         // Force-seal the active segment so compact() finds it as a candidate.
         // Records are ~29 B each; all 6 fit in the 512 B active segment without a
         // natural rollover.  compact() only processes sealed (inactive) segments.
@@ -114,7 +118,6 @@ class CompactionDeliveryRecoveryJourneySpec extends BrokerSystemTestSupport {
             Class.forName('com.messaging.storage.segment.SegmentAccess'))
         segmentAccess.getSegmentManager('prices-v1', 0)?.forceRollActiveSegment()
         scheduler.compact() // seals the segment; drv-A..F all survive (unique keys)
-        sleep(300)          // let SegmentManager install the new segment
 
         and: "connect legacy client AFTER first compaction so delivery starts with index populated"
         legacyClient = LegacyConsumerClient.connect('127.0.0.1', brokerTcpPort, 'price-quote-service')
@@ -153,7 +156,6 @@ class CompactionDeliveryRecoveryJourneySpec extends BrokerSystemTestSupport {
                 // Run compact twice to maximise the chance of racing a read or retry.
                 2.times {
                     scheduler.compact()
-                    sleep(80)
                 }
             } finally {
                 compactionDone.countDown()

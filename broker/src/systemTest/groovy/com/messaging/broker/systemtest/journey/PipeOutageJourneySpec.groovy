@@ -50,8 +50,13 @@ class PipeOutageJourneySpec extends BrokerSystemTestSupport {
              msgKey: "during-outage-${i}", eventType: 'MESSAGE', data: """{"i":${i}}"""]
         })
 
-        and: "broker polls for 2 seconds — all return 204 (paused)"
-        sleep(2000)
+        and: "broker keeps polling while delivery stays quiet during the pause window"
+        new PollingConditions(timeout: 10, delay: 0.2).eventually {
+            assert cloudServer.pollCount > pollsAtPauseStart
+        }
+        assertConditionStaysTrue(1500) {
+            collector().getAll().isEmpty()
+        }
 
         then: "no records are delivered during the pause window"
         collector().getAll().isEmpty()

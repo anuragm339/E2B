@@ -77,7 +77,6 @@ class RefreshWithCompactedAndActiveSegmentsJourneySpec extends BrokerSystemTestS
             Class.forName('com.messaging.storage.segment.SegmentAccess'))
         segmentAccess.getSegmentManager('prices-v1', 0)?.forceRollActiveSegment()
         scheduler.compact()
-        sleep(500)  // allow compaction to complete and SegmentManager to install new segments
 
         // ── Phase 3: write NEW records to the active segment (after compaction) ──
         and: "new records arrive on the active segment (plain .log, not .compacted.log)"

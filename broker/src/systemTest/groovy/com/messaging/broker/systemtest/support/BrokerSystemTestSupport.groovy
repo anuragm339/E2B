@@ -4,9 +4,12 @@ import io.micronaut.context.ApplicationContext
 import io.micronaut.runtime.server.EmbeddedServer
 import spock.lang.Shared
 import spock.lang.Specification
+import spock.util.concurrent.PollingConditions
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.LockSupport
 
 /**
  * Base class for all broker system (journey) tests.
@@ -54,9 +57,7 @@ abstract class BrokerSystemTestSupport extends Specification {
         // missed if the ServerStartupEvent publisher was created before its bean was resolved.
         // Manually trigger onApplicationEvent() to ensure the consumer connects.
         triggerConsumerManagerStartup(consumerCtx)
-
-        // Give the consumer time to connect and subscribe
-        sleep(3000)
+        awaitConsumerConnected(consumerCtx)
     }
 
     def cleanupSpec() {
@@ -213,6 +214,32 @@ abstract class BrokerSystemTestSupport extends Specification {
             }
         } catch (Exception e) {
             throw new RuntimeException("Failed to trigger ClientConsumerManager startup: " + e.message, e)
+        }
+    }
+
+    protected void awaitConsumerConnected(ApplicationContext ctx, int timeoutSecs = 15, int minConnectedTopics = 1) {
+        def mgrClass = Class.forName("com.messaging.client.ClientConsumerManager")
+        new PollingConditions(timeout: timeoutSecs, delay: 0.2).eventually {
+            def mgr = ctx.getBean(mgrClass)
+            assert mgr.isConnected()
+            assert mgr.getConnectedTopicCount() >= minConnectedTopics
+            assert ctx.findBean(TestRecordCollector).isPresent()
+        }
+    }
+
+    protected void assertConditionStaysTrue(long durationMs, long pollMs = 100L, Closure<Boolean> condition) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(durationMs)
+        while (System.nanoTime() < deadline) {
+            assert condition.call()
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(pollMs))
+        }
+        assert condition.call()
+    }
+
+    protected void waitForStableValue(long durationMs, Closure<Object> snapshotSupplier) {
+        def initial = snapshotSupplier.call()
+        assertConditionStaysTrue(durationMs) {
+            snapshotSupplier.call() == initial
         }
     }
 

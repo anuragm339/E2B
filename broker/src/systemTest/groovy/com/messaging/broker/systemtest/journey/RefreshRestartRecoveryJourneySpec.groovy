@@ -23,7 +23,7 @@ class RefreshRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
     def setupSpec() {
         consumerBCtx = newConsumerB(brokerTcpPort)
         triggerConsumerManagerStartup(consumerBCtx)
-        sleep(2000)
+        awaitConsumerConnected(consumerBCtx)
     }
 
     def cleanupSpec() {
@@ -83,7 +83,8 @@ class RefreshRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
         triggerConsumerManagerStartup(restartedConsumerA)
         def restartedConsumerB = newConsumerB(newBrokerPort)
         triggerConsumerManagerStartup(restartedConsumerB)
-        sleep(2000)
+        awaitConsumerConnected(restartedConsumerA)
+        awaitConsumerConnected(restartedConsumerB)
 
         then: "refresh recovery completes and both consumers receive READY"
         new PollingConditions(timeout: 40, delay: 0.5).eventually {

@@ -57,13 +57,12 @@ class LateConsumerAfterCompactionJourneySpec extends BrokerSystemTestSupport {
         def scheduler = brokerCtx.getBean(
             Class.forName('com.messaging.broker.compaction.CompactionScheduler'))
         scheduler.compact()
-        sleep(500)
 
         and: "a second consumer context is created and connects to the broker"
         def secondCtx = ApplicationContext.run(
             secondConsumerProperties(brokerTcpPort) as Map<String, Object>)
         triggerConsumerManagerStartup(secondCtx)
-        sleep(2000)
+        awaitConsumerConnected(secondCtx)
 
         then: "second consumer receives A-v3, B, C"
         def secondCollector = secondCtx.getBean(TestRecordCollector)
