@@ -51,6 +51,7 @@ public class RefreshContext {
     private final Instant startTime;
     private volatile Instant resetSentTime;
     private volatile Instant readySentTime;
+    private volatile Instant lastReplayProgressTime;
 
     // Downtime tracking
     // CopyOnWriteArrayList: recordStartup() (recovery thread) and getDowntimePeriods() (health/
@@ -92,6 +93,7 @@ public class RefreshContext {
         this.resetAckTimes = new ConcurrentHashMap<>();
         this.readyAckTimes = new ConcurrentHashMap<>();
         this.startTime = Instant.now();
+        this.lastReplayProgressTime = this.startTime;
         this.downtimePeriods = new CopyOnWriteArrayList<>();
         this.lastShutdownTime = null;
         this.refreshScope = refreshScope;
@@ -129,6 +131,7 @@ public class RefreshContext {
         resetAckTimes.put(consumerId, Instant.now());  // Record timestamp
         consumerReplaying.put(consumerId, true);  // Mark as replaying
         consumerOffsets.put(consumerId, 0L);      // Start from offset 0
+        lastReplayProgressTime = Instant.now();
     }
 
     public void recordReadyAck(String consumerId) {
@@ -139,6 +142,16 @@ public class RefreshContext {
 
     public void updateConsumerOffset(String consumerId, long offset) {
         consumerOffsets.put(consumerId, offset);
+    }
+
+    public boolean recordReplayProgress(String consumerId, long offset) {
+        Long previous = consumerOffsets.get(consumerId);
+        if (previous == null || offset > previous) {
+            consumerOffsets.put(consumerId, offset);
+            lastReplayProgressTime = Instant.now();
+            return true;
+        }
+        return false;
     }
 
     public boolean isConsumerReplaying(String consumerId) {
@@ -202,6 +215,8 @@ public class RefreshContext {
     public void setResetSentTime(Instant time) { this.resetSentTime = time; }
     public Instant getReadySentTime() { return readySentTime; }
     public void setReadySentTime(Instant time) { this.readySentTime = time; }
+    public Instant getLastReplayProgressTime() { return lastReplayProgressTime; }
+    public void setLastReplayProgressTime(Instant time) { this.lastReplayProgressTime = time; }
     public String getRefreshId() { return refreshId; }
     public void setRefreshId(String refreshId) { this.refreshId = refreshId; }
     public String getRefreshScope() { return refreshScope; }

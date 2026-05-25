@@ -11,6 +11,7 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Set;
 
@@ -44,6 +45,19 @@ public class RefreshReplayService implements ReplayPhase {
         Set<String> ackedConsumers = context.getReceivedResetAcks();
         if (ackedConsumers.isEmpty()) {
             return false;
+        }
+
+        int progressedConsumers = 0;
+        for (String consumerGroupTopic : ackedConsumers) {
+            long committedOffset = remoteConsumers.getCommittedOffset(consumerGroupTopic);
+            if (context.recordReplayProgress(consumerGroupTopic, committedOffset)) {
+                progressedConsumers++;
+            }
+        }
+
+        if (progressedConsumers > 0) {
+            log.debug("Replay progress advanced for topic {} on {} consumer(s); lastProgress={}",
+                    topic, progressedConsumers, Instant.now());
         }
 
         boolean allCaughtUp = allConsumersCaughtUp(topic, ackedConsumers);

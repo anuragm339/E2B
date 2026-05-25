@@ -674,6 +674,8 @@ public class Segment {
         try {
             logChannel.force(true);
             indexChannel.force(true);
+            NativePageCache.dropCache(logChannel);
+            NativePageCache.dropCache(indexChannel);
         } catch (IOException e) {
             log.error("Error forcing channels to disk", e);
         }

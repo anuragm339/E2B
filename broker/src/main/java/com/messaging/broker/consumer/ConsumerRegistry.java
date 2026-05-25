@@ -612,6 +612,13 @@ public class ConsumerRegistry {
     }
 
     /**
+     * Get committed offset for a group:topic pair.
+     */
+    public long getCommittedOffset(String consumerGroupTopic) {
+        return offsetTracker.getOffset(consumerGroupTopic);
+    }
+
+    /**
      * Get consumer group:topic identifier for clientId+topic.
      *
      * @deprecated Use getConsumerGroupTopicPairs() for multi-group support
