@@ -69,7 +69,7 @@ class RefreshRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
         when: "broker is shut down mid-refresh and later restarted with the same dataDir"
         consumerCtx.close()
         consumerBCtx.close()
-        brokerCtx.close()
+        closeBrokerContext(brokerCtx)
 
         int newBrokerPort = findFreePort()
         def restartedBrokerCtx = ApplicationContext.run(

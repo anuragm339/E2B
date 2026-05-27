@@ -62,9 +62,24 @@ abstract class BrokerSystemTestSupport extends Specification {
 
     def cleanupSpec() {
         consumerCtx?.close()
-        brokerCtx?.close()
+        closeBrokerContext(brokerCtx)
         cloudServer?.stop()
         dataDir?.toFile()?.deleteDir()
+    }
+
+    /**
+     * Disconnects the pipe connector before closing the broker context.
+     * HttpPipeConnector lacks @PreDestroy, so its scheduler thread (non-daemon) is
+     * never stopped by ApplicationContext.close().  Without this call, orphaned threads
+     * accumulate across spec classes and prevent the test JVM from exiting.
+     */
+    protected void closeBrokerContext(ApplicationContext ctx) {
+        if (ctx == null) return
+        try {
+            def pipeClass = Class.forName('com.messaging.common.api.PipeConnector')
+            ctx.findBean(pipeClass).ifPresent { it.disconnect() }
+        } catch (Exception ignored) {}
+        ctx.close()
     }
 
     def setup() {

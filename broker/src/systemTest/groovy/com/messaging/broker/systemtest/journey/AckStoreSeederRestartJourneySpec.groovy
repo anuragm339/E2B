@@ -46,7 +46,7 @@ class AckStoreSeederRestartJourneySpec extends BrokerSystemTestSupport {
 
         when: "consumer and broker are restarted with the same dataDir"
         consumerCtx.close()
-        brokerCtx.close()
+        closeBrokerContext(brokerCtx)
 
         int newBrokerPort = findFreePort()
         def restartedBrokerCtx = ApplicationContext.run(
