@@ -9,6 +9,30 @@ configurations {
     unitTestRuntimeOnly.extendsFrom runtimeOnly
 }
 
+sourceSets {
+    unitTest {
+        groovy.srcDir 'src/unitTest/groovy'
+        resources.srcDir 'src/unitTest/resources'
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+    integrationTest {
+        groovy.srcDir 'src/integrationTest/groovy'
+    }
+    journeyTest {
+        java.setSrcDirs(['src/systemTest/java'])
+        groovy.setSrcDirs(['src/systemTest/groovy'])
+        resources.setSrcDirs(['src/systemTest/resources'])
+        compileClasspath += sourceSets.main.output + configurations.testRuntimeClasspath
+        runtimeClasspath += output + compileClasspath
+    }
+    systemTest {
+        java.setSrcDirs(['src/blackboxSystemTest/java'])
+        groovy.setSrcDirs(['src/blackboxSystemTest/groovy'])
+        resources.setSrcDirs(['src/blackboxSystemTest/resources'])
+    }
+}
+
 dependencies {
     // Depend on all modules
     implementation project(':common')
@@ -63,33 +87,23 @@ dependencies {
     integrationTestImplementation 'org.xerial:sqlite-jdbc:3.45.1.0'  // SQLite driver for TestDataController tests
     integrationTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 
-    // System test dependencies
+    // Journey test dependencies (in-process harness)
+    journeyTestImplementation project(':test-consumer')
+    journeyTestImplementation 'org.apache.groovy:groovy:4.0.15'
+    journeyTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
+    journeyTestImplementation 'io.micronaut.test:micronaut-test-spock'
+    journeyTestImplementation 'io.micronaut:micronaut-inject-groovy'
+    journeyTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
+    journeyTestImplementation 'org.objenesis:objenesis:3.3'
+    journeyTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // System test dependencies (separate-process black-box)
     systemTestImplementation project(':test-consumer')
     systemTestImplementation 'org.apache.groovy:groovy:4.0.15'
     systemTestImplementation 'org.spockframework:spock-core:2.3-groovy-4.0'
-    systemTestImplementation 'io.micronaut.test:micronaut-test-spock'
-    systemTestImplementation 'io.micronaut:micronaut-inject-groovy'
     systemTestImplementation 'net.bytebuddy:byte-buddy:1.14.9'
     systemTestImplementation 'org.objenesis:objenesis:3.3'
     systemTestRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-}
-
-// Configure source sets for unit tests
-sourceSets {
-    unitTest {
-        groovy.srcDir 'src/unitTest/groovy'
-        resources.srcDir 'src/unitTest/resources'
-        compileClasspath += sourceSets.main.output
-        runtimeClasspath += sourceSets.main.output
-    }
-    // Add Groovy support to integrationTest source set (defined in root build.gradle)
-    integrationTest {
-        groovy.srcDir 'src/integrationTest/groovy'
-    }
-    // Add Groovy support to systemTest source set (defined in root build.gradle)
-    systemTest {
-        groovy.srcDir 'src/systemTest/groovy'
-    }
 }
 
 // Map test task to run unitTest source set
@@ -101,9 +115,33 @@ test {
 
 // integrationTest task already defined in root build.gradle
 
+tasks.register('journeyTest', Test) {
+    description = 'Runs in-process journey tests.'
+    group = 'verification'
+    testClassesDirs = sourceSets.journeyTest.output.classesDirs
+    classpath = sourceSets.journeyTest.runtimeClasspath
+    useJUnitPlatform()
+    shouldRunAfter test
+}
+
+def toAbsoluteClasspath = { FileCollection files ->
+    files.files.collect { it.absolutePath }.join(File.pathSeparator)
+}
+
+tasks.named('systemTest') {
+    description = 'Runs separate-process black-box system tests.'
+    shouldRunAfter tasks.named('journeyTest')
+    systemProperty 'blackbox.broker.classpath', toAbsoluteClasspath(sourceSets.main.runtimeClasspath)
+    systemProperty 'blackbox.consumer.classpath', toAbsoluteClasspath(project(':test-consumer').sourceSets.main.runtimeClasspath)
+}
+
 // The integrationTest resources dir is registered twice (root build.gradle + Gradle default convention),
 // so we must declare a duplicates strategy to avoid a build error when any file is placed there.
 processIntegrationTestResources {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+processJourneyTestResources {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 

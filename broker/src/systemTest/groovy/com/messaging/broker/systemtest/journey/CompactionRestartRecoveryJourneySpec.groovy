@@ -68,7 +68,7 @@ class CompactionRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
 
         when: "consumer context is closed, then broker context is closed (simulating restart)"
         consumerCtx.close()
-        brokerCtx.close()
+        closeBrokerContext(brokerCtx)
 
         and: "broker is restarted with the same dataDir on a new port"
         int newBrokerPort = findFreePort()
