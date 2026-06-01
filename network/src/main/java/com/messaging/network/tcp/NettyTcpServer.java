@@ -11,6 +11,7 @@ import com.messaging.network.codec.BinaryMessageEncoder;
 import com.messaging.network.codec.JsonMessageDecoder;
 import com.messaging.network.codec.JsonMessageEncoder;
 import com.messaging.network.handler.ServerMessageHandler;
+import com.messaging.network.metrics.BrokerNetworkMetrics;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.annotation.Value;
 import io.netty.bootstrap.ServerBootstrap;
@@ -48,6 +49,7 @@ public class NettyTcpServer implements NetworkServer {
     private final ConcurrentHashMap<String, Channel> clientChannels;
     private final List<MessageHandler> handlers;
     private final List<DisconnectHandler> disconnectHandlers;
+    private final BrokerNetworkMetrics networkMetrics;
 
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
@@ -55,16 +57,23 @@ public class NettyTcpServer implements NetworkServer {
 
     public NettyTcpServer(
             @Value("${broker.network.threads.boss:2}") int bossThreads,
-            @Value("${broker.network.threads.worker:8}") int workerThreads) {
+            @Value("${broker.network.threads.worker:8}") int workerThreads,
+            BrokerNetworkMetrics networkMetrics) {
 
         this.bossThreads = bossThreads;
         this.workerThreads = workerThreads;
         this.clientChannels = new ConcurrentHashMap<>();
         this.handlers = new CopyOnWriteArrayList<>();
         this.disconnectHandlers = new CopyOnWriteArrayList<>();
+        this.networkMetrics = networkMetrics;
+        this.networkMetrics.bindChannelStateGauges(this.clientChannels);
 
         log.info("Initialized NettyTcpServer: bossThreads={}, workerThreads={}",
                 bossThreads, workerThreads);
+    }
+
+    public NettyTcpServer(int bossThreads, int workerThreads) {
+        this(bossThreads, workerThreads, new BrokerNetworkMetrics(null));
     }
 
     @Override
@@ -81,6 +90,7 @@ public class NettyTcpServer implements NetworkServer {
                         protected void initChannel(SocketChannel ch) throws Exception {
                             String clientId = ch.remoteAddress().toString();
                             clientChannels.put(clientId, ch);
+                            networkMetrics.recordConnectionOpened();
 
                             ChannelPipeline pipeline = ch.pipeline();
 
@@ -95,6 +105,7 @@ public class NettyTcpServer implements NetworkServer {
                             // Handle disconnect
                             ch.closeFuture().addListener(future -> {
                                 clientChannels.remove(clientId);
+                                networkMetrics.recordConnectionClosed();
                                 log.info("Client disconnected: {}", clientId);
 
                                 // Notify disconnect handlers
@@ -145,16 +156,29 @@ public class NettyTcpServer implements NetworkServer {
     public CompletableFuture<Void> send(String clientId, BrokerMessage message) {
         Channel channel = clientChannels.get(clientId);
         if (channel == null || !channel.isActive()) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("Client not connected: " + clientId));
+            IllegalStateException ex = new IllegalStateException("Client not connected: " + clientId);
+            networkMetrics.recordSendFailure(messageType(message), "control", ex);
+            return CompletableFuture.failedFuture(ex);
+        }
+
+        if (!channel.isWritable()) {
+            IllegalStateException ex = new IllegalStateException("Channel not writable (backpressure): " + clientId);
+            networkMetrics.recordBackpressure(messageType(message), "control");
+            networkMetrics.recordSendFailure(messageType(message), "control", ex);
+            return CompletableFuture.failedFuture(ex);
         }
 
         CompletableFuture<Void> future = new CompletableFuture<>();
+        long startNanos = System.nanoTime();
+        String messageType = messageType(message);
+        int bytes = brokerMessageSizeBytes(message);
 
         channel.writeAndFlush(message).addListener((ChannelFutureListener) channelFuture -> {
             if (channelFuture.isSuccess()) {
+                networkMetrics.recordSendSuccess(messageType, "control", bytes, System.nanoTime() - startNanos);
                 future.complete(null);
             } else {
+                networkMetrics.recordSendFailure(messageType, "control", channelFuture.cause());
                 future.completeExceptionally(channelFuture.cause());
             }
         });
@@ -207,7 +231,7 @@ public class NettyTcpServer implements NetworkServer {
                 .thenCompose(ignored -> {
                     BatchPayloadFileRegion nettyRegion = new BatchPayloadFileRegion(batch, clientId);
                     regionRef.set(nettyRegion);
-                    return sendFileRegionInternal(clientId, nettyRegion);
+                    return sendFileRegionInternal(clientId, nettyRegion, batch.getTotalBytes());
                 })
                 .exceptionally(e -> {
                     // If the BatchPayloadFileRegion was never created (header send failed),
@@ -226,27 +250,33 @@ public class NettyTcpServer implements NetworkServer {
                 });
     }
 
-    private CompletableFuture<Void> sendFileRegionInternal(String clientId, FileRegion fileRegion) {
+    private CompletableFuture<Void> sendFileRegionInternal(String clientId, FileRegion fileRegion, long bytes) {
         Channel channel = clientChannels.get(clientId);
         if (channel == null || !channel.isActive()) {
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("Client not connected: " + clientId));
+            IllegalStateException ex = new IllegalStateException("Client not connected: " + clientId);
+            networkMetrics.recordSendFailure("BATCH_PAYLOAD", "file_region", ex);
+            return CompletableFuture.failedFuture(ex);
         }
 
         // Check if channel is writable before attempting to send
         // This prevents queueing writes when consumer is slow or disconnecting
         if (!channel.isWritable()) {
             log.warn("Channel not writable for client: {}, backpressure detected", clientId);
-            return CompletableFuture.failedFuture(
-                    new IllegalStateException("Channel not writable (backpressure): " + clientId));
+            IllegalStateException ex =
+                    new IllegalStateException("Channel not writable (backpressure): " + clientId);
+            networkMetrics.recordBackpressure("BATCH_PAYLOAD", "file_region");
+            networkMetrics.recordSendFailure("BATCH_PAYLOAD", "file_region", ex);
+            return CompletableFuture.failedFuture(ex);
         }
 
         CompletableFuture<Void> future = new CompletableFuture<>();
+        long startNanos = System.nanoTime();
 
         // Send FileRegion directly to Netty channel for zero-copy transfer
         // Netty will use sendfile() syscall for direct file-to-socket transfer
         channel.writeAndFlush(fileRegion).addListener((ChannelFutureListener) channelFuture -> {
             if (channelFuture.isSuccess()) {
+                networkMetrics.recordSendSuccess("BATCH_PAYLOAD", "file_region", bytes, System.nanoTime() - startNanos);
                 future.complete(null);
                 log.debug("Zero-copy FileRegion sent successfully to client: {}", clientId);
             } else {
@@ -260,6 +290,7 @@ public class NettyTcpServer implements NetworkServer {
                 } else {
                     log.debug("FileRegion send failed due to closed channel: {}", clientId);
                 }
+                networkMetrics.recordSendFailure("BATCH_PAYLOAD", "file_region", cause);
                 future.completeExceptionally(cause);
             }
         });
@@ -391,5 +422,17 @@ public class NettyTcpServer implements NetworkServer {
         public FileRegion touch(Object hint) {
             return this;
         }
+    }
+
+    private static String messageType(BrokerMessage message) {
+        return message != null && message.getType() != null ? message.getType().name() : "UNKNOWN";
+    }
+
+    private static int brokerMessageSizeBytes(BrokerMessage message) {
+        if (message == null) {
+            return 0;
+        }
+        int payloadLength = message.getPayload() != null ? message.getPayload().length : 0;
+        return 1 + 8 + 4 + payloadLength;
     }
 }
