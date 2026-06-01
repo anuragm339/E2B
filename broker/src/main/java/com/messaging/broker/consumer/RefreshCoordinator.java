@@ -1,6 +1,7 @@
 package com.messaging.broker.consumer;
 import com.messaging.broker.consumer.BatchDeliveryService;
 import com.messaging.broker.consumer.RefreshGatePolicy;
+import com.messaging.broker.monitoring.DataRefreshMetrics;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
@@ -37,6 +38,7 @@ public class RefreshCoordinator {
     private final RefreshGatePolicy dataRefreshGatePolicy;
     private final BatchDeliveryService batchDeliveryService;
     private final ConsumerRegistry remoteConsumers;
+    private final DataRefreshMetrics dataRefreshMetrics;
 
     // Shared state
     private final Map<String, RefreshContext> activeRefreshes;
@@ -55,7 +57,8 @@ public class RefreshCoordinator {
             RefreshWorkflow stateMachine,
             RefreshGatePolicy dataRefreshGatePolicy,
             BatchDeliveryService batchDeliveryService,
-            ConsumerRegistry remoteConsumers) {
+            ConsumerRegistry remoteConsumers,
+            DataRefreshMetrics dataRefreshMetrics) {
         this.initiationService = initiationService;
         this.resetService = resetService;
         this.replayService = replayService;
@@ -65,6 +68,7 @@ public class RefreshCoordinator {
         this.dataRefreshGatePolicy = dataRefreshGatePolicy;
         this.batchDeliveryService = batchDeliveryService;
         this.remoteConsumers = remoteConsumers;
+        this.dataRefreshMetrics = dataRefreshMetrics;
 
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r);
@@ -213,6 +217,7 @@ public class RefreshCoordinator {
         RefreshWorkflow.StateTransitionResult result = stateMachine.transition(state, RefreshState.ABORTED);
         if (result.isSuccess()) {
             context.setState(RefreshState.ABORTED);
+            dataRefreshMetrics.updateRefreshState(topic, RefreshState.ABORTED);
 
             ScheduledFuture<?> resetTask = resetRetryTasks.remove(topic);
             if (resetTask != null) resetTask.cancel(false);
@@ -254,6 +259,7 @@ public class RefreshCoordinator {
 
             if (transition.isSuccess()) {
                 context.setState(RefreshState.REPLAYING);
+                dataRefreshMetrics.updateRefreshState(topic, RefreshState.REPLAYING);
                 if (resetService instanceof RefreshResetService) {
                     ((RefreshResetService) resetService).persistState(context);
                 }

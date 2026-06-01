@@ -93,6 +93,7 @@ public class CompactionScheduler {
     public void compact() {
         if (!enabled) {
             log.debug("Compaction disabled, skipping");
+            metrics.recordCompactionSkipped("disabled");
             return;
         }
 
@@ -151,12 +152,14 @@ public class CompactionScheduler {
         if (sealedSegments.size() < minSegmentsPerTopic) {
             log.debug("Compaction skipped for topic={} partition={} sealedSegments={} minSegmentsPerTopic={}",
                     topic, partition, sealedSegments.size(), minSegmentsPerTopic);
+            metrics.recordCompactionSkipped("not_enough_sealed_segments");
             return false;
         }
         List<Segment> window = planner.selectDirtyWindow(sealedSegments, lastCheckpoint, windowSize);
 
         if (window.isEmpty()) {
             log.debug("No dirty segments for topic={} since checkpoint={}", topic, lastCheckpoint);
+            metrics.recordCompactionSkipped("no_dirty_segments");
             return false;
         }
 
@@ -221,12 +224,14 @@ public class CompactionScheduler {
         double processCpu = getProcessCpuUsage();
 
         if (heapUsage >= maxHeapUsage || memoryMonitor.isMemoryPressureHigh()) {
+            metrics.recordCompactionSkipped("memory_pressure");
             log.info("event=compaction_run_skipped phase={} topic={} reason=memory_pressure heapUsage={} maxHeapUsage={} warning={}",
                     phase, topic, heapUsage, maxHeapUsage, memoryMonitor.isMemoryPressureHigh());
             return false;
         }
 
         if (processCpu >= 0 && processCpu >= maxProcessCpuUsage) {
+            metrics.recordCompactionSkipped("cpu_pressure");
             log.info("event=compaction_run_skipped phase={} topic={} reason=cpu_pressure processCpuUsage={} maxProcessCpuUsage={}",
                     phase, topic, processCpu, maxProcessCpuUsage);
             return false;

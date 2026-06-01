@@ -15,51 +15,71 @@ public class DefaultConsumerEventLogger implements ConsumerEventLogger {
 
     @Override
     public void logConsumerRegistered(LogContext context) {
-        log.info("[CONSUMER] Registered: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=consumer.registered {}", context);
+        }
     }
 
     @Override
     public void logConsumerRegistrationDuplicate(LogContext context) {
-        log.warn("[CONSUMER] Registration duplicate (already registered): {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.warn("event=consumer.registration_duplicate {}", context);
+        }
     }
 
     @Override
     public void logConsumerUnregistered(LogContext context) {
-        log.info("[CONSUMER] Unregistered: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=consumer.unregistered {}", context);
+        }
     }
 
     @Override
     public void logBatchDeliveryStarted(LogContext context) {
-        log.debug("[DELIVERY] Batch started: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=batch_delivery.started {}", context);
+        }
     }
 
     @Override
     public void logBatchDeliverySucceeded(LogContext context) {
-        log.debug("[DELIVERY] Batch succeeded: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=batch_delivery.succeeded {}", context);
+        }
     }
 
     @Override
     public void logBatchDeliveryFailed(LogContext context) {
-        log.error("[DELIVERY] Batch failed: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.error("event=batch_delivery.failed {}", context);
+        }
     }
 
     @Override
     public void logBatchAckReceived(LogContext context) {
-        log.debug("[ACK] Batch ACK received: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=batch_ack.received {}", context);
+        }
     }
 
     @Override
     public void logConsumerOffsetUpdated(LogContext context) {
-        log.debug("[OFFSET] Updated: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=consumer.offset_updated {}", context);
+        }
     }
 
     @Override
     public void logConsumerLag(LogContext context) {
-        log.debug("[LAG] Calculated: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=consumer.lag_calculated {}", context);
+        }
     }
 
     @Override
     public void logConsumerOffsetClamped(LogContext context) {
-        log.warn("[OFFSET] Clamped: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.warn("event=consumer.offset_clamped {}", context);
+        }
     }
 }

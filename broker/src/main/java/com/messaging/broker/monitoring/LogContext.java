@@ -1,6 +1,7 @@
 package com.messaging.broker.monitoring;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -20,7 +21,7 @@ public class LogContext {
     }
 
     public Map<String, Object> getContext() {
-        return new HashMap<>(context);
+        return new LinkedHashMap<>(context);
     }
 
     public String get(String key) {

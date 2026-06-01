@@ -302,6 +302,18 @@ public class ConsumerRegistry {
                     clientId, consumerGroup, batch.getMessageCount(), batch.getTotalBytes(),
                     batch.getMaxOffsetPerTopic().keySet());
 
+            Map<String, Long> bytesPerTopic = batch.getBytesPerTopic();
+            Map<String, Integer> msgCountPerTopic = batch.getMessageCountPerTopic();
+            for (String topic : batch.getMaxOffsetPerTopic().keySet()) {
+                metrics.recordConsumerBatchSent(
+                        clientId,
+                        topic,
+                        consumerGroup,
+                        msgCountPerTopic.getOrDefault(topic, 0),
+                        bytesPerTopic.getOrDefault(topic, 0L)
+                );
+            }
+
             // Record bytes/messages transferred per topic for refresh metrics (during REPLAYING state only)
             if (refreshCoordinator != null) {
                 for (String topic : batch.getMaxOffsetPerTopic().keySet()) {
@@ -653,6 +665,10 @@ public class ConsumerRegistry {
         return registrationService.getConsumersByTopic(topic).stream()
                 .map(c -> c.getGroup() + ":" + c.getTopic())
                 .collect(Collectors.toSet());
+    }
+
+    public Collection<RemoteConsumer> getConsumersByClient(String clientId) {
+        return registrationService.getConsumersByClient(clientId);
     }
 
     /**

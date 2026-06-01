@@ -248,6 +248,7 @@ public class RefreshRecoveryService implements RefreshRecovery {
             // Advance directly to REPLAYING — no need to re-send RESET.
             log.info("All RESET ACKs already received for topic {} (persisted state) — advancing to REPLAYING", topic);
             context.setState(RefreshState.REPLAYING);
+            metrics.updateRefreshState(topic, RefreshState.REPLAYING);
             stateStore.saveState(context);
             resumeReplaying(topic, context);
             return;

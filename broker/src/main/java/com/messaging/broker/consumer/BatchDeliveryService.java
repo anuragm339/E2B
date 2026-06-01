@@ -11,6 +11,7 @@ import com.messaging.broker.consumer.ConsumerStateService;
 import com.messaging.broker.consumer.DeliveryStateStore;
 import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.broker.monitoring.DataRefreshMetrics;
+import com.messaging.broker.monitoring.LogMdc;
 import com.messaging.broker.model.DeliveryKey;
 import com.messaging.broker.consumer.RefreshCoordinator;
 import com.messaging.common.api.BatchReadableStorage;
@@ -232,6 +233,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             }
 
             traceId = TraceIds.newTraceId();
+            try (LogMdc.Scope ignored = LogMdc.with(traceId, consumer.getTopic(), consumer.getGroup(), consumer.getClientId())) {
 
             // ================= BATCH VISIBILITY =================
             metrics.recordBatchSize(batch.getRecordCount());
@@ -366,34 +368,36 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             }
 
             return DeliveryResult.success();
+            }
 
         } catch (Exception e) {
             String deliveryTraceId = traceId != null ? traceId : stateService.getTraceId(deliveryKey);
-            // Structured logging for delivery failure
-            LogContext failureContext = LogContext.builder()
-                    .traceId(deliveryTraceId)
-                    .clientId(consumer.getClientId())
-                    .topic(consumer.getTopic())
-                    .consumerGroup(consumer.getGroup())
-                    .offset(startOffset)
-                    .custom("error", e.getMessage())
-                    .custom("consecutiveFailures", consumer.getConsecutiveFailures())
-                    .custom("deliveryKey", deliveryKey)
-                    .build();
-            consumerLogger.logBatchDeliveryFailed(failureContext);
+            try (LogMdc.Scope ignored = LogMdc.with(deliveryTraceId, consumer.getTopic(), consumer.getGroup(), consumer.getClientId())) {
+                // Structured logging for delivery failure
+                LogContext failureContext = LogContext.builder()
+                        .traceId(deliveryTraceId)
+                        .clientId(consumer.getClientId())
+                        .topic(consumer.getTopic())
+                        .consumerGroup(consumer.getGroup())
+                        .offset(startOffset)
+                        .custom("error", e.getMessage())
+                        .custom("consecutiveFailures", consumer.getConsecutiveFailures())
+                        .custom("deliveryKey", deliveryKey)
+                        .build();
+                consumerLogger.logBatchDeliveryFailed(failureContext);
 
-            metrics.recordConsumerFailure(consumer.getClientId(), consumer.getTopic(), consumer.getGroup());
-            inFlight.set(false);
+                metrics.recordConsumerFailure(consumer.getClientId(), consumer.getTopic(), consumer.getGroup());
+                inFlight.set(false);
 
-            // Revert offset reservation on error
-            consumer.setCurrentOffset(startOffset);
+                // Revert offset reservation on error
+                consumer.setCurrentOffset(startOffset);
 
-            // Record failure for exponential backoff
-            consumer.recordFailure();
+                // Record failure for exponential backoff
+                consumer.recordFailure();
 
-            boolean isPermanentFailure = consumer.getConsecutiveFailures() >= MAX_CONSECUTIVE_FAILURES;
+                boolean isPermanentFailure = consumer.getConsecutiveFailures() >= MAX_CONSECUTIVE_FAILURES;
 
-            if (isPermanentFailure) {
+                if (isPermanentFailure) {
                 // Permanent failure: clear all state and unregister.
                 // Cancel the timeout if it was scheduled — the consumer is going away.
                 if (timeoutScheduled) {
@@ -406,7 +410,7 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                 log.error("Permanent failure for {} (consecutiveFailures={}), removing pending offset and unregistering",
                          deliveryKeyStr, MAX_CONSECUTIVE_FAILURES);
                 registrationService.unregisterConsumer(consumer.getClientId());
-            } else if (!timeoutScheduled) {
+                } else if (!timeoutScheduled) {
                 // sendBatchToConsumer() threw before the ACK timeout was scheduled.
                 // No ACK is coming and nothing will ever clear pendingOffset — clear it now
                 // so Gate 2 does not permanently block all future delivery attempts.
@@ -416,25 +420,26 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                 stateService.clearTraceId(deliveryKey);
                 log.warn("event=batch_delivery.transient_failure deliveryKey={} pendingOffsetCleared=true ackTimeoutMs={} consecutiveFailures={}",
                         deliveryKeyStr, ackTimeoutMs, consumer.getConsecutiveFailures());
-            } else {
+                } else {
                 // Exception thrown after the ACK timeout was already scheduled (rare: post-send
                 // metrics/logging path). The timeout will fire and clear pendingOffset on its own.
                 log.warn("event=batch_delivery.transient_failure deliveryKey={} pendingOffsetRetained=true timeoutScheduled=true ackTimeoutMs={} consecutiveFailures={}",
                         deliveryKeyStr, ackTimeoutMs, consumer.getConsecutiveFailures());
-            }
+                }
 
-            // Record failed transfer metrics
-            if (batch != null) {
-                metrics.recordConsumerTransferFailed(
-                    consumer.getClientId(),
-                    consumer.getTopic(),
-                    consumer.getGroup(),
-                    batch.getRecordCount(),
-                    batch.getTotalBytes()
-                );
-            }
+                // Record failed transfer metrics
+                if (batch != null) {
+                    metrics.recordConsumerTransferFailed(
+                        consumer.getClientId(),
+                        consumer.getTopic(),
+                        consumer.getGroup(),
+                        batch.getRecordCount(),
+                        batch.getTotalBytes()
+                    );
+                }
 
-            return DeliveryResult.failure(e.getMessage());
+                return DeliveryResult.failure(e.getMessage());
+            }
         }
     }
 

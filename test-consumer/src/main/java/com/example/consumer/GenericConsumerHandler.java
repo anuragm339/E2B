@@ -31,21 +31,20 @@ import java.util.List;
 )
 public class GenericConsumerHandler implements MessageHandler {
     private static final Logger log = LoggerFactory.getLogger(GenericConsumerHandler.class);
+    private static final int INFO_BATCH_SUMMARY_INTERVAL = 100;
 
     @Value("${consumer.type}")
     private String consumerType;
 
-    private int recordCount=0;
+    private int recordCount = 0;
+    private int batchCount = 0;
 
     @Override
     public void handleBatch(List<ConsumerRecord> records) throws Exception {
+        batchCount++;
+        recordCount += records.size();
 
-        recordCount+=records.size();
-
-        // CRITICAL DEBUG: Log EVERY batch received with detailed information
-        // This helps diagnose data refresh metric discrepancies by tracking actual deliveries
         if (!records.isEmpty()) {
-            // Calculate approximate batch size (rough estimate based on average message size)
             long estimatedBytes = records.stream()
                 .mapToLong(r -> {
                     long size = r.getMsgKey().length();
@@ -56,26 +55,32 @@ public class GenericConsumerHandler implements MessageHandler {
                 })
                 .sum();
 
-            // Log batch reception (offset and topic not exposed to consumer)
-            log.info("📦 [{}] BATCH_RECEIVED messages={}, estimatedBytes={}, cumulativeCount={}, firstKey={}, lastKey={}",
-                     consumerType, records.size(), estimatedBytes, recordCount,
-                     records.get(0).getMsgKey(), records.get(records.size() - 1).getMsgKey());
+            if (batchCount == 1 || batchCount % INFO_BATCH_SUMMARY_INTERVAL == 0) {
+                log.info("event=consumer.progress consumerType={} batches={} messages={} lastBatchMessages={} estimatedBytes={} firstKey={} lastKey={}",
+                        consumerType, batchCount, recordCount, records.size(), estimatedBytes,
+                        records.get(0).getMsgKey(), records.get(records.size() - 1).getMsgKey());
+            } else {
+                log.debug("event=consumer.batch_received consumerType={} batch={} messages={} estimatedBytes={} cumulativeCount={} firstKey={} lastKey={}",
+                        consumerType, batchCount, records.size(), estimatedBytes, recordCount,
+                        records.get(0).getMsgKey(), records.get(records.size() - 1).getMsgKey());
+            }
         }
 
-        log.info("[{}] Successfully processed batch of {} records", consumerType, recordCount);
+        log.debug("event=consumer.batch_processed consumerType={} cumulativeCount={}", consumerType, recordCount);
     }
 
     @Override
     public void onReset(String topic) throws Exception {
         // Clear caches, reset state, prepare for refreshed data
         // Example: cache.clear();
-        recordCount=0;
-        log.info("[{}] Cleanup complete for topic: {}, ready to receive fresh data reseting count to {}", consumerType, topic);
+        recordCount = 0;
+        batchCount = 0;
+        log.info("event=consumer.reset consumerType={} topic={} cumulativeCountResetTo={}", consumerType, topic, recordCount);
     }
 
     @Override
     public void onReady(String topic) throws Exception {
-        log.info("[{}] ===== GOT READY for topic: {} ===== Performing finalization operations... with total records {}", consumerType, topic,recordCount);
+        log.info("event=consumer.ready consumerType={} topic={} cumulativeCount={}", consumerType, topic, recordCount);
 
     }
 
@@ -102,31 +107,32 @@ public class GenericConsumerHandler implements MessageHandler {
     private void processBusinessLogic(ConsumerRecord record) {
         // Business logic specific to consumer type
         // E.g., price consumer might update price index
-        log.debug("[{}] Business logic for: {}", consumerType,record.getEventType(), record.getMsgKey());
+        log.debug("event=consumer.business_logic consumerType={} eventType={} msgKey={}",
+                consumerType, record.getEventType(), record.getMsgKey());
 
     }
 
     private void processPriceUpdate(ConsumerRecord record) {
         // Price-specific logic (e.g., update price cache, trigger alerts)
-        log.debug("[PRICE] Processing price update for: {}", record.getMsgKey());
+        log.debug("event=consumer.price_update msgKey={}", record.getMsgKey());
     }
 
     private void processProductUpdate(ConsumerRecord record) {
         // Product-specific logic (e.g., update search index)
-        log.debug("[PRODUCT] Processing product update for: {}", record.getMsgKey());
+        log.debug("event=consumer.product_update msgKey={}", record.getMsgKey());
     }
 
     private void processInventoryUpdate(ConsumerRecord record) {
         // Inventory-specific logic (e.g., check stock levels, trigger reorder)
-        log.debug("[INVENTORY] Processing inventory update for: {}", record.getMsgKey());
+        log.debug("event=consumer.inventory_update msgKey={}", record.getMsgKey());
     }
 
     private void processAuditLog(ConsumerRecord record) {
         // Audit-specific logic (e.g., append to audit trail, compliance checks)
-        log.debug("[AUDIT] Processing audit log for: {}", record.getMsgKey());
+        log.debug("event=consumer.audit_update msgKey={}", record.getMsgKey());
     }
 
     private void handleDeletion(String msgKey) {
-        log.debug("[{}] Handling deletion for: {}", consumerType, msgKey);
+        log.debug("event=consumer.delete consumerType={} msgKey={}", consumerType, msgKey);
     }
 }

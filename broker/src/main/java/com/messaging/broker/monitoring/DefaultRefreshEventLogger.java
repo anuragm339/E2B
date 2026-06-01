@@ -15,56 +15,78 @@ public class DefaultRefreshEventLogger implements RefreshEventLogger {
 
     @Override
     public void logRefreshStarted(LogContext context) {
-        log.info("[REFRESH] Started: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=refresh.started {}", context);
+        }
     }
 
     @Override
     public void logResetSent(LogContext context) {
-        log.info("[REFRESH] RESET sent: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=refresh.reset_sent {}", context);
+        }
     }
 
     @Override
     public void logResetAckReceived(LogContext context) {
-        log.debug("[REFRESH] RESET ACK received: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=refresh.reset_ack_received {}", context);
+        }
     }
 
     @Override
     public void logStateTransition(LogContext context) {
-        log.info("[REFRESH] State transition: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=refresh.state_transition {}", context);
+        }
     }
 
     @Override
     public void logReplayProgress(LogContext context) {
-        log.debug("[REFRESH] Replay progress: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=refresh.replay_progress {}", context);
+        }
     }
 
     @Override
     public void logReadySent(LogContext context) {
-        log.info("[REFRESH] READY sent: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=refresh.ready_sent {}", context);
+        }
     }
 
     @Override
     public void logReadyAckReceived(LogContext context) {
-        log.debug("[REFRESH] READY ACK received: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.debug("event=refresh.ready_ack_received {}", context);
+        }
     }
 
     @Override
     public void logRefreshCompleted(LogContext context) {
-        log.info("[REFRESH] Completed: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=refresh.completed {}", context);
+        }
     }
 
     @Override
     public void logRefreshAborted(LogContext context) {
-        log.error("[REFRESH] Aborted: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.error("event=refresh.aborted {}", context);
+        }
     }
 
     @Override
     public void logPipePaused(LogContext context) {
-        log.info("[REFRESH] Pipe paused: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=refresh.pipe_paused {}", context);
+        }
     }
 
     @Override
     public void logPipeResumed(LogContext context) {
-        log.info("[REFRESH] Pipe resumed: {}", context);
+        try (LogMdc.Scope ignored = LogMdc.withContext(context)) {
+            log.info("event=refresh.pipe_resumed {}", context);
+        }
     }
 }

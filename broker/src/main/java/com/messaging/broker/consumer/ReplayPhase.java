@@ -19,9 +19,10 @@ public interface ReplayPhase {
      *
      * @param clientId Client socket ID
      * @param topic Topic name
+     * @param consumerGroupTopic Consumer identifier in group:topic form
      * @param context Refresh context
      */
-    void startReplayForConsumer(String clientId, String topic, RefreshContext context);
+    void startReplayForConsumer(String clientId, String topic, String consumerGroupTopic, RefreshContext context);
 
     /**
      * Check if all consumers have caught up to latest offset.

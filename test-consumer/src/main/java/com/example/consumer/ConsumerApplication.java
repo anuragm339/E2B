@@ -18,13 +18,7 @@ public class ConsumerApplication {
                                 System.getenv().getOrDefault("CONSUMER_TOPIC", "unknown"));
         String consumerPort = System.getenv().getOrDefault("CONSUMER_PORT", "8080");
 
-        log.info("===================================================");
-        log.info("     Starting Consumer Application");
-        log.info("===================================================");
-        log.info("  Type:   {}", consumerType);
-        log.info("  Topics: {}", consumerTopics);
-        log.info("  Port:   {}", consumerPort);
-        log.info("===================================================");
+        log.info("event=consumer.starting type={} topics={} port={}", consumerType, consumerTopics, consumerPort);
 
         Micronaut.run(ConsumerApplication.class, args);
     }
