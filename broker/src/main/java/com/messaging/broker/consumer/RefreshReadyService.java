@@ -64,6 +64,7 @@ public class RefreshReadyService implements ReadyPhase {
         Set<String> readySnapshot = new HashSet<>(context.getReceivedResetAcks());  // T1
         context.setState(RefreshState.READY_SENT);                                  // T3
         context.setReadySentTime(Instant.now());
+        metrics.updateRefreshState(topic, RefreshState.READY_SENT);
 
         // Record READY sent metrics for each expected consumer
         for (String consumer : context.getExpectedConsumers()) {
@@ -170,6 +171,7 @@ public class RefreshReadyService implements ReadyPhase {
     @Override
     public void completeRefresh(String topic, RefreshContext context) {
         context.setState(RefreshState.COMPLETED);
+        metrics.updateRefreshState(topic, RefreshState.COMPLETED);
         stateStore.saveState(context);
 
         // Use context.getRefreshId() instead of currentRefreshId field

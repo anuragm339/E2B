@@ -35,6 +35,9 @@ public class ClientDisconnectHandler implements DisconnectHandler {
         for (int i = 0; i < unregisteredCount; i++) {
             metrics.recordConsumerDisconnection();
         }
+        if (unregisteredCount > 0) {
+            metrics.recordConsumerClientDisconnection();
+        }
 
         log.info("Disconnected client {} with {} topic subscriptions", clientId, unregisteredCount);
     }

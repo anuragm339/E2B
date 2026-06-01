@@ -3,6 +3,7 @@ package com.messaging.broker.handler;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.consumer.ConsumerRegistry;
 import com.messaging.broker.consumer.RefreshCoordinator;
+import com.messaging.broker.monitoring.LogMdc;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.model.BrokerMessage;
 import jakarta.inject.Inject;
@@ -45,23 +46,23 @@ public class ReadyAckHandler implements MessageHandler {
 
     @Override
     public void handle(String clientId, BrokerMessage message, String traceId) {
-        try {
+        try (LogMdc.Scope ignored = LogMdc.withTrace(traceId)) {
             ByteBuffer buffer = ByteBuffer.wrap(message.getPayload());
 
             // Handle empty payload for legacy startup READY_ACK
             if (buffer.remaining() == 0) {
-                remoteConsumers.markLegacyConsumerReady(clientId);
-                log.info("event=ready_ack.processed mode=legacy_startup clientId={} traceId={}", clientId, traceId);
-
-                // Do NOT send ACK back - legacy clients disconnect when receiving unexpected ACK
-                log.debug("Legacy client {} ready - no ACK sent (legacy protocol), traceId={}", clientId, traceId);
+                try (LogMdc.Scope clientScope = LogMdc.with(traceId, null, null, clientId)) {
+                    remoteConsumers.markLegacyConsumerReady(clientId);
+                    log.info("event=ready_ack.processed mode=legacy_startup clientId={}", clientId);
+                    log.debug("event=ready_ack.ack_suppressed mode=legacy_startup reason=legacy_protocol clientId={}", clientId);
+                }
                 return;
             }
 
             // Validate payload size
             if (buffer.remaining() < 8) {
-                log.error("READY_ACK payload too small from {}: {} bytes (expected >= 8 or 0), traceId={}",
-                         clientId, buffer.remaining(), traceId);
+                log.error("event=ready_ack.invalid_payload clientId={} reason=payload_too_small bytes={}",
+                        clientId, buffer.remaining());
                 server.closeConnection(clientId);
                 return;
             }
@@ -69,16 +70,15 @@ public class ReadyAckHandler implements MessageHandler {
             // Read topic
             int topicLen = buffer.getInt();
             if (topicLen < 0 || topicLen > 65535) {
-                log.error("Invalid topicLen in READY_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, topicLen, traceId);
+                log.error("event=ready_ack.invalid_payload clientId={} reason=topic_length topicLen={}",
+                        clientId, topicLen);
                 server.closeConnection(clientId);
                 return;
             }
 
             if (buffer.remaining() < topicLen + 4) {
-                log.error("Not enough data in READY_ACK from {}: remaining={}, needed={}, traceId={}",
-                         clientId, buffer.remaining(), topicLen + 4, traceId);
+                log.error("event=ready_ack.invalid_payload clientId={} reason=topic_bytes_missing remaining={} needed={}",
+                        clientId, buffer.remaining(), topicLen + 4);
                 server.closeConnection(clientId);
                 return;
             }
@@ -90,9 +90,8 @@ public class ReadyAckHandler implements MessageHandler {
             // Read group
             int groupLen = buffer.getInt();
             if (groupLen < 0 || groupLen > 65535) {
-                log.error("Invalid groupLen in READY_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, groupLen, traceId);
+                log.error("event=ready_ack.invalid_payload clientId={} reason=group_length groupLen={}",
+                        clientId, groupLen);
                 server.closeConnection(clientId);
                 return;
             }
@@ -106,16 +105,19 @@ public class ReadyAckHandler implements MessageHandler {
                         .findFirst()
                         .orElse(null);
                 if (group == null) {
-                    log.warn("event=ready_ack.group_resolution_failed clientId={} topic={} traceId={}",
-                             clientId, topic, traceId);
+                    try (LogMdc.Scope scope = LogMdc.with(traceId, topic, null, clientId)) {
+                        log.warn("event=ready_ack.group_resolution_failed clientId={} topic={}", clientId, topic);
+                    }
                     return; // soft-fail, do not close connection
                 }
-                log.debug("READY_ACK legacy fallback: resolved group={} for clientId={}, topic={}",
-                          group, clientId, topic);
+                try (LogMdc.Scope scope = LogMdc.with(traceId, topic, group, clientId)) {
+                    log.debug("event=ready_ack.group_resolved mode=legacy clientId={} topic={} group={}",
+                            clientId, topic, group);
+                }
             } else {
                 if (buffer.remaining() < groupLen) {
-                    log.error("Not enough data for group in READY_ACK from {}: remaining={}, needed={}, traceId={}",
-                             clientId, buffer.remaining(), groupLen, traceId);
+                    log.error("event=ready_ack.invalid_payload clientId={} reason=group_bytes_missing remaining={} needed={}",
+                            clientId, buffer.remaining(), groupLen);
                     server.closeConnection(clientId);
                     return;
                 }
@@ -127,41 +129,37 @@ public class ReadyAckHandler implements MessageHandler {
             // Construct consumerGroupTopic identifier
             String consumerGroupTopic = group + ":" + topic;
 
-            log.debug("Mapped consumer {} to group:topic identifier: {}, traceId={}", clientId, consumerGroupTopic, traceId);
+            try (LogMdc.Scope scope = LogMdc.with(traceId, topic, group, clientId)) {
+                log.debug("event=ready_ack.consumer_resolved clientId={} consumerKey={}", clientId, consumerGroupTopic);
 
-            // Check if this is startup READY_ACK or refresh READY_ACK
-            boolean isRefreshActive = topic != null && !topic.isEmpty() &&
-                    dataRefreshCoordinator.isRefreshActive(topic);
+                // Check if this is startup READY_ACK or refresh READY_ACK
+                boolean isRefreshActive = topic != null && !topic.isEmpty() &&
+                        dataRefreshCoordinator.isRefreshActive(topic);
 
-            if (isRefreshActive) {
-                // Refresh READY_ACK - delegate to RefreshCoordinator
-                log.info("event=ready_ack.processed mode=refresh clientId={} topic={} group={} traceId={}",
-                        clientId, topic, group, traceId);
-                dataRefreshCoordinator.handleReadyAck(consumerGroupTopic, topic, traceId);
-            } else {
-                // Startup READY_ACK - mark consumer as ready
-                // Determine if this is a legacy or modern consumer
-                String consumerKey = clientId + ":" + topic + ":" + group;
-                boolean isLegacy = remoteConsumers.isLegacyConsumer(consumerKey);
-
-                if (isLegacy || topic.isEmpty()) {
-                    // Legacy consumer - mark entire client as ready
-                    remoteConsumers.markLegacyConsumerReady(clientId);
-                    log.info("event=ready_ack.processed mode=legacy clientId={} topic={} group={} traceId={}",
-                            clientId, topic, group, traceId);
+                if (isRefreshActive) {
+                    log.info("event=ready_ack.processed mode=refresh clientId={} topic={} group={}",
+                            clientId, topic, group);
+                    dataRefreshCoordinator.handleReadyAck(consumerGroupTopic, topic, traceId);
                 } else {
-                    // Modern consumer - mark specific topic as ready
-                    remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
-                    log.info("event=ready_ack.processed mode=modern clientId={} topic={} group={} traceId={}",
-                            clientId, topic, group, traceId);
+                    String consumerKey = clientId + ":" + topic + ":" + group;
+                    boolean isLegacy = remoteConsumers.isLegacyConsumer(consumerKey);
+
+                    if (isLegacy || topic.isEmpty()) {
+                        remoteConsumers.markLegacyConsumerReady(clientId);
+                        log.info("event=ready_ack.processed mode=legacy clientId={} topic={} group={}",
+                                clientId, topic, group);
+                    } else {
+                        remoteConsumers.markModernConsumerTopicReady(clientId, topic, group);
+                        log.info("event=ready_ack.processed mode=modern clientId={} topic={} group={}",
+                                clientId, topic, group);
+                    }
                 }
+
+                log.debug("event=ready_ack.ack_suppressed clientId={} reason=protocol_compatibility", clientId);
             }
 
-            // Do NOT send ACK back - legacy protocol compatibility
-            log.debug("Consumer {} marked as READY - no ACK sent (legacy protocol compatibility), traceId={}", clientId, traceId);
-
         } catch (Exception e) {
-            log.error("Error handling READY_ACK from {}, traceId={}", clientId, traceId, e);
+            log.error("event=ready_ack.failed clientId={}", clientId, e);
         }
     }
 }

@@ -131,6 +131,7 @@ public class RefreshInitiator implements RefreshStarter {
 
         // Record metrics and pause pipe calls outside the lock (I/O-free, order doesn't matter)
         metrics.recordRefreshStarted(topic, "LOCAL", currentRefreshId);
+        metrics.updateRefreshState(topic, RefreshState.RESET_SENT);
 
         // Pause pipe calls before starting refresh
         pipeConnector.pausePipeCalls();

@@ -27,6 +27,18 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, Counter> consumerRetries = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> consumerDeliveryBlocked = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> topicMessagesStored = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> topicHeadOffsets = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> topicHeadOffsetGauges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> topicActiveSegmentBytes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> topicActiveSegmentBytesGauges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> topicSealedSegmentBytes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> topicSealedSegmentBytesGauges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> topicLargestSegmentBytes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> topicLargestSegmentBytesGauges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> topicActiveSegmentCount = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> topicActiveSegmentCountGauges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicLong> topicSealedSegmentCount = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Gauge> topicSealedSegmentCountGauges = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicLong> consumerOffsets = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, AtomicLong> consumerLag = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Timer> consumerDeliveryLatency = new ConcurrentHashMap<>();
@@ -73,11 +85,15 @@ public class BrokerMetrics {
     private final Counter storageWrites;
     private final Counter consumerConnections;
     private final Counter consumerDisconnections;
+    private final Counter consumerClientConnections;
+    private final Counter consumerClientDisconnections;
     private final ConcurrentHashMap<String, Counter> consumerAckTimeouts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> offsetGapsDetected = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionSkippedByReason = new ConcurrentHashMap<>();
 
     // Gauges
     private final AtomicLong activeConsumers = new AtomicLong(0);
+    private final AtomicLong activeConsumerClients = new AtomicLong(0);
     private final AtomicLong storageSize = new AtomicLong(0);
     private final AtomicLong activeSegments = new AtomicLong(0);
 
@@ -158,9 +174,25 @@ public class BrokerMetrics {
             .description("Total number of consumer disconnections")
             .register(registry);
 
+        this.consumerClientConnections = Counter.builder("broker.consumer.clients.connected")
+            .description("Total number of unique consumer client connections")
+            .register(registry);
+
+        this.consumerClientDisconnections = Counter.builder("broker.consumer.clients.disconnected")
+            .description("Total number of unique consumer client disconnections")
+            .register(registry);
+
         // Gauges
         Gauge.builder("broker.consumer.active", activeConsumers, AtomicLong::get)
-            .description("Number of currently active consumers")
+            .description("Number of currently active consumer subscriptions")
+            .register(registry);
+
+        Gauge.builder("broker.consumer.subscriptions.active", activeConsumers, AtomicLong::get)
+            .description("Number of currently active consumer subscriptions")
+            .register(registry);
+
+        Gauge.builder("broker.consumer.clients.active", activeConsumerClients, AtomicLong::get)
+            .description("Number of currently active unique consumer clients")
             .register(registry);
 
         Gauge.builder("broker.storage.size.bytes", storageSize, AtomicLong::get)
@@ -268,6 +300,21 @@ public class BrokerMetrics {
         ).increment();
     }
 
+    public void updateTopicHeadOffset(String topic, long offset) {
+        String topicLabel = (topic == null || topic.isBlank()) ? "unknown" : topic;
+        AtomicLong value = topicHeadOffsets.computeIfAbsent(topicLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            topicHeadOffsetGauges.computeIfAbsent(topicLabel, ignored ->
+                    Gauge.builder("broker.topic.head_offset", atomic, AtomicLong::get)
+                            .description("Current broker head offset per topic")
+                            .tag("topic", topicLabel)
+                            .register(registry)
+            );
+            return atomic;
+        });
+        value.set(offset);
+    }
+
     /**
      * Update last message time for a topic (seconds since epoch).
      * Used for data freshness SLA dashboards.
@@ -306,7 +353,17 @@ public class BrokerMetrics {
 
     public void recordConsumerDisconnection() {
         consumerDisconnections.increment();
-        activeConsumers.decrementAndGet();
+        activeConsumers.updateAndGet(current -> Math.max(0, current - 1));
+    }
+
+    public void recordConsumerClientConnection() {
+        consumerClientConnections.increment();
+        activeConsumerClients.incrementAndGet();
+    }
+
+    public void recordConsumerClientDisconnection() {
+        consumerClientDisconnections.increment();
+        activeConsumerClients.updateAndGet(current -> Math.max(0, current - 1));
     }
 
     // Gauge update methods
@@ -316,6 +373,70 @@ public class BrokerMetrics {
 
     public void updateActiveSegments(long count) {
         activeSegments.set(count);
+    }
+
+    public void updateTopicSegmentMetrics(String topic,
+                                          long activeSegmentBytes,
+                                          long sealedSegmentBytes,
+                                          long activeSegmentCount,
+                                          long sealedSegmentCount,
+                                          long largestSegmentBytes) {
+        String topicLabel = (topic == null || topic.isBlank()) ? "unknown" : topic;
+
+        topicActiveSegmentBytes.computeIfAbsent(topicLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            topicActiveSegmentBytesGauges.computeIfAbsent(key, gaugeKey ->
+                    Gauge.builder("broker.topic.segment.active.bytes", atomic, AtomicLong::get)
+                            .description("Bytes in the current active segment for a topic")
+                            .tag("topic", topicLabel)
+                            .register(registry)
+            );
+            return atomic;
+        }).set(Math.max(0, activeSegmentBytes));
+
+        topicSealedSegmentBytes.computeIfAbsent(topicLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            topicSealedSegmentBytesGauges.computeIfAbsent(key, gaugeKey ->
+                    Gauge.builder("broker.topic.segment.sealed.bytes", atomic, AtomicLong::get)
+                            .description("Total bytes across sealed segments for a topic")
+                            .tag("topic", topicLabel)
+                            .register(registry)
+            );
+            return atomic;
+        }).set(Math.max(0, sealedSegmentBytes));
+
+        topicLargestSegmentBytes.computeIfAbsent(topicLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            topicLargestSegmentBytesGauges.computeIfAbsent(key, gaugeKey ->
+                    Gauge.builder("broker.topic.segment.largest.bytes", atomic, AtomicLong::get)
+                            .description("Largest segment size in bytes for a topic")
+                            .tag("topic", topicLabel)
+                            .register(registry)
+            );
+            return atomic;
+        }).set(Math.max(0, largestSegmentBytes));
+
+        topicActiveSegmentCount.computeIfAbsent(topicLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            topicActiveSegmentCountGauges.computeIfAbsent(key, gaugeKey ->
+                    Gauge.builder("broker.topic.segment.active.count", atomic, AtomicLong::get)
+                            .description("Number of active segments for a topic")
+                            .tag("topic", topicLabel)
+                            .register(registry)
+            );
+            return atomic;
+        }).set(Math.max(0, activeSegmentCount));
+
+        topicSealedSegmentCount.computeIfAbsent(topicLabel, key -> {
+            AtomicLong atomic = new AtomicLong(0);
+            topicSealedSegmentCountGauges.computeIfAbsent(key, gaugeKey ->
+                    Gauge.builder("broker.topic.segment.sealed.count", atomic, AtomicLong::get)
+                            .description("Number of sealed segments for a topic")
+                            .tag("topic", topicLabel)
+                            .register(registry)
+            );
+            return atomic;
+        }).set(Math.max(0, sealedSegmentCount));
     }
 
     // Timer methods (returns Timer.Sample for start/stop pattern)
@@ -418,6 +539,9 @@ public class BrokerMetrics {
      */
     public void recordConsumerBatchSent(String consumerId, String topic, String group, int messageCount, long totalBytes) {
         String key = group + ":" + topic;
+
+        messagesSent.increment(messageCount);
+        bytesSent.increment(totalBytes);
 
         // Get or create counter for this group+topic
         Counter counter = consumerMessagesSent.computeIfAbsent(key, k ->
@@ -743,6 +867,16 @@ public class BrokerMetrics {
         String groupLabel = normalizeLegacyGroup(group);
         clearLegacyPendingBatch(groupLabel);
         recordLegacyBatchEvent(groupLabel, "timeout");
+    }
+
+    public void recordCompactionSkipped(String reason) {
+        String reasonLabel = (reason == null || reason.isBlank()) ? "unknown" : reason;
+        compactionSkippedByReason.computeIfAbsent(reasonLabel, key ->
+                Counter.builder("broker.compaction.skipped")
+                        .description("Compaction runs skipped by reason")
+                        .tag("reason", reasonLabel)
+                        .register(registry)
+        ).increment();
     }
 
     public void clearLegacyPendingBatch(String group) {

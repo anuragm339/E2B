@@ -3,6 +3,7 @@ package com.messaging.broker.handler;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.consumer.RemoteConsumer;
 import com.messaging.broker.consumer.ConsumerRegistry;
+import com.messaging.broker.monitoring.LogMdc;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.model.BrokerMessage;
 import jakarta.inject.Inject;
@@ -47,7 +48,7 @@ public class BatchAckHandler implements MessageHandler {
 
     @Override
     public void handle(String clientId, BrokerMessage message, String traceId) {
-        try {
+        try (LogMdc.Scope ignored = LogMdc.withTrace(traceId)) {
             // Legacy client detection: Empty payload indicates legacy merged batch ACK
             if (message.getPayload().length == 0) {
                 handleLegacyBatchAck(clientId, traceId);
@@ -59,8 +60,8 @@ public class BatchAckHandler implements MessageHandler {
 
             // Validate payload size
             if (buffer.remaining() < 8) {
-                log.error("BATCH_ACK payload too small from {}: {} bytes (expected >= 8), traceId={}",
-                         clientId, buffer.remaining(), traceId);
+                log.error("event=batch_ack.invalid_payload clientId={} reason=payload_too_small bytes={}",
+                        clientId, buffer.remaining());
                 server.closeConnection(clientId);
                 return;
             }
@@ -68,16 +69,15 @@ public class BatchAckHandler implements MessageHandler {
             // Read topic
             int topicLen = buffer.getInt();
             if (topicLen < 0 || topicLen > 65535) {
-                log.error("Invalid topicLen in BATCH_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, topicLen, traceId);
+                log.error("event=batch_ack.invalid_payload clientId={} reason=topic_length topicLen={}",
+                        clientId, topicLen);
                 server.closeConnection(clientId);
                 return;
             }
 
             if (buffer.remaining() < topicLen + 4) {
-                log.error("Not enough data in BATCH_ACK from {}: remaining={}, needed={}, traceId={}",
-                         clientId, buffer.remaining(), topicLen + 4, traceId);
+                log.error("event=batch_ack.invalid_payload clientId={} reason=topic_bytes_missing remaining={} needed={}",
+                        clientId, buffer.remaining(), topicLen + 4);
                 server.closeConnection(clientId);
                 return;
             }
@@ -89,16 +89,15 @@ public class BatchAckHandler implements MessageHandler {
             // Read group
             int groupLen = buffer.getInt();
             if (groupLen < 0 || groupLen > 65535) {
-                log.error("Invalid groupLen in BATCH_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, groupLen, traceId);
+                log.error("event=batch_ack.invalid_payload clientId={} reason=group_length groupLen={}",
+                        clientId, groupLen);
                 server.closeConnection(clientId);
                 return;
             }
 
             if (buffer.remaining() < groupLen) {
-                log.error("Not enough data for group in BATCH_ACK from {}: remaining={}, needed={}, traceId={}",
-                         clientId, buffer.remaining(), groupLen, traceId);
+                log.error("event=batch_ack.invalid_payload clientId={} reason=group_bytes_missing remaining={} needed={}",
+                        clientId, buffer.remaining(), groupLen);
                 server.closeConnection(clientId);
                 return;
             }
@@ -107,21 +106,26 @@ public class BatchAckHandler implements MessageHandler {
             buffer.get(groupBytes);
             String group = new String(groupBytes, StandardCharsets.UTF_8);
 
-            log.debug("Received BATCH_ACK from client: {}, topic: {}, group: {}, traceId={}", clientId, topic, group, traceId);
+            try (LogMdc.Scope scope = LogMdc.with(traceId, topic, group, clientId)) {
+                log.debug("event=batch_ack.received mode=modern clientId={} topic={} group={}", clientId, topic, group);
 
-            // Offload ACK processing to dedicated executor to prevent Netty event loop blocking
-            final String finalTopic = topic;
-            final String finalGroup = group;
-            ackExecutor.execute(() -> {
-                try {
-                    remoteConsumers.handleBatchAck(clientId, finalTopic, finalGroup);
-                } catch (Exception e) {
-                    log.error("Error processing BATCH_ACK from {}, traceId={}", clientId, traceId, e);
-                }
-            });
+                // Offload ACK processing to dedicated executor to prevent Netty event loop blocking
+                final String finalTopic = topic;
+                final String finalGroup = group;
+                ackExecutor.execute(() -> {
+                    try (LogMdc.Scope asyncScope = LogMdc.with(traceId, finalTopic, finalGroup, clientId)) {
+                        log.debug("event=batch_ack.processing_enqueued mode=modern clientId={} topic={} group={}",
+                                clientId, finalTopic, finalGroup);
+                        remoteConsumers.handleBatchAck(clientId, finalTopic, finalGroup);
+                    } catch (Exception e) {
+                        log.error("event=batch_ack.processing_failed mode=modern clientId={} topic={} group={}",
+                                clientId, finalTopic, finalGroup, e);
+                    }
+                });
+            }
 
         } catch (Exception e) {
-            log.error("Error handling BATCH_ACK from {}, traceId={}", clientId, traceId, e);
+            log.error("event=batch_ack.failed clientId={}", clientId, e);
         }
     }
 
@@ -129,28 +133,33 @@ public class BatchAckHandler implements MessageHandler {
      * Handle BATCH_ACK from legacy client (merged batch from multiple topics).
      */
     private void handleLegacyBatchAck(String clientId, String traceId) {
-        log.debug("Received legacy BATCH_ACK from client: {}, traceId={}", clientId, traceId);
+        try (LogMdc.Scope scope = LogMdc.with(traceId, null, null, clientId)) {
+            log.debug("event=batch_ack.received mode=legacy clientId={}", clientId);
 
-        // Look up legacy consumers to find the group
-        List<RemoteConsumer> legacyConsumers = remoteConsumers.getLegacyConsumersForClient(clientId);
+            // Look up legacy consumers to find the group
+            List<RemoteConsumer> legacyConsumers = remoteConsumers.getLegacyConsumersForClient(clientId);
 
-        if (legacyConsumers.isEmpty()) {
-            log.warn("Received legacy BATCH_ACK from unknown client: {}, traceId={}", clientId, traceId);
-            return;
-        }
-
-        // All legacy consumers for a client share the same group (serviceName)
-        String group = legacyConsumers.get(0).getGroup();
-
-        log.debug("Routing legacy BATCH_ACK to group: {}, traceId={}", group, traceId);
-
-        // Offload ACK processing to dedicated executor
-        ackExecutor.execute(() -> {
-            try {
-                remoteConsumers.handleLegacyBatchAck(clientId, group);
-            } catch (Exception e) {
-                log.error("Error processing legacy BATCH_ACK from {}, traceId={}", clientId, traceId, e);
+            if (legacyConsumers.isEmpty()) {
+                log.warn("event=batch_ack.unknown_legacy_client clientId={}", clientId);
+                return;
             }
-        });
+
+            // All legacy consumers for a client share the same group (serviceName)
+            String group = legacyConsumers.get(0).getGroup();
+
+            try (LogMdc.Scope groupScope = LogMdc.with(traceId, null, group, clientId)) {
+                log.debug("event=batch_ack.processing_enqueued mode=legacy clientId={} group={}", clientId, group);
+
+                // Offload ACK processing to dedicated executor
+                ackExecutor.execute(() -> {
+                    try (LogMdc.Scope asyncScope = LogMdc.with(traceId, null, group, clientId)) {
+                        remoteConsumers.handleLegacyBatchAck(clientId, group);
+                    } catch (Exception e) {
+                        log.error("event=batch_ack.processing_failed mode=legacy clientId={} group={}",
+                                clientId, group, e);
+                    }
+                });
+            }
+        }
     }
 }

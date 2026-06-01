@@ -10,6 +10,7 @@ import com.messaging.broker.consumer.ConsumerStateService;
 import com.messaging.broker.legacy.LegacyConsumerDeliveryManager;
 import com.messaging.broker.legacy.MergedBatch;
 import com.messaging.broker.monitoring.BrokerMetrics;
+import com.messaging.broker.monitoring.LogMdc;
 import com.messaging.broker.model.ConsumerKey;
 import com.messaging.broker.model.DeliveryKey;
 import com.messaging.broker.consumer.PendingAckStore;
@@ -87,6 +88,7 @@ public class BatchAckService implements ConsumerAckService {
         DeliveryKey deliveryKey = DeliveryKey.of(group, topic);
         String deliveryKeyStr = clientId + " -> " + deliveryKey;
         String traceId = stateService.getTraceId(deliveryKey);
+        try (LogMdc.Scope ignored = LogMdc.with(traceId, topic, group, clientId)) {
 
         // Calculate ACK latency
         long ackReceiveTime = System.currentTimeMillis();
@@ -246,7 +248,8 @@ public class BatchAckService implements ConsumerAckService {
                     deliveryKeyStr, topic, group, committedOffset, ackLatencyMs, handlerDurationMs,
                     describeExecutor(ackStorageExecutor));
         }
-        log.debug("ACK committed for {} at offset {}, traceId={}", deliveryKeyStr, committedOffset, traceId);
+        log.debug("ACK committed for {} at offset {}", deliveryKeyStr, committedOffset);
+        }
     }
 
     @Override
@@ -307,9 +310,6 @@ public class BatchAckService implements ConsumerAckService {
                 }
             }
 
-            // Record metrics for messages and bytes sent (NOW that ACK is received)
-            metrics.recordBatchMessagesSent(batch.getMessageCount(), batch.getTotalBytes());
-
             // Update metrics for each topic using actual per-topic counts
             Map<String, Long> bytesPerTopic = batch.getBytesPerTopic();
             Map<String, Integer> msgCountPerTopic = batch.getMessageCountPerTopic();
@@ -319,10 +319,6 @@ public class BatchAckService implements ConsumerAckService {
                 long offset = offsetTracker.getOffset(group + ":" + topic);
                 long topicBytes = bytesPerTopic.getOrDefault(topic, 0L);
                 int topicMessages = msgCountPerTopic.getOrDefault(topic, 0);
-
-                // Record per-consumer batch sent metrics with actual per-topic values
-                metrics.recordConsumerBatchSent(clientId, topic, group,
-                        topicMessages, topicBytes);
 
                 // Record delivery latency for this topic
                 if (deliverySample != null) {

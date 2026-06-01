@@ -1,5 +1,6 @@
 package com.messaging.broker.monitoring;
 
+import com.messaging.broker.consumer.RefreshState;
 import com.messaging.broker.consumer.RefreshContext;
 import io.micrometer.core.instrument.*;
 import io.micrometer.core.instrument.distribution.DistributionStatisticConfig;
@@ -50,6 +51,10 @@ public class DataRefreshMetrics {
     private final Map<String, AtomicDouble> downtimeValues;
     private final Map<String, Gauge> activeProcessingTimeGauges;
     private final Map<String, AtomicDouble> activeProcessingTimeValues;
+    private final Map<String, Gauge> refreshStateGauges;
+    private final Map<String, AtomicLong> refreshStateValues;
+    private final Map<String, Gauge> replayGapOffsetGauges;
+    private final Map<String, AtomicLong> replayGapOffsetValues;
 
     // State tracking
     private final Map<String, Long> refreshStartTimes;
@@ -84,6 +89,10 @@ public class DataRefreshMetrics {
         this.downtimeValues = new ConcurrentHashMap<>();
         this.activeProcessingTimeGauges = new ConcurrentHashMap<>();
         this.activeProcessingTimeValues = new ConcurrentHashMap<>();
+        this.refreshStateGauges = new ConcurrentHashMap<>();
+        this.refreshStateValues = new ConcurrentHashMap<>();
+        this.replayGapOffsetGauges = new ConcurrentHashMap<>();
+        this.replayGapOffsetValues = new ConcurrentHashMap<>();
 
         this.refreshStartTimes = new ConcurrentHashMap<>();
         this.resetSentTimes = new ConcurrentHashMap<>();
@@ -92,11 +101,43 @@ public class DataRefreshMetrics {
         this.replayStartTimes = new ConcurrentHashMap<>();
     }
 
+    public void updateRefreshState(String topic, RefreshState state) {
+        String topicKey = topic;
+        AtomicLong stateValue = refreshStateValues.computeIfAbsent(topicKey, k -> {
+            AtomicLong atomic = new AtomicLong(0);
+            refreshStateGauges.computeIfAbsent(topicKey, gk ->
+                    Gauge.builder("data_refresh_state_code", atomic, AtomicLong::get)
+                            .description("Current refresh state code per topic (IDLE=0 RESET_SENT=1 WAITING_FOR_ACKS=2 REPLAYING=3 READY_SENT=4 COMPLETED=5 ABORTED=6)")
+                            .tag("topic", topic)
+                            .register(registry)
+            );
+            return atomic;
+        });
+        stateValue.set(mapState(state));
+    }
+
+    public void updateReplayGapOffset(String topic, String consumer, long gap) {
+        String key = topic + ":" + consumer;
+        AtomicLong gapValue = replayGapOffsetValues.computeIfAbsent(key, k -> {
+            AtomicLong atomic = new AtomicLong(0);
+            replayGapOffsetGauges.computeIfAbsent(key, gk ->
+                    Gauge.builder("data_refresh_replay_gap_offset", atomic, AtomicLong::get)
+                            .description("Current replay gap offset (storage head - committed offset)")
+                            .tag("topic", topic)
+                            .tag("consumer", consumer)
+                            .register(registry)
+            );
+            return atomic;
+        });
+        gapValue.set(Math.max(0, gap));
+    }
+
     /**
      * Record refresh workflow started
      */
     public void recordRefreshStarted(String topic, String refreshType, String refreshId) {
         refreshStartedTotal.increment();
+        updateRefreshState(topic, RefreshState.RESET_SENT);
         long startTimeMs = System.currentTimeMillis();
         String stateKey = topic + ":" + refreshId;
         refreshStartTimes.put(stateKey, startTimeMs);
@@ -122,6 +163,7 @@ public class DataRefreshMetrics {
      * Record refresh workflow completed
      */
     public void recordRefreshCompleted(String topic, String refreshType, String status, String refreshId, RefreshContext context) {
+        updateRefreshState(topic, RefreshState.COMPLETED);
         // Use refresh_id to preserve per-refresh history in Prometheus.
         String key = topic + ":" + refreshType + ":" + status + ":" + refreshId;
 
@@ -334,7 +376,7 @@ public class DataRefreshMetrics {
      */
     public void recordReplayStarted(String topic, String consumer, String refreshId) {
         String key = topic + ":" + consumer + ":" + refreshId;
-        replayStartTimes.put(key, System.currentTimeMillis());
+        replayStartTimes.putIfAbsent(key, System.currentTimeMillis());
     }
 
     /**
@@ -627,6 +669,8 @@ public class DataRefreshMetrics {
 
         // Reset active processing time gauges to 0
         activeProcessingTimeValues.values().forEach(v -> v.set(0.0));
+        refreshStateValues.values().forEach(v -> v.set(0));
+        replayGapOffsetValues.values().forEach(v -> v.set(0));
 
         // Unregister and clear all Timer instances to reset histogram data
         // Timers must be unregistered from the registry because Micrometer
@@ -666,6 +710,21 @@ public class DataRefreshMetrics {
         resetAckTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
         readySentTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
         replayStartTimes.keySet().removeIf(k -> k.startsWith(topic + ":"));
+    }
+
+    private long mapState(RefreshState state) {
+        if (state == null) {
+            return 0;
+        }
+        return switch (state) {
+            case IDLE -> 0;
+            case RESET_SENT -> 1;
+            case WAITING_FOR_ACKS -> 2;
+            case REPLAYING -> 3;
+            case READY_SENT -> 4;
+            case COMPLETED -> 5;
+            case ABORTED -> 6;
+        };
     }
 
     /**

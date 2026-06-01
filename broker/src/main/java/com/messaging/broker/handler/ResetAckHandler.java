@@ -3,6 +3,7 @@ package com.messaging.broker.handler;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.consumer.ConsumerRegistrationService;
 import com.messaging.broker.consumer.RefreshCoordinator;
+import com.messaging.broker.monitoring.LogMdc;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.model.BrokerMessage;
 import jakarta.inject.Inject;
@@ -41,14 +42,14 @@ public class ResetAckHandler implements MessageHandler {
 
     @Override
     public void handle(String clientId, BrokerMessage message, String traceId) {
-        try {
+        try (LogMdc.Scope ignored = LogMdc.withTrace(traceId)) {
             // Parse payload: [topicLen:4][topic:var][groupLen:4][group:var]
             ByteBuffer buffer = ByteBuffer.wrap(message.getPayload());
 
             // Validate payload size
             if (buffer.remaining() < 8) {
-                log.error("RESET_ACK payload too small from {}: {} bytes (expected >= 8), traceId={}",
-                         clientId, buffer.remaining(), traceId);
+                log.error("event=reset_ack.invalid_payload clientId={} reason=payload_too_small bytes={}",
+                        clientId, buffer.remaining());
                 server.closeConnection(clientId);
                 return;
             }
@@ -56,16 +57,15 @@ public class ResetAckHandler implements MessageHandler {
             // Read topic
             int topicLen = buffer.getInt();
             if (topicLen < 0 || topicLen > 65535) {
-                log.error("Invalid topicLen in RESET_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, topicLen, traceId);
+                log.error("event=reset_ack.invalid_payload clientId={} reason=topic_length topicLen={}",
+                        clientId, topicLen);
                 server.closeConnection(clientId);
                 return;
             }
 
             if (buffer.remaining() < topicLen + 4) {
-                log.error("Not enough data in RESET_ACK from {}: remaining={}, needed={}, traceId={}",
-                         clientId, buffer.remaining(), topicLen + 4, traceId);
+                log.error("event=reset_ack.invalid_payload clientId={} reason=topic_bytes_missing remaining={} needed={}",
+                        clientId, buffer.remaining(), topicLen + 4);
                 server.closeConnection(clientId);
                 return;
             }
@@ -77,9 +77,8 @@ public class ResetAckHandler implements MessageHandler {
             // Read group
             int groupLen = buffer.getInt();
             if (groupLen < 0 || groupLen > 65535) {
-                log.error("Invalid groupLen in RESET_ACK from {}: {} (expected 0-65535). " +
-                         "Possible corrupted payload or protocol mismatch. Closing connection.",
-                         clientId, groupLen, traceId);
+                log.error("event=reset_ack.invalid_payload clientId={} reason=group_length groupLen={}",
+                        clientId, groupLen);
                 server.closeConnection(clientId);
                 return;
             }
@@ -93,16 +92,19 @@ public class ResetAckHandler implements MessageHandler {
                         .findFirst()
                         .orElse(null);
                 if (group == null) {
-                    log.warn("event=reset_ack.group_resolution_failed clientId={} topic={} traceId={}",
-                             clientId, topic, traceId);
+                    try (LogMdc.Scope scope = LogMdc.with(traceId, topic, null, clientId)) {
+                        log.warn("event=reset_ack.group_resolution_failed clientId={} topic={}", clientId, topic);
+                    }
                     return; // soft-fail, do not close connection
                 }
-                log.debug("RESET_ACK legacy fallback: resolved group={} for clientId={}, topic={}",
-                          group, clientId, topic);
+                try (LogMdc.Scope scope = LogMdc.with(traceId, topic, group, clientId)) {
+                    log.debug("event=reset_ack.group_resolved mode=legacy clientId={} topic={} group={}",
+                            clientId, topic, group);
+                }
             } else {
                 if (buffer.remaining() < groupLen) {
-                    log.error("Not enough data for group in RESET_ACK from {}: remaining={}, needed={}, traceId={}",
-                             clientId, buffer.remaining(), groupLen, traceId);
+                    log.error("event=reset_ack.invalid_payload clientId={} reason=group_bytes_missing remaining={} needed={}",
+                            clientId, buffer.remaining(), groupLen);
                     server.closeConnection(clientId);
                     return;
                 }
@@ -114,17 +116,17 @@ public class ResetAckHandler implements MessageHandler {
             // Construct consumerGroupTopic identifier
             String consumerGroupTopic = group + ":" + topic;
 
-            log.debug("Mapped consumer {} to group:topic identifier: {}, traceId={}", clientId, consumerGroupTopic, traceId);
+            try (LogMdc.Scope scope = LogMdc.with(traceId, topic, group, clientId)) {
+                log.debug("event=reset_ack.consumer_resolved clientId={} consumerKey={}", clientId, consumerGroupTopic);
 
-            // Delegate to RefreshCoordinator
-            log.info("event=reset_ack.processed clientId={} topic={} group={} traceId={}", clientId, topic, group, traceId);
-            dataRefreshCoordinator.handleResetAck(consumerGroupTopic, clientId, topic, traceId);
+                log.info("event=reset_ack.processed clientId={} topic={} group={}", clientId, topic, group);
+                dataRefreshCoordinator.handleResetAck(consumerGroupTopic, clientId, topic, traceId);
 
-            // Do NOT send ACK back - legacy protocol compatibility
-            log.debug("RESET_ACK processed for {} - no ACK sent (legacy protocol compatibility), traceId={}", clientId, traceId);
+                log.debug("event=reset_ack.ack_suppressed clientId={} reason=protocol_compatibility", clientId);
+            }
 
         } catch (Exception e) {
-            log.error("Error handling RESET_ACK from {}, traceId={}", clientId, traceId, e);
+            log.error("event=reset_ack.failed clientId={}", clientId, e);
         }
     }
 }

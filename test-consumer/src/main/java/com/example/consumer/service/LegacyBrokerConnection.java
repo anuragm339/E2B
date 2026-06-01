@@ -29,7 +29,7 @@ public class LegacyBrokerConnection implements BrokerConnection {
 
     @Override
     public void connect(String host, int port) throws IOException {
-        log.info("🔌 Connecting to broker using LEGACY Event protocol: {}:{}", host, port);
+        log.info("event=legacy_connection.connecting service={} host={} port={}", serviceName, host, port);
         socket = new Socket(host, port);
         wireManager = new LegacyWireManager(
                 new DataInputStream(socket.getInputStream()),
@@ -39,13 +39,13 @@ public class LegacyBrokerConnection implements BrokerConnection {
         // Send RegisterEvent
         RegisterEvent registerEvent = new RegisterEvent(PROTOCOL_VERSION, serviceName);
         wireManager.send(registerEvent);
-        log.info("📤 Sent RegisterEvent: version={}, service={}", PROTOCOL_VERSION, serviceName);
+        log.info("event=legacy_connection.register_sent service={} version={}", serviceName, PROTOCOL_VERSION);
     }
 
     @Override
     public void sendAck() throws IOException {
         wireManager.send(AckEvent.INSTANCE);
-        log.debug("✅ Sent ACK (legacy)");
+        log.debug("event=legacy_connection.ack_sent service={}", serviceName);
     }
 
     @Override
@@ -62,7 +62,7 @@ public class LegacyBrokerConnection implements BrokerConnection {
     public void close() throws IOException {
         if (socket != null && !socket.isClosed()) {
             socket.close();
-            log.info("🔌 Legacy connection closed");
+            log.info("event=legacy_connection.closed service={}", serviceName);
         }
     }
 

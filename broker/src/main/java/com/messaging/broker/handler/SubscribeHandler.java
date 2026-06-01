@@ -9,6 +9,7 @@ import com.messaging.broker.consumer.RefreshContext;
 import com.messaging.broker.consumer.RefreshState;
 import com.messaging.broker.legacy.LegacyClientConfig;
 import com.messaging.broker.monitoring.BrokerMetrics;
+import com.messaging.broker.monitoring.LogMdc;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.model.BrokerMessage;
 import jakarta.inject.Inject;
@@ -60,7 +61,7 @@ public class SubscribeHandler implements MessageHandler {
 
     @Override
     public void handle(String clientId, BrokerMessage message, String traceId) {
-        try {
+        try (LogMdc.Scope ignored = LogMdc.with(traceId, null, null, clientId)) {
             String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
             JsonNode json = objectMapper.readTree(payload);
 
@@ -101,6 +102,9 @@ public class SubscribeHandler implements MessageHandler {
             boolean isNew = remoteConsumers.registerConsumer(clientId, topic, group, false, traceId);
             if (isNew) {
                 metrics.recordConsumerConnection();
+                if (remoteConsumers.getConsumersByClient(clientId).size() == 1) {
+                    metrics.recordConsumerClientConnection();
+                }
             } else {
                 log.warn("event=subscribe.duplicate clientId={} topic={} group={} traceId={}",
                         clientId, topic, group, traceId);
@@ -217,6 +221,9 @@ public class SubscribeHandler implements MessageHandler {
         // Record metrics only for new registrations
         for (int i = 0; i < newRegistrations; i++) {
             metrics.recordConsumerConnection();
+        }
+        if (newRegistrations > 0 && remoteConsumers.getConsumersByClient(clientId).size() == newRegistrations) {
+            metrics.recordConsumerClientConnection();
         }
 
         log.info("event=subscribe.legacy_registered clientId={} service={} topicCount={} traceId={}",

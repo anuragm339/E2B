@@ -521,6 +521,35 @@ public class SegmentManager {
         return new ArrayList<>(segments.values());
     }
 
+    public Segment getActiveSegment() {
+        return activeSegment.get();
+    }
+
+    public long getActiveSegmentSizeBytes() {
+        Segment active = activeSegment.get();
+        return active == null ? 0L : active.getSize();
+    }
+
+    public long getSealedSegmentBytes() {
+        return segments.values().stream()
+                .mapToLong(Segment::getSize)
+                .sum();
+    }
+
+    public int getSealedSegmentCount() {
+        return segments.size();
+    }
+
+    public long getLargestSegmentBytes() {
+        long largestSealed = segments.values().stream()
+                .mapToLong(Segment::getSize)
+                .max()
+                .orElse(0L);
+        Segment active = activeSegment.get();
+        long activeSize = active == null ? 0L : active.getSize();
+        return Math.max(largestSealed, activeSize);
+    }
+
     /**
      * Force-seal the current active segment and start a new one.
      * Used by the admin HTTP trigger so compaction can run without waiting for the

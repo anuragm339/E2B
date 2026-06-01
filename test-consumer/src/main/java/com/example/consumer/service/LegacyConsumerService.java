@@ -19,6 +19,7 @@ import org.slf4j.LoggerFactory;
 @Requires(property = "consumer.legacy.enabled", value = "true")
 public class LegacyConsumerService implements ApplicationEventListener<ServerStartupEvent> {
     private static final Logger log = LoggerFactory.getLogger(LegacyConsumerService.class);
+    private static final int INFO_BATCH_SUMMARY_INTERVAL = 100;
 
     private final LegacyConfig legacyConfig;
     private final String brokerHost;
@@ -27,6 +28,8 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
     private LegacyBrokerConnection connection;
     private volatile boolean running = false;
     private Thread eventLoopThread;
+    private int batchCount = 0;
+    private int messageCount = 0;
 
     @Inject
     public LegacyConsumerService(
@@ -38,21 +41,17 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
         this.brokerHost = brokerHost;
         this.brokerPort = brokerPort;
 
-        log.info("🔧 LegacyConsumerService created - will start on ServerStartupEvent");
+        log.info("event=legacy_consumer.initialized service={} broker={}:{}", legacyConfig.getServiceName(), brokerHost, brokerPort);
     }
 
     @Override
     public void onApplicationEvent(ServerStartupEvent event) {
-        log.info("═══════════════════════════════════════════════════");
-        log.info("🚀 LEGACY MODE ENABLED - Using Event Protocol");
-        log.info("   Service: {}", legacyConfig.getServiceName());
-        log.info("   Broker: {}:{}", brokerHost, brokerPort);
-        log.info("═══════════════════════════════════════════════════");
+        log.info("event=legacy_consumer.starting service={} broker={}:{}", legacyConfig.getServiceName(), brokerHost, brokerPort);
 
         try {
             connect();
         } catch (Exception e) {
-            log.error("❌ Failed to start legacy consumer", e);
+            log.error("event=legacy_consumer.start_failed service={}", legacyConfig.getServiceName(), e);
             throw new RuntimeException("Failed to start legacy consumer", e);
         }
     }
@@ -66,29 +65,29 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
         eventLoopThread.setDaemon(false);  // Keep application alive
         eventLoopThread.start();
 
-        log.info("✅ Legacy consumer started successfully");
+        log.info("event=legacy_consumer.started service={}", legacyConfig.getServiceName());
     }
 
     private void runEventLoop() {
-        log.info("🔄 Event loop started");
+        log.info("event=legacy_consumer.event_loop_started service={}", legacyConfig.getServiceName());
 
         while (running) {
             try {
                 Event event = connection.nextEvent();
-                log.debug("📨 Received event: {}", event.getType());
+                log.debug("event=legacy_consumer.event_received type={}", event.getType());
 
                 handleEvent(event);
 
             } catch (Exception e) {
                 if (running) {
-                    log.error("❌ Error in event loop", e);
+                    log.error("event=legacy_consumer.event_loop_failed service={}", legacyConfig.getServiceName(), e);
                     // Optionally: implement reconnection logic here
                 }
                 running = false;
             }
         }
 
-        log.info("🛑 Event loop stopped");
+        log.info("event=legacy_consumer.event_loop_stopped service={}", legacyConfig.getServiceName());
     }
 
     private void handleEvent(Event event) throws Exception {
@@ -112,12 +111,12 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
                 break;
 
             case EOF:
-                log.info("📪 EOF received - shutting down");
+                log.info("event=legacy_consumer.eof_received service={}", legacyConfig.getServiceName());
                 running = false;
                 break;
 
             default:
-                log.warn("⚠️ Unexpected event type: {}", event.getType());
+                log.warn("event=legacy_consumer.unexpected_event service={} type={}", legacyConfig.getServiceName(), event.getType());
         }
 
         if (shouldAck) {
@@ -127,19 +126,29 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
 
     private boolean handleBatch(BatchEvent batchEvent) throws Exception {
         int size = batchEvent.count();
-        log.info("📦 BATCH received: size={}", size);
+        batchCount++;
+        messageCount += size;
+        if (batchCount == 1 || batchCount % INFO_BATCH_SUMMARY_INTERVAL == 0) {
+            log.info("event=legacy_consumer.progress service={} batches={} messages={} lastBatchSize={}",
+                    legacyConfig.getServiceName(), batchCount, messageCount, size);
+        } else {
+            log.debug("event=legacy_consumer.batch_received service={} batch={} size={} cumulativeMessages={}",
+                    legacyConfig.getServiceName(), batchCount, size, messageCount);
+        }
 
         for (Event e : batchEvent.getEvents()) {
             if (e.getType() == EventType.MESSAGE) {
                 DataMessageEvent msgEvent = (DataMessageEvent) e;
                 // Convert to ConsumerRecord for GenericConsumerHandler
                 // For now, just process the data
-                log.debug("  Message: type={}, key={}",
+                log.debug("event=legacy_consumer.batch_message service={} type={} key={}",
+                        legacyConfig.getServiceName(),
                         msgEvent.getMessage().getType(),
                         msgEvent.getMessage().getKey());
             } else if (e.getType() == EventType.DELETE) {
                 DeleteMessageEvent delEvent = (DeleteMessageEvent) e;
-                log.debug("  DELETE: key={}", delEvent.getMessage().getKey());
+                log.debug("event=legacy_consumer.batch_delete service={} key={}",
+                        legacyConfig.getServiceName(), delEvent.getMessage().getKey());
             }
         }
 
@@ -148,24 +157,27 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
 
     private boolean handleMessage(DataMessageEvent event) throws Exception {
         DataMessage msg = event.getMessage();
-        log.debug("📨 MESSAGE received: type={}, key={}", msg.getType(), msg.getKey());
+        log.debug("event=legacy_consumer.message_received service={} type={} key={}",
+                legacyConfig.getServiceName(), msg.getType(), msg.getKey());
         return true;  // Send ACK
     }
 
     private boolean handleReset(ResetEvent event) throws Exception {
-        log.info("🔄 RESET received - clearing local data");
+        batchCount = 0;
+        messageCount = 0;
+        log.info("event=legacy_consumer.reset_received service={}", legacyConfig.getServiceName());
         // Call GenericConsumerHandler.onReset() if needed
         // messageHandler.onReset("all-topics");
         return true;  // Send ACK
     }
 
     private boolean handleReady(ReadyEvent event) throws Exception {
-        log.info("✅ READY received - refresh complete");
+        log.info("event=legacy_consumer.ready_received service={}", legacyConfig.getServiceName());
         return true;  // Send ACK
     }
 
     public void shutdown() {
-        log.info("🛑 Shutting down legacy consumer...");
+        log.info("event=legacy_consumer.shutdown_started service={}", legacyConfig.getServiceName());
         running = false;
 
         try {
@@ -177,9 +189,9 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
                 eventLoopThread.join(5000);
             }
         } catch (Exception e) {
-            log.error("❌ Error during shutdown", e);
+            log.error("event=legacy_consumer.shutdown_failed service={}", legacyConfig.getServiceName(), e);
         }
 
-        log.info("✅ Legacy consumer shutdown complete");
+        log.info("event=legacy_consumer.shutdown_complete service={}", legacyConfig.getServiceName());
     }
 }

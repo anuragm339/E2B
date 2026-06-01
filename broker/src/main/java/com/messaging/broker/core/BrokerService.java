@@ -182,6 +182,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
 
             metrics.recordMessageStored(topic);
             metrics.recordTopicLastMessageTime(topic);
+            metrics.updateTopicHeadOffset(topic, offset);
 
             compactionIndex.updateKey(topic, record.getMsgKey(), offset,
                     record.getCreatedAt().toEpochMilli());
