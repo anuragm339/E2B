@@ -80,6 +80,11 @@ public class DeliveryScheduler {
     private void executeDelivery(RemoteConsumer consumer, long currentDelayMs) {
         log.debug("Executing delivery task for {}:{}", consumer.getClientId(), consumer.getTopic());
 
+        if (!consumerRegistry.isRegistered(consumer)) {
+            log.debug("Skipping delivery for unregistered consumer {}:{}", consumer.getClientId(), consumer.getTopic());
+            return;
+        }
+
         // Apply all gate policies
         for (DeliveryGatePolicy gate : gatePolicies) {
             DeliveryGatePolicy.GateResult result = gate.shouldDeliver(consumer);
@@ -90,7 +95,9 @@ public class DeliveryScheduler {
 
                 // Reschedule with backoff (no data found)
                 long nextDelay = retryPolicy.calculateNextDelay(currentDelayMs, false);
-                scheduleDelivery(consumer, nextDelay);
+                if (consumerRegistry.isRegistered(consumer)) {
+                    scheduleDelivery(consumer, nextDelay);
+                }
                 return;
             }
         }
@@ -109,7 +116,9 @@ public class DeliveryScheduler {
 
         // Calculate next delay based on success
         long nextDelay = retryPolicy.calculateNextDelay(currentDelayMs, success);
-        scheduleDelivery(consumer, nextDelay);
+        if (consumerRegistry.isRegistered(consumer)) {
+            scheduleDelivery(consumer, nextDelay);
+        }
     }
 
     /**

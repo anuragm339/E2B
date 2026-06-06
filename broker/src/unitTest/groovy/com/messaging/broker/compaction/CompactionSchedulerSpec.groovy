@@ -1,6 +1,7 @@
 package com.messaging.broker.compaction
 
 import com.messaging.common.api.StorageEngine
+import com.messaging.broker.monitoring.MemoryMonitor
 import com.messaging.storage.segment.Segment
 import com.messaging.storage.segment.SegmentAccess
 import com.messaging.storage.segment.SegmentManager
@@ -19,15 +20,20 @@ class CompactionSchedulerSpec extends Specification {
         def rewriter = Mock(CompactionRewriter)
         def compactionIndex = Mock(RocksDbCompactionIndex)
         def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
+        def memoryMonitor = Stub(MemoryMonitor) {
+            getHeapUsagePercent() >> 0.0d
+            isMemoryPressureHigh() >> false
+        }
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                false, 7, 10)
+                memoryMonitor, false, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
 
         then:
+        1 * metrics.recordCompactionSkipped("disabled")
         0 * storage.getTopicNames()
         0 * planner.selectDirtyWindow(_, _, _)
         0 * rewriter.rewrite(_, _, _, _, _, _)
@@ -50,15 +56,20 @@ class CompactionSchedulerSpec extends Specification {
         def rewriter = Mock(CompactionRewriter)
         def compactionIndex = Mock(RocksDbCompactionIndex)
         def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
+        def memoryMonitor = Stub(MemoryMonitor) {
+            getHeapUsagePercent() >> 0.0d
+            isMemoryPressureHigh() >> false
+        }
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                true, 7, 10)
+                memoryMonitor, true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
 
         then:
+        1 * metrics.recordCompactionSkipped("not_enough_sealed_segments")
         0 * rewriter.rewrite(_, _, _, _, _, _)
         0 * checkpointStore.saveCheckpoint(_, _, _)
     }
@@ -87,10 +98,14 @@ class CompactionSchedulerSpec extends Specification {
                     new CompactionRewriter.CompactionResult(5, 2, 1024L, 800L, 224L, 1, false)
         }
         def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
+        def memoryMonitor = Stub(MemoryMonitor) {
+            getHeapUsagePercent() >> 0.0d
+            isMemoryPressureHigh() >> false
+        }
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                true, 7, 10)
+                memoryMonitor, true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
@@ -123,16 +138,20 @@ class CompactionSchedulerSpec extends Specification {
         def rewriter = Mock(CompactionRewriter)
         def compactionIndex = Mock(RocksDbCompactionIndex)
         def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
+        def memoryMonitor = Stub(MemoryMonitor) {
+            getHeapUsagePercent() >> 0.0d
+            isMemoryPressureHigh() >> false
+        }
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                true, 7, 10)
+                memoryMonitor, true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
 
         then:
         noExceptionThrown()
-        1 * planner.selectDirtyWindow([], -1L, 10) >> []
+        1 * metrics.recordCompactionSkipped("not_enough_sealed_segments")
     }
 }

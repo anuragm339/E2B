@@ -1,5 +1,6 @@
 package com.messaging.broker.core;
 
+import com.messaging.broker.consistency.PipeLineageStore;
 import com.messaging.common.api.PipeConnector;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.common.model.TopologyResponse;
@@ -9,9 +10,15 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +41,14 @@ public class TopologyManager {
     private final String nodeId;
     private final ScheduledExecutorService scheduler;
     private final TopologyPropertiesStore propertiesStore;
+    private final PipeLineageStore lineageStore;
+    // Lightweight HTTP client used ONLY for probing a candidate parent's /health
+    // before tearing down the live connection to the current parent.
+    private final HttpClient probeHttp = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(2))
+            .build();
+    // Package-private so unit tests can swap a deterministic probe.
+    java.util.function.Predicate<String> parentReachableProbe = this::probeParentReachableHttp;
 
     private volatile String currentParentUrl;
     private volatile TopologyResponse currentTopology;
@@ -43,12 +58,14 @@ public class TopologyManager {
     public TopologyManager(
             CloudRegistryClient registryClient,
             PipeConnector pipeConnector,
+            PipeLineageStore lineageStore,
             @Value("${broker.registry.url}") String registryUrl,
             @Value("${broker.nodeId:local-001}") String nodeId,
             @Value("${broker.storage.data-dir:./data}") String dataDir) {
 
         this.registryClient = registryClient;
         this.pipeConnector = pipeConnector;
+        this.lineageStore = lineageStore;
         this.registryUrl = registryUrl;
         this.nodeId = nodeId;
         // Use single thread - topology updates are infrequent (every 30s)
@@ -142,17 +159,36 @@ public class TopologyManager {
                 return;
             }
 
-            // If parent changed, reconnect
+            // If parent changed, attempt to switch — but keep the old connection live
+            // until we've confirmed the new parent is reachable AND we've successfully
+            // connected to it. PipeLineage is only updated on successful swap.
             if (!newParentUrl.equals(currentParentUrl)) {
-                log.info("Parent changed from {} to {}", currentParentUrl, newParentUrl);
+                log.info("Parent change requested: {} -> {}", currentParentUrl, newParentUrl);
 
-                // Disconnect from old parent
+                // 1) Probe new parent BEFORE touching the live connection.
+                if (!parentReachableProbe.test(newParentUrl)) {
+                    log.warn("Cannot reach new parent {}; keeping connection to {}",
+                            newParentUrl, currentParentUrl);
+                    return;
+                }
+
+                // 2) Capture cursor BEFORE disconnect (disconnect could change connector state).
+                long cursorAtSwitch = pipeConnector.getCurrentOffset();
+                long firstOffsetFromNewParent = cursorAtSwitch < 0 ? 0L : cursorAtSwitch;
+
+                // 3) Probe succeeded — tear down old, connect new, update lineage on success.
                 if (currentParentUrl != null) {
                     disconnectFromParent();
                 }
-
-                // Connect to new parent
-                connectToParent(newParentUrl);
+                connectToParent(newParentUrl).whenComplete((v, ex) -> {
+                    if (ex == null) {
+                        lineageStore.recordParentSwitch(newParentUrl, firstOffsetFromNewParent);
+                    } else {
+                        log.error("Connect to {} failed after probe succeeded; " +
+                                "broker has no active pipe until next registry cycle",
+                                newParentUrl, ex);
+                    }
+                });
             }
 
             currentTopology = topology;
@@ -163,25 +199,27 @@ public class TopologyManager {
     }
 
     /**
-     * Connect to parent broker
+     * Connect to parent broker. Returns a future that completes when the underlying
+     * connector future resolves AND currentParentUrl + handler are committed — caller
+     * can chain side-effects (e.g. lineage update) onto the success path.
      */
-    private void connectToParent(String parentUrl) {
+    private CompletableFuture<Void> connectToParent(String parentUrl) {
         log.info("Connecting to parent: {}", parentUrl);
-
+        CompletableFuture<Void> done = new CompletableFuture<>();
         pipeConnector.connectToParent(parentUrl).whenComplete((connection, ex) -> {
             if (ex != null) {
                 log.error("Failed to connect to parent: {}", parentUrl, ex);
+                done.completeExceptionally(ex);
                 return;
             }
-
             log.info("Connected to parent: {}", parentUrl);
             currentParentUrl = parentUrl;
-
-            // Register message handler
             if (messageHandler != null) {
                 pipeConnector.onDataReceived(messageHandler);
             }
+            done.complete(null);
         });
+        return done;
     }
 
     /**
@@ -191,6 +229,30 @@ public class TopologyManager {
         log.info("Disconnecting from parent: {}", currentParentUrl);
         pipeConnector.disconnect();
         currentParentUrl = null;
+    }
+
+    /**
+     * Quick HTTP GET to the candidate parent's /health endpoint with a short timeout.
+     * Returns true iff the parent responds with a 2xx. Used before tearing down the
+     * live connection so a flaky/stale registry response can't strand the broker.
+     */
+    private boolean probeParentReachableHttp(String parentUrl) {
+        if (parentUrl == null || parentUrl.isBlank()) return false;
+        try {
+            HttpRequest req = HttpRequest.newBuilder(URI.create(parentUrl + "/health"))
+                    .timeout(Duration.ofSeconds(3))
+                    .GET()
+                    .build();
+            HttpResponse<Void> resp = probeHttp.send(req, HttpResponse.BodyHandlers.discarding());
+            boolean ok = resp.statusCode() / 100 == 2;
+            if (!ok) {
+                log.warn("Probe of {}/health returned HTTP {}", parentUrl, resp.statusCode());
+            }
+            return ok;
+        } catch (Exception e) {
+            log.warn("Probe of {}/health failed: {}", parentUrl, e.toString());
+            return false;
+        }
     }
 
     /**
@@ -205,6 +267,13 @@ public class TopologyManager {
      */
     public String getCurrentParentUrl() {
         return currentParentUrl;
+    }
+
+    /**
+     * This broker's stable node identifier (from broker.nodeId config).
+     */
+    public String getNodeId() {
+        return nodeId;
     }
 
     @PreDestroy

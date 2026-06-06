@@ -41,6 +41,18 @@ public class RefreshReplayService implements ReplayPhase {
         this.refreshLogger = refreshLogger;
     }
 
+    /**
+     * Backward-compatible constructor for tests that only verify replay gating
+     * and metric calls, not storage-head-based gap updates.
+     */
+    @Deprecated
+    public RefreshReplayService(
+            ConsumerRegistry remoteConsumers,
+            DataRefreshMetrics metrics,
+            RefreshEventLogger refreshLogger) {
+        this(remoteConsumers, null, metrics, refreshLogger);
+    }
+
     @Override
     public boolean checkReplayProgress(String topic, RefreshContext context) {
         java.util.Map<String, String> mdc = new HashMap<>();

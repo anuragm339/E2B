@@ -113,6 +113,8 @@ abstract class BrokerSystemTestSupport extends Specification {
             'broker.consumer.send-timeout-per-mb-seconds'          : '2',
             'broker.consumer.adaptive-polling.min-delay-ms'        : '50',
             'broker.consumer.adaptive-polling.max-delay-ms'        : '500',
+            'compaction.max-process-cpu-usage'                     : '100.0',
+            'compaction.max-heap-usage'                            : '100.0',
             'micronaut.server.port'                  : "${findFreePort()}",
             'data-refresh.enabled'                   : 'false',
             // Suppress test-consumer beans (GenericConsumerHandler/@Consumer) in broker context

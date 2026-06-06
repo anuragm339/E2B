@@ -62,17 +62,17 @@ class RefreshReplayServiceSpec extends Specification {
 
         then:
         !done
-        1 * metrics.recordReplayStarted("prices-v1", "prices-v1", "refresh-2")
+        1 * metrics.recordReplayStarted("prices-v1", "group-a:prices-v1", "refresh-2")
     }
 
     def "startReplayForConsumer swallows replay startup exceptions"() {
         given:
         def context = new RefreshContext("prices-v1", ["group-a:prices-v1"] as Set)
         context.setRefreshId("refresh-3")
-        metrics.recordReplayStarted("prices-v1", "prices-v1", "refresh-3") >> { throw new RuntimeException("boom") }
+        metrics.recordReplayStarted("prices-v1", "group-a:prices-v1", "refresh-3") >> { throw new RuntimeException("boom") }
 
         when:
-        service.startReplayForConsumer("client-a", "prices-v1", context)
+        service.startReplayForConsumer("client-a", "prices-v1", "group-a:prices-v1", context)
 
         then:
         noExceptionThrown()

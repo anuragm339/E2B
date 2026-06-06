@@ -61,6 +61,10 @@ public class SegmentMetadataStore {
                 record_count BIGINT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                segment_hash BLOB,
+                hash_record_count BIGINT NOT NULL DEFAULT 0,
+                compaction_epoch INTEGER NOT NULL DEFAULT 0,
+                hash_state TEXT NOT NULL DEFAULT 'pending',
                 UNIQUE(topic, partition, base_offset)
             )
         """;
@@ -71,7 +75,26 @@ public class SegmentMetadataStore {
             // Create indices
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_topic_partition ON segment_metadata(topic, partition)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_base_offset ON segment_metadata(base_offset)");
+
+            // Guarded ALTER TABLE for older DBs that pre-date the PipeConsistency columns.
+            // PRAGMA table_info returns one row per column; we add only the columns missing.
+            addColumnIfMissing(stmt, "segment_hash", "BLOB");
+            addColumnIfMissing(stmt, "hash_record_count", "BIGINT NOT NULL DEFAULT 0");
+            addColumnIfMissing(stmt, "compaction_epoch", "INTEGER NOT NULL DEFAULT 0");
+            addColumnIfMissing(stmt, "hash_state", "TEXT NOT NULL DEFAULT 'pending'");
         }
+    }
+
+    private void addColumnIfMissing(Statement stmt, String columnName, String columnDef) throws SQLException {
+        try (ResultSet rs = stmt.executeQuery("PRAGMA table_info(segment_metadata)")) {
+            while (rs.next()) {
+                if (columnName.equalsIgnoreCase(rs.getString("name"))) {
+                    return;
+                }
+            }
+        }
+        stmt.execute("ALTER TABLE segment_metadata ADD COLUMN " + columnName + " " + columnDef);
+        log.info("Migrated segment_metadata: added column {}", columnName);
     }
 
     /**
@@ -82,10 +105,11 @@ public class SegmentMetadataStore {
      */
     public synchronized void saveSegment(SegmentMetadata metadata) throws StorageException {
         String sql = """
-            INSERT OR REPLACE INTO segment_metadata 
-            (topic, partition, base_offset, max_offset, log_file_path, index_file_path, 
-             size_bytes, record_count, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO segment_metadata
+            (topic, partition, base_offset, max_offset, log_file_path, index_file_path,
+             size_bytes, record_count, created_at, updated_at,
+             segment_hash, hash_record_count, compaction_epoch, hash_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """;
 
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
@@ -99,10 +123,21 @@ public class SegmentMetadataStore {
             stmt.setLong(8, metadata.getRecordCount());
             stmt.setString(9, metadata.getCreatedAt().toString());
             stmt.setString(10, Instant.now().toString());
-            
+
+            byte[] hash = metadata.getSegmentHash();
+            if (hash == null) {
+                stmt.setNull(11, Types.BLOB);
+            } else {
+                stmt.setBytes(11, hash);
+            }
+            stmt.setLong(12, metadata.getHashRecordCount());
+            stmt.setInt(13, metadata.getCompactionEpoch());
+            stmt.setString(14, metadata.getHashState());
+
             stmt.executeUpdate();
-            log.debug("Saved segment metadata: topic={}, partition={}, baseOffset={}",
-                    metadata.getTopic(), metadata.getPartition(), metadata.getBaseOffset());
+            log.debug("Saved segment metadata: topic={}, partition={}, baseOffset={}, hashState={}",
+                    metadata.getTopic(), metadata.getPartition(), metadata.getBaseOffset(),
+                    metadata.getHashState());
         } catch (SQLException e) {
             StorageException ex = new StorageException(ErrorCode.STORAGE_METADATA_ERROR,
                 "Failed to save segment metadata", e);
@@ -115,37 +150,107 @@ public class SegmentMetadataStore {
     }
 
     /**
+     * Update only the hash-related columns for a sealed/compacted segment.
+     * Used by rolling-hash finalization and post-compaction recompute paths
+     * that don't need to rewrite the rest of the metadata row.
+     */
+    public synchronized void updateSegmentHash(
+            String topic,
+            int partition,
+            long baseOffset,
+            byte[] segmentHash,
+            long hashRecordCount,
+            int compactionEpoch,
+            String hashState
+    ) throws StorageException {
+        String sql = """
+            UPDATE segment_metadata
+               SET segment_hash = ?,
+                   hash_record_count = ?,
+                   compaction_epoch = ?,
+                   hash_state = ?,
+                   updated_at = ?
+             WHERE topic = ? AND partition = ? AND base_offset = ?
+        """;
+
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            if (segmentHash == null) {
+                stmt.setNull(1, Types.BLOB);
+            } else {
+                stmt.setBytes(1, segmentHash);
+            }
+            stmt.setLong(2, hashRecordCount);
+            stmt.setInt(3, compactionEpoch);
+            stmt.setString(4, hashState);
+            stmt.setString(5, Instant.now().toString());
+            stmt.setString(6, topic);
+            stmt.setInt(7, partition);
+            stmt.setLong(8, baseOffset);
+
+            int updated = stmt.executeUpdate();
+            if (updated == 0) {
+                log.warn("updateSegmentHash matched no rows: topic={}, partition={}, baseOffset={}",
+                        topic, partition, baseOffset);
+            }
+        } catch (SQLException e) {
+            StorageException ex = new StorageException(ErrorCode.STORAGE_METADATA_ERROR,
+                "Failed to update segment hash", e);
+            ex.withTopic(topic);
+            ex.withPartition(partition);
+            ex.withContext("baseOffset", baseOffset);
+            ExceptionLogger.logError(log, ex);
+            throw ex;
+        }
+    }
+
+    public synchronized SegmentMetadata getSegment(String topic, int partition, long baseOffset) {
+        String sql = """
+            SELECT topic, partition, base_offset, max_offset, log_file_path, index_file_path,
+                   size_bytes, record_count, created_at,
+                   segment_hash, hash_record_count, compaction_epoch, hash_state
+            FROM segment_metadata
+            WHERE topic = ? AND partition = ? AND base_offset = ?
+        """;
+
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            stmt.setString(1, topic);
+            stmt.setInt(2, partition);
+            stmt.setLong(3, baseOffset);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return mapRow(rs);
+                }
+            }
+        } catch (SQLException e) {
+            log.error("Failed to load segment metadata: topic={}, partition={}, baseOffset={}",
+                    topic, partition, baseOffset, e);
+        }
+        return null;
+    }
+
+    /**
      * Get all segments for a topic-partition
      * B6-5 fix: synchronized to guard shared Connection
      */
     public synchronized List<SegmentMetadata> getSegments(String topic, int partition) throws StorageException {
         String sql = """
             SELECT topic, partition, base_offset, max_offset, log_file_path, index_file_path,
-                   size_bytes, record_count, created_at, updated_at
+                   size_bytes, record_count, created_at,
+                   segment_hash, hash_record_count, compaction_epoch, hash_state
             FROM segment_metadata
             WHERE topic = ? AND partition = ?
             ORDER BY base_offset ASC
         """;
 
         List<SegmentMetadata> segments = new ArrayList<>();
-        
+
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
             stmt.setString(1, topic);
             stmt.setInt(2, partition);
-            
+
             ResultSet rs = stmt.executeQuery();
             while (rs.next()) {
-                segments.add(SegmentMetadata.builder()
-                        .topic(rs.getString("topic"))
-                        .partition(rs.getInt("partition"))
-                        .baseOffset(rs.getLong("base_offset"))
-                        .maxOffset(rs.getLong("max_offset"))
-                        .logFilePath(rs.getString("log_file_path"))
-                        .indexFilePath(rs.getString("index_file_path"))
-                        .sizeBytes(rs.getLong("size_bytes"))
-                        .recordCount(rs.getLong("record_count"))
-                        .createdAt(Instant.parse(rs.getString("created_at")))
-                        .build());
+                segments.add(mapRow(rs));
             }
         } catch (SQLException e) {
             StorageException ex = new StorageException(ErrorCode.STORAGE_METADATA_ERROR,
@@ -157,6 +262,24 @@ public class SegmentMetadataStore {
         }
 
         return segments;
+    }
+
+    private SegmentMetadata mapRow(ResultSet rs) throws SQLException {
+        return SegmentMetadata.builder()
+                .topic(rs.getString("topic"))
+                .partition(rs.getInt("partition"))
+                .baseOffset(rs.getLong("base_offset"))
+                .maxOffset(rs.getLong("max_offset"))
+                .logFilePath(rs.getString("log_file_path"))
+                .indexFilePath(rs.getString("index_file_path"))
+                .sizeBytes(rs.getLong("size_bytes"))
+                .recordCount(rs.getLong("record_count"))
+                .createdAt(Instant.parse(rs.getString("created_at")))
+                .segmentHash(rs.getBytes("segment_hash"))
+                .hashRecordCount(rs.getLong("hash_record_count"))
+                .compactionEpoch(rs.getInt("compaction_epoch"))
+                .hashState(rs.getString("hash_state"))
+                .build();
     }
 
     /**

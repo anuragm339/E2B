@@ -171,6 +171,15 @@ class BrokerRegistryIntegrationSpec extends Specification implements TestPropert
         }
 
         void registerHandlers() {
+            // TopologyManager probes parentUrl + "/health" before tearing down the live
+            // pipe connection (Fix 1). The stub plays both registry AND parent roles, so
+            // it must answer /health with 2xx — otherwise the probe rejects the parent and
+            // the broker never connects, making pipe-poll and downstream tests hang.
+            server.createContext('/health') { HttpExchange ex ->
+                ex.sendResponseHeaders(200, -1)
+                ex.close()
+            }
+
             server.createContext('/registry/topology') { HttpExchange ex ->
                 registryRequests.incrementAndGet()
                 def body = OBJECT_MAPPER.writeValueAsBytes([

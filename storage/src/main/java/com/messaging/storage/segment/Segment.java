@@ -4,6 +4,7 @@ import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.exception.StorageException;
+import com.messaging.common.hash.RecordHasher;
 import com.messaging.common.model.DeliveryBatch;
 import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
@@ -57,6 +58,17 @@ public class Segment {
     private boolean active;
     private final int effectiveIndexEntrySize; // INDEX_ENTRY_SIZE (v2) or INDEX_ENTRY_SIZE_LEGACY (v1)
 
+    // PipeConsistency rolling hash: built incrementally as records are appended.
+    // - Trustworthy if and only if this segment was created fresh (no existing log/index files at open).
+    //   When the constructor finds existing data on disk, the in-memory hash starts EMPTY and must be
+    //   reconstructed via SegmentHasher.reconstructFromScratch before being trusted.
+    private byte[] rollingHash = RecordHasher.EMPTY_HASH.clone();
+    private long rollingHashRecordCount = 0;
+    private boolean rollingHashTrustworthy = false;
+    // Set by CompactionRewriter on the merged segment so saveSegmentMetadata can persist the
+    // bumped epoch and hash_state='compacted'. Defaults to 0 for normally-sealed segments.
+    private int compactionEpoch = 0;
+
     public Segment(Path logPath, Path indexPath, long baseOffset, long maxSize, String topic, int partition) throws StorageException {
         this.baseOffset = baseOffset;
         this.logPath = logPath;
@@ -94,6 +106,12 @@ public class Segment {
             // If segment has existing data, recover index and nextOffset
             if (logPosition > FILE_HEADER_SIZE) {
                 recoverIndex();
+                // Existing data on disk: rolling hash field doesn't reflect those records yet.
+                // Caller must invoke SegmentHasher.reconstructFromScratch before trusting it.
+                this.rollingHashTrustworthy = false;
+            } else {
+                // Fresh segment: rolling hash starts from EMPTY and we will fold every append.
+                this.rollingHashTrustworthy = true;
             }
         } catch (IOException e) {
             throw new StorageException(ErrorCode.STORAGE_IO_ERROR,
@@ -442,6 +460,19 @@ public class Segment {
             // Increment record count for next write
             recordCount++;
 
+            // Fold this record into the rolling PipeConsistency hash. Only meaningful when
+            // rollingHashTrustworthy is true (fresh segment); reconstructFromScratch must run first
+            // on segments loaded from disk before the rolling hash can be relied on.
+            if (rollingHashTrustworthy) {
+                int recCrc = RecordHasher.recordCrc(
+                        offset,
+                        record.getMsgKey(),
+                        (char) record.getEventType().getCode(),
+                        record.getData());
+                rollingHash = RecordHasher.combine(rollingHash, recCrc);
+                rollingHashRecordCount++;
+            }
+
             // Force to disk for durability
             logChannel.force(false);
             indexChannel.force(false);
@@ -659,6 +690,70 @@ public class Segment {
                     .withSegmentPath(logPath.toString())
                     .withContext("operation", "readRecordAtOffset"));
         }
+    }
+
+    /**
+     * Immutable snapshot of the rolling hash plus the offset range it covers.
+     * Used by PipeConsistency to compare a segment against an upstream hash.
+     */
+    public static final class RollingHashSnapshot {
+        public final byte[] hash;
+        public final long recordCount;
+        public final long maxOffsetExclusive;
+        public final boolean trustworthy;
+
+        public RollingHashSnapshot(byte[] hash, long recordCount, long maxOffsetExclusive, boolean trustworthy) {
+            this.hash = hash;
+            this.recordCount = recordCount;
+            this.maxOffsetExclusive = maxOffsetExclusive;
+            this.trustworthy = trustworthy;
+        }
+    }
+
+    /**
+     * Snapshot the rolling hash under the segment monitor so it is consistent with the
+     * offset range it claims to cover. Pairs with Segment.append() to give the auditor
+     * a stable view of "the hash of records [baseOffset .. maxOffsetExclusive)".
+     *
+     * If !trustworthy, the caller must use SegmentHasher.reconstructFromScratch before
+     * comparing against an upstream hash.
+     */
+    public synchronized RollingHashSnapshot snapshotRollingHash() {
+        return new RollingHashSnapshot(
+                rollingHash.clone(),
+                rollingHashRecordCount,
+                nextOffset,
+                rollingHashTrustworthy);
+    }
+
+    /**
+     * Install a recomputed rolling hash, typically after lazy backfill. Marks the hash as
+     * trustworthy so subsequent appends fold into it normally. Caller is responsible for
+     * holding any external coordination needed.
+     */
+    public synchronized void installRollingHash(byte[] hash, long recordCount) {
+        if (hash == null || hash.length != RecordHasher.HASH_LEN) {
+            throw new IllegalArgumentException("rolling hash must be " + RecordHasher.HASH_LEN + " bytes");
+        }
+        this.rollingHash = hash.clone();
+        this.rollingHashRecordCount = recordCount;
+        this.rollingHashTrustworthy = true;
+    }
+
+    public int getPartition() {
+        return partition;
+    }
+
+    public String getTopic() {
+        return topic;
+    }
+
+    public synchronized int getCompactionEpoch() {
+        return compactionEpoch;
+    }
+
+    public synchronized void setCompactionEpoch(int epoch) {
+        this.compactionEpoch = epoch;
     }
 
     /**

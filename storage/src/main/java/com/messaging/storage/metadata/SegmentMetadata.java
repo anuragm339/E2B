@@ -1,11 +1,16 @@
 package com.messaging.storage.metadata;
 
 import java.time.Instant;
+import java.util.Arrays;
 
 /**
  * Metadata about a segment
  */
 public class SegmentMetadata {
+    public static final String HASH_STATE_PENDING = "pending";
+    public static final String HASH_STATE_FINAL = "final";
+    public static final String HASH_STATE_COMPACTED = "compacted";
+
     private final String topic;
     private final int partition;
     private final long baseOffset;
@@ -15,6 +20,10 @@ public class SegmentMetadata {
     private final long sizeBytes;
     private final long recordCount;
     private final Instant createdAt;
+    private final byte[] segmentHash;
+    private final long hashRecordCount;
+    private final int compactionEpoch;
+    private final String hashState;
 
     private SegmentMetadata(Builder builder) {
         this.topic = builder.topic;
@@ -26,6 +35,10 @@ public class SegmentMetadata {
         this.sizeBytes = builder.sizeBytes;
         this.recordCount = builder.recordCount;
         this.createdAt = builder.createdAt != null ? builder.createdAt : Instant.now();
+        this.segmentHash = builder.segmentHash == null ? null : builder.segmentHash.clone();
+        this.hashRecordCount = builder.hashRecordCount;
+        this.compactionEpoch = builder.compactionEpoch;
+        this.hashState = builder.hashState != null ? builder.hashState : HASH_STATE_PENDING;
     }
 
     public static Builder builder() {
@@ -68,6 +81,27 @@ public class SegmentMetadata {
         return createdAt;
     }
 
+    public byte[] getSegmentHash() {
+        return segmentHash == null ? null : segmentHash.clone();
+    }
+
+    public long getHashRecordCount() {
+        return hashRecordCount;
+    }
+
+    public int getCompactionEpoch() {
+        return compactionEpoch;
+    }
+
+    public String getHashState() {
+        return hashState;
+    }
+
+    public boolean hasFinalHash() {
+        return segmentHash != null
+                && (HASH_STATE_FINAL.equals(hashState) || HASH_STATE_COMPACTED.equals(hashState));
+    }
+
     public static class Builder {
         private String topic;
         private int partition;
@@ -78,6 +112,10 @@ public class SegmentMetadata {
         private long sizeBytes;
         private long recordCount;
         private Instant createdAt;
+        private byte[] segmentHash;
+        private long hashRecordCount;
+        private int compactionEpoch;
+        private String hashState;
 
         public Builder topic(String topic) {
             this.topic = topic;
@@ -121,6 +159,26 @@ public class SegmentMetadata {
 
         public Builder createdAt(Instant createdAt) {
             this.createdAt = createdAt;
+            return this;
+        }
+
+        public Builder segmentHash(byte[] segmentHash) {
+            this.segmentHash = segmentHash == null ? null : segmentHash.clone();
+            return this;
+        }
+
+        public Builder hashRecordCount(long hashRecordCount) {
+            this.hashRecordCount = hashRecordCount;
+            return this;
+        }
+
+        public Builder compactionEpoch(int compactionEpoch) {
+            this.compactionEpoch = compactionEpoch;
+            return this;
+        }
+
+        public Builder hashState(String hashState) {
+            this.hashState = hashState;
             return this;
         }
 

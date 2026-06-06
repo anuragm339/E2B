@@ -59,6 +59,15 @@ public interface PipeConnector {
     void disconnect();
 
     /**
+     * The pipe-level cursor: the next offset this connector will request via /pipe/poll.
+     * Used by PipeConsistency lineage tracking to record the exact boundary at which a
+     * new parent started producing. Implementations that don't track a cursor return -1.
+     */
+    default long getCurrentOffset() {
+        return -1L;
+    }
+
+    /**
      * Pipe connection interface
      */
     interface PipeConnection {

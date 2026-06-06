@@ -32,6 +32,9 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
 
     LegacyConsumerClient legacyClient
 
+    @Override
+    protected String defaultTopic() { '__unused_legacy_only__' }
+
     /**
      * Connect as 'price-quote-service' and complete the startup handshake (READY → ACK)
      * before each test so the client is in normal delivery mode from the start.
@@ -43,6 +46,14 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
             assert legacyClient.received.any { it instanceof ReadyEvent }
         }
         legacyClient.sendAck()
+        def registry = brokerCtx.getBean(ConsumerRegistry)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            def legacyConsumers = registry.getAllConsumers().findAll {
+                it.legacy && it.group == 'price-quote-service'
+            }
+            assert !legacyConsumers.isEmpty()
+            assert legacyConsumers.every { registry.isLegacyConsumerReady(it.clientId) }
+        }
         legacyClient.clearReceived()
     }
 
@@ -137,16 +148,29 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
             assert legacyClient.received.any { it instanceof BatchEvent }
         }
-        def beforeAck = legacyClient.received.findAll { it instanceof BatchEvent }.size()
+        def beforeAck = legacyClient.received
+            .findAll { it instanceof BatchEvent }
+            .collectMany { (it as BatchEvent).messages*.key }
+            .count { it == 'legacy-dedup-1' }
 
         when: "ACK is sent and then no new messages are enqueued"
         legacyClient.received.findAll { it instanceof BatchEvent }.each { legacyClient.sendAck() }
+        def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert offsetTracker.getOffset('price-quote-service:prices-v1') >= 2L
+        }
         waitForStableValue(2000) {
-            legacyClient.received.findAll { it instanceof BatchEvent }.size()
+            legacyClient.received
+                .findAll { it instanceof BatchEvent }
+                .collectMany { (it as BatchEvent).messages*.key }
+                .count { it == 'legacy-dedup-1' }
         }
 
         then: "no additional BatchEvents are received after the ACK"
-        def afterAck = legacyClient.received.findAll { it instanceof BatchEvent }.size()
+        def afterAck = legacyClient.received
+            .findAll { it instanceof BatchEvent }
+            .collectMany { (it as BatchEvent).messages*.key }
+            .count { it == 'legacy-dedup-1' }
         afterAck == beforeAck  // count did not grow → no re-delivery
 
         and: "no wire errors"

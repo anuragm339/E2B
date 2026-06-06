@@ -74,6 +74,9 @@ class CompactionDeliveryRecoveryJourneySpec extends BrokerSystemTestSupport {
         return base
     }
 
+    @Override
+    protected String defaultTopic() { '__unused_legacy_only__' }
+
     def setup() {
         // legacyClient is connected inside the test AFTER Phase 1 compaction.
         // Connecting before Phase 1 records arrive would let the broker deliver them

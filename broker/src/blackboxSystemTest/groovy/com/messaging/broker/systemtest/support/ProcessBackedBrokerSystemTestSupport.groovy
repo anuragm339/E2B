@@ -67,7 +67,7 @@ abstract class ProcessBackedBrokerSystemTestSupport extends Specification {
                 "-Dlogback.configurationFile=${consumerLogbackFile()}"
             ]
         )
-        waitForLogContains(consumerProcess, 'Starting Consumer Application')
+        waitForAnyLogContains(consumerProcess, ['event=consumer.starting', 'Starting Consumer Application'])
         awaitPortOpen(consumerProcess, consumerHttpPort)
     }
 
@@ -89,6 +89,7 @@ abstract class ProcessBackedBrokerSystemTestSupport extends Specification {
             'CONSUMER_TOPICS' : defaultTopic(),
             'CONSUMER_GROUP'  : defaultGroup(),
             'CONSUMER_PORT'   : "${consumerHttpPort}",
+            'CONSUMER_BATCH_LOG_LEVEL': 'DEBUG',
             'LEGACY_MODE'     : 'false',
             'BROKER_HOST'     : '127.0.0.1',
             'BROKER_PORT'     : "${brokerTcpPort}",
@@ -165,6 +166,14 @@ abstract class ProcessBackedBrokerSystemTestSupport extends Specification {
         new PollingConditions(timeout: timeoutSecs, delay: 0.2).eventually {
             assert proc.isAlive()
             assert proc.readLog().contains(token)
+        }
+    }
+
+    protected void waitForAnyLogContains(ManagedJavaProcess proc, List<String> tokens, int timeoutSecs = 30) {
+        new PollingConditions(timeout: timeoutSecs, delay: 0.2).eventually {
+            assert proc.isAlive()
+            String logText = proc.readLog()
+            assert tokens.any { logText.contains(it) }
         }
     }
 

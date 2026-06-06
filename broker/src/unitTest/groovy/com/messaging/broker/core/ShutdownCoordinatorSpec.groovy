@@ -9,6 +9,7 @@ import java.util.concurrent.TimeUnit
 class ShutdownCoordinatorSpec extends Specification {
 
     ExecutorService ackExecutor
+    ExecutorService ackStorageExecutor
     ExecutorService storageExecutor
     ScheduledExecutorService consumerScheduler
     ScheduledExecutorService dataRefreshScheduler
@@ -17,12 +18,15 @@ class ShutdownCoordinatorSpec extends Specification {
 
     def setup() {
         ackExecutor = Mock(ExecutorService)
+        ackStorageExecutor = Mock(ExecutorService)
         storageExecutor = Mock(ExecutorService)
         consumerScheduler = Mock(ScheduledExecutorService)
         dataRefreshScheduler = Mock(ScheduledExecutorService)
         flushScheduler = Mock(ScheduledExecutorService)
 
-        coordinator = new ShutdownCoordinator(ackExecutor, storageExecutor, consumerScheduler, dataRefreshScheduler, flushScheduler)
+        coordinator = new ShutdownCoordinator(
+                ackExecutor, ackStorageExecutor, storageExecutor,
+                consumerScheduler, dataRefreshScheduler, flushScheduler)
     }
 
     def "should shutdown all executors gracefully"() {
@@ -31,6 +35,7 @@ class ShutdownCoordinatorSpec extends Specification {
         dataRefreshScheduler.awaitTermination(_, _) >> true
         flushScheduler.awaitTermination(_, _) >> true
         ackExecutor.awaitTermination(_, _) >> true
+        ackStorageExecutor.awaitTermination(_, _) >> true
         storageExecutor.awaitTermination(_, _) >> true
 
         when:
@@ -45,6 +50,8 @@ class ShutdownCoordinatorSpec extends Specification {
 
         1 * ackExecutor.shutdown()
         1 * ackExecutor.awaitTermination(10, TimeUnit.SECONDS)
+        1 * ackStorageExecutor.shutdown()
+        1 * ackStorageExecutor.awaitTermination(10, TimeUnit.SECONDS)
     }
 
     def "should force shutdown if graceful shutdown times out"() {
@@ -56,6 +63,7 @@ class ShutdownCoordinatorSpec extends Specification {
 
         flushScheduler.awaitTermination(_, _) >> true
         ackExecutor.awaitTermination(_, _) >> true
+        ackStorageExecutor.awaitTermination(_, _) >> true
         storageExecutor.awaitTermination(_, _) >> true
 
         when:
@@ -72,6 +80,7 @@ class ShutdownCoordinatorSpec extends Specification {
         dataRefreshScheduler.awaitTermination(_, _) >> true
         flushScheduler.awaitTermination(_, _) >> true
         ackExecutor.awaitTermination(_, _) >> true
+        ackStorageExecutor.awaitTermination(_, _) >> true
         storageExecutor.awaitTermination(_, _) >> true
 
         when:
@@ -95,6 +104,7 @@ class ShutdownCoordinatorSpec extends Specification {
         ackExecutor.awaitTermination(10, TimeUnit.SECONDS) >> false
         ackExecutor.awaitTermination(5, TimeUnit.SECONDS) >> true
         ackExecutor.shutdownNow() >> droppedTasks
+        ackStorageExecutor.awaitTermination(_, _) >> true
         storageExecutor.awaitTermination(_, _) >> true
 
         when:

@@ -115,6 +115,15 @@ public class HttpPipeConnector implements PipeConnector {
     }
 
     /**
+     * The next offset this connector will request via /pipe/poll. Used by PipeConsistency
+     * lineage tracking to record the boundary where a new parent started producing.
+     */
+    @Override
+    public long getCurrentOffset() {
+        return currentOffset;
+    }
+
+    /**
      * Single-thread polling loop (no task buildup)
      */
     private void pollLoop() {

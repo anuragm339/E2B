@@ -142,6 +142,11 @@ public class ConsumerRegistry {
         Collection<RemoteConsumer> consumers = registrationService.getConsumersByClient(clientId);
 
         for (RemoteConsumer consumer : consumers) {
+            java.util.concurrent.Future<?> deliveryTask = consumer.getDeliveryTask();
+            if (deliveryTask != null) {
+                deliveryTask.cancel(false);
+                consumer.setDeliveryTask(null);
+            }
             stateService.removeDeliveryState(DeliveryKey.of(consumer.getGroup(), consumer.getTopic()));
             metrics.completePendingAck(consumer.getTopic(), consumer.getGroup());
         }
@@ -154,6 +159,12 @@ public class ConsumerRegistry {
         }
 
         return registrationService.unregisterConsumer(clientId);
+    }
+
+    public boolean isRegistered(RemoteConsumer consumer) {
+        return registrationService.getConsumer(
+                ConsumerKey.of(consumer.getClientId(), consumer.getTopic(), consumer.getGroup()))
+                .isPresent();
     }
 
     /**

@@ -14,7 +14,7 @@ class ModernConsumerEndToEndSystemSpec extends ProcessBackedBrokerSystemTestSupp
         ])
 
         then: "the external consumer process logs receipt of the batch"
-        waitForLogContains(consumerProcess, 'BATCH_RECEIVED')
+        waitForAnyLogContains(consumerProcess, ['event=consumer.progress', 'event=consumer.batch_received'])
         waitForLogContains(consumerProcess, 'firstKey=bbx-1')
         waitForLogContains(consumerProcess, 'lastKey=bbx-2')
 
