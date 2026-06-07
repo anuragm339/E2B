@@ -11,6 +11,27 @@ import io.micrometer.core.instrument.Timer;
 public interface PendingAckStore {
 
     /**
+     * Atomically reserve the single pending slot with all ACK-visible state initialized.
+     *
+     * @return delivery generation, or -1 when another batch already owns the slot
+     */
+    long reservePendingBatch(
+            String clientId,
+            MergedBatch batch,
+            Timer.Sample timerSample,
+            long sendTimeMs);
+
+    /**
+     * Atomically claim and remove the current pending delivery.
+     */
+    PendingLegacyDelivery claimPendingDelivery(String clientId);
+
+    /**
+     * Atomically claim and remove only the expected delivery generation.
+     */
+    PendingLegacyDelivery claimPendingDelivery(String clientId, long expectedGeneration);
+
+    /**
      * Store pending legacy batch.
      *
      * @param clientId Client connection identifier

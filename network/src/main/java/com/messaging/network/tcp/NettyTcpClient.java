@@ -23,7 +23,11 @@ import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
@@ -132,7 +136,7 @@ public class NettyTcpClient implements NetworkClient {
     public void shutdown() {
         // N2 FIX: Only shutdown EventLoopGroup if we own it
         if (workerGroup != null && ownEventLoopGroup) {
-            workerGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully().syncUninterruptibly();
             log.info("NettyTcpClient shutdown complete (EventLoopGroup shut down)");
         } else {
             log.debug("NettyTcpClient shutdown (shared EventLoopGroup not shut down)");
@@ -143,15 +147,19 @@ public class NettyTcpClient implements NetworkClient {
      * TCP connection implementation
      */
     public static class TcpConnection implements Connection {
-        private Channel channel;
-        private Consumer<BrokerMessage> messageHandler;
-        private Runnable disconnectHandler;
+        private static final int MAX_EARLY_ACKS = 10_000;
+
+        private volatile Channel channel;
+        private volatile Consumer<BrokerMessage> messageHandler;
+        private volatile Runnable disconnectHandler;
         private final ConcurrentHashMap<Long, CompletableFuture<Void>> pendingAcks;
-        private final java.util.Set<Long> completedAcks;
+        private final ConcurrentLinkedQueue<Long> earlyAckOrder;
+        private final AtomicInteger earlyAckCount;
 
         public TcpConnection() {
             this.pendingAcks = new ConcurrentHashMap<>();
-            this.completedAcks = ConcurrentHashMap.newKeySet();
+            this.earlyAckOrder = new ConcurrentLinkedQueue<>();
+            this.earlyAckCount = new AtomicInteger();
         }
 
         public void setChannel(Channel channel) {
@@ -164,7 +172,6 @@ public class NettyTcpClient implements NetworkClient {
                 pendingAcks.values().forEach(f -> f.completeExceptionally(
                         new IllegalStateException("Connection closed")));
                 pendingAcks.clear();
-                completedAcks.clear();
 
                 // Notify disconnect handler
                 if (disconnectHandler != null) {
@@ -209,12 +216,19 @@ public class NettyTcpClient implements NetworkClient {
         public void handleIncomingMessage(BrokerMessage message) {
             // Handle ACKs specially
             if (message.getType() == BrokerMessage.MessageType.ACK) {
-                CompletableFuture<Void> ackFuture = pendingAcks.remove(message.getMessageId());
-                if (ackFuture != null) {
-                    ackFuture.complete(null);
-                } else {
-                    // Preserve ACKs that arrive before waitForAck() registers interest.
-                    completedAcks.add(message.getMessageId());
+                AtomicBoolean earlyAck = new AtomicBoolean();
+                pendingAcks.compute(message.getMessageId(), (messageId, ackFuture) -> {
+                    CompletableFuture<Void> signal = ackFuture != null
+                            ? ackFuture
+                            : new CompletableFuture<>();
+                    earlyAck.set(ackFuture == null);
+                    signal.complete(null);
+                    return signal;
+                });
+                if (earlyAck.get()) {
+                    earlyAckOrder.add(message.getMessageId());
+                    earlyAckCount.incrementAndGet();
+                    trimEarlyAcks();
                 }
             }
 
@@ -235,18 +249,19 @@ public class NettyTcpClient implements NetworkClient {
 
         @Override
         public boolean waitForAck(long messageId, long timeoutMs) {
-            if (completedAcks.remove(messageId)) {
-                return true;
-            }
-
-            CompletableFuture<Void> ackFuture = new CompletableFuture<>();
-            pendingAcks.put(messageId, ackFuture);
+            CompletableFuture<Void> ackFuture =
+                    pendingAcks.computeIfAbsent(messageId, ignored -> new CompletableFuture<>());
 
             try {
                 ackFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
+                pendingAcks.remove(messageId, ackFuture);
                 return true;
-            } catch (Exception e) {
-                pendingAcks.remove(messageId);
+            } catch (InterruptedException e) {
+                pendingAcks.remove(messageId, ackFuture);
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (TimeoutException | java.util.concurrent.ExecutionException e) {
+                pendingAcks.remove(messageId, ackFuture);
                 return false;
             }
         }
@@ -256,6 +271,18 @@ public class NettyTcpClient implements NetworkClient {
             if (channel != null && channel.isActive()) {
                 channel.close();
                 log.info("Disconnected");
+            }
+        }
+
+        private void trimEarlyAcks() {
+            while (earlyAckCount.get() > MAX_EARLY_ACKS) {
+                Long oldestMessageId = earlyAckOrder.poll();
+                if (oldestMessageId == null) {
+                    return;
+                }
+                earlyAckCount.decrementAndGet();
+                pendingAcks.computeIfPresent(oldestMessageId, (ignored, signal) ->
+                        signal.isDone() ? null : signal);
             }
         }
     }

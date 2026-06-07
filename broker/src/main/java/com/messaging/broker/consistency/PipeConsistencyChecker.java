@@ -519,6 +519,15 @@ public class PipeConsistencyChecker {
         boolean anyError = false;
         boolean anyStale = false;
         int drilledChunks = 0;
+        // Diagnostics: counters that let operators see what work the cycle actually did.
+        // Logged once per HOP-global call so audit cost can be correlated with the CPU/heap
+        // spike on the container Stats panel.
+        int chunksProcessed = 0;
+        int upstreamHashCalls = 0;
+        long localRecordsHashed = 0L;
+        long upstreamRecordsHashed = 0L;
+        long hashComputeNanos = 0L;
+        long upstreamCallNanos = 0L;
         java.util.HashMap<String, Long> perTopicMissing = new java.util.HashMap<>();
         java.util.HashMap<String, Long> perTopicExtra = new java.util.HashMap<>();
         java.util.HashMap<String, Long> perTopicDataMismatch = new java.util.HashMap<>();
@@ -537,16 +546,24 @@ public class PipeConsistencyChecker {
             long chunkFrom = sub.fromOffsetInclusive;
             while (chunkFrom <= clampedHi) {
                 long chunkTo = Math.min(clampedHi, chunkFrom + chunkSize - 1);
+                long t0 = System.nanoTime();
                 BrokerSegmentHashView.Computed local = hashView.computeGlobalHash(chunkFrom, chunkTo);
+                hashComputeNanos += (System.nanoTime() - t0);
+                localRecordsHashed += local.recordCount;
                 String projection = local.maxCompactionEpoch > 0 ? "compacted" : "raw";
 
+                long t1 = System.nanoTime();
                 UpstreamConsistencyClient.HashResponse up = upstream.fetchHash(
                         sub.parentUrl, GLOBAL_SCOPE, chunkFrom, chunkTo, projection);
+                upstreamCallNanos += (System.nanoTime() - t1);
+                upstreamHashCalls++;
+                chunksProcessed++;
                 if (!up.ok) {
                     anyError = true;
                     chunkFrom = chunkTo + 1;
                     continue;
                 }
+                upstreamRecordsHashed += up.recordCount;
                 b.comparedUpstream(up.nodeId, sub.parentUrl);
 
                 boolean countDiffers = local.recordCount != up.recordCount;
@@ -566,6 +583,13 @@ public class PipeConsistencyChecker {
                 chunkFrom = chunkTo + 1;
             }
         }
+
+        LOG.info("event=pipe_consistency.hop_global.summary subranges={} chunksProcessed={} "
+                + "upstreamHashCalls={} drilledChunks={} localRecordsHashed={} upstreamRecordsHashed={} "
+                + "hashComputeMs={} upstreamCallMs={}",
+                subranges.size(), chunksProcessed, upstreamHashCalls, drilledChunks,
+                localRecordsHashed, upstreamRecordsHashed,
+                hashComputeNanos / 1_000_000L, upstreamCallNanos / 1_000_000L);
 
         if (anyError) {
             b.status(PipeConsistencyReport.Status.ERROR).errorMessage("one or more subranges failed");
@@ -745,6 +769,17 @@ public class PipeConsistencyChecker {
         int recorded = 0;
         long localCountInChunk = 0;
         long upstreamCountInChunk = 0;
+        // Diagnostics — drill-down builds two HashMaps of MessageRecord per page (broker side
+        // + upstream side), with record bodies up to max-message-size each. Counting pages,
+        // total record bytes, and wall time pins down whether this is the source of the
+        // spike on the container Stats panel.
+        int pagesFetched = 0;
+        long localBytesMaterialised = 0L;
+        long upstreamBytesMaterialised = 0L;
+        long startedAtNanos = System.nanoTime();
+        long heapBefore = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+        LOG.info("event=pipe_consistency.drill_down.start chunk=[{},{}] pageSize={} parent={}",
+                fromOffset, toOffset, pageSize, parentUrl);
 
         // Cursor-paged: each successful fetch returns up to `pageSize` records with offsets
         // in (cursor, toOffset]. We track `brokerReadFloor` so broker-side reads cover the
@@ -759,12 +794,16 @@ public class PipeConsistencyChecker {
             }
             List<UpstreamConsistencyClient.RangeRecord> upstreamPage =
                     upstream.fetchRange(parentUrl, GLOBAL_SCOPE, fromOffset, toOffset, cursor, pageSize);
+            pagesFetched++;
             if (upstreamPage.isEmpty()) {
                 // Cloud has no more records in this chunk. There may still be broker records
                 // beyond brokerReadFloor that cloud doesn't have → real "extra on broker".
                 java.util.Map<Long, com.messaging.common.model.MessageRecord> tail =
                         readAllTopicsInPage(brokerReadFloor, toOffset);
                 localCountInChunk += tail.size();
+                for (com.messaging.common.model.MessageRecord r : tail.values()) {
+                    localBytesMaterialised += approxRecordBytes(r);
+                }
                 for (java.util.Map.Entry<Long, com.messaging.common.model.MessageRecord> e : tail.entrySet()) {
                     if (recorded >= maxMismatchReport) break;
                     com.messaging.common.model.MessageRecord loc = e.getValue();
@@ -777,13 +816,19 @@ public class PipeConsistencyChecker {
             }
 
             java.util.Map<Long, UpstreamConsistencyClient.RangeRecord> upstreamByOffset = new java.util.HashMap<>();
-            for (UpstreamConsistencyClient.RangeRecord r : upstreamPage) upstreamByOffset.put(r.offset, r);
+            for (UpstreamConsistencyClient.RangeRecord r : upstreamPage) {
+                upstreamByOffset.put(r.offset, r);
+                upstreamBytesMaterialised += approxRangeRecordBytes(r);
+            }
 
             long upstreamMax = upstreamPage.get(upstreamPage.size() - 1).offset;
             // Read broker records in the SAME window cloud just covered — from where the
             // previous page ended (or chunk start), through this page's last cloud offset.
             java.util.Map<Long, com.messaging.common.model.MessageRecord> localByOffset =
                     readAllTopicsInPage(brokerReadFloor, upstreamMax);
+            for (com.messaging.common.model.MessageRecord r : localByOffset.values()) {
+                localBytesMaterialised += approxRecordBytes(r);
+            }
 
             localCountInChunk += localByOffset.size();
             upstreamCountInChunk += upstreamByOffset.size();
@@ -826,6 +871,34 @@ public class PipeConsistencyChecker {
         }
         report.addMismatchedSegment(new PipeConsistencyReport.SegmentSummary(
                 fromOffset, toOffset, null, null, localCountInChunk, upstreamCountInChunk));
+
+        long heapAfter = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+        long durationMs = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+        LOG.info("event=pipe_consistency.drill_down.done chunk=[{},{}] pagesFetched={} "
+                + "brokerRecords={} upstreamRecords={} brokerBytesKB={} upstreamBytesKB={} "
+                + "recorded={} durationMs={} heapBeforeMB={} heapAfterMB={} heapDeltaMB={}",
+                fromOffset, toOffset, pagesFetched,
+                localCountInChunk, upstreamCountInChunk,
+                localBytesMaterialised >> 10, upstreamBytesMaterialised >> 10,
+                recorded, durationMs,
+                heapBefore >> 20, heapAfter >> 20, (heapAfter - heapBefore) >> 20);
+    }
+
+    private static long approxRecordBytes(com.messaging.common.model.MessageRecord r) {
+        if (r == null) return 0L;
+        long size = 64L; // object headers + offset + timestamp + small fields
+        if (r.getMsgKey() != null) size += r.getMsgKey().length();
+        if (r.getData() != null) size += r.getData().length();
+        if (r.getTopic() != null) size += r.getTopic().length();
+        return size;
+    }
+
+    private static long approxRangeRecordBytes(UpstreamConsistencyClient.RangeRecord r) {
+        if (r == null) return 0L;
+        long size = 48L;
+        if (r.msgKey != null) size += r.msgKey.length();
+        if (r.data != null) size += r.data.length();
+        return size;
     }
 
     private static String nullToUnknown(String s) {

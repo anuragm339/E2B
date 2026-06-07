@@ -76,6 +76,7 @@ broker:
     # Raise per-mb-seconds for slow networks; raise base-seconds for high-latency links.
     send-timeout-base-seconds: ${SEND_TIMEOUT_BASE_SECONDS:1}
     send-timeout-per-mb-seconds: ${SEND_TIMEOUT_PER_MB_SECONDS:2}
+    storage-read-timeout-seconds: ${STORAGE_READ_TIMEOUT_SECONDS:30}
     max-message-size-per-consumer: ${MAX_MESSAGE_SIZE_PER_CONSUMER:262144}  # 256KB default; below G1 humongous threshold (512KB with 1MB regions)
     # DEPRECATED: max-batch-size-per-consumer no longer used (size-only batching now)
     # max-batch-size-per-consumer: ${MAX_BATCH_SIZE_PER_CONSUMER:100}
@@ -158,14 +159,20 @@ legacy-clients:
 executor:
   ack:
     threads: ${EXECUTOR_ACK_THREADS:2}
+    queue-capacity: ${EXECUTOR_ACK_QUEUE_CAPACITY:1000}
   ack-storage:
     threads: ${EXECUTOR_ACK_STORAGE_THREADS:2}
+    queue-capacity: ${EXECUTOR_ACK_STORAGE_QUEUE_CAPACITY:100}
   consumer-scheduler:
     threads: ${EXECUTOR_CONSUMER_SCHEDULER_THREADS:2}
   storage:
     threads: ${EXECUTOR_STORAGE_THREADS:2}
+    queue-capacity: ${EXECUTOR_STORAGE_QUEUE_CAPACITY:100}
 
 ack-store:
+  # Backend selection. Supported: rocks (default), memory. New backends are added by implementing
+  # com.messaging.broker.ack.AckStore and annotating with @Requires(property="ack-store.backend").
+  backend: ${ACK_STORE_BACKEND:rocks}
   live-replay:
     enabled: ${ACK_STORE_LIVE_REPLAY_ENABLED:true}
   seed-on-startup:
@@ -178,6 +185,11 @@ ack-store:
     initial-delay: ${ACK_RECONCILIATION_INITIAL_DELAY:2m}
     enabled: ${ACK_RECONCILIATION_ENABLED:true}
     auto-sync-enabled: ${ACK_RECONCILIATION_AUTO_SYNC:false}
+
+compaction-index:
+  # Backend selection. Supported: rocks (default), memory. New backends are added by implementing
+  # com.messaging.broker.compaction.CompactionIndex and annotating with @Requires(property="compaction-index.backend").
+  backend: ${COMPACTION_INDEX_BACKEND:rocks}
 
 compaction:
   enabled: ${COMPACTION_ENABLED:true}
@@ -197,10 +209,10 @@ pipe-consistency-config:
   _comment: configured under the `pipe.consistency.*` namespace below
 pipe:
   consistency:
-    enabled: ${PIPE_CONSISTENCY_ENABLED:false}
+    enabled: ${PIPE_CONSISTENCY_ENABLED:true}
     schedule:
       hop-interval: ${PIPE_CONSISTENCY_HOP_INTERVAL:10m}
-      initial-delay: ${PIPE_CONSISTENCY_INITIAL_DELAY:10m}
+      initial-delay: ${PIPE_CONSISTENCY_INITIAL_DELAY:2m}
       deep-interval: ${PIPE_CONSISTENCY_DEEP_INTERVAL:24h}
       deep-initial-delay: ${PIPE_CONSISTENCY_DEEP_INITIAL_DELAY:30m}
     upstream:

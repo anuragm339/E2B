@@ -39,7 +39,9 @@ class CloudRegistryClientIntegrationSpec extends Specification {
     def setupSpec() {
         stub = RegistryStub.start()
         standaloneHttpClient = HttpClient.create(new URL(stub.baseUrl))
-        client = new CloudRegistryClient(standaloneHttpClient)
+        client = new CloudRegistryClient(
+                standaloneHttpClient,
+                { Runnable task -> task.run() } as java.util.concurrent.Executor)
     }
 
     def cleanupSpec() {

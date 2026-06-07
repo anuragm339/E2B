@@ -4,7 +4,7 @@ import com.messaging.common.api.StorageEngine
 import com.messaging.common.model.EventType
 import com.messaging.common.model.MessageRecord
 import com.messaging.pipe.metrics.PipeMetrics
-import io.micronaut.http.client.HttpClient
+import io.micronaut.http.client.StreamingHttpClient
 import io.micronaut.http.client.annotation.Client
 import io.micronaut.runtime.server.EmbeddedServer
 import io.micronaut.test.annotation.MockBean
@@ -27,7 +27,7 @@ import java.util.concurrent.TimeUnit
  * @MicronautTest starts the embedded server with the real PipeServer controller.
  * StorageEngine is replaced with a Spock mock via @MockBean so we can control
  * what records the PipeServer returns.  A fresh HttpPipeConnector is created per
- * test (it is not a shared singleton here) using the Micronaut-managed HttpClient,
+ * test (it is not a shared singleton here) using the Micronaut-managed StreamingHttpClient,
  * ensuring each test gets an independent polling thread.
  */
 @MicronautTest
@@ -48,7 +48,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
     @Inject StorageEngine  storage
     @Inject PipeMetrics    pipeMetrics
 
-    @Inject @Client("/") HttpClient httpClient
+    @Inject @Client("/") StreamingHttpClient streamingHttpClient
 
     @MockBean(StorageEngine)
     StorageEngine mockStorage() { Mock(StorageEngine) }
@@ -61,7 +61,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
 
     private HttpPipeConnector buildConnector() {
         new HttpPipeConnector(
-            httpClient,
+            streamingHttpClient,
             tempDir.toString(),
             100L,   // minPollIntervalMs
             1000L,  // maxPollIntervalMs
@@ -110,7 +110,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         keys.containsAll(['key-1', 'key-2', 'key-3'])
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 
     // =========================================================================
@@ -136,7 +136,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         keys.isEmpty()
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 
     // =========================================================================
@@ -171,7 +171,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         connection.getLastReceivedOffset() >= 0
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 
     // =========================================================================
@@ -198,7 +198,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         keys.isEmpty()
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 
     // =========================================================================
@@ -230,7 +230,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         keys.isEmpty()
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 
     def "resumePipeCalls restarts delivery after pause"() {
@@ -263,7 +263,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         keys.contains('resumed-key')
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 
     // =========================================================================
@@ -301,7 +301,7 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         connector.getHealth() == com.messaging.common.api.PipeConnector.PipeHealth.HEALTHY
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 
     // =========================================================================
@@ -350,6 +350,6 @@ class HttpPipeConnectorIntegrationSpec extends Specification implements TestProp
         delivered[0] == 'k10'
 
         cleanup:
-        connector?.disconnect()
+        connector?.destroy()
     }
 }

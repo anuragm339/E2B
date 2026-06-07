@@ -15,6 +15,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * Handles BATCH_ACK messages - consumer acknowledges receipt and processing of a batch.
@@ -112,7 +113,7 @@ public class BatchAckHandler implements MessageHandler {
                 // Offload ACK processing to dedicated executor to prevent Netty event loop blocking
                 final String finalTopic = topic;
                 final String finalGroup = group;
-                ackExecutor.execute(() -> {
+                submitAckTask(clientId, "modern", () -> {
                     try (LogMdc.Scope asyncScope = LogMdc.with(traceId, finalTopic, finalGroup, clientId)) {
                         log.debug("event=batch_ack.processing_enqueued mode=modern clientId={} topic={} group={}",
                                 clientId, finalTopic, finalGroup);
@@ -151,7 +152,7 @@ public class BatchAckHandler implements MessageHandler {
                 log.debug("event=batch_ack.processing_enqueued mode=legacy clientId={} group={}", clientId, group);
 
                 // Offload ACK processing to dedicated executor
-                ackExecutor.execute(() -> {
+                submitAckTask(clientId, "legacy", () -> {
                     try (LogMdc.Scope asyncScope = LogMdc.with(traceId, null, group, clientId)) {
                         remoteConsumers.handleLegacyBatchAck(clientId, group);
                     } catch (Exception e) {
@@ -160,6 +161,16 @@ public class BatchAckHandler implements MessageHandler {
                     }
                 });
             }
+        }
+    }
+
+    private void submitAckTask(String clientId, String mode, Runnable task) {
+        try {
+            ackExecutor.execute(task);
+        } catch (RejectedExecutionException e) {
+            log.error("event=batch_ack.rejected mode={} clientId={} action=close_connection",
+                    mode, clientId, e);
+            server.closeConnection(clientId);
         }
     }
 }

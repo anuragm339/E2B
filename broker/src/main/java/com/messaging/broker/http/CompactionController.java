@@ -18,7 +18,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 
 /**
  * Admin HTTP endpoints for compaction.
@@ -65,32 +64,32 @@ public class CompactionController {
         List<String> sealed  = new ArrayList<>();
         List<String> errors  = new ArrayList<>();
 
-        for (String topic : storage.getTopicNames()) {
-            SegmentManager sm = segmentAccess.getSegmentManager(topic, 0);
-            if (sm == null) continue;
-            try {
-                sm.forceRollActiveSegment();
-                sealed.add(topic);
-            } catch (Exception e) {
-                log.error("Failed to force-roll segment for topic={}", topic, e);
-                errors.add(topic + ": " + e.getMessage());
+        boolean triggered = scheduler.triggerAsync(() -> {
+            for (String topic : storage.getTopicNames()) {
+                SegmentManager sm = segmentAccess.getSegmentManager(topic, 0);
+                if (sm == null) {
+                    continue;
+                }
+                try {
+                    sm.forceRollActiveSegment();
+                    sealed.add(topic);
+                } catch (Exception e) {
+                    log.error("Failed to force-roll segment for topic={}", topic, e);
+                    errors.add(topic + ": " + e.getMessage());
+                }
             }
-        }
-
-        log.info("Force-sealed {} topic(s), {} error(s). Starting compaction sweep.", sealed.size(), errors.size());
-
-        CompletableFuture.runAsync(scheduler::compact)
-                .exceptionally(ex -> {
-                    log.error("Compaction sweep failed after manual trigger", ex);
-                    return null;
-                });
+            log.info("Force-sealed {} topic(s), {} error(s). Starting compaction sweep.",
+                    sealed.size(), errors.size());
+        });
 
         Map<String, Object> response = new HashMap<>();
-        response.put("triggered", true);
+        response.put("triggered", triggered);
         response.put("sealedTopics", sealed);
         response.put("sealErrors", errors);
-        response.put("message", "Active segments force-sealed and compaction sweep started. "
-                + "Check broker logs or Grafana compaction dashboard for results.");
+        response.put("message", triggered
+                ? "Active segments force-sealed and compaction sweep started. "
+                    + "Check broker logs or Grafana compaction dashboard for results."
+                : "Compaction is already running; active segments were not force-sealed.");
         return response;
     }
 

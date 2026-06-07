@@ -100,12 +100,12 @@ public class ConsumerContext {
         return consecutiveFailures;
     }
 
-    public void incrementFailures() {
+    public synchronized void incrementFailures() {
         ++consecutiveFailures;
         lastFailureTime = System.currentTimeMillis();
     }
 
-    public void resetFailures() {
+    public synchronized void resetFailures() {
         consecutiveFailures = 0;
         lastFailureTime = 0L;
     }

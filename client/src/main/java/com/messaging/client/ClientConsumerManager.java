@@ -84,6 +84,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
     private final Map<String, NettyTcpClient.Connection> connectionsPerTopicGroup = new ConcurrentHashMap<>();
     private final Map<String, AtomicBoolean> connectedPerTopicGroup = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> reconnectAttemptsPerTopicGroup = new ConcurrentHashMap<>();
+    private final Set<String> reconnectScheduledPerTopicGroup = ConcurrentHashMap.newKeySet();
 
     private ScheduledExecutorService reconnectScheduler;
     private ScheduledExecutorService healthCheckScheduler;
@@ -135,10 +136,18 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         log.info("N2 FIX: Created shared EventLoopGroup for all connections");
 
         reconnectScheduler = Executors.newSingleThreadScheduledExecutor(
-            r -> new Thread(r, "consumer-reconnect")
+            r -> {
+                Thread thread = new Thread(r, "consumer-reconnect");
+                thread.setDaemon(true);
+                return thread;
+            }
         );
         healthCheckScheduler = Executors.newSingleThreadScheduledExecutor(
-            r -> new Thread(r, "consumer-health")
+            r -> {
+                Thread thread = new Thread(r, "consumer-health");
+                thread.setDaemon(true);
+                return thread;
+            }
         );
 
         connectToBroker();
@@ -337,7 +346,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
      * N1 FIX: Schedule reconnect for a specific topic:group connection
      */
     private void scheduleTopicGroupReconnect(String topicGroup) {
-        if (!running.get()) {
+        if (!running.get() || !reconnectScheduledPerTopicGroup.add(topicGroup)) {
             return;
         }
 
@@ -351,15 +360,26 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
         log.info("⟳ Scheduling reconnect for topic:group '{}' in {}ms (attempt {})", topicGroup, delayMs, attemptCount);
 
-        reconnectScheduler.schedule(() -> {
-            cleanupTopicGroupConnection(topicGroup);
-            try {
-                connectToTopicGroup(topicGroup);
-            } catch (Exception e) {
-                log.error("Reconnect failed for topic:group '{}': {}", topicGroup, e.getMessage());
-                scheduleTopicGroupReconnect(topicGroup);
+        try {
+            reconnectScheduler.schedule(() -> {
+                reconnectScheduledPerTopicGroup.remove(topicGroup);
+                if (!running.get()) {
+                    return;
+                }
+                cleanupTopicGroupConnection(topicGroup);
+                try {
+                    connectToTopicGroup(topicGroup);
+                } catch (Exception e) {
+                    log.error("Reconnect failed for topic:group '{}': {}", topicGroup, e.getMessage());
+                    scheduleTopicGroupReconnect(topicGroup);
+                }
+            }, delayMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            reconnectScheduledPerTopicGroup.remove(topicGroup);
+            if (running.get()) {
+                throw e;
             }
-        }, delayMs, TimeUnit.MILLISECONDS);
+        }
     }
 
     /**
@@ -815,6 +835,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         log.info("=== ClientConsumerManager Shutting Down (N1+N2 per-topic:group connections) ===");
 
         running.set(false);
+        reconnectScheduledPerTopicGroup.clear();
 
         // Mark all topic:group connections as disconnected
         for (AtomicBoolean connected : connectedPerTopicGroup.values()) {
@@ -823,13 +844,8 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
         cleanupAllConnections();
 
-        if (reconnectScheduler != null) {
-            reconnectScheduler.shutdownNow();
-        }
-
-        if (healthCheckScheduler != null) {
-            healthCheckScheduler.shutdownNow();
-        }
+        shutdownScheduler(reconnectScheduler, "reconnect");
+        shutdownScheduler(healthCheckScheduler, "health-check");
 
         // N2 FIX: Shutdown shared EventLoopGroup
         if (sharedEventLoopGroup != null) {
@@ -844,6 +860,21 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
         log.info("ClientConsumerManager shutdown complete - closed {} topic:group connections",
                 connectionsPerTopicGroup.size());
+    }
+
+    private void shutdownScheduler(ScheduledExecutorService scheduler, String name) {
+        if (scheduler == null) {
+            return;
+        }
+        scheduler.shutdownNow();
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                log.warn("{} scheduler did not terminate within 5 seconds", name);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted while stopping {} scheduler", name);
+        }
     }
 
     /**

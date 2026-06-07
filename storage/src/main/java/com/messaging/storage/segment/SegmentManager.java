@@ -20,6 +20,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Manages multiple segments for a topic-partition (Phase 10: Refactored to use service layer)
@@ -40,6 +41,8 @@ public class SegmentManager {
     // Write lock: held exclusively by replaceSegments to prevent readers from accessing
     // a segment that is being closed mid-read (ClosedChannelException on logChannel).
     private final ReentrantReadWriteLock segmentLock = new ReentrantReadWriteLock();
+    // Serializes the active-segment transaction while allowing concurrent reads.
+    private final ReentrantLock appendLock = new ReentrantLock(true);
 
     // Phase 10: Service layer dependencies
     private final StorageRecoveryService recoveryService;
@@ -104,6 +107,15 @@ public class SegmentManager {
      * NOTE: Does NOT modify the input record object
      */
     public long append(MessageRecord record) throws MessagingException {
+        appendLock.lock();
+        try {
+            return appendLocked(record);
+        } finally {
+            appendLock.unlock();
+        }
+    }
+
+    private long appendLocked(MessageRecord record) throws MessagingException {
         Segment current = activeSegment.get();
 
         // Check if we need to roll to a new segment — also checks that the specific
@@ -130,25 +142,26 @@ public class SegmentManager {
         // Records arriving from the pipe already carry their parent-assigned offsets and
         // must NOT be re-numbered — they are preserved unchanged.
         long availableOffset = current.getNextOffset();
+        MessageRecord recordToAppend = record;
         if (record.getOffset() == 0 && availableOffset > 0) {
-            record.setOffset(availableOffset);
+            recordToAppend = copyWithOffset(record, availableOffset);
         }
 
         long offset;
         try {
-            offset = current.append(record);
+            offset = current.append(recordToAppend);
         } catch (StorageException e) {
             if (isSegmentFullCause(e)) {
-                // Safety net: hasSpaceFor() pre-check missed this (e.g. concurrent writer filled segment)
+                // Safety net for an unexpected size-estimation mismatch.
                 segmentLock.writeLock().lock();
                 try {
-                    rollSegment(record.getOffset());
+                    rollSegment(recordToAppend.getOffset());
                 } finally {
                     segmentLock.writeLock().unlock();
                 }
                 log.info("event=segment_manager.roll_on_full topic={} partition={} base={}",
-                         topic, partition, record.getOffset());
-                offset = activeSegment.get().append(record);
+                         topic, partition, recordToAppend.getOffset());
+                offset = activeSegment.get().append(recordToAppend);
             } else {
                 throw e;
             }
@@ -161,6 +174,19 @@ public class SegmentManager {
         }
 
         return offset;
+    }
+
+    private MessageRecord copyWithOffset(MessageRecord source, long offset) {
+        MessageRecord copy = new MessageRecord(
+                offset,
+                source.getTopic(),
+                source.getPartition(),
+                source.getMsgKey(),
+                source.getEventType(),
+                source.getData(),
+                source.getCreatedAt());
+        copy.setContentType(source.getContentType());
+        return copy;
     }
 
     private static boolean isSegmentFullCause(Throwable t) {
@@ -557,14 +583,19 @@ public class SegmentManager {
      * No-op if there is no active segment or the active segment is empty.
      */
     public void forceRollActiveSegment() throws StorageException {
-        Segment active = activeSegment.get();
-        if (active == null || active.getSize() == 0) {
-            log.debug("forceRollActiveSegment: nothing to roll (topic={} partition={})", topic, partition);
-            return;
+        appendLock.lock();
+        try {
+            Segment active = activeSegment.get();
+            if (active == null || active.getSize() == 0) {
+                log.debug("forceRollActiveSegment: nothing to roll (topic={} partition={})", topic, partition);
+                return;
+            }
+            log.info("Force-rolling active segment: topic={} partition={} baseOffset={}",
+                    topic, partition, active.getBaseOffset());
+            rollSegment();
+        } finally {
+            appendLock.unlock();
         }
-        log.info("Force-rolling active segment: topic={} partition={} baseOffset={}",
-                topic, partition, active.getBaseOffset());
-        rollSegment();
     }
 
     /**

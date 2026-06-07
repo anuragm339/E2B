@@ -8,6 +8,9 @@ import spock.lang.TempDir
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class SegmentManagerSpec extends Specification {
 
@@ -285,6 +288,38 @@ class SegmentManagerSpec extends Specification {
         manager.getCurrentOffset() == 3000000L
 
         cleanup:
+        manager?.close()
+    }
+
+    def "concurrent auto-offset appends allocate unique sequential offsets without mutating inputs"() {
+        given:
+        int recordCount = 200
+        def manager = newManager("concurrent-append-topic", 10 * 1024 * 1024L)
+        def records = (0..<recordCount).collect { i ->
+            createRecord(0L, "key-${i}", "data-${i}")
+        }
+        def executor = Executors.newFixedThreadPool(8)
+        def start = new CountDownLatch(1)
+
+        when:
+        def futures = records.collect { record ->
+            executor.submit({
+                start.await()
+                manager.append(record)
+            } as java.util.concurrent.Callable<Long>)
+        }
+        start.countDown()
+        def offsets = futures.collect { it.get(10, TimeUnit.SECONDS) }
+        def expectedOffsets = (0..<recordCount).collect { it as long }
+
+        then:
+        offsets.toSet().size() == recordCount
+        offsets.sort() == expectedOffsets
+        records.every { it.offset == 0L }
+        manager.read(0L, recordCount)*.offset == expectedOffsets
+
+        cleanup:
+        executor?.shutdownNow()
         manager?.close()
     }
 

@@ -1,7 +1,7 @@
 package com.messaging.broker.core;
 
 import com.messaging.broker.ack.AckStoreSeeder;
-import com.messaging.broker.compaction.RocksDbCompactionIndex;
+import com.messaging.broker.compaction.CompactionIndex;
 import com.messaging.broker.handler.DisconnectHandler;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.handler.MessageHandlerRegistry;
@@ -23,13 +23,9 @@ import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Inject;
-import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Main broker service that wires storage and network together
@@ -46,9 +42,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final BrokerMetrics metrics;
     private final MessageHandlerRegistry handlerRegistry;
     private final DisconnectHandler disconnectHandler;
-    private final ExecutorService ackExecutor;
+    private final ShutdownCoordinator shutdownCoordinator;
     private final AckStoreSeeder ackStoreSeeder;
-    private final RocksDbCompactionIndex compactionIndex;
+    private final CompactionIndex compactionIndex;
     private final int serverPort;
     private final boolean ackStoreSeedOnStartupEnabled;
 
@@ -62,9 +58,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             BrokerMetrics metrics,
             MessageHandlerRegistry handlerRegistry,
             DisconnectHandler disconnectHandler,
-            @Named("ackExecutor") ExecutorService ackExecutor,
+            ShutdownCoordinator shutdownCoordinator,
             AckStoreSeeder ackStoreSeeder,
-            RocksDbCompactionIndex compactionIndex,
+            CompactionIndex compactionIndex,
             @Value("${broker.network.port:9092}") int serverPort,
             @Value("${ack-store.seed-on-startup.enabled:true}") boolean ackStoreSeedOnStartupEnabled) {
 
@@ -76,7 +72,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.metrics = metrics;
         this.handlerRegistry = handlerRegistry;
         this.disconnectHandler = disconnectHandler;
-        this.ackExecutor = ackExecutor;
+        this.shutdownCoordinator = shutdownCoordinator;
         this.ackStoreSeeder = ackStoreSeeder;
         this.compactionIndex = compactionIndex;
         this.serverPort = serverPort;
@@ -112,7 +108,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             try {
                 ackStoreSeeder.seed();
             } catch (Exception e) {
-                log.warn("AckStoreSeeder failed — continuing startup without backfill", e);
+                throw new IllegalStateException(
+                        "ACK store seeding failed; refusing to start with unverifiable ACK state",
+                        e);
             }
         } else {
             log.info("AckStoreSeeder skipped at startup because ack-store.seed-on-startup.enabled=false");
@@ -236,19 +234,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     public void shutdown() {
         log.info("Shutting down broker...");
 
-        // Shutdown ACK executor first to stop accepting new ACKs
-        log.info("Shutting down ACK executor...");
-        ackExecutor.shutdown();
-        try {
-            if (!ackExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
-                log.warn("ACK executor did not terminate in time, forcing shutdown");
-                ackExecutor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            log.warn("Interrupted while waiting for ACK executor shutdown", e);
-            ackExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+        // Stop network ingress before draining executors so no new ACK tasks are accepted.
+        server.shutdown();
 
         // Stop adaptive delivery manager
         adaptiveDeliveryManager.stop();
@@ -259,8 +246,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         // Stop consumer delivery
         consumerDelivery.shutdown();
 
-        // Shutdown server and storage
-        server.shutdown();
+        // Drain the centrally owned executor beans after all producers have stopped.
+        shutdownCoordinator.shutdown();
+
         try {
             storage.close();
         } catch (Exception e) {

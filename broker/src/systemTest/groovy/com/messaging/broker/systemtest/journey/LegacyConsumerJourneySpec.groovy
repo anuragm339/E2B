@@ -86,7 +86,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
 
     // ── Scenario 2: Merged batch delivery across two topics ───────────────────
 
-    def "legacy client receives merged batch from multiple topics and ACK advances offsets for all topics"() {
+    def "legacy client receives batches from multiple topics and ACK advances offsets for all topics"() {
         given: "one message is enqueued on prices-v1 and one on reference-data-v5"
         cloudServer.enqueueMessages([
             [offset: 1L, topic: 'prices-v1', partition: 0,
@@ -103,10 +103,15 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
             assert legacyClient.received.any { it instanceof BatchEvent }
         }
 
-        and: "the received legacy batches cover both topic messages"
+        and: "ACKing each observed batch lets delivery continue until both topic messages arrive"
+        int acknowledgedBatches = 0
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
-            def allBatchKeys = legacyClient.received
-                .findAll { it instanceof BatchEvent }
+            def batches = legacyClient.received.findAll { it instanceof BatchEvent }
+            while (acknowledgedBatches < batches.size()) {
+                legacyClient.sendAck()
+                acknowledgedBatches++
+            }
+            def allBatchKeys = batches
                 .collectMany { (it as BatchEvent).messages*.key }
                 .toSet()
             assert allBatchKeys.contains('legacy-price-1')
@@ -116,10 +121,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         and: "no wire errors on the connection"
         legacyClient.errors.isEmpty()
 
-        when: "legacy client ACKs all received batches"
-        legacyClient.received.findAll { it instanceof BatchEvent }.each { legacyClient.sendAck() }
-
-        then: "offsets advance in ConsumerOffsetTracker for all delivered topics"
+        and: "offsets advance in ConsumerOffsetTracker for all delivered topics"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             def priceOffset = offsetTracker.getOffset('price-quote-service:prices-v1')

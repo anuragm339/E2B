@@ -9,6 +9,7 @@ import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.scheduling.annotation.Scheduled;
 import jakarta.inject.Inject;
+import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,6 +19,8 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Set;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Scheduled background job that drives Kafka-style incremental log compaction.
@@ -37,7 +40,7 @@ public class CompactionScheduler {
     private final CompactionCheckpointStore checkpointStore;
     private final CompactionPlanner planner;
     private final CompactionRewriter rewriter;
-    private final RocksDbCompactionIndex compactionIndex;
+    private final CompactionIndex compactionIndex;
     private final BrokerMetrics metrics;
     private final com.messaging.broker.monitoring.MemoryMonitor memoryMonitor;
     private final boolean enabled;
@@ -48,6 +51,8 @@ public class CompactionScheduler {
     private final double maxProcessCpuUsage;
     private final double maxHeapUsage;
     private final com.sun.management.OperatingSystemMXBean osBean;
+    private final Executor compactionExecutor;
+    private final AtomicBoolean compactionRunning = new AtomicBoolean();
 
     @Inject
     public CompactionScheduler(
@@ -56,9 +61,10 @@ public class CompactionScheduler {
             CompactionCheckpointStore checkpointStore,
             CompactionPlanner planner,
             CompactionRewriter rewriter,
-            RocksDbCompactionIndex compactionIndex,
+            CompactionIndex compactionIndex,
             BrokerMetrics metrics,
             com.messaging.broker.monitoring.MemoryMonitor memoryMonitor,
+            @Named("compactionExecutor") Executor compactionExecutor,
             @Value("${compaction.enabled:true}") boolean enabled,
             @Value("${compaction.tombstone-retention-days:7}") int tombstoneRetentionDays,
             @Value("${compaction.window-size:10}") int windowSize,
@@ -74,6 +80,7 @@ public class CompactionScheduler {
         this.compactionIndex       = compactionIndex;
         this.metrics               = metrics;
         this.memoryMonitor         = memoryMonitor;
+        this.compactionExecutor    = compactionExecutor;
         this.enabled               = enabled;
         this.tombstoneRetentionDays = tombstoneRetentionDays;
         this.windowSize            = windowSize;
@@ -91,6 +98,57 @@ public class CompactionScheduler {
         fixedDelay   = "${compaction.schedule.interval:24h}",
         initialDelay = "${compaction.schedule.initial-delay:5m}")
     public void compact() {
+        if (!compactionRunning.compareAndSet(false, true)) {
+            log.info("event=compaction_run_skipped reason=already_running");
+            metrics.recordCompactionSkipped("already_running");
+            return;
+        }
+        runClaimedCompaction();
+    }
+
+    /**
+     * Submit a manual compaction only when no scheduled or manual run is active.
+     *
+     * @return true when the run was accepted, false when another run owns the guard
+     */
+    public boolean triggerAsync() {
+        return triggerAsync(() -> {
+        });
+    }
+
+    /**
+     * Claim the single-flight guard, run synchronous preparation, then submit compaction.
+     * Preparation is protected by the same guard so segment rollover cannot overlap a run.
+     */
+    public boolean triggerAsync(Runnable preparation) {
+        if (!compactionRunning.compareAndSet(false, true)) {
+            metrics.recordCompactionSkipped("already_running");
+            return false;
+        }
+
+        try {
+            preparation.run();
+            compactionExecutor.execute(this::runClaimedCompaction);
+            return true;
+        } catch (RuntimeException e) {
+            compactionRunning.set(false);
+            throw e;
+        }
+    }
+
+    public boolean isCompactionRunning() {
+        return compactionRunning.get();
+    }
+
+    private void runClaimedCompaction() {
+        try {
+            compactInternal();
+        } finally {
+            compactionRunning.set(false);
+        }
+    }
+
+    private void compactInternal() {
         if (!enabled) {
             log.debug("Compaction disabled, skipping");
             metrics.recordCompactionSkipped("disabled");
@@ -245,6 +303,15 @@ public class CompactionScheduler {
             return -1;
         }
         double load = osBean.getProcessCpuLoad();
-        return load >= 0 ? load : -1;
+        return normalizeProcessCpuLoad(load);
+    }
+
+    static double normalizeProcessCpuLoad(double load) {
+        if (load < 0) {
+            return -1;
+        }
+        // Some JDK/OS combinations expose a percentage (for example 1.7 for 1.7%)
+        // even though the management API documents a 0..1 fraction.
+        return load > 1.0 && load <= 100.0 ? load / 100.0 : load;
     }
 }

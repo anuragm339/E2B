@@ -1,6 +1,7 @@
 package com.messaging.broker.ack;
 
 import com.messaging.broker.compaction.SharedRocksDb;
+import io.micronaut.context.annotation.Requires;
 import jakarta.inject.Singleton;
 import org.rocksdb.*;
 import org.slf4j.Logger;
@@ -22,7 +23,8 @@ import java.nio.charset.StandardCharsets;
  * Lifecycle (open/close) is managed by {@link SharedRocksDb}.
  */
 @Singleton
-public class RocksDbAckStore {
+@Requires(property = "ack-store.backend", value = "rocks", defaultValue = "rocks")
+public class RocksDbAckStore implements AckStore {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbAckStore.class);
 
@@ -42,12 +44,16 @@ public class RocksDbAckStore {
     /**
      * Write or overwrite the ACK record for a (topic, group, offset) triple.
      */
+    @Override
     public void put(String topic, String group, long offset, AckRecord record) {
         byte[] key = buildKey(topic, group, offset);
         try {
             db.put(cf, writeOptions, key, record.toBytes());
-        } catch (RocksDBException e) {
+        } catch (RocksDBException | IllegalStateException e) {
             log.error("RocksDB put failed for topic={} group={} offset={}", topic, group, offset, e);
+            throw new AckStoreException(
+                    "RocksDB ACK put failed for topic=" + topic + " group=" + group + " offset=" + offset,
+                    e);
         }
     }
 
@@ -56,14 +62,17 @@ public class RocksDbAckStore {
      *
      * @return AckRecord if found, null otherwise
      */
+    @Override
     public AckRecord get(String topic, String group, long offset) {
         byte[] key = buildKey(topic, group, offset);
         try {
             byte[] value = db.get(cf, key);
             return value != null ? AckRecord.fromBytes(value) : null;
-        } catch (RocksDBException e) {
+        } catch (RocksDBException | IllegalStateException e) {
             log.error("RocksDB get failed for topic={} group={} offset={}", topic, group, offset, e);
-            return null;
+            throw new AckStoreException(
+                    "RocksDB ACK get failed for topic=" + topic + " group=" + group + " offset=" + offset,
+                    e);
         }
     }
 
@@ -75,7 +84,11 @@ public class RocksDbAckStore {
      * Arrays are parallel: topics[i], groups[i], records[i] form one entry.
      * The key is derived from records[i].offset — every record is written regardless of msgKey.
      */
+    @Override
     public void putBatch(String[] topics, String[] groups, AckRecord[] records) {
+        if (topics.length != groups.length || topics.length != records.length) {
+            throw new IllegalArgumentException("ACK batch arrays must have equal lengths");
+        }
         if (topics.length == 0) {
             return;
         }
@@ -85,8 +98,9 @@ public class RocksDbAckStore {
             }
             db.write(writeOptions, batch);
             log.debug("RocksDB ACK: wrote {} records", topics.length);
-        } catch (RocksDBException e) {
+        } catch (RocksDBException | IllegalStateException e) {
             log.error("RocksDB putBatch failed (size={})", topics.length, e);
+            throw new AckStoreException("RocksDB ACK batch write failed for size=" + topics.length, e);
         }
     }
 
@@ -99,6 +113,7 @@ public class RocksDbAckStore {
      * Called when a data refresh starts (RESET_SENT) so stale ACK data does not
      * persist across a consumer state wipe.
      */
+    @Override
     public void clearByTopicAndGroup(String topic, String group) {
         byte[] prefix = (topic + "|" + group + "|").getBytes(StandardCharsets.UTF_8);
         try (WriteBatch batch = new WriteBatch();
@@ -118,8 +133,11 @@ public class RocksDbAckStore {
                 db.write(writeOptions, batch);
             }
             log.info("RocksDB ACK cleared {} entries for topic={} group={}", deleted, topic, group);
-        } catch (RocksDBException e) {
+        } catch (RocksDBException | IllegalStateException e) {
             log.error("Failed to clear RocksDB ACK for topic={} group={}", topic, group, e);
+            throw new AckStoreException(
+                    "RocksDB ACK clear failed for topic=" + topic + " group=" + group,
+                    e);
         }
     }
 

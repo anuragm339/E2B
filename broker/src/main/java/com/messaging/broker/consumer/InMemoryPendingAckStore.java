@@ -6,6 +6,8 @@ import io.micrometer.core.instrument.Timer;
 import jakarta.inject.Singleton;
 
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * In-memory implementation of PendingAckStore.
@@ -15,67 +17,108 @@ import java.util.concurrent.ConcurrentHashMap;
 @Singleton
 public class InMemoryPendingAckStore implements PendingAckStore {
 
-    // Map: clientId -> MergedBatch awaiting ACK
-    private final ConcurrentHashMap<String, MergedBatch> pendingLegacyBatches = new ConcurrentHashMap<>();
+    private final AtomicLong nextGeneration = new AtomicLong();
+    private final ConcurrentHashMap<String, PendingLegacyDelivery> pendingDeliveries =
+            new ConcurrentHashMap<>();
 
-    // Map: clientId -> Timer.Sample for delivery latency tracking
-    private final ConcurrentHashMap<String, Timer.Sample> pendingLegacyTimers = new ConcurrentHashMap<>();
+    @Override
+    public long reservePendingBatch(
+            String clientId,
+            MergedBatch batch,
+            Timer.Sample timerSample,
+            long sendTimeMs) {
+        long generation = nextGeneration.incrementAndGet();
+        PendingLegacyDelivery delivery =
+                new PendingLegacyDelivery(generation, batch, timerSample, sendTimeMs);
+        return pendingDeliveries.putIfAbsent(clientId, delivery) == null ? generation : -1L;
+    }
 
-    // Map: clientId -> wall-clock send time (ms) for ACK latency calculation
-    private final ConcurrentHashMap<String, Long> pendingLegacySendTimes = new ConcurrentHashMap<>();
+    @Override
+    public PendingLegacyDelivery claimPendingDelivery(String clientId) {
+        return pendingDeliveries.remove(clientId);
+    }
+
+    @Override
+    public PendingLegacyDelivery claimPendingDelivery(String clientId, long expectedGeneration) {
+        AtomicReference<PendingLegacyDelivery> claimed = new AtomicReference<>();
+        pendingDeliveries.computeIfPresent(clientId, (ignored, delivery) -> {
+            if (delivery.generation() != expectedGeneration) {
+                return delivery;
+            }
+            claimed.set(delivery);
+            return null;
+        });
+        return claimed.get();
+    }
 
     @Override
     public void putPendingBatch(String clientId, MergedBatch batch) {
-        pendingLegacyBatches.put(clientId, batch);
+        long generation = nextGeneration.incrementAndGet();
+        pendingDeliveries.put(
+                clientId,
+                new PendingLegacyDelivery(generation, batch, null, -1L));
     }
 
     @Override
     public boolean putPendingBatchIfAbsent(String clientId, MergedBatch batch) {
-        return pendingLegacyBatches.putIfAbsent(clientId, batch) == null;
+        return reservePendingBatch(clientId, batch, null, -1L) >= 0;
     }
 
     @Override
     public MergedBatch getPendingBatch(String clientId) {
-        return pendingLegacyBatches.get(clientId);
+        PendingLegacyDelivery delivery = pendingDeliveries.get(clientId);
+        return delivery == null ? null : delivery.batch();
     }
 
     @Override
     public MergedBatch removePendingBatch(String clientId) {
-        return pendingLegacyBatches.remove(clientId);
+        AtomicReference<MergedBatch> removed = new AtomicReference<>();
+        pendingDeliveries.computeIfPresent(clientId, (ignored, delivery) -> {
+            removed.set(delivery.batch());
+            return new PendingLegacyDelivery(
+                    delivery.generation(), null, delivery.timer(), delivery.sendTime());
+        });
+        return removed.get();
     }
 
     @Override
     public void startTimer(String clientId, Timer.Sample timerSample) {
-        pendingLegacyTimers.put(clientId, timerSample);
+        pendingDeliveries.computeIfPresent(clientId, (ignored, delivery) ->
+                new PendingLegacyDelivery(
+                        delivery.generation(), delivery.batch(), timerSample, delivery.sendTime()));
     }
 
     @Override
     public Timer.Sample removeTimer(String clientId) {
-        return pendingLegacyTimers.remove(clientId);
+        AtomicReference<Timer.Sample> removed = new AtomicReference<>();
+        pendingDeliveries.computeIfPresent(clientId, (ignored, delivery) -> {
+            removed.set(delivery.timer());
+            return new PendingLegacyDelivery(
+                    delivery.generation(), delivery.batch(), null, delivery.sendTime());
+        });
+        return removed.get();
     }
 
     @Override
     public void recordSendTime(String clientId, long sendTimeMs) {
-        pendingLegacySendTimes.put(clientId, sendTimeMs);
+        pendingDeliveries.computeIfPresent(clientId, (ignored, delivery) ->
+                new PendingLegacyDelivery(
+                        delivery.generation(), delivery.batch(), delivery.timer(), sendTimeMs));
     }
 
     @Override
     public long getSendTime(String clientId) {
-        Long time = pendingLegacySendTimes.get(clientId);
-        return time != null ? time : -1L;
+        PendingLegacyDelivery delivery = pendingDeliveries.get(clientId);
+        return delivery == null ? -1L : delivery.sendTime();
     }
 
     @Override
     public void removeClient(String clientId) {
-        pendingLegacyBatches.remove(clientId);
-        pendingLegacyTimers.remove(clientId);
-        pendingLegacySendTimes.remove(clientId);
+        pendingDeliveries.remove(clientId);
     }
 
     @Override
     public void clear() {
-        pendingLegacyBatches.clear();
-        pendingLegacyTimers.clear();
-        pendingLegacySendTimes.clear();
+        pendingDeliveries.clear();
     }
 }

@@ -1,6 +1,10 @@
 package com.messaging.broker.ack
 
 import com.messaging.broker.compaction.SharedRocksDb
+import org.rocksdb.ColumnFamilyHandle
+import org.rocksdb.RocksDB
+import org.rocksdb.RocksDBException
+import org.rocksdb.WriteOptions
 import spock.lang.Specification
 import spock.lang.TempDir
 
@@ -115,5 +119,37 @@ class RocksDbAckStoreSpec extends Specification {
         store.get("t1", "g1", 2L) == null
         store.get("t1", "g2", 3L) != null   // preserved — different group
         store.get("t2", "g1", 4L) != null   // preserved — different topic
+    }
+
+    def "RocksDB failures are propagated instead of reported as missing data"() {
+        given:
+        def failingDb = Mock(RocksDB)
+        def failingSharedDb = Stub(SharedRocksDb) {
+            getDb() >> failingDb
+            getDefaultHandle() >> Mock(ColumnFamilyHandle)
+            getWriteOptions() >> Mock(WriteOptions)
+        }
+        def failingStore = new RocksDbAckStore(failingSharedDb)
+        failingDb.get(_ as ColumnFamilyHandle, _ as byte[]) >> {
+            throw new RocksDBException("simulated read failure")
+        }
+
+        when:
+        failingStore.get("prices-v1", "price-group", 1L)
+
+        then:
+        def failure = thrown(AckStoreException)
+        failure.message.contains("get failed")
+    }
+
+    def "putBatch rejects mismatched parallel arrays"() {
+        when:
+        store.putBatch(
+                ["t1"] as String[],
+                [] as String[],
+                [new AckRecord(1L, 10L)] as AckRecord[])
+
+        then:
+        thrown(IllegalArgumentException)
     }
 }

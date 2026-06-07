@@ -695,26 +695,56 @@ public class BrokerMetrics {
     public void removeConsumerMetrics(String consumerId, String topic, String group) {
         String key = group + ":" + topic;
 
-        // OOM FIX: Re-enabled removal to prevent memory leak from ephemeral port reconnections
-        consumerMessagesSent.remove(key);
-        consumerBytesSent.remove(key);
-        consumerAcks.remove(key);
-        consumerFailures.remove(key);
-        consumerRetries.remove(key);
-        consumerDeliveryBlocked.entrySet().removeIf(entry -> entry.getKey().startsWith(key + ":"));
+        removeMeter(consumerMessagesSent.remove(key));
+        removeMeter(consumerBytesSent.remove(key));
+        removeMeter(consumerAcks.remove(key));
+        removeMeter(consumerFailures.remove(key));
+        removeMeter(consumerRetries.remove(key));
+        consumerDeliveryBlocked.entrySet().removeIf(entry -> {
+            if (!entry.getKey().startsWith(key + ":")) {
+                return false;
+            }
+            removeMeter(entry.getValue());
+            return true;
+        });
+        removeGauge("broker.consumer.offset", topic, group);
         consumerOffsets.remove(key);
+        removeGauge("broker.consumer.lag", topic, group);
         consumerLag.remove(key);
-        consumerDeliveryLatency.remove(key);
-        consumerBytesFailed.remove(key);
-        consumerMessagesFailed.remove(key);
+        removeMeter(consumerDeliveryLatency.remove(key));
+        removeMeter(consumerBytesFailed.remove(key));
+        removeMeter(consumerMessagesFailed.remove(key));
+        removeGauge("broker.consumer.last_delivery_time_ms", topic, group);
         consumerLastDeliveryTime.remove(key);
+        removeGauge("broker.consumer.last_ack_time_ms", topic, group);
         consumerLastAckTime.remove(key);
-        consumerAckTimeouts.remove(key);
+        removeMeter(consumerAckTimeouts.remove(key));
+        pendingAckStartTime.remove(key);
+        removeMeter(pendingAckAgeGauges.remove(key));
+        removeGauge("ack.reconciliation.missing.keys", topic, group);
+        reconciliationMissingKeys.remove(key);
+        removeGauge("ack.reconciliation.gap.min.offset", topic, group);
+        reconciliationGapMinOffset.remove(key);
+        removeGauge("ack.reconciliation.gap.max.offset", topic, group);
+        reconciliationGapMaxOffset.remove(key);
 
         // Note: offsetGapsDetected uses topic:partition key, not group:topic, so not removed here
 
         log.info("OOM FIX: Removed metrics for disconnected consumer: group={}, topic={}, key={}",
                   group, topic, key);
+    }
+
+    private void removeMeter(Meter meter) {
+        if (meter != null) {
+            registry.remove(meter);
+        }
+    }
+
+    private void removeGauge(String name, String topic, String group) {
+        Meter meter = registry.find(name)
+                .tags("topic", topic, "group", group)
+                .meter();
+        removeMeter(meter);
     }
 
     /**

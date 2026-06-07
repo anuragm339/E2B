@@ -23,6 +23,39 @@ public class ConsumerStateManager implements ConsumerStateService {
     }
 
     @Override
+    public long beginDelivery(DeliveryKey key) {
+        return deliveryStore.beginDelivery(key);
+    }
+
+    @Override
+    public void setOriginalOffset(DeliveryKey key, long generation, long originalOffset) {
+        deliveryStore.setOriginalOffset(key, generation, originalOffset);
+    }
+
+    @Override
+    public PendingDelivery claimPendingDelivery(DeliveryKey key) {
+        return deliveryStore.claimPendingDelivery(key);
+    }
+
+    @Override
+    public PendingDelivery claimPendingDelivery(DeliveryKey key, long expectedGeneration) {
+        return deliveryStore.claimPendingDelivery(key, expectedGeneration);
+    }
+
+    @Override
+    public boolean scheduleTimeout(
+            DeliveryKey key,
+            long expectedGeneration,
+            ScheduledFuture<?> task) {
+        return deliveryStore.scheduleTimeout(key, expectedGeneration, task);
+    }
+
+    @Override
+    public boolean completeDelivery(DeliveryKey key, long expectedGeneration) {
+        return deliveryStore.completeDelivery(key, expectedGeneration);
+    }
+
+    @Override
     public AtomicBoolean markInFlight(DeliveryKey key) {
         return deliveryStore.markInFlight(key);
     }

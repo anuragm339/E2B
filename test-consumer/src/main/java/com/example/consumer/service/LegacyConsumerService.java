@@ -6,10 +6,13 @@ import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
+import jakarta.annotation.PreDestroy;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Legacy consumer service - only activated when consumer.legacy.enabled=true
@@ -28,6 +31,7 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
     private LegacyBrokerConnection connection;
     private volatile boolean running = false;
     private Thread eventLoopThread;
+    private final AtomicBoolean shutdownStarted = new AtomicBoolean();
     private int batchCount = 0;
     private int messageCount = 0;
 
@@ -176,7 +180,11 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
         return true;  // Send ACK
     }
 
+    @PreDestroy
     public void shutdown() {
+        if (!shutdownStarted.compareAndSet(false, true)) {
+            return;
+        }
         log.info("event=legacy_consumer.shutdown_started service={}", legacyConfig.getServiceName());
         running = false;
 
@@ -187,7 +195,16 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
 
             if (eventLoopThread != null) {
                 eventLoopThread.join(5000);
+                if (eventLoopThread.isAlive()) {
+                    eventLoopThread.interrupt();
+                }
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (eventLoopThread != null) {
+                eventLoopThread.interrupt();
+            }
+            log.warn("event=legacy_consumer.shutdown_interrupted service={}", legacyConfig.getServiceName());
         } catch (Exception e) {
             log.error("event=legacy_consumer.shutdown_failed service={}", legacyConfig.getServiceName(), e);
         }

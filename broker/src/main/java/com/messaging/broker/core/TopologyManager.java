@@ -23,6 +23,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 /**
@@ -53,7 +54,8 @@ public class TopologyManager {
     private volatile String currentParentUrl;
     private volatile TopologyResponse currentTopology;
     private volatile Function<MessageRecord, Boolean> messageHandler;
-    private volatile boolean running;
+    private final AtomicBoolean running = new AtomicBoolean();
+    private final AtomicBoolean queryInFlight = new AtomicBoolean();
 
     public TopologyManager(
             CloudRegistryClient registryClient,
@@ -74,8 +76,6 @@ public class TopologyManager {
             t.setName("TopologyManager");
             return t;
         });
-        this.running = false;
-
         // Initialize properties store
         Path dataDirPath = Paths.get(dataDir);
         this.propertiesStore = new TopologyPropertiesStore(dataDirPath);
@@ -92,8 +92,10 @@ public class TopologyManager {
             return;
         }
 
+        if (!running.compareAndSet(false, true)) {
+            return;
+        }
         log.info("Starting topology manager...");
-        running = true;
 
         // Schedule periodic registry queries
         scheduler.scheduleWithFixedDelay(
@@ -116,7 +118,7 @@ public class TopologyManager {
      * Query Cloud Registry and update topology if changed
      */
     private void queryAndUpdateTopology() {
-        if (!running) {
+        if (!running.get() || !queryInFlight.compareAndSet(false, true)) {
             return;
         }
 
@@ -124,15 +126,23 @@ public class TopologyManager {
             log.debug("Querying Cloud Registry for topology...");
 
             registryClient.getTopology(registryUrl, nodeId).whenComplete((topology, ex) -> {
-                if (ex != null) {
-//                    log.error("Failed to query Cloud Registry", ex);
-                    return;
-                }
+                try {
+                    if (!running.get()) {
+                        return;
+                    }
+                    if (ex != null) {
+                        log.warn("Failed to query Cloud Registry", ex);
+                        return;
+                    }
 
-                handleTopologyUpdate(topology);
+                    handleTopologyUpdate(topology);
+                } finally {
+                    queryInFlight.set(false);
+                }
             });
 
         } catch (Exception e) {
+            queryInFlight.set(false);
             log.error("Error in queryAndUpdateTopology", e);
         }
     }
@@ -279,11 +289,22 @@ public class TopologyManager {
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down topology manager...");
-        running = false;
+        if (!running.compareAndSet(true, false)) {
+            return;
+        }
         scheduler.shutdown();
 
         if (currentParentUrl != null) {
             disconnectFromParent();
+        }
+
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
         }
 
         log.info("Topology manager shutdown complete");

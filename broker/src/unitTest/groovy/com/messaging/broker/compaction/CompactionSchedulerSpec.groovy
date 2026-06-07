@@ -8,8 +8,22 @@ import com.messaging.storage.segment.SegmentManager
 import spock.lang.Specification
 
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class CompactionSchedulerSpec extends Specification {
+
+    def "process CPU load normalization accepts fractional and percentage JVM formats"() {
+        expect:
+        CompactionScheduler.normalizeProcessCpuLoad(raw) == normalized
+
+        where:
+        raw     || normalized
+        -1.0d   || -1.0d
+        0.42d   || 0.42d
+        1.75d   || 0.0175d
+        100.0d  || 1.0d
+    }
 
     def "compact() does nothing when disabled"() {
         given:
@@ -27,7 +41,8 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, false, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
+                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                false, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
@@ -63,7 +78,8 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
+                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
@@ -105,7 +121,8 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
+                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
@@ -145,7 +162,8 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
+                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
         scheduler.compact()
@@ -153,5 +171,89 @@ class CompactionSchedulerSpec extends Specification {
         then:
         noExceptionThrown()
         1 * metrics.recordCompactionSkipped("not_enough_sealed_segments")
+    }
+
+    def "manual trigger rejects overlap until the claimed run completes"() {
+        given:
+        def queuedTask = new AtomicReference<Runnable>()
+        def executor = { Runnable task -> queuedTask.set(task) } as java.util.concurrent.Executor
+        def storage = Mock(StorageEngine) { getTopicNames() >> [] }
+        def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
+        def memoryMonitor = Stub(MemoryMonitor) {
+            getHeapUsagePercent() >> 0.0d
+            isMemoryPressureHigh() >> false
+        }
+        def scheduler = new CompactionScheduler(
+                storage,
+                Mock(SegmentAccess),
+                Mock(CompactionCheckpointStore),
+                Mock(CompactionPlanner),
+                Mock(CompactionRewriter),
+                Mock(RocksDbCompactionIndex),
+                metrics,
+                memoryMonitor,
+                executor,
+                true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
+
+        when:
+        def firstAccepted = scheduler.triggerAsync()
+
+        then:
+        firstAccepted
+        scheduler.isCompactionRunning()
+
+        when:
+        def secondAccepted = scheduler.triggerAsync()
+
+        then:
+        !secondAccepted
+        1 * metrics.recordCompactionSkipped("already_running")
+
+        when:
+        queuedTask.get().run()
+
+        then:
+        !scheduler.isCompactionRunning()
+        1 * storage.getTopicNames() >> []
+    }
+
+    def "manual preparation is protected by the compaction single-flight guard"() {
+        given:
+        def queuedTask = new AtomicReference<Runnable>()
+        def executor = { Runnable task -> queuedTask.set(task) } as java.util.concurrent.Executor
+        def preparationCount = new AtomicInteger()
+        def storage = Mock(StorageEngine) { getTopicNames() >> [] }
+        def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
+        def scheduler = new CompactionScheduler(
+                storage,
+                Mock(SegmentAccess),
+                Mock(CompactionCheckpointStore),
+                Mock(CompactionPlanner),
+                Mock(CompactionRewriter),
+                Mock(RocksDbCompactionIndex),
+                metrics,
+                Stub(MemoryMonitor) {
+                    getHeapUsagePercent() >> 0.0d
+                    isMemoryPressureHigh() >> false
+                },
+                executor,
+                true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
+
+        when:
+        def firstAccepted = scheduler.triggerAsync { preparationCount.incrementAndGet() }
+        def secondAccepted = scheduler.triggerAsync { preparationCount.incrementAndGet() }
+
+        then:
+        firstAccepted
+        !secondAccepted
+        preparationCount.get() == 1
+        1 * metrics.recordCompactionSkipped("already_running")
+
+        when:
+        queuedTask.get().run()
+
+        then:
+        !scheduler.isCompactionRunning()
+        1 * storage.getTopicNames() >> []
     }
 }

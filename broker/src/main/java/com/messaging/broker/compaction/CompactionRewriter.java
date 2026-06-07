@@ -107,7 +107,7 @@ public class CompactionRewriter {
             String topic,
             int partition,
             SegmentManager segmentManager,
-            RocksDbCompactionIndex compactionIndex,
+            CompactionIndex compactionIndex,
             int tombstoneRetentionDays) throws MessagingException {
 
         if (candidates.isEmpty()) {
@@ -337,7 +337,7 @@ public class CompactionRewriter {
             String msgKey,
             long recordOffset,
             MessageRecord record,
-            RocksDbCompactionIndex compactionIndex,
+            CompactionIndex compactionIndex,
             int tombstoneRetentionDays) {
 
         // Null-keyed records are never indexed, so they are never eligible for deletion

@@ -6,6 +6,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -47,7 +48,7 @@ public class PropertiesFileStore implements PropertiesStore {
         try {
             Files.createDirectories(Paths.get(dataDir));
         } catch (IOException e) {
-            log.error("Failed to create data directory: {}", dataDir, e);
+            throw new PropertiesStoreException("Failed to create data directory: " + dataDir, e);
         }
 
         // Load existing properties
@@ -68,22 +69,22 @@ public class PropertiesFileStore implements PropertiesStore {
     }
 
     @Override
-    public void put(String key, String value) {
+    public synchronized void put(String key, String value) {
         cache.put(key, value);
     }
 
     @Override
-    public void putAll(Map<String, String> properties) {
+    public synchronized void putAll(Map<String, String> properties) {
         cache.putAll(properties);
     }
 
     @Override
-    public void remove(String key) {
+    public synchronized void remove(String key) {
         cache.remove(key);
     }
 
     @Override
-    public Map<String, String> getAll() {
+    public synchronized Map<String, String> getAll() {
         return Map.copyOf(cache);
     }
 
@@ -103,7 +104,7 @@ public class PropertiesFileStore implements PropertiesStore {
     }
 
     @Override
-    public void clear() {
+    public synchronized void clear() {
         cache.clear();
     }
 
@@ -128,7 +129,8 @@ public class PropertiesFileStore implements PropertiesStore {
             log.info("Loaded {} properties from {} file", cache.size(), description);
 
         } catch (Exception e) {
-            log.error("Failed to load {} from disk, starting fresh", description, e);
+            throw new PropertiesStoreException(
+                    "Failed to load " + description + " from " + propertiesFilePath, e);
         }
     }
 
@@ -149,12 +151,21 @@ public class PropertiesFileStore implements PropertiesStore {
             }
 
             // Atomic rename
-            Files.move(tempFile, propertiesFilePath, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(
+                        tempFile,
+                        propertiesFilePath,
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tempFile, propertiesFilePath, StandardCopyOption.REPLACE_EXISTING);
+            }
 
             log.trace("Flushed {} properties to {} file", cache.size(), description);
 
         } catch (Exception e) {
-            log.error("Failed to flush {} to disk", description, e);
+            throw new PropertiesStoreException(
+                    "Failed to flush " + description + " to " + propertiesFilePath, e);
         }
     }
 }

@@ -5,6 +5,8 @@ import spock.lang.Specification
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class RefreshContextSpec extends Specification {
 
@@ -119,6 +121,30 @@ class RefreshContextSpec extends Specification {
 
         then:
         winners.size() == 1
+    }
+
+    def "replay progress remains monotonic under competing updates"() {
+        given:
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        def executor = Executors.newFixedThreadPool(8)
+        def start = new CountDownLatch(1)
+        def offsets = (1L..200L).toList().reverse()
+        def futures = offsets.collect { offset ->
+            executor.submit {
+                start.await()
+                context.recordReplayProgress("groupA:topic", offset)
+            }
+        }
+
+        when:
+        start.countDown()
+        futures*.get(5, TimeUnit.SECONDS)
+
+        then:
+        context.consumerOffsets["groupA:topic"] == 200L
+
+        cleanup:
+        executor.shutdownNow()
     }
 
     def "all reset and ready acks checks reflect expected consumers"() {

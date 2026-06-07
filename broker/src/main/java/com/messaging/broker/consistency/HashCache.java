@@ -9,6 +9,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
@@ -24,12 +27,17 @@ public class HashCache {
     private final int maxEntries;
     private final Map<Key, CachedHash> store;
     private final ConcurrentHashMap<Key, CompletableFuture<CachedHash>> inFlight = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Key, Thread> owners = new ConcurrentHashMap<>();
+    private final long waitTimeoutMs;
 
     private final AtomicLong hits = new AtomicLong();
     private final AtomicLong misses = new AtomicLong();
 
-    public HashCache(@Value("${pipe.consistency.hash-cache.max-entries:10000}") int maxEntries) {
+    public HashCache(
+            @Value("${pipe.consistency.hash-cache.max-entries:10000}") int maxEntries,
+            @Value("${pipe.consistency.hash-cache.wait-timeout-ms:30000}") long waitTimeoutMs) {
         this.maxEntries = Math.max(64, maxEntries);
+        this.waitTimeoutMs = Math.max(1L, waitTimeoutMs);
         this.store = Collections.synchronizedMap(new LinkedHashMap<>(this.maxEntries, 0.75f, true) {
             @Override
             protected boolean removeEldestEntry(Map.Entry<Key, CachedHash> eldest) {
@@ -47,12 +55,21 @@ public class HashCache {
         CompletableFuture<CachedHash> mine = new CompletableFuture<>();
         CompletableFuture<CachedHash> existing = inFlight.putIfAbsent(key, mine);
         if (existing != null) {
+            if (owners.get(key) == Thread.currentThread()) {
+                throw new IllegalStateException("Recursive hash computation for " + key);
+            }
             try {
-                return existing.get();
-            } catch (Exception e) {
+                return existing.get(waitTimeoutMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted waiting for hash computation " + key, e);
+            } catch (TimeoutException e) {
+                throw new RuntimeException("Timed out waiting for hash computation " + key, e);
+            } catch (ExecutionException e) {
                 throw new RuntimeException("Coalesced hash computation failed for " + key, e);
             }
         }
+        owners.put(key, Thread.currentThread());
         try {
             CachedHash result = compute.get();
             store.put(key, result);
@@ -63,6 +80,7 @@ public class HashCache {
             mine.completeExceptionally(e);
             throw e;
         } finally {
+            owners.remove(key, Thread.currentThread());
             inFlight.remove(key, mine);
         }
     }
@@ -112,14 +130,18 @@ public class HashCache {
     }
 
     public static final class CachedHash {
-        public final byte[] hash;
+        private final byte[] hash;
         public final long recordCount;
         public final String projection;
 
         public CachedHash(byte[] hash, long recordCount, String projection) {
-            this.hash = hash;
+            this.hash = hash.clone();
             this.recordCount = recordCount;
             this.projection = projection;
+        }
+
+        public byte[] getHash() {
+            return hash.clone();
         }
     }
 }

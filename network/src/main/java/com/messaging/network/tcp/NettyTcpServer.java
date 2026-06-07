@@ -335,11 +335,11 @@ public class NettyTcpServer implements NetworkServer {
         }
 
         if (workerGroup != null) {
-            workerGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully().syncUninterruptibly();
         }
 
         if (bossGroup != null) {
-            bossGroup.shutdownGracefully();
+            bossGroup.shutdownGracefully().syncUninterruptibly();
         }
 
         clientChannels.clear();

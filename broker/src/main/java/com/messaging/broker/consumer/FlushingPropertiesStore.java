@@ -5,7 +5,9 @@ import org.slf4j.LoggerFactory;
 import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Properties repository with automatic periodic flushing.
@@ -19,6 +21,9 @@ public class FlushingPropertiesStore implements PropertiesStore {
     private final ScheduledExecutorService flusher;
     private final long flushIntervalMs;
     private final String description;
+    private final AtomicBoolean started = new AtomicBoolean();
+    private final AtomicBoolean stopped = new AtomicBoolean();
+    private volatile ScheduledFuture<?> flushTask;
 
     /**
      * Create periodic flush repository.
@@ -33,12 +38,26 @@ public class FlushingPropertiesStore implements PropertiesStore {
             String fileName,
             String description,
             long flushIntervalMs) {
+        this(
+                new PropertiesFileStore(dataDir, fileName, description),
+                createFlusher(description),
+                description,
+                flushIntervalMs);
+    }
 
-        this.delegate = new PropertiesFileStore(dataDir, fileName, description);
+    FlushingPropertiesStore(
+            PropertiesFileStore delegate,
+            ScheduledExecutorService flusher,
+            String description,
+            long flushIntervalMs) {
+        this.delegate = delegate;
+        this.flusher = flusher;
         this.flushIntervalMs = flushIntervalMs;
         this.description = description;
+    }
 
-        this.flusher = Executors.newSingleThreadScheduledExecutor(runnable -> {
+    private static ScheduledExecutorService createFlusher(String description) {
+        return Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread t = new Thread(runnable);
             t.setName(description + "-Flusher");
             t.setDaemon(true);
@@ -50,8 +69,14 @@ public class FlushingPropertiesStore implements PropertiesStore {
      * Start periodic flushing.
      */
     public void start() {
-        flusher.scheduleWithFixedDelay(
-                delegate::persistToDisk,
+        if (stopped.get()) {
+            throw new IllegalStateException(description + " store has already been stopped");
+        }
+        if (!started.compareAndSet(false, true)) {
+            return;
+        }
+        flushTask = flusher.scheduleWithFixedDelay(
+                this::flushSafely,
                 flushIntervalMs,
                 flushIntervalMs,
                 TimeUnit.MILLISECONDS
@@ -63,8 +88,15 @@ public class FlushingPropertiesStore implements PropertiesStore {
      * Stop periodic flushing and perform final flush.
      */
     public void stop() {
+        if (!stopped.compareAndSet(false, true)) {
+            return;
+        }
         log.info("Stopping periodic flush for {}...", description);
 
+        ScheduledFuture<?> task = flushTask;
+        if (task != null) {
+            task.cancel(false);
+        }
         flusher.shutdown();
         try {
             if (!flusher.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -79,6 +111,14 @@ public class FlushingPropertiesStore implements PropertiesStore {
         delegate.persistToDisk();
 
         log.info("Stopped periodic flush for {}", description);
+    }
+
+    private void flushSafely() {
+        try {
+            delegate.persistToDisk();
+        } catch (PropertiesStoreException e) {
+            log.error("Periodic flush failed for {}; the next scheduled flush will retry", description, e);
+        }
     }
 
     // Delegate all PropertiesStore methods

@@ -40,7 +40,7 @@ class BatchDeliveryServiceSpec extends Specification {
     BatchDeliveryService service = new BatchDeliveryService(
             server, storage, batchStorage, stateService, readinessService, offsetTracker,
             metrics, dataRefreshMetrics, registrationService, scheduler, storageExecutor,
-            100, 1, 1, consumerLogger, compactionIndex
+            100, 1, 1, 30, consumerLogger, compactionIndex
     )
 
     def cleanup() {
@@ -112,6 +112,7 @@ class BatchDeliveryServiceSpec extends Specification {
         readinessService.isModernConsumerTopicReady("client-1", "prices-v1", "group-a") >> true
         stateService.markInFlight(DeliveryKey.of("group-a", "prices-v1")) >> new AtomicBoolean(false)
         stateService.getPendingOffset(DeliveryKey.of("group-a", "prices-v1")) >> null
+        stateService.beginDelivery(DeliveryKey.of("group-a", "prices-v1")) >> 1L
         metrics.startStorageReadTimer() >> Mock(Timer.Sample)
         def emptyBatch = new TrackingBatch("prices-v1", new byte[0], 0, 0)
         batchStorage.getBatch("prices-v1", 0, 0L, 1024) >> emptyBatch
@@ -132,6 +133,7 @@ class BatchDeliveryServiceSpec extends Specification {
         readinessService.isModernConsumerTopicReady("client-1", "prices-v1", "group-a") >> true
         stateService.markInFlight(DeliveryKey.of("group-a", "prices-v1")) >> new AtomicBoolean(false)
         stateService.getPendingOffset(DeliveryKey.of("group-a", "prices-v1")) >> null
+        stateService.beginDelivery(DeliveryKey.of("group-a", "prices-v1")) >> 1L
         metrics.startStorageReadTimer() >> Mock(Timer.Sample)
         def dataBatch = new TrackingBatch("prices-v1", 'abc'.bytes, 1, 0)
         batchStorage.getBatch("prices-v1", 0, 0L, 1024) >> dataBatch
@@ -147,12 +149,33 @@ class BatchDeliveryServiceSpec extends Specification {
         consumer.consecutiveFailures > 0
         1 * metrics.stopStorageReadTimer(_ as Timer.Sample)
         1 * metrics.recordStorageRead()
-        // sendBatchToConsumer() threw before the ACK timeout was scheduled — pending state must be
-        // cleared immediately so Gate 2 does not permanently block all future delivery attempts.
-        1 * stateService.clearFromOffset(_)
-        1 * stateService.clearPendingOffset(_)
+        1 * stateService.completeDelivery(DeliveryKey.of("group-a", "prices-v1"), 1L) >> true
         1 * metrics.recordConsumerTransferFailed("client-1", "prices-v1", "group-a", 1, 3)
         1 * metrics.recordConsumerFailure("client-1", "prices-v1", "group-a")
+    }
+
+    def "deliverBatch cancels a network send that exceeds its deadline"() {
+        given:
+        def consumer = new RemoteConsumer("client-1", "prices-v1", "group-a")
+        def deliveryKey = DeliveryKey.of("group-a", "prices-v1")
+        def batch = new TrackingBatch("prices-v1", 'abc'.bytes, 1, 0)
+        def sendFuture = new CompletableFuture<Void>()
+        readinessService.isModernConsumerTopicReady("client-1", "prices-v1", "group-a") >> true
+        stateService.markInFlight(deliveryKey) >> new AtomicBoolean(false)
+        stateService.getPendingOffset(deliveryKey) >> null
+        stateService.beginDelivery(deliveryKey) >> 1L
+        metrics.startStorageReadTimer() >> Mock(Timer.Sample)
+        metrics.startConsumerDeliveryTimer() >> Mock(Timer.Sample)
+        batchStorage.getBatch("prices-v1", 0, 0L, 1024) >> batch
+        server.sendBatch("client-1", "group-a", batch) >> sendFuture
+
+        when:
+        def result = service.deliverBatch(consumer, 1024)
+
+        then:
+        !result.delivered()
+        sendFuture.isCancelled()
+        1 * stateService.completeDelivery(deliveryKey, 1L) >> true
     }
 
     def "deliverBatch succeeds records lag and refresh metrics during replay"() {
@@ -171,6 +194,7 @@ class BatchDeliveryServiceSpec extends Specification {
         readinessService.isModernConsumerTopicReady("client-1", "prices-v1", "group-a") >> true
         stateService.markInFlight(deliveryKey) >> new AtomicBoolean(false)
         stateService.getPendingOffset(deliveryKey) >> null
+        stateService.beginDelivery(deliveryKey) >> 1L
         metrics.startStorageReadTimer() >> Mock(Timer.Sample)
         metrics.startConsumerDeliveryTimer() >> Mock(Timer.Sample)
         batchStorage.getBatch("prices-v1", 0, 0L, 1024) >> batch
@@ -192,7 +216,7 @@ class BatchDeliveryServiceSpec extends Specification {
         1 * stateService.recordTraceId(deliveryKey, _ as String)
         1 * metrics.startPendingAck("prices-v1", "group-a")
         1 * stateService.recordBatchSendTime(deliveryKey, _ as Long)
-        1 * stateService.scheduleTimeout(deliveryKey, _)
+        1 * stateService.scheduleTimeout(deliveryKey, 1L, _) >> true
         1 * metrics.stopConsumerDeliveryTimer(_ as Timer.Sample, "client-1", "prices-v1", "group-a")
         1 * dataRefreshMetrics.recordDataTransferred("prices-v1", "group-a", 3L, 2, "refresh-1", "LOCAL")
         1 * metrics.recordConsumerBatchSent("client-1", "prices-v1", "group-a", 2, 3L)
@@ -210,6 +234,7 @@ class BatchDeliveryServiceSpec extends Specification {
         readinessService.isModernConsumerTopicReady("client-1", "prices-v1", "group-a") >> true
         stateService.markInFlight(deliveryKey) >> new AtomicBoolean(false)
         stateService.getPendingOffset(deliveryKey) >> null
+        stateService.beginDelivery(deliveryKey) >> 1L
         metrics.startStorageReadTimer() >> Mock(Timer.Sample)
         metrics.startConsumerDeliveryTimer() >> Mock(Timer.Sample)
         batchStorage.getBatch("prices-v1", 0, 0L, 1024) >> batch
@@ -223,10 +248,7 @@ class BatchDeliveryServiceSpec extends Specification {
         consumer.currentOffset == 0L
         consumer.consecutiveFailures == 10
         1 * metrics.recordConsumerFailure("client-1", "prices-v1", "group-a")
-        1 * stateService.clearFromOffset(deliveryKey)
-        1 * stateService.clearPendingOffset(deliveryKey)
-        1 * stateService.recordBatchSendTime(deliveryKey, 0L)
-        1 * stateService.clearTraceId(deliveryKey)
+        1 * stateService.completeDelivery(deliveryKey, 1L) >> true
         1 * registrationService.unregisterConsumer("client-1")
         1 * metrics.recordConsumerTransferFailed("client-1", "prices-v1", "group-a", 1, 3)
     }

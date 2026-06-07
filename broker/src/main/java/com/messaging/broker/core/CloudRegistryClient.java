@@ -9,11 +9,13 @@ import io.micronaut.http.HttpResponse;
 import io.micronaut.http.client.HttpClient;
 import io.micronaut.http.client.annotation.Client;
 import jakarta.inject.Inject;
+import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 /**
  * Client for querying Cloud Registry to get topology information
@@ -24,10 +26,14 @@ public class CloudRegistryClient {
 
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
+    private final Executor registryExecutor;
 
     @Inject
-    public CloudRegistryClient(@Client("/") HttpClient httpClient) {
+    public CloudRegistryClient(
+            @Client("/") HttpClient httpClient,
+            @Named("registryExecutor") Executor registryExecutor) {
         this.httpClient = httpClient;
+        this.registryExecutor = registryExecutor;
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
         log.info("CloudRegistryClient initialized");
@@ -85,6 +91,6 @@ public class CloudRegistryClient {
                 // Lambda limitation: Wrap in RuntimeException
                 throw new RuntimeException("Failed to query Cloud Registry - see cause for details", ex);
             }
-        });
+        }, registryExecutor);
     }
 }

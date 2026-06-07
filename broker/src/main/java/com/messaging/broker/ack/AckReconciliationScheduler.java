@@ -47,7 +47,7 @@ public class AckReconciliationScheduler {
 
     private final ConsumerRegistrationService registrationService;
     private final StorageEngine storage;
-    private final RocksDbAckStore ackStore;
+    private final AckStore ackStore;
     private final BrokerMetrics metrics;
     private final ConsumerOffsetTracker offsetTracker;
     private final boolean enabled;
@@ -66,7 +66,7 @@ public class AckReconciliationScheduler {
     public AckReconciliationScheduler(
             ConsumerRegistrationService registrationService,
             StorageEngine storage,
-            RocksDbAckStore ackStore,
+            AckStore ackStore,
             BrokerMetrics metrics,
             ConsumerOffsetTracker offsetTracker,
             @Value("${ack-store.reconciliation.enabled:true}") boolean enabled,

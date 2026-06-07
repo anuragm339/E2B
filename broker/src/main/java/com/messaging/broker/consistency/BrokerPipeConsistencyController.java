@@ -74,7 +74,7 @@ public class BrokerPipeConsistencyController {
         });
 
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("hash", toHex(result.hash));
+        body.put("hash", toHex(result.getHash()));
         body.put("recordCount", result.recordCount);
         body.put("projection", result.projection);
         body.put("cached", cachedFlag[0]);

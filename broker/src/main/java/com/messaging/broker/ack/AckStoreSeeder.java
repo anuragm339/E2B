@@ -27,12 +27,12 @@ public class AckStoreSeeder {
     private static final int READ_BATCH_SIZE = 500;
 
     private final ConsumerOffsetTracker offsetTracker;
-    private final RocksDbAckStore ackStore;
+    private final AckStore ackStore;
     private final StorageEngine storage;
 
     public AckStoreSeeder(
             ConsumerOffsetTracker offsetTracker,
-            RocksDbAckStore ackStore,
+            AckStore ackStore,
             StorageEngine storage) {
         this.offsetTracker = offsetTracker;
         this.ackStore = ackStore;

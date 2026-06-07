@@ -46,11 +46,20 @@ public class PipeConsistencyScheduler {
     public void runHopCycle() {
         if (!enabled) return;
         sleepJitter();
+        long startedAtNanos = System.nanoTime();
+        long heapBefore = usedHeapBytes();
         try {
             PipeConsistencyReport r = checker.runHopGlobal();
-            LOG.info("HOP-global audit status={}", r.status);
+            long heapAfter = usedHeapBytes();
+            long durationMs = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+            LOG.info("event=pipe_consistency.hop_cycle.done status={} durationMs={} "
+                    + "heapBeforeMB={} heapAfterMB={} heapDeltaMB={}",
+                    r.status, durationMs,
+                    heapBefore >> 20, heapAfter >> 20, (heapAfter - heapBefore) >> 20);
         } catch (Exception e) {
-            LOG.warn("HOP-global audit failed: {}", e.getMessage());
+            long durationMs = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+            LOG.warn("event=pipe_consistency.hop_cycle.failed durationMs={} cause={}",
+                    durationMs, e.getMessage());
         }
     }
 
@@ -59,12 +68,26 @@ public class PipeConsistencyScheduler {
     public void runDeepCycle() {
         if (!enabled) return;
         sleepJitter();
+        long startedAtNanos = System.nanoTime();
+        long heapBefore = usedHeapBytes();
         try {
             PipeConsistencyReport r = checker.runDeepGlobal();
-            LOG.info("DEEP-global audit status={}", r.status);
+            long heapAfter = usedHeapBytes();
+            long durationMs = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+            LOG.info("event=pipe_consistency.deep_cycle.done status={} durationMs={} "
+                    + "heapBeforeMB={} heapAfterMB={} heapDeltaMB={}",
+                    r.status, durationMs,
+                    heapBefore >> 20, heapAfter >> 20, (heapAfter - heapBefore) >> 20);
         } catch (Exception e) {
-            LOG.warn("DEEP-global audit failed: {}", e.getMessage());
+            long durationMs = (System.nanoTime() - startedAtNanos) / 1_000_000L;
+            LOG.warn("event=pipe_consistency.deep_cycle.failed durationMs={} cause={}",
+                    durationMs, e.getMessage());
         }
+    }
+
+    private static long usedHeapBytes() {
+        Runtime rt = Runtime.getRuntime();
+        return rt.totalMemory() - rt.freeMemory();
     }
 
     private static void sleepQuietly(long ms) {

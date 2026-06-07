@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Fair scheduler with per-topic work queue bounds.
@@ -26,15 +27,26 @@ public class TopicFairScheduler {
     private final ScheduledExecutorService scheduler;
     private final Map<String, Semaphore> topicSemaphores;
     // Track pending retry tasks to prevent unbounded recursive scheduling.
-    private final Map<String, ScheduledFuture<?>> pendingRetries;
+    private final Map<String, RetrySlot> pendingRetries;
     private final int maxInFlightPerTopic;
+    private final AtomicLong retryGeneration = new AtomicLong();
+    private final AtomicLong threadCounter = new AtomicLong();
+
+    private static final class RetrySlot {
+        private final long generation;
+        private volatile ScheduledFuture<?> future;
+
+        private RetrySlot(long generation) {
+            this.generation = generation;
+        }
+    }
 
     public TopicFairScheduler(
             @Value("${broker.consumer.fairness.threads:2}") int threads,
             @Value("${broker.consumer.fairness.max-in-flight-per-topic:1}") int maxInFlightPerTopic) {
         this.scheduler = Executors.newScheduledThreadPool(threads, r -> {
             Thread t = new Thread(r);
-            t.setName("TopicFairScheduler-" + t.getId());
+            t.setName("TopicFairScheduler-" + threadCounter.incrementAndGet());
             t.setDaemon(true);
             return t;
         });
@@ -78,34 +90,59 @@ public class TopicFairScheduler {
             topic, k -> new Semaphore(maxInFlightPerTopic)
         );
 
-        return scheduler.schedule(() -> {
-            // Try to acquire permit (non-blocking)
-            if (semaphore.tryAcquire()) {
-                try {
-                    // Clear pending retry since task is now running
-                    pendingRetries.remove(deliveryKey);
-                    task.run();
-                } catch (Exception e) {
-                    log.error("Task execution failed for topic={}, deliveryKey={}", topic, deliveryKey, e);
-                } finally {
-                    semaphore.release();
-                }
-            } else {
-                // No permit available: only reschedule if no retry is already pending.
-                ScheduledFuture<?> existingRetry = pendingRetries.get(deliveryKey);
-                if (existingRetry == null || existingRetry.isDone()) {
-                    // No retry pending, schedule one
-                    log.trace("Skipping task for topic={}, deliveryKey={} - max in-flight reached, scheduling single retry",
-                            topic, deliveryKey);
-                    ScheduledFuture<?> retryFuture = scheduleWithKey(topic, deliveryKey, task, delay, unit);
-                    pendingRetries.put(deliveryKey, retryFuture);
-                } else {
-                    // Retry already pending, drop this attempt to prevent task buildup
-                    log.trace("Skipping task for topic={}, deliveryKey={} - retry already pending",
-                            topic, deliveryKey);
-                }
-            }
-        }, delay, unit);
+        return scheduler.schedule(
+                () -> runAttempt(topic, deliveryKey, task, delay, unit, semaphore),
+                delay,
+                unit);
+    }
+
+    private void runAttempt(
+            String topic,
+            String deliveryKey,
+            Runnable task,
+            long retryDelay,
+            TimeUnit retryUnit,
+            Semaphore semaphore) {
+        if (!semaphore.tryAcquire()) {
+            scheduleSingleRetry(topic, deliveryKey, task, retryDelay, retryUnit, semaphore);
+            return;
+        }
+
+        try {
+            task.run();
+        } catch (RuntimeException e) {
+            log.error("Task execution failed for topic={}, deliveryKey={}", topic, deliveryKey, e);
+            throw e;
+        } finally {
+            semaphore.release();
+        }
+    }
+
+    private void scheduleSingleRetry(
+            String topic,
+            String deliveryKey,
+            Runnable task,
+            long delay,
+            TimeUnit unit,
+            Semaphore semaphore) {
+        RetrySlot slot = new RetrySlot(retryGeneration.incrementAndGet());
+        RetrySlot existing = pendingRetries.putIfAbsent(deliveryKey, slot);
+        if (existing != null) {
+            log.trace("Skipping task for topic={}, deliveryKey={} - retry generation={} already pending",
+                    topic, deliveryKey, existing.generation);
+            return;
+        }
+
+        try {
+            long retryDelayMs = Math.max(1L, unit.toMillis(delay));
+            slot.future = scheduler.schedule(() -> {
+                pendingRetries.remove(deliveryKey, slot);
+                runAttempt(topic, deliveryKey, task, delay, unit, semaphore);
+            }, retryDelayMs, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException e) {
+            pendingRetries.remove(deliveryKey, slot);
+            throw e;
+        }
     }
 
     /**
