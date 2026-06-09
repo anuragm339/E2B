@@ -56,11 +56,6 @@ public class CompactionRewriter {
     private static final Logger log = LoggerFactory.getLogger(CompactionRewriter.class);
     private static final long MS_PER_DAY = 86_400_000L;
 
-    // Optional — Micronaut injects when PipeConsistency wiring is present. Allowing null keeps
-    // this class testable in isolation (Spock mocks pass nothing).
-    @jakarta.inject.Inject
-    com.messaging.broker.consistency.HashCache pipeConsistencyHashCache;
-
     public static class CompactionResult {
         public final int recordsRemoved;
         public final int tombstonesRemoved;
@@ -161,11 +156,6 @@ public class CompactionRewriter {
         long bytesStreamedIn         = 0L;
         boolean hadUnexpiredTombstone = false;
 
-        // PipeConsistency: accumulate rolling hash over survivors in append order so the merged
-        // segment's hash matches what cloud-server's `projection=compacted` will produce over the
-        // same offset range.
-        byte[] rollingHash = com.messaging.common.hash.RecordHasher.EMPTY_HASH.clone();
-
         // The compacted segment's maxSize must accommodate all survivors.
         // Use the combined on-disk size of all candidates as the ceiling — survivors can never
         // exceed total input bytes. Guard against empty/zero-size inputs.
@@ -215,13 +205,6 @@ public class CompactionRewriter {
                         } else {
                             writer.append(record);
                             survivorCount++;
-                            // Fold this survivor into the rolling hash in append order.
-                            int recCrc = com.messaging.common.hash.RecordHasher.recordCrc(
-                                    actualOffset,
-                                    record.getMsgKey(),
-                                    (char) record.getEventType().getCode(),
-                                    record.getData());
-                            rollingHash = com.messaging.common.hash.RecordHasher.combine(rollingHash, recCrc);
                             // Track whether a live DELETE tombstone was kept within retention window
                             if (record.getEventType() == EventType.DELETE) {
                                 long[] latestInfo = compactionIndex.getLatestOffsetAndTimestamp(
@@ -290,28 +273,7 @@ public class CompactionRewriter {
 
         compactedSegment.seal();
 
-        // PipeConsistency: install the rolling hash we accumulated over survivors,
-        // and bump the compaction epoch (max input epoch + 1) so HashCache invalidation
-        // and projection routing work correctly downstream.
-        compactedSegment.installRollingHash(rollingHash, survivorCount);
-        int maxInputEpoch = 0;
-        for (Segment in : candidates) {
-            int ep = segmentManager.getSegmentCompactionEpoch(in.getBaseOffset());
-            if (ep > maxInputEpoch) {
-                maxInputEpoch = ep;
-            }
-        }
-        compactedSegment.setCompactionEpoch(maxInputEpoch + 1);
-
         segmentManager.replaceSegments(candidates, compactedSegment);
-
-        // PipeConsistency: invalidate any cached hashes whose range overlaps the compacted window
-        // so child brokers don't see stale pre-compaction hashes on their next call.
-        if (pipeConsistencyHashCache != null) {
-            long compactedLo = candidates.get(0).getBaseOffset();
-            long compactedHi = compactedSegment.getNextOffset() - 1;
-            pipeConsistencyHashCache.invalidateOverlapping(topic, compactedLo, compactedHi);
-        }
 
         long bytesWritten = writer.getBytesWritten();
         long mmapFreedMB  = (totalInputBytes - bytesWritten) / (1024 * 1024);

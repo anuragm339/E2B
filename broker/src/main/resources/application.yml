@@ -203,30 +203,6 @@ compaction:
     interval: ${COMPACTION_INTERVAL:24h}
     initial-delay: ${COMPACTION_INITIAL_DELAY:5m}
 
-# PipeConsistency: periodic audit of pipe-ingested data against upstream.
-# Disabled by default. See provider/docs/PIPE_CONSISTENCY.md.
-pipe-consistency-config:
-  _comment: configured under the `pipe.consistency.*` namespace below
-pipe:
-  consistency:
-    enabled: ${PIPE_CONSISTENCY_ENABLED:true}
-    schedule:
-      hop-interval: ${PIPE_CONSISTENCY_HOP_INTERVAL:10m}
-      initial-delay: ${PIPE_CONSISTENCY_INITIAL_DELAY:2m}
-      deep-interval: ${PIPE_CONSISTENCY_DEEP_INTERVAL:24h}
-      deep-initial-delay: ${PIPE_CONSISTENCY_DEEP_INITIAL_DELAY:30m}
-    upstream:
-      timeout: ${PIPE_CONSISTENCY_UPSTREAM_TIMEOUT:30s}
-    deep:
-      max-hops: ${PIPE_CONSISTENCY_DEEP_MAX_HOPS:8}
-    hash-cache:
-      max-entries: ${PIPE_CONSISTENCY_HASH_CACHE_MAX_ENTRIES:10000}
-    drill-down:
-      batch-size: ${PIPE_CONSISTENCY_DRILLDOWN_BATCH_SIZE:1000}
-      max-mismatch-report: ${PIPE_CONSISTENCY_DRILLDOWN_MAX_MISMATCH_REPORT:100}
-    endpoint:
-      enabled: ${PIPE_CONSISTENCY_ENDPOINT_ENABLED:true}
-
 logger:
   levels:
     com.messaging: WARN  # Default to warnings/errors unless a package is explicitly promoted

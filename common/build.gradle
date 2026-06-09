@@ -14,9 +14,6 @@ dependencies {
     api 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
     api 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.15.2'
 
-    // Guava for Murmur3-128 used by PipeConsistency RecordHasher
-    api 'com.google.guava:guava:32.1.3-jre'
-
     // Micronaut HTTP client (for shared client filters)
     implementation 'io.micronaut:micronaut-http-client'
 

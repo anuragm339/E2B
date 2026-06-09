@@ -706,22 +706,6 @@ public class SegmentManager {
         try {
             long recordCount = segment.getRecordCount();
 
-            Segment.RollingHashSnapshot snap = segment.snapshotRollingHash();
-            // Trustworthy rolling hash exists only for segments whose entire lifetime happened in this
-            // JVM. Segments loaded from disk are flagged untrustworthy until SegmentHasher backfill runs.
-            byte[] hashToPersist = snap.trustworthy ? snap.hash : null;
-            int epoch = segment.getCompactionEpoch();
-            String hashState;
-            if (!snap.trustworthy) {
-                hashState = SegmentMetadata.HASH_STATE_PENDING;
-            } else if (epoch > 0) {
-                hashState = SegmentMetadata.HASH_STATE_COMPACTED;
-            } else if (segment.isActive()) {
-                hashState = SegmentMetadata.HASH_STATE_PENDING;
-            } else {
-                hashState = SegmentMetadata.HASH_STATE_FINAL;
-            }
-
             SegmentMetadata metadata = SegmentMetadata.builder()
                     .topic(topic)
                     .partition(partition)
@@ -731,10 +715,6 @@ public class SegmentManager {
                     .indexFilePath(segment.getIndexPath().toString())
                     .sizeBytes(segment.getSize())
                     .recordCount(recordCount)
-                    .segmentHash(hashToPersist)
-                    .hashRecordCount(snap.recordCount)
-                    .compactionEpoch(epoch)
-                    .hashState(hashState)
                     .build();
 
             metadataStore.saveSegment(metadata);
@@ -775,23 +755,6 @@ public class SegmentManager {
 
     public Path getDataDir() {
         return dataDir;
-    }
-
-    /**
-     * Access to the per-topic metadata store, used by PipeConsistency to read sealed
-     * segment hashes without re-opening the SQLite file.
-     */
-    public SegmentMetadataStore getMetadataStore() {
-        return metadataStore;
-    }
-
-    /**
-     * Look up a segment's persisted compaction_epoch (0 if no metadata row exists yet).
-     * Used by CompactionRewriter to derive the merged segment's epoch as max(inputs)+1.
-     */
-    public int getSegmentCompactionEpoch(long baseOffset) {
-        SegmentMetadata md = metadataStore.getSegment(topic, partition, baseOffset);
-        return md == null ? 0 : md.getCompactionEpoch();
     }
 
     public long getMaxSegmentSize() {

@@ -1,7 +1,6 @@
 # Concurrency Audit Comparison
 
 **Reviewed:** 2026-06-07
-**Branch:** `feature/pipe-consistency`
 
 ## Post-Comparison Remediation
 

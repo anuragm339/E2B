@@ -1,6 +1,5 @@
 package com.messaging.broker.core;
 
-import com.messaging.broker.consistency.PipeLineageStore;
 import com.messaging.common.api.PipeConnector;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.common.model.TopologyResponse;
@@ -42,7 +41,6 @@ public class TopologyManager {
     private final String nodeId;
     private final ScheduledExecutorService scheduler;
     private final TopologyPropertiesStore propertiesStore;
-    private final PipeLineageStore lineageStore;
     // Lightweight HTTP client used ONLY for probing a candidate parent's /health
     // before tearing down the live connection to the current parent.
     private final HttpClient probeHttp = HttpClient.newBuilder()
@@ -60,14 +58,12 @@ public class TopologyManager {
     public TopologyManager(
             CloudRegistryClient registryClient,
             PipeConnector pipeConnector,
-            PipeLineageStore lineageStore,
             @Value("${broker.registry.url}") String registryUrl,
             @Value("${broker.nodeId:local-001}") String nodeId,
             @Value("${broker.storage.data-dir:./data}") String dataDir) {
 
         this.registryClient = registryClient;
         this.pipeConnector = pipeConnector;
-        this.lineageStore = lineageStore;
         this.registryUrl = registryUrl;
         this.nodeId = nodeId;
         // Use single thread - topology updates are infrequent (every 30s)
@@ -169,9 +165,8 @@ public class TopologyManager {
                 return;
             }
 
-            // If parent changed, attempt to switch — but keep the old connection live
-            // until we've confirmed the new parent is reachable AND we've successfully
-            // connected to it. PipeLineage is only updated on successful swap.
+            // If parent changed, keep the old connection live until the new parent
+            // has passed the reachability probe.
             if (!newParentUrl.equals(currentParentUrl)) {
                 log.info("Parent change requested: {} -> {}", currentParentUrl, newParentUrl);
 
@@ -182,23 +177,11 @@ public class TopologyManager {
                     return;
                 }
 
-                // 2) Capture cursor BEFORE disconnect (disconnect could change connector state).
-                long cursorAtSwitch = pipeConnector.getCurrentOffset();
-                long firstOffsetFromNewParent = cursorAtSwitch < 0 ? 0L : cursorAtSwitch;
-
-                // 3) Probe succeeded — tear down old, connect new, update lineage on success.
+                // Probe succeeded — tear down old and connect to the new parent.
                 if (currentParentUrl != null) {
                     disconnectFromParent();
                 }
-                connectToParent(newParentUrl).whenComplete((v, ex) -> {
-                    if (ex == null) {
-                        lineageStore.recordParentSwitch(newParentUrl, firstOffsetFromNewParent);
-                    } else {
-                        log.error("Connect to {} failed after probe succeeded; " +
-                                "broker has no active pipe until next registry cycle",
-                                newParentUrl, ex);
-                    }
-                });
+                connectToParent(newParentUrl);
             }
 
             currentTopology = topology;
@@ -210,8 +193,7 @@ public class TopologyManager {
 
     /**
      * Connect to parent broker. Returns a future that completes when the underlying
-     * connector future resolves AND currentParentUrl + handler are committed — caller
-     * can chain side-effects (e.g. lineage update) onto the success path.
+     * connector future resolves and currentParentUrl plus the handler are committed.
      */
     private CompletableFuture<Void> connectToParent(String parentUrl) {
         log.info("Connecting to parent: {}", parentUrl);

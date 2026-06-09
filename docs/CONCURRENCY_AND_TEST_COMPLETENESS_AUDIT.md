@@ -1,7 +1,6 @@
 # Concurrency and Test Completeness Audit
 
 **Audit date:** 2026-06-07
-**Branch:** `feature/pipe-consistency`
 **Java:** Java 17 target, audited on JDK 21.0.7; Micronaut 4.2.1, Gradle 8.5
 **Scope:** `broker`, `client`, `common`, `network`, `pipe`, `storage`, and `test-consumer`
 

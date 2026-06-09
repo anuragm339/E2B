@@ -1,6 +1,5 @@
 package com.messaging.broker.core
 
-import com.messaging.broker.consistency.PipeLineageStore
 import com.messaging.common.api.PipeConnector
 import com.messaging.common.model.MessageRecord
 import com.messaging.common.model.TopologyResponse
@@ -62,32 +61,25 @@ class TopologyManagerProbeIntegrationSpec extends Specification {
     def "probe accepts 2xx /health and proceeds with the switch"() {
         given:
         def pipeConnector = new FakePipeConnector()
-        def lineage = new PipeLineageStore(tempDir)
         def manager = new TopologyManager(
-                Mock(CloudRegistryClient), pipeConnector, lineage,
+                Mock(CloudRegistryClient), pipeConnector,
                 "http://registry", "node-1", tempDir.toString())
         manager.onMessageReceived({ MessageRecord r -> true })
 
         when: 'topology requests a switch to the healthy server'
         invokeHandleTopologyUpdate(manager, ["http://127.0.0.1:${healthyPort}".toString()])
         waitFor { pipeConnector.connectCalls == 1 }
-        Thread.sleep(50)  // lineage update is chained to connect-success
 
         then: '/health was probed and the switch went through'
         healthyHits.get() == 1
         manager.getCurrentParentUrl() == "http://127.0.0.1:${healthyPort}"
-        lineage.allEntries().size() == 1
-
-        cleanup:
-        lineage?.close()
     }
 
     def "probe rejects 5xx /health and leaves the live connection untouched"() {
         given:
         def pipeConnector = new FakePipeConnector()
-        def lineage = new PipeLineageStore(tempDir)
         def manager = new TopologyManager(
-                Mock(CloudRegistryClient), pipeConnector, lineage,
+                Mock(CloudRegistryClient), pipeConnector,
                 "http://registry", "node-1", tempDir.toString())
         manager.onMessageReceived({ MessageRecord r -> true })
 
@@ -100,23 +92,17 @@ class TopologyManagerProbeIntegrationSpec extends Specification {
         invokeHandleTopologyUpdate(manager, ["http://127.0.0.1:${unhealthyPort}".toString()])
         Thread.sleep(150)
 
-        then: 'no disconnect, no new connect, no new lineage row'
+        then: 'no disconnect and no new connect'
         pipeConnector.disconnectCalls == 0
         pipeConnector.connectCalls == 1
         manager.getCurrentParentUrl() == "http://127.0.0.1:${healthyPort}"
-        lineage.allEntries().size() == 1
-        lineage.allEntries()[0].open
-
-        cleanup:
-        lineage?.close()
     }
 
     def "probe rejects an unroutable URL (no listener) and leaves the live connection untouched"() {
         given:
         def pipeConnector = new FakePipeConnector()
-        def lineage = new PipeLineageStore(tempDir)
         def manager = new TopologyManager(
-                Mock(CloudRegistryClient), pipeConnector, lineage,
+                Mock(CloudRegistryClient), pipeConnector,
                 "http://registry", "node-1", tempDir.toString())
         manager.onMessageReceived({ MessageRecord r -> true })
 
@@ -133,12 +119,9 @@ class TopologyManagerProbeIntegrationSpec extends Specification {
         pipeConnector.disconnectCalls == 0
         pipeConnector.connectCalls == 1
         manager.getCurrentParentUrl() == "http://127.0.0.1:${healthyPort}"
-
-        cleanup:
-        lineage?.close()
     }
 
-    def "probe can succeed but connect still fail; lineage stays on old parent and no new row is written"() {
+    def "probe can succeed but connect still fail"() {
         given:
         def secondHealthyHits = new AtomicInteger()
         def secondHealthyServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0)
@@ -152,9 +135,8 @@ class TopologyManagerProbeIntegrationSpec extends Specification {
 
         and:
         def pipeConnector = new FakePipeConnector()
-        def lineage = new PipeLineageStore(tempDir)
         def manager = new TopologyManager(
-                Mock(CloudRegistryClient), pipeConnector, lineage,
+                Mock(CloudRegistryClient), pipeConnector,
                 "http://registry", "node-1", tempDir.toString())
         manager.onMessageReceived({ MessageRecord r -> true })
 
@@ -171,18 +153,13 @@ class TopologyManagerProbeIntegrationSpec extends Specification {
         waitFor { pipeConnector.connectCalls == 2 }
         Thread.sleep(100)
 
-        then: 'probe succeeded, old parent was torn down, but lineage did not advance'
+        then: 'probe succeeded but the broker has no active parent'
         secondHealthyHits.get() == 1
         pipeConnector.disconnectCalls == 1
         manager.getCurrentParentUrl() == null
-        def rows = lineage.allEntries()
-        rows.size() == 1
-        rows[0].parentUrl == "http://127.0.0.1:${healthyPort}"
-        rows[0].open
 
         cleanup:
         secondHealthyServer?.stop(0)
-        lineage?.close()
     }
 
     private static void waitFor(Closure cond) {
@@ -206,10 +183,7 @@ class TopologyManagerProbeIntegrationSpec extends Specification {
     private static class FakePipeConnector implements PipeConnector {
         int connectCalls = 0
         int disconnectCalls = 0
-        long currentOffsetValue = 0L
         Integer failOnConnectCall
-
-        @Override long getCurrentOffset() { currentOffsetValue }
 
         @Override
         CompletableFuture<PipeConnection> connectToParent(String parentUrl) {
