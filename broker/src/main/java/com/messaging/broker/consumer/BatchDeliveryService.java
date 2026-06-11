@@ -241,9 +241,11 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
             batch = applyCompactionFilter(consumer.getTopic(), batch, capturedOffset);
             if (batch.isEmpty()) {
                 // All records in the batch were superseded — advance offset without sending.
+                // Offsets are persisted per group:topic (DeliveryKey), never per clientId:
+                // clientId is the remote socket address and changes on every reconnect.
                 try { batch.close(); } catch (IOException ignored) {}
                 consumer.setCurrentOffset(originalLastOffset + 1);
-                offsetTracker.updateOffset(consumer.getClientId(), originalLastOffset + 1);
+                offsetTracker.updateOffset(deliveryKey.toString(), originalLastOffset + 1);
                 stateService.completeDelivery(deliveryKey, deliveryGeneration);
                 return DeliveryResult.success();
             }

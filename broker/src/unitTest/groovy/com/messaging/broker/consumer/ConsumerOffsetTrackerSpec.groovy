@@ -30,6 +30,25 @@ class ConsumerOffsetTrackerSpec extends Specification {
         reloaded.shutdown()
     }
 
+    def "getCommittedOffset distinguishes no-commit from committed-through-zero"() {
+        given:
+        def tracker = new ConsumerOffsetTracker(tempDir.toString())
+        tracker.init()
+
+        expect: "no commit yet → -1, not 0 (a default of 0 makes the record at offset 0 undeliverable)"
+        tracker.getCommittedOffset("groupA:topicA") == -1L
+        tracker.getOffset("groupA:topicA") == 0L
+
+        when:
+        tracker.updateOffset("groupA:topicA", 0L)
+
+        then:
+        tracker.getCommittedOffset("groupA:topicA") == 0L
+
+        cleanup:
+        tracker.shutdown()
+    }
+
     def "resetOffset flushes updated value"() {
         given:
         def tracker = new ConsumerOffsetTracker(tempDir.toString())

@@ -122,4 +122,16 @@ class InMemoryAckStoreSpec extends Specification {
         cleanup:
         pool.shutdownNow()
     }
+
+    def "getAckedOffsetsInRange returns only matching topic, group, and half-open range"() {
+        given:
+        [5L, 7L, 9L, 12L].each { store.put('prices-v1', 'g1', it, new AckRecord(it, 100L)) }
+        store.put('prices-v1', 'g2', 7L, new AckRecord(7L, 100L))
+        store.put('orders-v1', 'g1', 7L, new AckRecord(7L, 100L))
+
+        expect:
+        store.getAckedOffsetsInRange('prices-v1', 'g1', 5L, 12L) == [5L, 7L, 9L] as Set
+        store.getAckedOffsetsInRange('prices-v1', 'g1', 0L, 5L).isEmpty()
+        store.getAckedOffsetsInRange('prices-v1', 'g1', 12L, 12L).isEmpty()
+    }
 }

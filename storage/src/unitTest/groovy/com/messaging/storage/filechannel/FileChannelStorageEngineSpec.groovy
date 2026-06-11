@@ -271,6 +271,7 @@ class FileChannelStorageEngineSpec extends Specification {
         return new FileChannelStorageEngine(
             dataDir.toString(),
             maxSegmentSize,
+            -1L,  // disable page-cache eviction in unit tests
             watermarkTracker,
             metadataFactory
         )

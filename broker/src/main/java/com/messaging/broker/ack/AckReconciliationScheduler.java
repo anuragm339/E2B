@@ -181,13 +181,18 @@ public class AckReconciliationScheduler {
                 break;
             }
 
+            // One range scan per chunk instead of one RocksDB point-get per record.
+            long chunkFirst = records.get(0).getOffset();
+            long chunkLastExclusive = records.get(records.size() - 1).getOffset() + 1;
+            Set<Long> ackedInChunk =
+                    ackStore.getAckedOffsetsInRange(topic, group, chunkFirst, chunkLastExclusive);
+
             for (MessageRecord r : records) {
                 if (r.getOffset() >= committedOffset) {
                     // Past the committed boundary — consumer hasn't ACKed these yet
                     break outer;
                 }
-                AckRecord ackRecord = ackStore.get(topic, group, r.getOffset());
-                if (ackRecord == null) {
+                if (!ackedInChunk.contains(r.getOffset())) {
                     missingCount++;
                     if (r.getOffset() < minMissingOffset) minMissingOffset = r.getOffset();
                     if (r.getOffset() > maxMissingOffset) maxMissingOffset = r.getOffset();

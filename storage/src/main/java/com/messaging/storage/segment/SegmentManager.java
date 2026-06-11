@@ -577,6 +577,27 @@ public class SegmentManager {
     }
 
     /**
+     * Force buffered bytes of the active segment to disk (group commit).
+     * Invoked periodically by the storage engine's flush scheduler — replaces the old
+     * per-record fsync, bounding data loss on power cut to one flush interval.
+     */
+    public void flushActiveSegment() {
+        flushActiveSegment(-1L);
+    }
+
+    /**
+     * Group-commit flush with page-cache eviction of cold, already-flushed log bytes.
+     *
+     * @param cacheTailKeepBytes hot tail to keep cached; negative disables eviction
+     */
+    public void flushActiveSegment(long cacheTailKeepBytes) {
+        Segment active = activeSegment.get();
+        if (active != null) {
+            active.flush(cacheTailKeepBytes);
+        }
+    }
+
+    /**
      * Force-seal the current active segment and start a new one.
      * Used by the admin HTTP trigger so compaction can run without waiting for the
      * segment to fill to {@code maxSegmentSize} (useful during development/testing).

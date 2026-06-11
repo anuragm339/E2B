@@ -148,6 +148,10 @@ public class PropertiesFileStore implements PropertiesStore {
 
             try (FileOutputStream fos = new FileOutputStream(tempFile.toFile())) {
                 props.store(fos, description + " - Updated: " + new Date());
+                // fsync BEFORE the rename: on power loss the rename can become durable while
+                // the file contents are not, leaving an empty/partial offsets file. POS devices
+                // lose power routinely, so the contents must hit disk first.
+                fos.getFD().sync();
             }
 
             // Atomic rename

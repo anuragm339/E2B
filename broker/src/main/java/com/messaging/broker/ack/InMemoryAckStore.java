@@ -76,6 +76,18 @@ public class InMemoryAckStore implements AckStore {
         log.info("InMemoryAckStore cleared {} entries for topic={} group={}", deleted, topic, group);
     }
 
+    @Override
+    public java.util.Set<Long> getAckedOffsetsInRange(String topic, String group, long fromOffset, long toOffsetExclusive) {
+        java.util.Set<Long> acked = new java.util.HashSet<>();
+        for (Key key : store.keySet()) {
+            if (key.offset >= fromOffset && key.offset < toOffsetExclusive
+                    && key.topic.equals(topic) && key.group.equals(group)) {
+                acked.add(key.offset);
+            }
+        }
+        return acked;
+    }
+
     int size() {
         return store.size();
     }

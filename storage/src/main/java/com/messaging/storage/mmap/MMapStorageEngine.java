@@ -138,6 +138,23 @@ public class MMapStorageEngine implements StorageEngine, BatchReadableStorage, c
         return managers.get(new TopicPartition(topic, partition));
     }
 
+    /**
+     * Group commit: periodically force active-segment bytes to disk.
+     * See FileChannelStorageEngine.flushActiveSegments() — same rationale.
+     */
+    @io.micronaut.scheduling.annotation.Scheduled(
+            fixedDelay = "${broker.storage.flush-interval:1s}",
+            initialDelay = "${broker.storage.flush-interval:1s}")
+    public void flushActiveSegments() {
+        for (Map.Entry<TopicPartition, SegmentManager> entry : managers.entrySet()) {
+            try {
+                entry.getValue().flushActiveSegment();
+            } catch (Exception e) {
+                log.warn("Periodic segment flush failed for {}", entry.getKey(), e);
+            }
+        }
+    }
+
     @Override
     public void compact(String topic, int partition) {
         // Compaction will be implemented in CompactionEngine

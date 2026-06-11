@@ -411,63 +411,67 @@ public class HttpPipeConnector implements PipeConnector {
             PipeConnectionImpl expectedConnection) throws IOException {
         int count = 0;
         long lastSuccessfulOffset = currentOffset;  // Track last successful offset
+        boolean completed = false;
 
-        JsonParser parser = objectMapper.createParser(is);
+        try {
+            JsonParser parser = objectMapper.createParser(is);
 
-        if (parser.nextToken() != JsonToken.START_ARRAY) {
-            return 0;
-        }
-
-        while (parser.nextToken() == JsonToken.START_OBJECT) {
-            if (!isActive(generation, expectedConnection)) {
-                break;
+            if (parser.nextToken() != JsonToken.START_ARRAY) {
+                return 0;
             }
-            MessageRecord record =
-                    objectMapper.readValue(parser, MessageRecord.class);
 
-            if (dataHandler != null) {
-                // Attempt to store message - handler returns true on success, false on failure
-                boolean success = dataHandler.apply(record);
-
-                if (success) {
-                    // SUCCESS - update last successful offset
-                    lastSuccessfulOffset = record.getOffset();
-                    count++;
-
-                    log.trace("Successfully stored pipe message at offset {}", record.getOffset());
-                } else {
-                    // STORAGE FAILURE - stop processing batch, keep old offset
-                    log.error("CRITICAL: Failed to store pipe message at offset {}, " +
-                             "stopping batch. Next poll will retry from offset {}",
-                             record.getOffset(), lastSuccessfulOffset);
-
-                    metrics.recordFetchError();
-
-                    // Stop processing this batch - remaining messages will be retried on next poll
+            while (parser.nextToken() == JsonToken.START_OBJECT) {
+                if (!isActive(generation, expectedConnection)) {
                     break;
                 }
+                MessageRecord record =
+                        objectMapper.readValue(parser, MessageRecord.class);
+
+                if (dataHandler != null) {
+                    // Attempt to store message - handler returns true on success, false on failure
+                    boolean success = dataHandler.apply(record);
+
+                    if (success) {
+                        // SUCCESS - update last successful offset
+                        lastSuccessfulOffset = record.getOffset();
+                        count++;
+
+                        log.trace("Successfully stored pipe message at offset {}", record.getOffset());
+                    } else {
+                        // STORAGE FAILURE - stop processing batch, keep old offset
+                        log.error("CRITICAL: Failed to store pipe message at offset {}, " +
+                                 "stopping batch. Next poll will retry from offset {}",
+                                 record.getOffset(), lastSuccessfulOffset);
+
+                        metrics.recordFetchError();
+
+                        // Stop processing this batch - remaining messages will be retried on next poll
+                        break;
+                    }
+                }
             }
-        }
-
-        if (!isActive(generation, expectedConnection)) {
-            return count;
-        }
-
-        // Update current offset only to last successfully stored message
-        currentOffset = lastSuccessfulOffset;
-        expectedConnection.lastReceivedOffset = lastSuccessfulOffset;
-        expectedConnection.lastMessageTime = System.currentTimeMillis();
-
-        // Persist offset file ONLY if we successfully stored messages
-        if (count > 0) {
-            persistOffset();
-            log.debug("Persisted pipe offset after successful batch: offset={}, messagesStored={}",
-                     currentOffset, count);
-        }
-
-        // Record metrics: messages received from pipe
-        if (count > 0) {
-            metrics.recordMessagesReceived(count);
+            completed = true;
+        } finally {
+            // Commit progress for records that were already stored even if the stream died
+            // mid-array (truncated response, malformed JSON). Without this, the next poll
+            // re-fetches from the stale offset and the parent re-sends records that are
+            // already on disk — duplicate appends. (BrokerService also guards against
+            // duplicates defensively, but the offset should not rewind in the first place.)
+            if (isActive(generation, expectedConnection)) {
+                if (count > 0) {
+                    currentOffset = lastSuccessfulOffset;
+                    expectedConnection.lastReceivedOffset = lastSuccessfulOffset;
+                    persistOffset();
+                    metrics.recordMessagesReceived(count);
+                    log.debug("Persisted pipe offset after batch: offset={}, messagesStored={}, streamCompleted={}",
+                             currentOffset, count, completed);
+                }
+                // Health heartbeat: only a cleanly completed exchange (or real stored data)
+                // counts — repeated mid-stream failures should still degrade pipe health.
+                if (completed || count > 0) {
+                    expectedConnection.lastMessageTime = System.currentTimeMillis();
+                }
+            }
         }
 
         return count;
@@ -503,11 +507,18 @@ public class HttpPipeConnector implements PipeConnector {
             props.setProperty("pipe.current.offset", String.valueOf(currentOffset));
 
             Path tmp = offsetFilePath.resolveSibling(OFFSET_FILE + ".tmp");
-            try (OutputStream os = Files.newOutputStream(tmp)) {
+            try (FileOutputStream os = new FileOutputStream(tmp.toFile())) {
                 props.store(os, "Pipe offset");
+                // fsync before rename so a power cut can never leave an empty offset file
+                os.getFD().sync();
             }
 
-            Files.move(tmp, offsetFilePath, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(tmp, offsetFilePath,
+                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, offsetFilePath, StandardCopyOption.REPLACE_EXISTING);
+            }
             lastPersistedOffset = currentOffset;
         } catch (Exception e) {
             log.error("Failed to persist offset", e);

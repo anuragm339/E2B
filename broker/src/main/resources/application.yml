@@ -26,7 +26,9 @@ micronaut:
 endpoints:
   all:
     enabled: true
-    sensitive: false
+    # Sensitive by default: POS devices expose this port on store networks. Only the
+    # endpoints monitoring actually scrapes are opened up explicitly below.
+    sensitive: true
   prometheus:
     enabled: true
     sensitive: false
@@ -48,7 +50,12 @@ broker:
   storage:
     type: filechannel  # FileChannel-based (no mmap) for true zero-copy via sendfile()
     dataDir: ${DATA_DIR:/Users/anuragmishra/Desktop/workspace/messaging/data/}
-    segment-size: ${SEGMENT_SIZE:104857600}  # 1GB default; override via SEGMENT_SIZE env var (e.g. 10485760 = 10MB for testing)
+    segment-size: ${SEGMENT_SIZE:104857600}  # 100MB default; override via SEGMENT_SIZE env var (e.g. 10485760 = 10MB for testing)
+    flush-interval: ${STORAGE_FLUSH_INTERVAL:1s}  # Group-commit fsync cadence for the active segment (bounds power-cut data loss)
+    # Page-cache control: after each flush, evict already-fsynced log pages older than this
+    # tail from the OS page cache (posix_fadvise DONTNEED). Keeps Docker's reported memory
+    # flat on constrained devices. Tail stays cached for consumer delivery. -1 disables.
+    cache-drop-tail-keep-bytes: ${STORAGE_CACHE_DROP_TAIL_KEEP_BYTES:4194304}  # 4MB
 
   default-topic: ${DEFAULT_TOPIC:default-topic}
 
@@ -106,7 +113,7 @@ legacy-clients:
   # Key: serviceName (sent in RegisterEvent.clientId)
   # Value: list of topics to subscribe
   service-topics:
-    price-quote-service:
+    price-quote:
       - prices-v1
       - reference-data-v5
       - non-promotable-products
@@ -120,7 +127,7 @@ legacy-clients:
     search-enterprise:
       - search-product
 
-    tesco-location-service:
+    tesco-location:
       - location
       - location-clusters
 
@@ -197,8 +204,8 @@ compaction:
   window-size: ${COMPACTION_WINDOW_SIZE:10}  # Max sealed segments per compaction run (incremental)
   max-topics-per-run: ${COMPACTION_MAX_TOPICS_PER_RUN:2147483647}  # Use env to cap full-sweep breadth in constrained environments
   min-segments-per-topic: ${COMPACTION_MIN_SEGMENTS_PER_TOPIC:1}  # Avoid rewriting single sealed segments unless explicitly enabled
-  max-process-cpu-usage: ${COMPACTION_MAX_PROCESS_CPU_USAGE:1.0}  # Skip compaction when broker CPU is already hot
-  max-heap-usage: ${COMPACTION_MAX_HEAP_USAGE:1.0}  # Skip compaction when heap pressure is already high
+  max-process-cpu-usage: ${COMPACTION_MAX_PROCESS_CPU_USAGE:0.7}  # Skip compaction when broker CPU is already hot (1.0 disables the guard)
+  max-heap-usage: ${COMPACTION_MAX_HEAP_USAGE:0.7}  # Skip compaction when heap pressure is already high (1.0 disables the guard)
   schedule:
     interval: ${COMPACTION_INTERVAL:24h}
     initial-delay: ${COMPACTION_INITIAL_DELAY:5m}

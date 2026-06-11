@@ -108,9 +108,11 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             try {
                 ackStoreSeeder.seed();
             } catch (Exception e) {
-                throw new IllegalStateException(
-                        "ACK store seeding failed; refusing to start with unverifiable ACK state",
-                        e);
+                // Degrade, don't brick: a transient RocksDB problem (disk full, leftover lock)
+                // must not make a store device unbootable. The reconciliation scheduler
+                // detects and reports any ACK gaps the failed seeding would have closed.
+                log.error("ACK store seeding failed — continuing startup with possibly " +
+                        "incomplete ACK state; reconciliation will surface any gaps", e);
             }
         } else {
             log.info("AckStoreSeeder skipped at startup because ack-store.seed-on-startup.enabled=false");
@@ -173,6 +175,19 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // Store message in local storage
             // Use topic from record, fallback to default if not set
             String topic = record.getTopic();
+
+            // Duplicate guard: parent offsets are monotonically increasing per topic, so a
+            // record at or below the topic's storage head was already stored — the parent
+            // re-sent it (poll retry after a mid-stream failure). Re-appending it would create
+            // duplicate physical records with the same offset and break the sorted-index
+            // invariant. Treat as success so the pipe offset advances past it.
+            long topicHead = storage.getCurrentOffset(topic, 0);
+            if (record.getOffset() > 0 && record.getOffset() <= topicHead) {
+                log.info("event=pipe_message.duplicate_skipped topic={} offset={} storageHead={}",
+                        topic, record.getOffset(), topicHead);
+                metrics.stopE2ETimer(e2eSample);
+                return true;
+            }
 
             Timer.Sample storageSample = metrics.startStorageWriteTimer();
             long offset = storage.append(topic, 0, record);

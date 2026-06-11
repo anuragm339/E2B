@@ -103,7 +103,7 @@ AdaptiveBatchDeliveryManager (watermark polling) → BatchDeliveryService.delive
 Kafka-style segments managed by `SegmentManager`:
 - **Active segments** use sequential scan (no index)
 - **Sealed segments** use sparse index (every 4 KB) for O(log n) lookups
-- Segments roll over at configurable size (default 1 GB), CRC32 on read/write
+- Segments roll over at configurable size (default 100 MB via `SEGMENT_SIZE`). **No CRC** in the current format (index v2 dropped it; the log never had one) — corruption is detected only indirectly via recovery truncation (B7-2/B7-3/B7-4)
 - SQLite (`SegmentMetadataStore`) tracks segment boundaries
 - Two implementations: `MMapStorageEngine` (memory-mapped) and `FileChannelStorageEngine`
 
@@ -169,7 +169,8 @@ Offsets are persisted to property files via `FlushingPropertiesStore` (periodic 
 
 ### Storage layer
 - Active segments scan sequentially; sealed segments must keep sparse-index consistency.
-- Always validate CRC32 on reads. Test segment boundaries (end of segment, cross-segment).
+- There is no per-record CRC in the current format — do not assume reads detect corruption. Test segment boundaries (end of segment, cross-segment).
+- Appends are NOT fsynced per record. The active segment is force()d by a periodic group-commit flush (`broker.storage.flush-interval`, default 1s) plus on seal/roll/close; crash recovery truncates torn tails on reopen.
 - Recovery (`storage.recover()`) is called from `BrokerService.onApplicationEvent` — failures there abort startup.
 
 ### Network layer
@@ -182,7 +183,7 @@ Offsets are persisted to property files via `FlushingPropertiesStore` (periodic 
 - After `storage.append()`, do not signal consumers directly — the watermark poll picks them up. Producer→consumer push has been removed.
 
 ### Concurrency
-- `ConsumerContext.consecutiveFailures` is a `volatile int` mutated by `++`; treat as racy until migrated to `AtomicInteger` (see `RemoteConsumer` for the precedent).
+- `ConsumerContext.consecutiveFailures` and `RemoteConsumer.consecutiveFailures` are both `AtomicInteger` — keep new failure counters atomic.
 - No `UncaughtExceptionHandler` is installed on broker thread factories. Exceptions thrown by `execute()` (no `Future.get()` consumer) are silently swallowed. When adding async work, wrap the body in `try/catch (Throwable)` and log.
 - Avoid blocking a scheduler thread on `Future.get(longTimeout)` against another pool. There is a known long-blocking pattern in `BatchDeliveryService` (`storageExecutor.submit(...).get(10, TimeUnit.MINUTES)`) — do not copy it for new code.
 - Full audit (findings F1–F10, per-component risks, coverage gaps, drafted JUnit/Mockito/Awaitility tests, prioritised remediation): [`readme/CONCURRENCY_ANALYSIS.md`](readme/CONCURRENCY_ANALYSIS.md). Consult before changing executor lifecycle, refresh state, or batch delivery flow.

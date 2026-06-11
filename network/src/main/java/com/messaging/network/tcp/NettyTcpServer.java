@@ -24,7 +24,6 @@ import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -197,8 +196,9 @@ public class NettyTcpServer implements NetworkServer {
      *   4. Closes the connection on failure so the consumer decoder resets to its initial state
      *
      * Ownership: the transport owns the batch from the moment sendBatch() is called.
-     * batch.close() is called via BatchFileRegion.deallocate() for all outcomes; if the
-     * header send fails before the region is created the exceptionally handler closes it directly.
+     * batch.close() is called via BatchPayloadFileRegion.deallocate() for all outcomes;
+     * if the writes are never handed to Netty (channel gone / loop shut down) the batch
+     * is closed directly before the failed future is returned.
      */
     @Override
     public CompletableFuture<Void> sendBatch(String clientId, String group, DeliveryBatch batch) {
@@ -221,81 +221,91 @@ public class NettyTcpServer implements NetworkServer {
                 System.currentTimeMillis(),
                 headerBytes);
 
-        long timeoutSeconds = 1 + (batch.getTotalBytes() / (1024 * 1024) * 10);
-
-        // Track whether the BatchFileRegion was created so the exceptionally handler
-        // knows whether deallocate() will eventually close the batch.
-        AtomicReference<BatchPayloadFileRegion> regionRef = new AtomicReference<>();
-
-        return send(clientId, headerMsg)
-                .thenCompose(ignored -> {
-                    BatchPayloadFileRegion nettyRegion = new BatchPayloadFileRegion(batch, clientId);
-                    regionRef.set(nettyRegion);
-                    return sendFileRegionInternal(clientId, nettyRegion, batch.getTotalBytes());
-                })
-                .exceptionally(e -> {
-                    // If the BatchPayloadFileRegion was never created (header send failed),
-                    // deallocate() will never be called — close the batch directly.
-                    if (regionRef.get() == null) {
-                        try {
-                            batch.close();
-                        } catch (IOException closeEx) {
-                            log.warn("Failed to close DeliveryBatch after header send failure for client {}", clientId, closeEx);
-                        }
-                    }
-                    log.error("sendBatch failed after BATCH_HEADER sent for client {}. " +
-                              "Closing connection to reset consumer decoder state.", clientId, e);
-                    closeConnection(clientId);
-                    throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
-                });
-    }
-
-    private CompletableFuture<Void> sendFileRegionInternal(String clientId, FileRegion fileRegion, long bytes) {
         Channel channel = clientChannels.get(clientId);
         if (channel == null || !channel.isActive()) {
             IllegalStateException ex = new IllegalStateException("Client not connected: " + clientId);
             networkMetrics.recordSendFailure("BATCH_PAYLOAD", "file_region", ex);
+            closeBatchQuietly(batch, clientId);
             return CompletableFuture.failedFuture(ex);
         }
-
-        // Check if channel is writable before attempting to send
-        // This prevents queueing writes when consumer is slow or disconnecting
         if (!channel.isWritable()) {
             log.warn("Channel not writable for client: {}, backpressure detected", clientId);
             IllegalStateException ex =
                     new IllegalStateException("Channel not writable (backpressure): " + clientId);
             networkMetrics.recordBackpressure("BATCH_PAYLOAD", "file_region");
             networkMetrics.recordSendFailure("BATCH_PAYLOAD", "file_region", ex);
+            closeBatchQuietly(batch, clientId);
             return CompletableFuture.failedFuture(ex);
         }
 
-        CompletableFuture<Void> future = new CompletableFuture<>();
+        CompletableFuture<Void> headerFuture = new CompletableFuture<>();
+        CompletableFuture<Void> payloadFuture = new CompletableFuture<>();
         long startNanos = System.nanoTime();
+        int headerSize = brokerMessageSizeBytes(headerMsg);
+        long payloadBytes = batch.getTotalBytes();
 
-        // Send FileRegion directly to Netty channel for zero-copy transfer
-        // Netty will use sendfile() syscall for direct file-to-socket transfer
-        channel.writeAndFlush(fileRegion).addListener((ChannelFutureListener) channelFuture -> {
-            if (channelFuture.isSuccess()) {
-                networkMetrics.recordSendSuccess("BATCH_PAYLOAD", "file_region", bytes, System.nanoTime() - startNanos);
-                future.complete(null);
-                log.debug("Zero-copy FileRegion sent successfully to client: {}", clientId);
-            } else {
-                // Only log error if it's not a connection-related issue (already handled elsewhere)
-                Throwable cause = channelFuture.cause();
-                String causeClassName = cause != null ? cause.getClass().getName() : "null";
-                // Check for closed channel exceptions (including Netty's internal StacklessClosedChannelException)
-                if (!(cause instanceof java.nio.channels.ClosedChannelException) &&
-                    !causeClassName.contains("ClosedChannelException")) {
-                    log.error("Failed to send FileRegion to client: {}", clientId, cause);
-                } else {
-                    log.debug("FileRegion send failed due to closed channel: {}", clientId);
-                }
-                networkMetrics.recordSendFailure("BATCH_PAYLOAD", "file_region", cause);
-                future.completeExceptionally(cause);
-            }
-        });
+        // Enqueue BATCH_HEADER and payload in ONE event-loop task. The consumer-side
+        // decoder is stateful (after a header it consumes raw bytes as payload), so a
+        // control frame or another topic's batch header written by a different thread
+        // must never land between the two writes. Writes submitted from other threads
+        // become separate event-loop tasks and therefore cannot interleave inside this one.
+        try {
+            channel.eventLoop().execute(() -> {
+                channel.write(headerMsg).addListener((ChannelFutureListener) f -> {
+                    if (f.isSuccess()) {
+                        networkMetrics.recordSendSuccess("BATCH_HEADER", "control", headerSize, System.nanoTime() - startNanos);
+                        headerFuture.complete(null);
+                    } else {
+                        networkMetrics.recordSendFailure("BATCH_HEADER", "control", f.cause());
+                        headerFuture.completeExceptionally(f.cause());
+                    }
+                });
 
-        return future;
+                // Netty owns the region from here: deallocate() closes the batch on
+                // success, failure, or cancellation — including header-write failure,
+                // which fails this queued write too.
+                BatchPayloadFileRegion region = new BatchPayloadFileRegion(batch, clientId);
+                channel.writeAndFlush(region).addListener((ChannelFutureListener) f -> {
+                    if (f.isSuccess()) {
+                        networkMetrics.recordSendSuccess("BATCH_PAYLOAD", "file_region", payloadBytes, System.nanoTime() - startNanos);
+                        log.debug("Zero-copy FileRegion sent successfully to client: {}", clientId);
+                        payloadFuture.complete(null);
+                    } else {
+                        Throwable cause = f.cause();
+                        String causeClassName = cause != null ? cause.getClass().getName() : "null";
+                        // Closed-channel failures are routine (consumer disconnect) — keep them at debug
+                        if (!(cause instanceof java.nio.channels.ClosedChannelException) &&
+                            !causeClassName.contains("ClosedChannelException")) {
+                            log.error("Failed to send FileRegion to client: {}", clientId, cause);
+                        } else {
+                            log.debug("FileRegion send failed due to closed channel: {}", clientId);
+                        }
+                        networkMetrics.recordSendFailure("BATCH_PAYLOAD", "file_region", cause);
+                        payloadFuture.completeExceptionally(cause);
+                    }
+                });
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Event loop shut down — the region was never handed to Netty, close directly.
+            closeBatchQuietly(batch, clientId);
+            return CompletableFuture.failedFuture(e);
+        }
+
+        return CompletableFuture.allOf(headerFuture, payloadFuture)
+                .exceptionally(e -> {
+                    log.error("sendBatch failed for client {}. " +
+                              "Closing connection to reset consumer decoder state.", clientId, e);
+                    closeConnection(clientId);
+                    throw (e instanceof RuntimeException) ? (RuntimeException) e : new RuntimeException(e);
+                });
+    }
+
+    private static void closeBatchQuietly(DeliveryBatch batch, String clientId) {
+        try {
+            batch.close();
+        } catch (IOException closeEx) {
+            log.warn("Failed to close DeliveryBatch for client {}", clientId, closeEx);
+        }
     }
 
     @Override

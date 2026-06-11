@@ -45,6 +45,7 @@ public class ConsumerDeliveryManager {
         this.scheduler = Executors.newScheduledThreadPool(schedulerThreads, r -> {
             Thread t = new Thread(r);
             t.setName("ConsumerDeliveryScheduler-" + threadCounter.incrementAndGet());
+            t.setDaemon(true); // never block JVM exit on delivery polling
             return t;
         });
         this.deliveryTasks = new ConcurrentHashMap<>();
@@ -152,8 +153,13 @@ public class ConsumerDeliveryManager {
             } else {
                 handleBatchFailure(context, deliverable);
             }
-        } catch (Exception e) {
-            log.error("Error in delivery loop for consumer: {}", context.getConsumerId(), e);
+        } catch (Throwable t) {
+            // Throwable, not Exception: an Error escaping this runnable silently cancels the
+            // scheduleWithFixedDelay task and the consumer freezes until restart with no log.
+            log.error("Error in delivery loop for consumer: {}", context.getConsumerId(), t);
+            if (t instanceof Error) {
+                throw (Error) t; // rethrow after logging — OOM etc. must stay fatal to the task
+            }
         }
     }
 

@@ -100,7 +100,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
     def "storage.read is called with MSG_CHUNK=50, not once per message"() {
         given: "100-entry index for one topic"
         prepareTopicIndex("prices-v1", (0L..99L).toList())
-        offsetTracker.getOffset("test-group:prices-v1") >> -1L
+        offsetTracker.getCommittedOffset("test-group:prices-v1") >> -1L
         storage.getEarliestOffset("prices-v1", 0) >> 0L
         storage.getCurrentOffset("prices-v1", 0) >> 99L
 
@@ -119,7 +119,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
     def "storage.read called once when index has fewer than MSG_CHUNK entries"() {
         given: "only 10 entries — fits in one chunk"
         prepareTopicIndex("small-topic", (0L..9L).toList())
-        offsetTracker.getOffset("g:small-topic") >> -1L
+        offsetTracker.getCommittedOffset("g:small-topic") >> -1L
         storage.getEarliestOffset("small-topic", 0) >> 0L
         storage.getCurrentOffset("small-topic", 0) >> 9L
 
@@ -137,7 +137,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
     def "committed offset advances start position and chunk read begins at correct offset"() {
         given: "75-entry index, consumer has committed up to offset 49"
         prepareTopicIndex("topic-a", (0L..74L).toList())
-        offsetTracker.getOffset("g:topic-a") >> 49L  // committed
+        offsetTracker.getCommittedOffset("g:topic-a") >> 49L  // committed
         storage.getEarliestOffset("topic-a", 0) >> 0L
         storage.getCurrentOffset("topic-a", 0) >> 74L
 
@@ -161,8 +161,8 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
         prepareTopicIndex("topic-a", [0L, 2L, 4L, 6L])
         prepareTopicIndex("topic-b", [1L, 3L, 5L, 7L])
 
-        offsetTracker.getOffset("g:topic-a") >> -1L
-        offsetTracker.getOffset("g:topic-b") >> -1L
+        offsetTracker.getCommittedOffset("g:topic-a") >> -1L
+        offsetTracker.getCommittedOffset("g:topic-b") >> -1L
         storage.getEarliestOffset("topic-a", 0) >> 0L
         storage.getEarliestOffset("topic-b", 0) >> 1L
         storage.getCurrentOffset("topic-a", 0) >> 6L
@@ -186,8 +186,8 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
         prepareTopicIndex("topic-big",   (0L..9L).toList())
         prepareTopicIndex("topic-small", [5L, 6L])
 
-        offsetTracker.getOffset("g:topic-big")   >> -1L
-        offsetTracker.getOffset("g:topic-small") >> -1L
+        offsetTracker.getCommittedOffset("g:topic-big")   >> -1L
+        offsetTracker.getCommittedOffset("g:topic-small") >> -1L
         storage.getEarliestOffset("topic-big", 0)   >> 0L
         storage.getEarliestOffset("topic-small", 0) >> 5L
         storage.getCurrentOffset("topic-big", 0)   >> 9L
@@ -209,7 +209,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
     def "messages within a single topic remain in offset order"() {
         given: "100-entry single-topic index"
         prepareTopicIndex("ordered", (0L..99L).toList())
-        offsetTracker.getOffset("g:ordered") >> -1L
+        offsetTracker.getCommittedOffset("g:ordered") >> -1L
         storage.getEarliestOffset("ordered", 0) >> 0L
         storage.getCurrentOffset("ordered", 0) >> 99L
 
@@ -243,7 +243,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
         given: "storage reports no data"
         storage.getCurrentOffset("empty-topic", 0) >> -1L
         storage.getEarliestOffset("empty-topic", 0) >> 0L
-        offsetTracker.getOffset("g:empty-topic") >> -1L
+        offsetTracker.getCommittedOffset("g:empty-topic") >> -1L
 
         when:
         def batch = manager.buildMergedBatch(["empty-topic"], "g", Long.MAX_VALUE)
@@ -256,7 +256,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
     def "startOffset beyond currentOffset produces empty batch"() {
         given: "consumer is fully caught up (committed == current)"
         prepareTopicIndex("caught-up", (0L..9L).toList())
-        offsetTracker.getOffset("g:caught-up") >> 9L  // committed at last
+        offsetTracker.getCommittedOffset("g:caught-up") >> 9L  // committed at last
         storage.getEarliestOffset("caught-up", 0) >> 0L
         storage.getCurrentOffset("caught-up", 0) >> 9L  // startOffset would be 10 > 9
 
@@ -271,7 +271,7 @@ class LegacyConsumerDeliveryManagerSpec extends Specification {
     def "maxBytes limit stops the merge loop early"() {
         given: "100-entry index"
         prepareTopicIndex("big", (0L..99L).toList())
-        offsetTracker.getOffset("g:big") >> -1L
+        offsetTracker.getCommittedOffset("g:big") >> -1L
         storage.getEarliestOffset("big", 0) >> 0L
         storage.getCurrentOffset("big", 0) >> 99L
         // Each message is ~60 bytes (key + data + 50 overhead per MergedBatch.estimateMessageSize)

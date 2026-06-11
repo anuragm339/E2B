@@ -90,6 +90,8 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, Counter> consumerAckTimeouts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> offsetGapsDetected = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> compactionSkippedByReason = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionAllDeleted = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerOffsetForceResets = new ConcurrentHashMap<>();
 
     // Gauges
     private final AtomicLong activeConsumers = new AtomicLong(0);
@@ -904,6 +906,37 @@ public class BrokerMetrics {
         compactionSkippedByReason.computeIfAbsent(reasonLabel, key ->
                 Counter.builder("broker.compaction.skipped")
                         .description("Compaction runs skipped by reason")
+                        .tag("reason", reasonLabel)
+                        .register(registry)
+        ).increment();
+    }
+
+    /**
+     * Compaction removed an entire segment window with no replacement (all records superseded
+     * or expired). Consumers committed inside the removed range will be force-reset — fleet
+     * dashboards must be able to alert on this instead of relying on a WARN log line.
+     */
+    public void recordCompactionAllDeleted(String topic) {
+        compactionAllDeleted.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.all_deleted")
+                        .description("Compaction runs that deleted an entire segment window with no replacement")
+                        .tag("topic", t)
+                        .register(registry)
+        ).increment();
+    }
+
+    /**
+     * A consumer's committed offset pointed below the earliest available data (segments
+     * compacted/deleted while it was offline) and was silently advanced to the earliest
+     * available offset. Signals potential message loss visibility for that group.
+     */
+    public void recordConsumerOffsetForceReset(String topic, String reason) {
+        String reasonLabel = (reason == null || reason.isBlank()) ? "unknown" : reason;
+        String key = topic + ":" + reasonLabel;
+        consumerOffsetForceResets.computeIfAbsent(key, k ->
+                Counter.builder("broker.consumer.offset.force_reset")
+                        .description("Consumer offsets force-advanced past missing data")
+                        .tag("topic", topic)
                         .tag("reason", reasonLabel)
                         .register(registry)
         ).increment();

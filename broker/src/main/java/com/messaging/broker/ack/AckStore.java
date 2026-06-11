@@ -50,4 +50,16 @@ public interface AckStore {
      * @throws AckStoreException if the backend delete fails
      */
     void clearByTopicAndGroup(String topic, String group);
+
+    /**
+     * Return all acked offsets for a {@code (topic, group)} pair in
+     * {@code [fromOffset, toOffsetExclusive)}.
+     *
+     * <p>Exists so bulk verification paths (startup seeding, reconciliation) can replace
+     * one point lookup per record with a single range scan — on the RocksDB backend a
+     * prefix iteration instead of N {@code get()} calls.
+     *
+     * @throws AckStoreException if the backend read fails
+     */
+    java.util.Set<Long> getAckedOffsetsInRange(String topic, String group, long fromOffset, long toOffsetExclusive);
 }

@@ -152,4 +152,23 @@ class RocksDbAckStoreSpec extends Specification {
         then:
         thrown(IllegalArgumentException)
     }
+
+    def "getAckedOffsetsInRange returns only offsets inside the half-open range"() {
+        given:
+        [5L, 7L, 9L, 12L].each { store.put("prices-v1", "g1", it, new AckRecord(it, 100L)) }
+        // different group and topic must not bleed into the result
+        store.put("prices-v1", "g2", 7L, new AckRecord(7L, 100L))
+        store.put("orders-v1", "g1", 7L, new AckRecord(7L, 100L))
+
+        expect:
+        store.getAckedOffsetsInRange("prices-v1", "g1", 5L, 12L) == [5L, 7L, 9L] as Set
+        store.getAckedOffsetsInRange("prices-v1", "g1", 6L, 13L) == [7L, 9L, 12L] as Set
+        store.getAckedOffsetsInRange("prices-v1", "g1", 0L, 5L).isEmpty()
+        store.getAckedOffsetsInRange("prices-v1", "g1", 9L, 9L).isEmpty()
+    }
+
+    def "getAckedOffsetsInRange on an empty store returns an empty set"() {
+        expect:
+        store.getAckedOffsetsInRange("prices-v1", "g1", 0L, 100L).isEmpty()
+    }
 }

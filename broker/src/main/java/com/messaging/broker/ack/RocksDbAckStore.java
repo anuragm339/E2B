@@ -141,6 +141,50 @@ public class RocksDbAckStore implements AckStore {
         }
     }
 
+    // ── Range scan (seeding / reconciliation) ────────────────────────────────
+
+    /**
+     * Collect all acked offsets in {@code [fromOffset, toOffsetExclusive)} with a single
+     * prefix iteration. Keys are zero-padded so lexicographic order equals numeric order —
+     * seek directly to the first candidate and stop at the range end.
+     */
+    @Override
+    public java.util.Set<Long> getAckedOffsetsInRange(String topic, String group, long fromOffset, long toOffsetExclusive) {
+        java.util.Set<Long> acked = new java.util.HashSet<>();
+        if (toOffsetExclusive <= fromOffset) {
+            return acked;
+        }
+        byte[] prefix = (topic + "|" + group + "|").getBytes(StandardCharsets.UTF_8);
+        byte[] seekKey = buildKey(topic, group, Math.max(0, fromOffset));
+        try (RocksIterator iter = db.newIterator(cf)) {
+            iter.seek(seekKey);
+            while (iter.isValid()) {
+                byte[] key = iter.key();
+                if (!startsWith(key, prefix)) {
+                    break;
+                }
+                long offset = parseOffset(key, prefix.length);
+                if (offset >= toOffsetExclusive) {
+                    break;
+                }
+                acked.add(offset);
+                iter.next();
+            }
+        } catch (IllegalStateException e) {
+            throw new AckStoreException(
+                    "RocksDB ACK range scan failed for topic=" + topic + " group=" + group, e);
+        }
+        return acked;
+    }
+
+    private static long parseOffset(byte[] key, int offsetStart) {
+        long value = 0;
+        for (int i = offsetStart; i < key.length; i++) {
+            value = value * 10 + (key[i] - '0');
+        }
+        return value;
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private byte[] buildKey(String topic, String group, long offset) {

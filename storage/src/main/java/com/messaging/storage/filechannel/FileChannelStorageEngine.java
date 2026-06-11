@@ -41,6 +41,10 @@ public class FileChannelStorageEngine implements StorageEngine, BatchReadableSto
 
     private final Path dataDir;
     private final long maxSegmentSize;
+    // Hot tail of the active segment kept in page cache on each periodic flush;
+    // older (already-fsynced) pages are evicted so Docker's cgroup memory stays flat.
+    // Negative disables eviction.
+    private final long cacheDropTailKeepBytes;
     private final Map<TopicPartition, SegmentManager> managers;
     private final StorageWatermarkTracker watermarkTracker;
     private final com.messaging.storage.metadata.SegmentMetadataStoreFactory metadataStoreFactory;
@@ -49,11 +53,13 @@ public class FileChannelStorageEngine implements StorageEngine, BatchReadableSto
     public FileChannelStorageEngine(
             @Value("${broker.storage.data-dir:/data}") String dataDir,
             @Value("${broker.storage.segment-size:1073741824}") long maxSegmentSize,
+            @Value("${broker.storage.cache-drop-tail-keep-bytes:4194304}") long cacheDropTailKeepBytes,
             StorageWatermarkTracker watermarkTracker,
             com.messaging.storage.metadata.SegmentMetadataStoreFactory metadataStoreFactory) {
 
         this.dataDir = Paths.get(dataDir);
         this.maxSegmentSize = maxSegmentSize;
+        this.cacheDropTailKeepBytes = cacheDropTailKeepBytes;
         this.watermarkTracker = watermarkTracker;
         this.metadataStoreFactory = metadataStoreFactory;
         this.managers = new ConcurrentHashMap<>();
@@ -145,6 +151,25 @@ public class FileChannelStorageEngine implements StorageEngine, BatchReadableSto
     @Override
     public SegmentManager getSegmentManager(String topic, int partition) {
         return managers.get(new TopicPartition(topic, partition));
+    }
+
+    /**
+     * Group commit: periodically force active-segment bytes to disk.
+     * Replaces the old per-record fsync (two fsyncs per append) — on POS flash storage that
+     * pattern caps throughput and burns write endurance. Power-cut data loss is bounded by
+     * one flush interval; crash recovery truncates any torn tail (B7-2/B7-3/B7-4).
+     */
+    @io.micronaut.scheduling.annotation.Scheduled(
+            fixedDelay = "${broker.storage.flush-interval:1s}",
+            initialDelay = "${broker.storage.flush-interval:1s}")
+    public void flushActiveSegments() {
+        for (Map.Entry<TopicPartition, SegmentManager> entry : managers.entrySet()) {
+            try {
+                entry.getValue().flushActiveSegment(cacheDropTailKeepBytes);
+            } catch (Exception e) {
+                log.warn("Periodic segment flush failed for {}", entry.getKey(), e);
+            }
+        }
     }
 
     @Override

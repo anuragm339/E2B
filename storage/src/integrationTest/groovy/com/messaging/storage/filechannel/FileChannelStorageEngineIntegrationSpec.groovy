@@ -236,7 +236,7 @@ class FileChannelStorageEngineIntegrationSpec extends Specification implements T
     private static FileChannelStorageEngine newEngine(Path dir, long maxSegmentSize) {
         def watermark = new StorageWatermarkTracker()
         def factory   = new SegmentMetadataStoreFactory(dir.toString())
-        return new FileChannelStorageEngine(dir.toString(), maxSegmentSize, watermark, factory)
+        return new FileChannelStorageEngine(dir.toString(), maxSegmentSize, -1L, watermark, factory)
     }
 
     private static MessageRecord record(long offset, String key, String data) {

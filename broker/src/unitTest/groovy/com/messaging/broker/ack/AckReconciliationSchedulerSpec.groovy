@@ -48,9 +48,7 @@ class AckReconciliationSchedulerSpec extends Specification {
         ]
 
         // offset 1 has no ACK entry
-        ackStore.get("prices-v1", "group1", 0L) >> new AckRecord(0L, 1000L)
-        ackStore.get("prices-v1", "group1", 1L) >> null
-        ackStore.get("prices-v1", "group1", 2L) >> new AckRecord(2L, 1000L)
+        ackStore.getAckedOffsetsInRange("prices-v1", "group1", 0L, 3L) >> ([0L, 2L] as Set)
 
         when:
         scheduler.reconcile()
@@ -69,8 +67,7 @@ class AckReconciliationSchedulerSpec extends Specification {
                 makeMsg(1L, "prices-v1", "key-B")
         ]
 
-        ackStore.get("prices-v1", "group1", 0L) >> new AckRecord(0L, 1000L)
-        ackStore.get("prices-v1", "group1", 1L) >> new AckRecord(1L, 1001L)
+        ackStore.getAckedOffsetsInRange("prices-v1", "group1", 0L, 2L) >> ([0L, 1L] as Set)
 
         when:
         scheduler.reconcile()
@@ -92,15 +89,14 @@ class AckReconciliationSchedulerSpec extends Specification {
                 makeMsg(2L, "prices-v1", "key-C")  // offset >= committedOffset → stop
         ]
 
-        ackStore.get("prices-v1", "group1", 0L) >> new AckRecord(0L, 1000L)
-        ackStore.get("prices-v1", "group1", 1L) >> null
+        // No ACK entry for offsets 1 and 2 — only offset 1 may be counted as missing,
+        // offset 2 is at/beyond the committed boundary and must be skipped.
+        ackStore.getAckedOffsetsInRange("prices-v1", "group1", 0L, 3L) >> ([0L] as Set)
 
         when:
         scheduler.reconcile()
 
         then:
-        // offset 2 should NOT be checked (it's at/beyond committedOffset)
-        0 * ackStore.get("prices-v1", "group1", 2L)
         1 * metrics.updateReconciliationMissingKeys("prices-v1", "group1", 1L)
     }
 
@@ -126,8 +122,7 @@ class AckReconciliationSchedulerSpec extends Specification {
                 makeMsg(0L, "prices-v1", null),   // null msgKey — still checked by offset
                 makeMsg(1L, "prices-v1", "key-B")
         ]
-        ackStore.get("prices-v1", "group1", 0L) >> new AckRecord(0L, 999L)   // null-key record found
-        ackStore.get("prices-v1", "group1", 1L) >> new AckRecord(1L, 1000L)  // key-B found
+        ackStore.getAckedOffsetsInRange("prices-v1", "group1", 0L, 2L) >> ([0L, 1L] as Set)
 
         when:
         scheduler.reconcile()
@@ -151,7 +146,7 @@ class AckReconciliationSchedulerSpec extends Specification {
 
         then: "no storage reads, no RocksDB lookups, no metric updates"
         0 * storage.read(*_)
-        0 * ackStore.get(*_)
+        0 * ackStore.getAckedOffsetsInRange(*_)
         0 * metrics.updateReconciliationMissingKeys(*_)
     }
 
@@ -161,7 +156,7 @@ class AckReconciliationSchedulerSpec extends Specification {
         storage.getEarliestOffset("prices-v1", 0) >> 0L
         offsetTracker.getOffset("group1:prices-v1") >> 1L
         storage.read("prices-v1", 0, 0L, 500) >> [makeMsg(0L, "prices-v1", "key-A")]
-        ackStore.get("prices-v1", "group1", 0L) >> new AckRecord(0L, 1000L)
+        ackStore.getAckedOffsetsInRange("prices-v1", "group1", 0L, 1L) >> ([0L] as Set)
 
         scheduler.pauseForTopic("prices-v1")
         scheduler.resumeForTopic("prices-v1")
@@ -186,7 +181,7 @@ class AckReconciliationSchedulerSpec extends Specification {
                 makeMsg(1L, "prices-v1", "key-B")
         ]
         storage.read("prices-v1", 0, 2L, 500) >> [makeMsg(2L, "prices-v1", "key-C")]
-        ackStore.get(*_) >> new AckRecord(0L, 1000L)    // all offsets found
+        ackStore.getAckedOffsetsInRange(*_) >> ([0L, 1L, 2L] as Set)    // all offsets found
 
         scheduler.reconcile()   // first run — checkpoint set to 2
 
@@ -209,7 +204,7 @@ class AckReconciliationSchedulerSpec extends Specification {
                 makeMsg(0L, "prices-v1", "key-A"),
                 makeMsg(1L, "prices-v1", "key-B")
         ]
-        ackStore.get(*_) >> new AckRecord(0L, 1000L)
+        ackStore.getAckedOffsetsInRange(*_) >> ([0L, 1L] as Set)
 
         scheduler.reconcile()                   // sets checkpoint to 2
 

@@ -244,6 +244,10 @@ public class CompactionScheduler {
 
         compactionIndex.markCompactedThrough(topic, compactedThroughOffset);
 
+        if (result.allRecordsDeleted) {
+            metrics.recordCompactionAllDeleted(topic);
+        }
+
         // Only advance the checkpoint when no live tombstones were left behind.
         // If tombstones are still within their retention window, the same window must be
         // re-selected on the next run so they can be removed once they age out.
