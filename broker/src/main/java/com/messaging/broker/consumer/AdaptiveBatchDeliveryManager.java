@@ -8,6 +8,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Adaptive polling-based batch delivery manager.
@@ -28,7 +29,7 @@ public class AdaptiveBatchDeliveryManager {
     private final DeliveryScheduler deliveryScheduler;
     private final DeliveryStateStore deliveryStateStore;
 
-    private volatile boolean running = false;
+    private final AtomicBoolean running = new AtomicBoolean();
 
     // Tracks legacy clientIds that already have a scheduled delivery task.
     // Legacy consumers share one TCP connection across multiple topics; one task per clientId suffices.
@@ -60,12 +61,10 @@ public class AdaptiveBatchDeliveryManager {
      * Start adaptive delivery for all consumers.
      */
     public void start() {
-        if (running) {
+        if (!running.compareAndSet(false, true)) {
             log.warn("AdaptiveBatchDeliveryManager already running");
             return;
         }
-
-        running = true;
 
         log.info("Starting adaptive batch delivery for {} existing consumers",
                 consumerRegistry.getAllConsumers().size());
@@ -85,7 +84,7 @@ public class AdaptiveBatchDeliveryManager {
      * @param consumer Consumer to register
      */
     public void registerConsumer(RemoteConsumer consumer) {
-        if (running) {
+        if (running.get()) {
             if (consumer.isLegacy() && !scheduledLegacyClients.add(consumer.getClientId())) {
                 // Legacy consumers share one connection for N topics; only one delivery task needed.
                 log.debug("Legacy consumer {} already has a delivery task, skipping duplicate scheduling for topic {}",
@@ -111,11 +110,9 @@ public class AdaptiveBatchDeliveryManager {
      * Stop adaptive delivery.
      */
     public void stop() {
-        if (!running) {
+        if (!running.compareAndSet(true, false)) {
             return;
         }
-
-        running = false;
         deliveryScheduler.shutdown();
         log.info("Adaptive delivery manager stopped");
     }
@@ -128,6 +125,6 @@ public class AdaptiveBatchDeliveryManager {
         int trackedStates = deliveryStateStore.getTrackedCount();
 
         return String.format("AdaptiveBatchDeliveryManager[running=%s, consumers=%d, trackedStates=%d]",
-                running, consumerCount, trackedStates);
+                running.get(), consumerCount, trackedStates);
     }
 }

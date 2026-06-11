@@ -17,6 +17,9 @@ dependencies {
     implementation 'io.micronaut:micronaut-http-client'
     implementation 'io.micronaut:micronaut-http-server-netty'
 
+    // Reactor — used by HttpPipeConnector to bridge StreamingHttpClient chunks to InputStream.
+    implementation 'io.projectreactor:reactor-core'
+
     // Jackson (includes JsonMapper required by DefaultHttpClient)
     implementation 'io.micronaut:micronaut-jackson-databind'
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.3'

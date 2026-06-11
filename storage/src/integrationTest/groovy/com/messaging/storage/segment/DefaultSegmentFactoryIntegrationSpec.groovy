@@ -21,7 +21,8 @@ class DefaultSegmentFactoryIntegrationSpec extends Specification {
         def metadataStore = new SegmentMetadataStore(tempDir)
 
         when:
-        def segment = factory.createSegment(tempDir, 'prices-v1', 0, 123L, metadataStore)
+        def segment = factory.createSegment(
+                tempDir, 'prices-v1', 0, 123L, 1024L * 1024L, metadataStore)
 
         then:
         segment.baseOffset == 123L

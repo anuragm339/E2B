@@ -2,7 +2,7 @@ package com.messaging.broker.handler;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.messaging.broker.compaction.RocksDbCompactionIndex;
+import com.messaging.broker.compaction.CompactionIndex;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.common.api.NetworkServer;
@@ -29,7 +29,7 @@ public class DataHandler implements MessageHandler {
     private final StorageEngine storage;
     private final NetworkServer server;
     private final BrokerMetrics metrics;
-    private final RocksDbCompactionIndex compactionIndex;
+    private final CompactionIndex compactionIndex;
     private final ObjectMapper objectMapper;
 
     @Inject
@@ -37,7 +37,7 @@ public class DataHandler implements MessageHandler {
             StorageEngine storage,
             NetworkServer server,
             BrokerMetrics metrics,
-            RocksDbCompactionIndex compactionIndex) {
+            CompactionIndex compactionIndex) {
         this.storage = storage;
         this.server = server;
         this.metrics = metrics;

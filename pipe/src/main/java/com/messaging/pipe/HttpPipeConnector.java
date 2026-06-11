@@ -9,21 +9,28 @@ import com.messaging.pipe.metrics.PipeMetrics;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.micronaut.http.client.HttpClient;
+import io.micronaut.core.io.buffer.ByteBuffer;
+import io.micronaut.http.HttpRequest;
+import io.micronaut.http.client.StreamingHttpClient;
 import io.micronaut.http.client.annotation.Client;
+import io.micronaut.http.client.exceptions.HttpClientResponseException;
 import io.micrometer.core.instrument.Timer;
 import io.micronaut.context.annotation.Value;
+import io.netty.util.ReferenceCounted;
+import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
 
 import java.io.*;
-import java.net.URI;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.*;
+import java.time.Duration;
+import java.util.Enumeration;
+import java.util.Iterator;
 import java.util.Properties;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 
 /**
@@ -37,8 +44,7 @@ public class HttpPipeConnector implements PipeConnector {
 
     private static final String OFFSET_FILE = "pipe-offset.properties";
 
-    private final HttpClient httpClient;  // kept for Micronaut injection only; not used in pollParent
-    private final java.net.http.HttpClient streamingHttpClient;
+    private final StreamingHttpClient streamingHttpClient;
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
     private final Path offsetFilePath;
@@ -46,10 +52,14 @@ public class HttpPipeConnector implements PipeConnector {
     private final long minPollIntervalMs;
     private final long maxPollIntervalMs;
     private final int pollLimit;
+    private final Object lifecycleLock = new Object();
+    private final AtomicLong connectionGeneration = new AtomicLong();
 
     private volatile PipeConnectionImpl connection;
     private volatile Function<MessageRecord, Boolean> dataHandler;
     private volatile boolean running;
+    private volatile boolean destroyed;
+    private volatile Future<?> pollTask;
     private volatile boolean pausePipeCalls = false;  // For DataRefresh support
 
     private volatile long currentOffset = 0;
@@ -57,16 +67,13 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile long adaptiveDelay;
 
     public HttpPipeConnector(
-            @Client("/") HttpClient httpClient,
+            @Client("/") StreamingHttpClient streamingHttpClient,
             @Value("${broker.storage.data-dir:./data}") String dataDir,
             @Value("${broker.pipe.min-poll-interval-ms:500}") long minPollIntervalMs,
             @Value("${broker.pipe.max-poll-interval-ms:20000}") long maxPollIntervalMs,
             @Value("${broker.pipe.poll-limit:5}") int pollLimit,
             PipeMetrics metrics) throws StorageException {
-        this.httpClient = httpClient;
-        this.streamingHttpClient = java.net.http.HttpClient.newBuilder()
-                .connectTimeout(java.time.Duration.ofSeconds(10))
-                .build();
+        this.streamingHttpClient = streamingHttpClient;
 
         this.objectMapper = new ObjectMapper();
         this.objectMapper.findAndRegisterModules();
@@ -99,26 +106,38 @@ public class HttpPipeConnector implements PipeConnector {
 
     @Override
     public CompletableFuture<PipeConnection> connectToParent(String parentUrl) {
-        return CompletableFuture.supplyAsync(() -> {
-            this.connection = new PipeConnectionImpl(parentUrl);
-            this.running = true;
-            this.adaptiveDelay = minPollIntervalMs;
+        synchronized (lifecycleLock) {
+            if (destroyed) {
+                return CompletableFuture.failedFuture(
+                        new IllegalStateException("Pipe connector has been destroyed"));
+            }
 
-            scheduler.execute(this::pollLoop);
+            stopPollingLocked();
 
-            // NOTE: Offset persistence now happens immediately after each successful batch
-            // in streamAndHandle() - no separate periodic task needed
+            long generation = connectionGeneration.incrementAndGet();
+            PipeConnectionImpl newConnection = new PipeConnectionImpl(parentUrl);
+            connection = newConnection;
+            running = true;
+            adaptiveDelay = minPollIntervalMs;
 
-            log.info("event=pipe_connector.connected parentUrl={}", parentUrl);
-            return connection;
-        });
+            try {
+                pollTask = scheduler.submit(() -> pollLoop(generation, newConnection));
+            } catch (RejectedExecutionException e) {
+                running = false;
+                newConnection.connected = false;
+                return CompletableFuture.failedFuture(e);
+            }
+
+            log.info("event=pipe_connector.connected parentUrl={} generation={}", parentUrl, generation);
+            return CompletableFuture.completedFuture(newConnection);
+        }
     }
 
     /**
      * Single-thread polling loop (no task buildup)
      */
-    private void pollLoop() {
-        while (running) {
+    private void pollLoop(long generation, PipeConnectionImpl expectedConnection) {
+        while (isActive(generation, expectedConnection)) {
             // Check if paused (for DataRefresh)
             if (pausePipeCalls) {
                 try {
@@ -132,7 +151,7 @@ public class HttpPipeConnector implements PipeConnector {
 
             long start = System.currentTimeMillis();
             try {
-                int received = pollParent();
+                int received = pollParent(generation, expectedConnection);
                 long duration = System.currentTimeMillis() - start;
 
                 if (received > 0) {
@@ -176,9 +195,17 @@ public class HttpPipeConnector implements PipeConnector {
 
     @Override
     public void reconnect() {
-        if (connection != null) {
+        String parentUrl;
+        synchronized (lifecycleLock) {
+            parentUrl = connection != null ? connection.parentUrl : null;
+        }
+        if (parentUrl != null) {
             disconnect();
-            connectToParent(connection.parentUrl);
+            connectToParent(parentUrl).whenComplete((ignored, failure) -> {
+                if (failure != null) {
+                    log.error("event=pipe_connector.reconnect_failed parentUrl={}", parentUrl, failure);
+                }
+            });
         }
     }
 
@@ -200,74 +227,173 @@ public class HttpPipeConnector implements PipeConnector {
 
     @Override
     public void disconnect() {
-        running = false;
+        synchronized (lifecycleLock) {
+            connectionGeneration.incrementAndGet();
+            stopPollingLocked();
+        }
         persistOffset();
-        scheduler.shutdownNow();
-        if (connection != null) {
-            connection.connected = false;
+    }
+
+    @PreDestroy
+    public void destroy() {
+        synchronized (lifecycleLock) {
+            if (destroyed) {
+                return;
+            }
+            destroyed = true;
+            connectionGeneration.incrementAndGet();
+            stopPollingLocked();
+            scheduler.shutdownNow();
+        }
+        persistOffset();
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                log.warn("event=pipe_connector.scheduler_shutdown_timeout");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void stopPollingLocked() {
+        running = false;
+        Future<?> task = pollTask;
+        pollTask = null;
+        if (task != null) {
+            task.cancel(true);
+        }
+        PipeConnectionImpl currentConnection = connection;
+        if (currentConnection != null) {
+            currentConnection.connected = false;
+        }
+    }
+
+    private boolean isActive(long generation, PipeConnectionImpl expectedConnection) {
+        return running
+                && connectionGeneration.get() == generation
+                && connection == expectedConnection
+                && expectedConnection.connected;
+    }
+
+    /**
+     * Poll parent broker using a streaming body — no byte[] buffer.
+     *
+     * <p>Uses Micronaut {@link StreamingHttpClient#dataStream(HttpRequest)} which emits
+     * {@link ByteBuffer} chunks as they arrive on the wire. The chunks are bridged into a
+     * {@link SequenceInputStream} so the existing Jackson streaming parser consumes the body
+     * incrementally. Materialising the full response body (e.g. via {@code toBlocking().exchange(_, byte[].class)})
+     * regressed previously: 1-2 MB poll responses created humongous G1 objects every 500 ms
+     * and filled the heap in under 7 minutes (OOM exit 3). The streaming path here preserves
+     * the original constant-memory property while removing the second HTTP stack.
+     *
+     * <p>{@code .timeout(30s)} on the Reactor pipeline replaces the per-request timeout that
+     * used to live on the {@code java.net.http} request builder: it fires if no chunk arrives
+     * for 30 s. Initial connect/response-headers timeout is governed by the Micronaut HTTP
+     * client config ({@code micronaut.http.client.read-timeout} / {@code connect-timeout}).
+     */
+    private int pollParent(long generation, PipeConnectionImpl expectedConnection) throws IOException {
+        if (!isActive(generation, expectedConnection)) return 0;
+
+        Timer.Sample sample = metrics.startFetchTimer();
+        String parentUrl = normalizeUrl(expectedConnection.parentUrl);
+        String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + pollLimit;
+        HttpRequest<?> request = HttpRequest.GET(pollUrl);
+
+        try {
+            // CRITICAL: copy each chunk to a heap byte[] **on the Netty event-loop thread**
+            // (synchronously inside .map()), BEFORE Micronaut's dataStream releases the underlying
+            // pooled ByteBuf when onNext returns. Doing the copy later, from the polling thread
+            // inside the iterator, reads pool memory that has already been reclaimed and zeroed by
+            // a subsequent request — visible to Jackson as
+            //   "Illegal unquoted character (CTRL-CHAR, code 0)"
+            // somewhere deep inside a JSON string value. .map() runs synchronously in onNext, so
+            // the bytes are safely materialised on the heap before the slot is reused.
+            Iterator<byte[]> chunks = Flux.from(streamingHttpClient.dataStream(request))
+                    .timeout(Duration.ofSeconds(30))
+                    .map(HttpPipeConnector::copyAndRelease)
+                    .toIterable()
+                    .iterator();
+
+            try (InputStream is = new SequenceInputStream(toInputStreamEnumeration(chunks))) {
+                if (!isActive(generation, expectedConnection)) {
+                    return 0;
+                }
+                int count = streamAndHandle(is, generation, expectedConnection);
+                if (count == 0) metrics.recordEmptyFetch();
+                return count;
+            }
+        } catch (RuntimeException re) {
+            HttpClientResponseException responseEx = unwrapResponseException(re);
+            if (responseEx != null) {
+                int statusCode = responseEx.getStatus().getCode();
+                log.warn("event=pipe_connector.poll_failed status={}", statusCode);
+                metrics.recordFetchError();
+                return 0;
+            }
+            metrics.recordFetchError();
+            throw new IOException("Pipe poll failed", re);
+        } catch (IOException e) {
+            metrics.recordFetchError();
+            throw e;
+        } finally {
+            metrics.recordFetchLatency(sample);
         }
     }
 
     /**
-     * Poll parent broker using a streaming InputStream — no byte[] buffer.
-     * The previous implementation used httpClient.toBlocking().exchange(request, byte[].class)
-     * which materialized the full response body as a byte[] before parsing. With message
-     * payloads from the 4.3 GB SQLite database, each poll response was 1-2 MB, creating a
-     * humongous G1 object every 500 ms and filling the heap in under 7 minutes (OOM exit 3).
-     * java.net.http.HttpClient.BodyHandlers.ofInputStream() streams directly into the JSON
-     * parser with no intermediate heap copy.
+     * Copy a chunk from Micronaut's pooled Netty buffer into a heap {@code byte[]} and release
+     * the underlying buffer back to the pool. Called synchronously inside Reactor's {@code .map()}
+     * so it runs on the Netty event-loop thread — before the framework's auto-release would
+     * otherwise reuse the slot for the next request.
+     *
+     * <p>The explicit release is also necessary to avoid a slow Netty-pool leak: {@code dataStream}
+     * hands buffer ownership to the subscriber, so without this call the {@code refCnt} stays at 1
+     * for the lifetime of the JVM.
      */
-    private int pollParent() throws IOException {
-        if (!running || connection == null) return 0;
-
-        Timer.Sample sample = metrics.startFetchTimer();
-
+    private static byte[] copyAndRelease(ByteBuffer<?> chunk) {
         try {
-            String parentUrl = normalizeUrl(connection.parentUrl);
-            String pollUrl = parentUrl + "/pipe/poll?offset=" + currentOffset + "&limit=" + pollLimit;
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(pollUrl))
-                    .timeout(java.time.Duration.ofSeconds(30))
-                    .GET()
-                    .build();
-
-            HttpResponse<InputStream> response;
-            try {
-                response = streamingHttpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return 0;
+            return chunk.toByteArray();
+        } finally {
+            Object nativeBuffer = chunk.asNativeBuffer();
+            if (nativeBuffer instanceof ReferenceCounted refCounted) {
+                refCounted.release();
             }
-
-            metrics.recordFetchLatency(sample);
-
-            int statusCode = response.statusCode();
-            if (statusCode == 200) {
-                try (InputStream is = response.body()) {
-                    int count = streamAndHandle(is);
-                    if (count == 0) metrics.recordEmptyFetch();
-                    return count;
-                }
-            }
-
-            // Drain non-200 body to allow TCP connection reuse
-            try (InputStream is = response.body()) {
-                is.transferTo(OutputStream.nullOutputStream());
-            }
-
-            if (statusCode == 204) {
-                metrics.recordEmptyFetch();
-            } else {
-                log.warn("event=pipe_connector.poll_failed status={}", statusCode);
-                metrics.recordFetchError();
-            }
-            return 0;
-
-        } catch (IOException e) {
-            metrics.recordFetchError();
-            throw e;
         }
+    }
+
+    /**
+     * Bridge an {@code Iterator<byte[]>} of pre-copied chunks (see {@link #copyAndRelease}) into
+     * the {@link Enumeration} {@link SequenceInputStream} expects. Wrapping each byte array in a
+     * {@link ByteArrayInputStream} is constant-memory: only one chunk-sized array is live per
+     * iteration step.
+     */
+    private static Enumeration<InputStream> toInputStreamEnumeration(Iterator<byte[]> chunks) {
+        return new Enumeration<InputStream>() {
+            @Override
+            public boolean hasMoreElements() {
+                return chunks.hasNext();
+            }
+
+            @Override
+            public InputStream nextElement() {
+                return new ByteArrayInputStream(chunks.next());
+            }
+        };
+    }
+
+    /**
+     * Walk the cause chain to find an {@link HttpClientResponseException} that may have been
+     * wrapped by Reactor's blocking iterator. Returns {@code null} if the failure is something
+     * else (network I/O, Reactor timeout, etc.).
+     */
+    private static HttpClientResponseException unwrapResponseException(Throwable t) {
+        while (t != null) {
+            if (t instanceof HttpClientResponseException hcre) {
+                return hcre;
+            }
+            t = t.getCause();
+        }
+        return null;
     }
 
     /**
@@ -279,59 +405,73 @@ public class HttpPipeConnector implements PipeConnector {
      * - Persists offset file after successful batch
      * - On failure, next poll retries from last successful offset (no data loss)
      */
-    private int streamAndHandle(InputStream is) throws IOException {
+    private int streamAndHandle(
+            InputStream is,
+            long generation,
+            PipeConnectionImpl expectedConnection) throws IOException {
         int count = 0;
         long lastSuccessfulOffset = currentOffset;  // Track last successful offset
+        boolean completed = false;
 
-        JsonParser parser = objectMapper.createParser(is);
+        try {
+            JsonParser parser = objectMapper.createParser(is);
 
-        if (parser.nextToken() != JsonToken.START_ARRAY) {
-            return 0;
-        }
+            if (parser.nextToken() != JsonToken.START_ARRAY) {
+                return 0;
+            }
 
-        while (parser.nextToken() == JsonToken.START_OBJECT) {
-            MessageRecord record =
-                    objectMapper.readValue(parser, MessageRecord.class);
-
-            if (dataHandler != null) {
-                // Attempt to store message - handler returns true on success, false on failure
-                boolean success = dataHandler.apply(record);
-
-                if (success) {
-                    // SUCCESS - update last successful offset
-                    lastSuccessfulOffset = record.getOffset();
-                    count++;
-
-                    log.trace("Successfully stored pipe message at offset {}", record.getOffset());
-                } else {
-                    // STORAGE FAILURE - stop processing batch, keep old offset
-                    log.error("CRITICAL: Failed to store pipe message at offset {}, " +
-                             "stopping batch. Next poll will retry from offset {}",
-                             record.getOffset(), lastSuccessfulOffset);
-
-                    metrics.recordFetchError();
-
-                    // Stop processing this batch - remaining messages will be retried on next poll
+            while (parser.nextToken() == JsonToken.START_OBJECT) {
+                if (!isActive(generation, expectedConnection)) {
                     break;
                 }
+                MessageRecord record =
+                        objectMapper.readValue(parser, MessageRecord.class);
+
+                if (dataHandler != null) {
+                    // Attempt to store message - handler returns true on success, false on failure
+                    boolean success = dataHandler.apply(record);
+
+                    if (success) {
+                        // SUCCESS - update last successful offset
+                        lastSuccessfulOffset = record.getOffset();
+                        count++;
+
+                        log.trace("Successfully stored pipe message at offset {}", record.getOffset());
+                    } else {
+                        // STORAGE FAILURE - stop processing batch, keep old offset
+                        log.error("CRITICAL: Failed to store pipe message at offset {}, " +
+                                 "stopping batch. Next poll will retry from offset {}",
+                                 record.getOffset(), lastSuccessfulOffset);
+
+                        metrics.recordFetchError();
+
+                        // Stop processing this batch - remaining messages will be retried on next poll
+                        break;
+                    }
+                }
             }
-        }
-
-        // Update current offset only to last successfully stored message
-        currentOffset = lastSuccessfulOffset;
-        connection.lastReceivedOffset = lastSuccessfulOffset;
-        connection.lastMessageTime = System.currentTimeMillis();
-
-        // Persist offset file ONLY if we successfully stored messages
-        if (count > 0) {
-            persistOffset();
-            log.debug("Persisted pipe offset after successful batch: offset={}, messagesStored={}",
-                     currentOffset, count);
-        }
-
-        // Record metrics: messages received from pipe
-        if (count > 0) {
-            metrics.recordMessagesReceived(count);
+            completed = true;
+        } finally {
+            // Commit progress for records that were already stored even if the stream died
+            // mid-array (truncated response, malformed JSON). Without this, the next poll
+            // re-fetches from the stale offset and the parent re-sends records that are
+            // already on disk — duplicate appends. (BrokerService also guards against
+            // duplicates defensively, but the offset should not rewind in the first place.)
+            if (isActive(generation, expectedConnection)) {
+                if (count > 0) {
+                    currentOffset = lastSuccessfulOffset;
+                    expectedConnection.lastReceivedOffset = lastSuccessfulOffset;
+                    persistOffset();
+                    metrics.recordMessagesReceived(count);
+                    log.debug("Persisted pipe offset after batch: offset={}, messagesStored={}, streamCompleted={}",
+                             currentOffset, count, completed);
+                }
+                // Health heartbeat: only a cleanly completed exchange (or real stored data)
+                // counts — repeated mid-stream failures should still degrade pipe health.
+                if (completed || count > 0) {
+                    expectedConnection.lastMessageTime = System.currentTimeMillis();
+                }
+            }
         }
 
         return count;
@@ -367,11 +507,18 @@ public class HttpPipeConnector implements PipeConnector {
             props.setProperty("pipe.current.offset", String.valueOf(currentOffset));
 
             Path tmp = offsetFilePath.resolveSibling(OFFSET_FILE + ".tmp");
-            try (OutputStream os = Files.newOutputStream(tmp)) {
+            try (FileOutputStream os = new FileOutputStream(tmp.toFile())) {
                 props.store(os, "Pipe offset");
+                // fsync before rename so a power cut can never leave an empty offset file
+                os.getFD().sync();
             }
 
-            Files.move(tmp, offsetFilePath, StandardCopyOption.REPLACE_EXISTING);
+            try {
+                Files.move(tmp, offsetFilePath,
+                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, offsetFilePath, StandardCopyOption.REPLACE_EXISTING);
+            }
             lastPersistedOffset = currentOffset;
         } catch (Exception e) {
             log.error("Failed to persist offset", e);

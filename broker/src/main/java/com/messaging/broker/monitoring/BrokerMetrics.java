@@ -90,6 +90,8 @@ public class BrokerMetrics {
     private final ConcurrentHashMap<String, Counter> consumerAckTimeouts = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> offsetGapsDetected = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Counter> compactionSkippedByReason = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> compactionAllDeleted = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Counter> consumerOffsetForceResets = new ConcurrentHashMap<>();
 
     // Gauges
     private final AtomicLong activeConsumers = new AtomicLong(0);
@@ -695,26 +697,56 @@ public class BrokerMetrics {
     public void removeConsumerMetrics(String consumerId, String topic, String group) {
         String key = group + ":" + topic;
 
-        // OOM FIX: Re-enabled removal to prevent memory leak from ephemeral port reconnections
-        consumerMessagesSent.remove(key);
-        consumerBytesSent.remove(key);
-        consumerAcks.remove(key);
-        consumerFailures.remove(key);
-        consumerRetries.remove(key);
-        consumerDeliveryBlocked.entrySet().removeIf(entry -> entry.getKey().startsWith(key + ":"));
+        removeMeter(consumerMessagesSent.remove(key));
+        removeMeter(consumerBytesSent.remove(key));
+        removeMeter(consumerAcks.remove(key));
+        removeMeter(consumerFailures.remove(key));
+        removeMeter(consumerRetries.remove(key));
+        consumerDeliveryBlocked.entrySet().removeIf(entry -> {
+            if (!entry.getKey().startsWith(key + ":")) {
+                return false;
+            }
+            removeMeter(entry.getValue());
+            return true;
+        });
+        removeGauge("broker.consumer.offset", topic, group);
         consumerOffsets.remove(key);
+        removeGauge("broker.consumer.lag", topic, group);
         consumerLag.remove(key);
-        consumerDeliveryLatency.remove(key);
-        consumerBytesFailed.remove(key);
-        consumerMessagesFailed.remove(key);
+        removeMeter(consumerDeliveryLatency.remove(key));
+        removeMeter(consumerBytesFailed.remove(key));
+        removeMeter(consumerMessagesFailed.remove(key));
+        removeGauge("broker.consumer.last_delivery_time_ms", topic, group);
         consumerLastDeliveryTime.remove(key);
+        removeGauge("broker.consumer.last_ack_time_ms", topic, group);
         consumerLastAckTime.remove(key);
-        consumerAckTimeouts.remove(key);
+        removeMeter(consumerAckTimeouts.remove(key));
+        pendingAckStartTime.remove(key);
+        removeMeter(pendingAckAgeGauges.remove(key));
+        removeGauge("ack.reconciliation.missing.keys", topic, group);
+        reconciliationMissingKeys.remove(key);
+        removeGauge("ack.reconciliation.gap.min.offset", topic, group);
+        reconciliationGapMinOffset.remove(key);
+        removeGauge("ack.reconciliation.gap.max.offset", topic, group);
+        reconciliationGapMaxOffset.remove(key);
 
         // Note: offsetGapsDetected uses topic:partition key, not group:topic, so not removed here
 
         log.info("OOM FIX: Removed metrics for disconnected consumer: group={}, topic={}, key={}",
                   group, topic, key);
+    }
+
+    private void removeMeter(Meter meter) {
+        if (meter != null) {
+            registry.remove(meter);
+        }
+    }
+
+    private void removeGauge(String name, String topic, String group) {
+        Meter meter = registry.find(name)
+                .tags("topic", topic, "group", group)
+                .meter();
+        removeMeter(meter);
     }
 
     /**
@@ -874,6 +906,37 @@ public class BrokerMetrics {
         compactionSkippedByReason.computeIfAbsent(reasonLabel, key ->
                 Counter.builder("broker.compaction.skipped")
                         .description("Compaction runs skipped by reason")
+                        .tag("reason", reasonLabel)
+                        .register(registry)
+        ).increment();
+    }
+
+    /**
+     * Compaction removed an entire segment window with no replacement (all records superseded
+     * or expired). Consumers committed inside the removed range will be force-reset — fleet
+     * dashboards must be able to alert on this instead of relying on a WARN log line.
+     */
+    public void recordCompactionAllDeleted(String topic) {
+        compactionAllDeleted.computeIfAbsent(topic, t ->
+                Counter.builder("broker.compaction.all_deleted")
+                        .description("Compaction runs that deleted an entire segment window with no replacement")
+                        .tag("topic", t)
+                        .register(registry)
+        ).increment();
+    }
+
+    /**
+     * A consumer's committed offset pointed below the earliest available data (segments
+     * compacted/deleted while it was offline) and was silently advanced to the earliest
+     * available offset. Signals potential message loss visibility for that group.
+     */
+    public void recordConsumerOffsetForceReset(String topic, String reason) {
+        String reasonLabel = (reason == null || reason.isBlank()) ? "unknown" : reason;
+        String key = topic + ":" + reasonLabel;
+        consumerOffsetForceResets.computeIfAbsent(key, k ->
+                Counter.builder("broker.consumer.offset.force_reset")
+                        .description("Consumer offsets force-advanced past missing data")
+                        .tag("topic", topic)
                         .tag("reason", reasonLabel)
                         .register(registry)
         ).increment();

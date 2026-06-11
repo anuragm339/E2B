@@ -1,7 +1,7 @@
 package com.messaging.broker.consumer;
 
 import com.messaging.broker.ack.AckRecord;
-import com.messaging.broker.ack.RocksDbAckStore;
+import com.messaging.broker.ack.AckStore;
 import com.messaging.broker.monitoring.ConsumerEventLogger;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.consumer.ConsumerAckService;
@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -52,7 +53,7 @@ public class BatchAckService implements ConsumerAckService {
     private final ConsumerRegistrationService registrationService;
     private final LegacyConsumerDeliveryManager legacyDeliveryManager;
     private final ConsumerEventLogger consumerLogger;
-    private final RocksDbAckStore ackStore;
+    private final AckStore ackStore;
     private final ExecutorService ackStorageExecutor;
     private final boolean liveReplayEnabled;
 
@@ -66,7 +67,7 @@ public class BatchAckService implements ConsumerAckService {
             ConsumerRegistrationService registrationService,
             LegacyConsumerDeliveryManager legacyDeliveryManager,
             ConsumerEventLogger consumerLogger,
-            RocksDbAckStore ackStore,
+            AckStore ackStore,
             @Named("ackStorageExecutor") ExecutorService ackStorageExecutor,
             @Value("${ack-store.live-replay.enabled:true}") boolean liveReplayEnabled) {
         this.stateService = stateService;
@@ -87,33 +88,25 @@ public class BatchAckService implements ConsumerAckService {
         long handlerStartMs = System.currentTimeMillis();
         DeliveryKey deliveryKey = DeliveryKey.of(group, topic);
         String deliveryKeyStr = clientId + " -> " + deliveryKey;
-        String traceId = stateService.getTraceId(deliveryKey);
+        PendingDelivery pendingDelivery = stateService.claimPendingDelivery(deliveryKey);
+        String traceId = pendingDelivery != null
+                ? pendingDelivery.traceId()
+                : stateService.getTraceId(deliveryKey);
         try (LogMdc.Scope ignored = LogMdc.with(traceId, topic, group, clientId)) {
 
         // Calculate ACK latency
         long ackReceiveTime = System.currentTimeMillis();
-        Long sendTime = stateService.getBatchSendTime(deliveryKey);
+        Long sendTime = pendingDelivery != null ? pendingDelivery.sendTime() : null;
         long ackLatencyMs = sendTime != null && sendTime > 0 ? (ackReceiveTime - sendTime) : -1;
 
-        // Atomically claim ownership of the pending offset.
-        // removePendingOffset() is a single ConcurrentHashMap.remove() call — whichever thread
-        // (this ACK handler or the scheduled timeout) calls it first gets the non-null value.
-        // The other gets null and short-circuits, preventing the double-revert race.
-        Long committedOffset = stateService.removePendingOffset(deliveryKey);
-
-        // Cancel timeout
-        stateService.cancelTimeout(deliveryKey);
-
-        if (committedOffset == null) {
-            log.warn("event=batch_ack.late_ack deliveryKey={} ackLatencyMs={} action=clear_inflight traceId={}",
+        if (pendingDelivery == null) {
+            log.warn("event=batch_ack.late_ack deliveryKey={} ackLatencyMs={} action=ignore traceId={}",
                      deliveryKeyStr, ackLatencyMs, traceId);
-            // Always clear inFlight on any ACK, even a late one
-            stateService.recordBatchSendTime(deliveryKey, 0);
-            stateService.clearInFlight(deliveryKey);
-            stateService.clearTraceId(deliveryKey);
             return;
         }
 
+        long committedOffset = pendingDelivery.pendingOffset();
+        try {
         // Structured logging for ACK received
         LogContext ackContext = LogContext.builder()
                 .traceId(traceId)
@@ -167,16 +160,7 @@ public class BatchAckService implements ConsumerAckService {
             offsetTracker.updateOffset(group + ":" + topic, committedOffset);
         }
 
-        // Capture fromOffset BEFORE clearing in-flight to prevent race: once clearInFlight() fires,
-        // the delivery scheduler can immediately start the next batch and overwrite fromOffset via
-        // setFromOffset(). Capturing first ensures we read this batch's window, not the next one's.
-        Long capturedFromOffset = stateService.getFromOffset(deliveryKey);
-        stateService.clearFromOffset(deliveryKey);  // clear before async task to prevent leak
-
-        // Clear in-flight status (opens the delivery race window — fromOffset already captured above)
-        stateService.recordBatchSendTime(deliveryKey, 0);
-        stateService.clearInFlight(deliveryKey);
-        stateService.clearTraceId(deliveryKey);
+        Long capturedFromOffset = pendingDelivery.fromOffset();
 
         // Async RocksDB write: re-read batch from storage to extract msgKeys.
         // Uses a loop in chunks of 500 because storage.read() has a 1MB internal size limit —
@@ -189,7 +173,7 @@ public class BatchAckService implements ConsumerAckService {
             final long ackReceiveTimeSnap = ackReceiveTime;
             // Use a dedicated ACK storage pool so replay/persistence work cannot occupy
             // the delivery read pool and stall all TopicFairScheduler threads.
-            ackStorageExecutor.execute(() -> {
+            Runnable replayTask = () -> {
                 if (toOffsetSnap <= fromOffsetSnap) return;
                 long replayStartMs = System.currentTimeMillis();
                 int writtenAckRecords = 0;
@@ -198,9 +182,6 @@ public class BatchAckService implements ConsumerAckService {
                     // Flush per storage chunk rather than accumulating all records first.
                     // A post-refresh replay ACK can span 1M+ offsets — building a single
                     // ArrayList of all AckRecords before writing filled the heap (OOM).
-                    String[] topicArr = new String[]{topicSnap};
-                    String[] groupArr = new String[]{groupSnap};
-
                     long currentOffset = fromOffsetSnap;
                     while (currentOffset < toOffsetSnap) {
                         int chunkSize = (int) Math.min(toOffsetSnap - currentOffset, 500);
@@ -236,7 +217,14 @@ public class BatchAckService implements ConsumerAckService {
                     log.warn("event=batch_ack.rocksdb_write_failed topic={} group={} fromOffset={}",
                             topicSnap, groupSnap, fromOffsetSnap, ex);
                 }
-            });
+            };
+            try {
+                ackStorageExecutor.execute(replayTask);
+            } catch (RejectedExecutionException e) {
+                log.warn("event=batch_ack.replay_rejected topic={} group={} action=caller_runs",
+                        topicSnap, groupSnap, e);
+                replayTask.run();
+            }
         } else if (!liveReplayEnabled && capturedFromOffset != null) {
             log.debug("event=batch_ack.replay_skipped topic={} group={} fromOffset={} toOffset={} reason=disabled",
                     topic, group, capturedFromOffset, committedOffset);
@@ -249,6 +237,9 @@ public class BatchAckService implements ConsumerAckService {
                     describeExecutor(ackStorageExecutor));
         }
         log.debug("ACK committed for {} at offset {}", deliveryKeyStr, committedOffset);
+        } finally {
+            stateService.completeDelivery(deliveryKey, pendingDelivery.generation());
+        }
         }
     }
 
@@ -256,10 +247,10 @@ public class BatchAckService implements ConsumerAckService {
     public void handleLegacyBatchAck(String clientId, String group) {
         long handlerStartMs = System.currentTimeMillis();
         long ackReceiveTime = System.currentTimeMillis();
-        long sendTime = pendingAckStore.getSendTime(clientId);
-        Timer.Sample deliverySample = pendingAckStore.removeTimer(clientId);
-        MergedBatch batch = pendingAckStore.removePendingBatch(clientId);
-        pendingAckStore.removeClient(clientId); // clean up send time and any remaining state
+        PendingLegacyDelivery pendingDelivery = pendingAckStore.claimPendingDelivery(clientId);
+        long sendTime = pendingDelivery == null ? -1L : pendingDelivery.sendTime();
+        Timer.Sample deliverySample = pendingDelivery == null ? null : pendingDelivery.timer();
+        MergedBatch batch = pendingDelivery == null ? null : pendingDelivery.batch();
 
         if (batch == null) {
             metrics.recordLegacyDeliveryBlocked(group, "late_ack_or_timeout");

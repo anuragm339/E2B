@@ -4,6 +4,7 @@ import spock.lang.Specification
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentMap
+import java.util.concurrent.ExecutionException
 
 class TopicFairSchedulerSpec extends Specification {
 
@@ -32,6 +33,24 @@ class TopicFairSchedulerSpec extends Specification {
 
         cleanup:
         blockerRelease.countDown()
+        scheduler.shutdown()
+    }
+
+    def "task failure remains observable through the returned future"() {
+        given:
+        def scheduler = new TopicFairScheduler(1, 1)
+
+        when:
+        def future = scheduler.scheduleWithKey(
+                "topic", "key", { throw new IllegalStateException("boom") },
+                0, TimeUnit.MILLISECONDS)
+        future.get(2, TimeUnit.SECONDS)
+
+        then:
+        def failure = thrown(ExecutionException)
+        failure.cause instanceof IllegalStateException
+
+        cleanup:
         scheduler.shutdown()
     }
 

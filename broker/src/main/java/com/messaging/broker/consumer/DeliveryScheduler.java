@@ -80,6 +80,11 @@ public class DeliveryScheduler {
     private void executeDelivery(RemoteConsumer consumer, long currentDelayMs) {
         log.debug("Executing delivery task for {}:{}", consumer.getClientId(), consumer.getTopic());
 
+        if (!consumerRegistry.isRegistered(consumer)) {
+            log.debug("Skipping delivery for unregistered consumer {}:{}", consumer.getClientId(), consumer.getTopic());
+            return;
+        }
+
         // Apply all gate policies
         for (DeliveryGatePolicy gate : gatePolicies) {
             DeliveryGatePolicy.GateResult result = gate.shouldDeliver(consumer);
@@ -90,7 +95,7 @@ public class DeliveryScheduler {
 
                 // Reschedule with backoff (no data found)
                 long nextDelay = retryPolicy.calculateNextDelay(currentDelayMs, false);
-                scheduleDelivery(consumer, nextDelay);
+                reschedule(consumer, nextDelay);
                 return;
             }
         }
@@ -109,7 +114,26 @@ public class DeliveryScheduler {
 
         // Calculate next delay based on success
         long nextDelay = retryPolicy.calculateNextDelay(currentDelayMs, success);
-        scheduleDelivery(consumer, nextDelay);
+        reschedule(consumer, nextDelay);
+    }
+
+    /**
+     * Reschedule the consumer's next poll. Delivery continuation depends entirely on this
+     * call — if scheduling throws (e.g. rejected execution outside shutdown), the consumer's
+     * polling chain would end permanently with nothing to restart it. Log loudly so a stalled
+     * consumer is diagnosable; the consumer recovers on its next re-registration.
+     */
+    private void reschedule(RemoteConsumer consumer, long delayMs) {
+        if (!consumerRegistry.isRegistered(consumer)) {
+            return;
+        }
+        try {
+            scheduleDelivery(consumer, delayMs);
+        } catch (Exception e) {
+            log.error("event=delivery_scheduler.reschedule_failed clientId={} topic={} delayMs={} " +
+                      "— polling chain for this consumer has STOPPED until it re-registers",
+                    consumer.getClientId(), consumer.getTopic(), delayMs, e);
+        }
     }
 
     /**

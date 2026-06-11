@@ -74,11 +74,10 @@ public class DeliveryStateStore {
      */
     public void saveState(String deliveryKey, long lastAckedOffset, long inFlightUntil) {
         DeliveryState state = new DeliveryState(lastAckedOffset, inFlightUntil);
-        cache.put(deliveryKey, state);
-
-        // Persist to repository (periodic flush handles disk I/O)
-        repository.put(deliveryKey + ".offset", String.valueOf(lastAckedOffset));
-        repository.put(deliveryKey + ".until", String.valueOf(inFlightUntil));
+        cache.compute(deliveryKey, (key, ignored) -> {
+            persistState(key, state);
+            return state;
+        });
 
         log.trace("Saved delivery state: {}={}", deliveryKey, state);
     }
@@ -90,8 +89,12 @@ public class DeliveryStateStore {
      * @param lastAckedOffset New acknowledged offset
      */
     public void updateAckedOffset(String deliveryKey, long lastAckedOffset) {
-        DeliveryState current = getState(deliveryKey);
-        saveState(deliveryKey, lastAckedOffset, current.inFlightUntil);
+        cache.compute(deliveryKey, (key, current) -> {
+            DeliveryState existing = current != null ? current : new DeliveryState(0, 0);
+            DeliveryState updated = new DeliveryState(lastAckedOffset, existing.inFlightUntil);
+            persistState(key, updated);
+            return updated;
+        });
     }
 
     /**
@@ -101,8 +104,12 @@ public class DeliveryStateStore {
      * @param inFlightUntil Timestamp when in-flight expires
      */
     public void updateInFlightUntil(String deliveryKey, long inFlightUntil) {
-        DeliveryState current = getState(deliveryKey);
-        saveState(deliveryKey, current.lastAckedOffset, inFlightUntil);
+        cache.compute(deliveryKey, (key, current) -> {
+            DeliveryState existing = current != null ? current : new DeliveryState(0, 0);
+            DeliveryState updated = new DeliveryState(existing.lastAckedOffset, inFlightUntil);
+            persistState(key, updated);
+            return updated;
+        });
     }
 
     /**
@@ -150,6 +157,11 @@ public class DeliveryStateStore {
             });
 
         log.info("Loaded {} delivery states from repository", cache.size());
+    }
+
+    private void persistState(String deliveryKey, DeliveryState state) {
+        repository.put(deliveryKey + ".offset", String.valueOf(state.lastAckedOffset));
+        repository.put(deliveryKey + ".until", String.valueOf(state.inFlightUntil));
     }
 
     /**

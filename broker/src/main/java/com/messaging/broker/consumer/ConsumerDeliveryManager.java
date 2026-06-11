@@ -1,6 +1,6 @@
 package com.messaging.broker.consumer;
 
-import com.messaging.broker.compaction.RocksDbCompactionIndex;
+import com.messaging.broker.compaction.CompactionIndex;
 import com.messaging.common.annotation.RetryPolicy;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.ConsumerRecord;
@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
@@ -27,14 +28,15 @@ public class ConsumerDeliveryManager {
     private final StorageEngine storage;
     private final ConsumerAnnotationProcessor processor;
     private final ConsumerOffsetTracker offsetTracker;
-    private final RocksDbCompactionIndex compactionIndex;
+    private final CompactionIndex compactionIndex;
     private final ScheduledExecutorService scheduler;
     private final Map<String, Future<?>> deliveryTasks;
+    private final AtomicLong threadCounter = new AtomicLong();
 
     @Inject
     public ConsumerDeliveryManager(StorageEngine storage, ConsumerAnnotationProcessor processor,
                                   ConsumerOffsetTracker offsetTracker,
-                                  RocksDbCompactionIndex compactionIndex) {
+                                  CompactionIndex compactionIndex) {
         this.storage = storage;
         this.processor = processor;
         this.offsetTracker = offsetTracker;
@@ -42,7 +44,8 @@ public class ConsumerDeliveryManager {
         int schedulerThreads = Math.min(4, Runtime.getRuntime().availableProcessors());
         this.scheduler = Executors.newScheduledThreadPool(schedulerThreads, r -> {
             Thread t = new Thread(r);
-            t.setName("ConsumerDeliveryScheduler-" + t.getId());
+            t.setName("ConsumerDeliveryScheduler-" + threadCounter.incrementAndGet());
+            t.setDaemon(true); // never block JVM exit on delivery polling
             return t;
         });
         this.deliveryTasks = new ConcurrentHashMap<>();
@@ -57,7 +60,7 @@ public class ConsumerDeliveryManager {
         log.info("Message delivery started for {} consumers", deliveryTasks.size());
     }
 
-    public void startConsumerDelivery(ConsumerContext context) {
+    public synchronized void startConsumerDelivery(ConsumerContext context) {
         String consumerId = context.getConsumerId();
         if (deliveryTasks.containsKey(consumerId)) {
             log.warn("Delivery already started for consumer: {}", consumerId);
@@ -150,8 +153,13 @@ public class ConsumerDeliveryManager {
             } else {
                 handleBatchFailure(context, deliverable);
             }
-        } catch (Exception e) {
-            log.error("Error in delivery loop for consumer: {}", context.getConsumerId(), e);
+        } catch (Throwable t) {
+            // Throwable, not Exception: an Error escaping this runnable silently cancels the
+            // scheduleWithFixedDelay task and the consumer freezes until restart with no log.
+            log.error("Error in delivery loop for consumer: {}", context.getConsumerId(), t);
+            if (t instanceof Error) {
+                throw (Error) t; // rethrow after logging — OOM etc. must stay fatal to the task
+            }
         }
     }
 

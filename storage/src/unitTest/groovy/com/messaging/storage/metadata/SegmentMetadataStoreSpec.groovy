@@ -49,6 +49,37 @@ class SegmentMetadataStoreSpec extends Specification {
         thrown(StorageException)
     }
 
+    def "saveSegment round-trips segment metadata"() {
+        given:
+        def store = new SegmentMetadataStore(tempDir)
+        def md = SegmentMetadata.builder()
+                .topic("topic")
+                .partition(0)
+                .baseOffset(0L)
+                .maxOffset(99L)
+                .logFilePath("/tmp/s.log")
+                .indexFilePath("/tmp/s.index")
+                .sizeBytes(2048L)
+                .recordCount(100L)
+                .createdAt(Instant.now())
+                .build()
+
+        when:
+        store.saveSegment(md)
+        def loaded = store.getSegments("topic", 0)
+
+        then:
+        loaded.size() == 1
+        loaded[0].topic == "topic"
+        loaded[0].partition == 0
+        loaded[0].baseOffset == 0L
+        loaded[0].maxOffset == 99L
+        loaded[0].recordCount == 100L
+
+        cleanup:
+        store?.close()
+    }
+
     private static SegmentMetadata sampleMetadata() {
         return SegmentMetadata.builder()
             .topic("topic")

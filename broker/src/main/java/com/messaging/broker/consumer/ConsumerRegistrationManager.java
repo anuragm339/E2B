@@ -147,6 +147,15 @@ public class ConsumerRegistrationManager implements ConsumerRegistrationService 
                     .consumerGroup(consumer.getGroup())
                     .build();
             consumerLogger.logConsumerUnregistered(context);
+
+            // Drop the consumer's meters unless another connected client still serves the
+            // same group:topic. Without this, every reconnect (new ephemeral-port clientId)
+            // leaks a full set of Counter/Gauge/Timer objects in the meter registry.
+            boolean groupTopicStillActive = sessionStore.getByTopic(consumer.getTopic()).stream()
+                    .anyMatch(c -> c.getGroup().equals(consumer.getGroup()));
+            if (!groupTopicStillActive) {
+                metrics.removeConsumerMetrics(clientId, consumer.getTopic(), consumer.getGroup());
+            }
         }
 
         return count;

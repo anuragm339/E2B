@@ -1,5 +1,6 @@
 package com.messaging.broker.compaction;
 
+import io.micronaut.context.annotation.Requires;
 import jakarta.inject.Singleton;
 import org.rocksdb.*;
 import org.slf4j.Logger;
@@ -26,7 +27,8 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@link CompactionScheduler} once they exceed the configured retention period.
  */
 @Singleton
-public class RocksDbCompactionIndex {
+@Requires(property = "compaction-index.backend", value = "rocks", defaultValue = "rocks")
+public class RocksDbCompactionIndex implements CompactionIndex {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbCompactionIndex.class);
     private static final String TOPIC_STALE_MAX_PREFIX = "__meta__|stale|";
@@ -53,6 +55,7 @@ public class RocksDbCompactionIndex {
      * from both reading the old value and then racing to write (the slower write would regress
      * the index if it carries a lower offset).
      */
+    @Override
     public void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs) {
         if (msgKey == null) return;  // records without a key are not tracked for compaction
         byte[] key = buildKey(topic, msgKey);
@@ -80,6 +83,7 @@ public class RocksDbCompactionIndex {
      *
      * <p>Returns {@code false} for records without a key (msgKey == null) — they are never superseded.
      */
+    @Override
     public boolean isSuperseded(String topic, String msgKey, long recordOffset) {
         if (msgKey == null) return false;
         byte[] key = buildKey(topic, msgKey);
@@ -98,6 +102,7 @@ public class RocksDbCompactionIndex {
      * Returns {@code [latestOffset, latestTimestampMs]} for a specific (topic, msgKey),
      * or {@code null} if the key is not in the index.
      */
+    @Override
     public long[] getLatestOffsetAndTimestamp(String topic, String msgKey) {
         byte[] key = buildKey(topic, msgKey);
         try {
@@ -116,6 +121,7 @@ public class RocksDbCompactionIndex {
      * <p>Uses a single RocksDB seek + prefix comparison — no map allocation. Callers in the
      * delivery hot-path should use this before deciding whether to decode the batch at all.
      */
+    @Override
     public boolean hasIndexedKeysForTopic(String topic) {
         byte[] prefix = (topic + "|").getBytes(StandardCharsets.UTF_8);
         try (RocksIterator iter = db.newIterator(cf)) {
@@ -135,6 +141,7 @@ public class RocksDbCompactionIndex {
      * that starts strictly after that offset cannot contain an old version and can stay
      * on the zero-copy path.
      */
+    @Override
     public boolean shouldFilterDelivery(String topic, long deliveryStartOffset) {
         long maxSupersededOffset = getMaxSupersededOffset(topic);
         return maxSupersededOffset >= 0 && deliveryStartOffset <= maxSupersededOffset;
@@ -145,6 +152,7 @@ public class RocksDbCompactionIndex {
      * When the compaction sweep has covered the highest known stale offset for the topic,
      * the delivery-time filter can be disabled again until a newer duplicate arrives.
      */
+    @Override
     public void markCompactedThrough(String topic, long compactedThroughOffset) {
         if (compactedThroughOffset < 0) {
             return;
@@ -175,6 +183,7 @@ public class RocksDbCompactionIndex {
      *
      * @return map of {@code msgKey -> [latestOffset, latestTimestampMs]}
      */
+    @Override
     public Map<String, long[]> getLatestOffsetsForTopic(String topic) {
         byte[] prefix = (topic + "|").getBytes(StandardCharsets.UTF_8);
         Map<String, long[]> result = new HashMap<>();

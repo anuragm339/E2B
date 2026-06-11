@@ -32,6 +32,9 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
 
     LegacyConsumerClient legacyClient
 
+    @Override
+    protected String defaultTopic() { '__unused_legacy_only__' }
+
     /**
      * Connect as 'price-quote-service' and complete the startup handshake (READY → ACK)
      * before each test so the client is in normal delivery mode from the start.
@@ -43,6 +46,14 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
             assert legacyClient.received.any { it instanceof ReadyEvent }
         }
         legacyClient.sendAck()
+        def registry = brokerCtx.getBean(ConsumerRegistry)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            def legacyConsumers = registry.getAllConsumers().findAll {
+                it.legacy && it.group == 'price-quote-service'
+            }
+            assert !legacyConsumers.isEmpty()
+            assert legacyConsumers.every { registry.isLegacyConsumerReady(it.clientId) }
+        }
         legacyClient.clearReceived()
     }
 
@@ -75,7 +86,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
 
     // ── Scenario 2: Merged batch delivery across two topics ───────────────────
 
-    def "legacy client receives merged batch from multiple topics and ACK advances offsets for all topics"() {
+    def "legacy client receives batches from multiple topics and ACK advances offsets for all topics"() {
         given: "one message is enqueued on prices-v1 and one on reference-data-v5"
         cloudServer.enqueueMessages([
             [offset: 1L, topic: 'prices-v1', partition: 0,
@@ -92,10 +103,15 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
             assert legacyClient.received.any { it instanceof BatchEvent }
         }
 
-        and: "the received legacy batches cover both topic messages"
+        and: "ACKing each observed batch lets delivery continue until both topic messages arrive"
+        int acknowledgedBatches = 0
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
-            def allBatchKeys = legacyClient.received
-                .findAll { it instanceof BatchEvent }
+            def batches = legacyClient.received.findAll { it instanceof BatchEvent }
+            while (acknowledgedBatches < batches.size()) {
+                legacyClient.sendAck()
+                acknowledgedBatches++
+            }
+            def allBatchKeys = batches
                 .collectMany { (it as BatchEvent).messages*.key }
                 .toSet()
             assert allBatchKeys.contains('legacy-price-1')
@@ -105,10 +121,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         and: "no wire errors on the connection"
         legacyClient.errors.isEmpty()
 
-        when: "legacy client ACKs all received batches"
-        legacyClient.received.findAll { it instanceof BatchEvent }.each { legacyClient.sendAck() }
-
-        then: "offsets advance in ConsumerOffsetTracker for all delivered topics"
+        and: "offsets advance in ConsumerOffsetTracker for all delivered topics"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             def priceOffset = offsetTracker.getOffset('price-quote-service:prices-v1')
@@ -137,16 +150,29 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
             assert legacyClient.received.any { it instanceof BatchEvent }
         }
-        def beforeAck = legacyClient.received.findAll { it instanceof BatchEvent }.size()
+        def beforeAck = legacyClient.received
+            .findAll { it instanceof BatchEvent }
+            .collectMany { (it as BatchEvent).messages*.key }
+            .count { it == 'legacy-dedup-1' }
 
         when: "ACK is sent and then no new messages are enqueued"
         legacyClient.received.findAll { it instanceof BatchEvent }.each { legacyClient.sendAck() }
+        def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
+        new PollingConditions(timeout: 10, delay: 0.3).eventually {
+            assert offsetTracker.getOffset('price-quote-service:prices-v1') >= 2L
+        }
         waitForStableValue(2000) {
-            legacyClient.received.findAll { it instanceof BatchEvent }.size()
+            legacyClient.received
+                .findAll { it instanceof BatchEvent }
+                .collectMany { (it as BatchEvent).messages*.key }
+                .count { it == 'legacy-dedup-1' }
         }
 
         then: "no additional BatchEvents are received after the ACK"
-        def afterAck = legacyClient.received.findAll { it instanceof BatchEvent }.size()
+        def afterAck = legacyClient.received
+            .findAll { it instanceof BatchEvent }
+            .collectMany { (it as BatchEvent).messages*.key }
+            .count { it == 'legacy-dedup-1' }
         afterAck == beforeAck  // count did not grow → no re-delivery
 
         and: "no wire errors"

@@ -94,7 +94,9 @@ class BlackBoxMockCloudServer {
             def parts = requestLine.split(' ')
             def path = parts.length > 1 ? parts[1] : '/'
             def out = new DataOutputStream(client.outputStream)
-            if (path.startsWith('/registry/topology')) {
+            if (path.startsWith('/health')) {
+                sendText(out, 200, 'OK')
+            } else if (path.startsWith('/registry/topology')) {
                 serveTopology(out)
             } else if (path.startsWith('/pipe/poll')) {
                 servePipePoll(out)

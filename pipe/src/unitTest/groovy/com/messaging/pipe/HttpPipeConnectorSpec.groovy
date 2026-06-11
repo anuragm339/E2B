@@ -5,6 +5,8 @@ import spock.lang.Specification
 import spock.lang.TempDir
 
 import java.nio.file.Path
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
 
 /**
  * Unit tests for HttpPipeConnector - HTTP-based parent broker connection
@@ -151,5 +153,28 @@ class HttpPipeConnectorSpec extends Specification {
 
         then: "future completes successfully"
         future.get() == null
+    }
+
+    def "disconnect keeps connector reusable and destroy terminates it permanently"() {
+        given:
+        def connector = new HttpPipeConnector(
+                null, tempDir.toString(), 100L, 1000L, 5, Mock(PipeMetrics))
+
+        when:
+        def first = connector.connectToParent("http://127.0.0.1:1").get(2, TimeUnit.SECONDS)
+        connector.disconnect()
+        def second = connector.connectToParent("http://127.0.0.1:1").get(2, TimeUnit.SECONDS)
+
+        then:
+        !first.connected
+        second.connected
+        noExceptionThrown()
+
+        when:
+        connector.destroy()
+        connector.connectToParent("http://127.0.0.1:1").get(2, TimeUnit.SECONDS)
+
+        then:
+        thrown(ExecutionException)
     }
 }

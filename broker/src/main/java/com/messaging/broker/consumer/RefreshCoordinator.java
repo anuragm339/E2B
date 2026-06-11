@@ -87,6 +87,35 @@ public class RefreshCoordinator {
     }
 
     /**
+     * Backward-compatible constructor used by older tests that do not care about
+     * refresh-state metric emission.
+     */
+    @Deprecated
+    public RefreshCoordinator(
+            RefreshStarter initiationService,
+            ResetPhase resetService,
+            ReplayPhase replayService,
+            ReadyPhase readyService,
+            RefreshRecovery recoveryService,
+            RefreshWorkflow stateMachine,
+            RefreshGatePolicy dataRefreshGatePolicy,
+            BatchDeliveryService batchDeliveryService,
+            ConsumerRegistry remoteConsumers) {
+        this(
+                initiationService,
+                resetService,
+                replayService,
+                readyService,
+                recoveryService,
+                stateMachine,
+                dataRefreshGatePolicy,
+                batchDeliveryService,
+                remoteConsumers,
+                null
+        );
+    }
+
+    /**
      * Inject shared state into all services.
      */
     private void wireServices() {
@@ -217,7 +246,9 @@ public class RefreshCoordinator {
         RefreshWorkflow.StateTransitionResult result = stateMachine.transition(state, RefreshState.ABORTED);
         if (result.isSuccess()) {
             context.setState(RefreshState.ABORTED);
-            dataRefreshMetrics.updateRefreshState(topic, RefreshState.ABORTED);
+            if (dataRefreshMetrics != null) {
+                dataRefreshMetrics.updateRefreshState(topic, RefreshState.ABORTED);
+            }
 
             ScheduledFuture<?> resetTask = resetRetryTasks.remove(topic);
             if (resetTask != null) resetTask.cancel(false);
@@ -259,7 +290,9 @@ public class RefreshCoordinator {
 
             if (transition.isSuccess()) {
                 context.setState(RefreshState.REPLAYING);
-                dataRefreshMetrics.updateRefreshState(topic, RefreshState.REPLAYING);
+                if (dataRefreshMetrics != null) {
+                    dataRefreshMetrics.updateRefreshState(topic, RefreshState.REPLAYING);
+                }
                 if (resetService instanceof RefreshResetService) {
                     ((RefreshResetService) resetService).persistState(context);
                 }

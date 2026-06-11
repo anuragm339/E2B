@@ -19,8 +19,13 @@ public class ConsumerOffsetTracker {
     private static final Logger log = LoggerFactory.getLogger(ConsumerOffsetTracker.class);
     private static final String OFFSET_FILE = "consumer-offsets.properties";
     private static final long FLUSH_INTERVAL_MS = 5000;
+    // Minimum gap between synchronous flushes triggered by updateOffset(). Each flush
+    // rewrites the whole properties file — doing that per ACK hammers flash storage.
+    private static final long MIN_SYNC_FLUSH_GAP_MS = 1000;
 
     private final FlushingPropertiesStore repository;
+    private final java.util.concurrent.atomic.AtomicLong lastSyncFlushMs =
+            new java.util.concurrent.atomic.AtomicLong(0);
 
     public ConsumerOffsetTracker(@Value("${broker.storage.data-dir:./data}") String dataDir) {
         this.repository = new FlushingPropertiesStore(
@@ -50,15 +55,36 @@ public class ConsumerOffsetTracker {
     }
 
     /**
-     * Update offset for a consumer and flush immediately to disk.
-     * Synchronous flush prevents offset loss on unexpected JVM exit: if the background
-     * flush is blocked by EMFILE (too many open files from FD leaks), offsets written
-     * only to the in-memory cache are lost on restart, causing consumers to replay from
-     * offset 0 and inflating delivery metrics.
+     * Get the committed offset for a consumer, or -1 when nothing has ever been committed.
+     *
+     * Unlike {@link #getOffset}, this distinguishes "no commit yet" from "committed through
+     * offset 0" — callers that must decide between "start from earliest" and "resume after
+     * the committed offset" need that distinction (a default of 0 silently makes the record
+     * at offset 0 undeliverable).
+     */
+    public long getCommittedOffset(String consumerId) {
+        String value = repository.get(consumerId);
+        return value != null ? Long.parseLong(value) : -1L;
+    }
+
+    /**
+     * Update offset for a consumer and flush to disk, rate-limited to one synchronous
+     * flush per {@link #MIN_SYNC_FLUSH_GAP_MS}.
+     *
+     * The synchronous flush exists to bound offset loss on unexpected JVM exit (the
+     * original EMFILE incident left in-memory offsets unflushed and consumers replayed
+     * from 0). Flushing on EVERY ACK, however, rewrites the whole properties file per
+     * batch — needless flash wear and IO on POS hardware. The rate limit bounds loss to
+     * ~1s of ACK progress (offsets are at-least-once safe to lose); the 5s background
+     * flusher and the final flush on stop cover the remainder.
      */
     public void updateOffset(String consumerId, long offset) {
         repository.put(consumerId, String.valueOf(offset));
-        repository.flush();
+        long now = System.currentTimeMillis();
+        long last = lastSyncFlushMs.get();
+        if (now - last >= MIN_SYNC_FLUSH_GAP_MS && lastSyncFlushMs.compareAndSet(last, now)) {
+            repository.flush();
+        }
     }
 
     /**

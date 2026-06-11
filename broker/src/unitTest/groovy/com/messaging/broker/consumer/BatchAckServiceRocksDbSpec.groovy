@@ -46,10 +46,8 @@ class BatchAckServiceRocksDbSpec extends Specification {
     def "modern ACK path calls ackStore.putBatch with correct offsets for all records"() {
         given:
         def deliveryKey = DeliveryKey.of("group1", "prices-v1")
-        stateService.getTraceId(deliveryKey) >> "trace-1"
-        stateService.getBatchSendTime(deliveryKey) >> 1000L
-        stateService.removePendingOffset(deliveryKey) >> 5L       // nextOffset = 5 (atomic remove)
-        stateService.getFromOffset(deliveryKey) >> 2L             // startOffset = 2
+        stateService.claimPendingDelivery(deliveryKey) >>
+                new PendingDelivery(1L, 2L, 5L, 2L, 1000L, "trace-1")
 
         def consumerKey = ConsumerKey.of("client-1", "prices-v1", "group1")
         def consumer = Mock(RemoteConsumer)
@@ -77,10 +75,8 @@ class BatchAckServiceRocksDbSpec extends Specification {
     def "modern ACK path does not call ackStore when fromOffset is null"() {
         given:
         def deliveryKey = DeliveryKey.of("group1", "prices-v1")
-        stateService.getTraceId(deliveryKey) >> "trace-1"
-        stateService.getBatchSendTime(deliveryKey) >> 1000L
-        stateService.removePendingOffset(deliveryKey) >> 5L       // atomic remove
-        stateService.getFromOffset(deliveryKey) >> null           // not set
+        stateService.claimPendingDelivery(deliveryKey) >>
+                new PendingDelivery(1L, 2L, 5L, null, 1000L, "trace-1")
 
         def consumerKey = ConsumerKey.of("client-1", "prices-v1", "group1")
         def consumer = Mock(RemoteConsumer)
@@ -96,12 +92,10 @@ class BatchAckServiceRocksDbSpec extends Specification {
     }
 
     def "modern ACK path with no pending offset (late ACK) writes nothing to RocksDB"() {
-        given: "removePendingOffset returns null — simulates a late ACK or double ACK"
+        given: "the generation claim returns null — simulates a late ACK or double ACK"
         def deliveryKey = DeliveryKey.of("group1", "prices-v1")
         stateService.getTraceId(deliveryKey) >> "trace-1"
-        stateService.getBatchSendTime(deliveryKey) >> 1000L
-        stateService.removePendingOffset(deliveryKey) >> null   // late ACK — method returns early
-        stateService.getFromOffset(deliveryKey) >> 2L
+        stateService.claimPendingDelivery(deliveryKey) >> null
 
         def consumerKey = ConsumerKey.of("client-1", "prices-v1", "group1")
         def consumer = Mock(RemoteConsumer)
@@ -124,10 +118,8 @@ class BatchAckServiceRocksDbSpec extends Specification {
         // (simulating truncation), the second call returns the remaining 41.
         // Without the loop fix, only the first 60 records would reach RocksDB.
         def deliveryKey = DeliveryKey.of("group-large", "prices-v1")
-        stateService.getTraceId(deliveryKey)         >> "trace-large"
-        stateService.getBatchSendTime(deliveryKey)   >> 9000L
-        stateService.removePendingOffset(deliveryKey) >> 1101L   // nextOffset (lastOffset=1100)
-        stateService.getFromOffset(deliveryKey)       >> 1000L   // first record offset
+        stateService.claimPendingDelivery(deliveryKey) >>
+                new PendingDelivery(2L, 1000L, 1101L, 1000L, 9000L, "trace-large")
 
         def consumerKey = ConsumerKey.of("client-large", "prices-v1", "group-large")
         def consumer = Mock(RemoteConsumer) { getCurrentOffset() >> 1101L }
@@ -171,10 +163,8 @@ class BatchAckServiceRocksDbSpec extends Specification {
     def "records at or beyond toOffset are excluded from the RocksDB write"() {
         given: "storage returns a record beyond the batch boundary (offset == toOffset)"
         def deliveryKey = DeliveryKey.of("group-boundary", "prices-v1")
-        stateService.getTraceId(deliveryKey)          >> "trace-b"
-        stateService.getBatchSendTime(deliveryKey)    >> 5000L
-        stateService.removePendingOffset(deliveryKey) >> 10L   // nextOffset = 10 (toOffset)
-        stateService.getFromOffset(deliveryKey)        >> 7L   // fromOffset
+        stateService.claimPendingDelivery(deliveryKey) >>
+                new PendingDelivery(3L, 7L, 10L, 7L, 5000L, "trace-b")
 
         def consumerKey = ConsumerKey.of("client-boundary", "prices-v1", "group-boundary")
         registrationService.getConsumer(consumerKey) >> Optional.of(Mock(RemoteConsumer) {
@@ -210,9 +200,8 @@ class BatchAckServiceRocksDbSpec extends Specification {
         batch.add("prices-v1", msg1)
         batch.add("prices-v1", msg2)
 
-        pendingAckStore.getSendTime("client-legacy") >> 1000L
-        pendingAckStore.removeTimer("client-legacy") >> null
-        pendingAckStore.removePendingBatch("client-legacy") >> batch
+        pendingAckStore.claimPendingDelivery("client-legacy") >>
+                new PendingLegacyDelivery(1L, batch, null, 1000L)
 
         when:
         service.handleLegacyBatchAck("client-legacy", "price-quote-group")
@@ -238,9 +227,8 @@ class BatchAckServiceRocksDbSpec extends Specification {
         batch.getMessageCount() >> 1
         batch.getTotalBytes() >> 50L
 
-        pendingAckStore.getSendTime("client-legacy") >> 1000L
-        pendingAckStore.removeTimer("client-legacy") >> null
-        pendingAckStore.removePendingBatch("client-legacy") >> batch
+        pendingAckStore.claimPendingDelivery("client-legacy") >>
+                new PendingLegacyDelivery(1L, batch, null, 1000L)
         storage.getCurrentOffset("prices-v1", 0) >> 11L
 
         when:

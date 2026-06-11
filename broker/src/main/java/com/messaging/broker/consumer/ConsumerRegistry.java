@@ -24,8 +24,10 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 /**
@@ -37,6 +39,7 @@ public class ConsumerRegistry {
     private static final Logger log = LoggerFactory.getLogger(ConsumerRegistry.class);
     private static final long LEGACY_PENDING_ACK_WARN_THRESHOLD_MS = 5_000L;
     private static final long LEGACY_BLOCKED_WARN_INTERVAL_MS = 10_000L;
+    private static final long NETWORK_SEND_TIMEOUT_SECONDS = 10L;
 
     private final ConsumerRegistrationService registrationService;
     private final ConsumerReadinessService readinessService;
@@ -142,6 +145,11 @@ public class ConsumerRegistry {
         Collection<RemoteConsumer> consumers = registrationService.getConsumersByClient(clientId);
 
         for (RemoteConsumer consumer : consumers) {
+            java.util.concurrent.Future<?> deliveryTask = consumer.getDeliveryTask();
+            if (deliveryTask != null) {
+                deliveryTask.cancel(false);
+                consumer.setDeliveryTask(null);
+            }
             stateService.removeDeliveryState(DeliveryKey.of(consumer.getGroup(), consumer.getTopic()));
             metrics.completePendingAck(consumer.getTopic(), consumer.getGroup());
         }
@@ -154,6 +162,12 @@ public class ConsumerRegistry {
         }
 
         return registrationService.unregisterConsumer(clientId);
+    }
+
+    public boolean isRegistered(RemoteConsumer consumer) {
+        return registrationService.getConsumer(
+                ConsumerKey.of(consumer.getClientId(), consumer.getTopic(), consumer.getGroup()))
+                .isPresent();
     }
 
     /**
@@ -245,17 +259,17 @@ public class ConsumerRegistry {
 
             Timer.Sample deliverySample = metrics.startConsumerDeliveryTimer();
 
-            // Atomic delivery-slot reservation: putIfAbsent on the underlying ConcurrentHashMap
-            // ensures only one thread proceeds to the network send even without a method-level lock.
-            // Must happen BEFORE the send so an early ACK finds the pending batch in the store.
-            if (!pendingAckStore.putPendingBatchIfAbsent(clientId, batch)) {
+            // Reserve all ACK-visible state before the send so an immediate ACK can claim one
+            // immutable generation without observing partially initialized maps.
+            long sendTime = System.currentTimeMillis();
+            long deliveryGeneration =
+                    pendingAckStore.reservePendingBatch(clientId, batch, deliverySample, sendTime);
+            if (deliveryGeneration < 0) {
                 metrics.recordLegacyDeliveryBlocked(consumerGroup, "slot_taken");
                 logLegacyPendingAckBlocked(clientId, consumerGroup, "slot_taken",
                         pendingAckStore.getPendingBatch(clientId));
                 return false;
             }
-            pendingAckStore.recordSendTime(clientId, System.currentTimeMillis());
-            pendingAckStore.startTimer(clientId, deliverySample);
             metrics.recordBatchSize(batch.getMessageCount());
             metrics.recordLegacyBatchSent(consumerGroup, batch.getMessageCount(), batch.getMaxOffsetPerTopic().size());
 
@@ -264,12 +278,9 @@ public class ConsumerRegistry {
             }
 
             try {
-                server.send(clientId, batchMessage).get();
+                awaitSend(server.send(clientId, batchMessage));
             } catch (Exception sendEx) {
-                // Send failed — remove the pre-stored batch so delivery isn't permanently blocked
-                pendingAckStore.removePendingBatch(clientId);
-                pendingAckStore.removeTimer(clientId);
-                pendingAckStore.removeClient(clientId);
+                pendingAckStore.claimPendingDelivery(clientId, deliveryGeneration);
                 metrics.clearLegacyPendingBatch(consumerGroup);
                 log.warn("event=legacy_batch.send_failed clientId={} group={} messageCount={} bytes={} topicOffsets={} error={}",
                         clientId, consumerGroup, batch.getMessageCount(), batch.getTotalBytes(),
@@ -277,23 +288,21 @@ public class ConsumerRegistry {
                 throw sendEx;
             }
 
-            // Schedule ACK timeout: if the consumer never ACKs, unblock delivery after the timeout window.
-            // Use send timestamp (not the batch object) as the identity check to avoid retaining the
-            // ~1MB MergedBatch in the lambda closure for the full 60-second timeout window.
-            final long batchSendTime = pendingAckStore.getSendTime(clientId);
+            // The timeout can only claim the generation it was created for. A stale timer can
+            // never clear a newer batch, even when two sends share the same millisecond timestamp.
+            final long batchSendTime = sendTime;
             consumerScheduler.schedule(() -> {
-                if (pendingAckStore.getSendTime(clientId) == batchSendTime) {
-                    MergedBatch pending = pendingAckStore.getPendingBatch(clientId);
-                    if (pending != null) {
-                        long pendingAgeMs = Math.max(0, System.currentTimeMillis() - batchSendTime);
-                        log.warn("event=legacy_batch.ack_timeout clientId={} group={} pendingAckAgeMs={} messageCount={} topicCount={} topicOffsets={} action=clear_pending_batch",
-                                clientId, consumerGroup, pendingAgeMs, pending.getMessageCount(),
-                                pending.getMaxOffsetPerTopic().size(), pending.getMaxOffsetPerTopic());
-                        metrics.recordLegacyBatchTimeout(consumerGroup);
-                        pendingAckStore.removeClient(clientId);
-                        for (String t : pending.getMaxOffsetPerTopic().keySet()) {
-                            metrics.completePendingAck(t, consumerGroup);
-                        }
+                PendingLegacyDelivery timedOut =
+                        pendingAckStore.claimPendingDelivery(clientId, deliveryGeneration);
+                if (timedOut != null) {
+                    MergedBatch pending = timedOut.batch();
+                    long pendingAgeMs = Math.max(0, System.currentTimeMillis() - timedOut.sendTime());
+                    log.warn("event=legacy_batch.ack_timeout clientId={} group={} pendingAckAgeMs={} messageCount={} topicCount={} topicOffsets={} action=clear_pending_batch",
+                            clientId, consumerGroup, pendingAgeMs, pending.getMessageCount(),
+                            pending.getMaxOffsetPerTopic().size(), pending.getMaxOffsetPerTopic());
+                    metrics.recordLegacyBatchTimeout(consumerGroup);
+                    for (String t : pending.getMaxOffsetPerTopic().keySet()) {
+                        metrics.completePendingAck(t, consumerGroup);
                     }
                 }
             }, legacyAckTimeoutMs, TimeUnit.MILLISECONDS);
@@ -439,7 +448,7 @@ public class ConsumerRegistry {
                     System.currentTimeMillis(),
                     new byte[0]
             );
-            server.send(clientId, readyMessage).get();
+            awaitSend(server.send(clientId, readyMessage));
             log.debug("Sent READY to legacy consumer: {}", clientId);
 
             // Schedule retry if no ACK received
@@ -460,7 +469,7 @@ public class ConsumerRegistry {
                     System.currentTimeMillis(),
                     topicBytes
             );
-            server.send(clientId, readyMessage).get();
+            awaitSend(server.send(clientId, readyMessage));
             log.debug("Sent READY to modern consumer: {}:{}:{}", clientId, topic, group);
 
             // Schedule retry if no ACK received
@@ -485,7 +494,7 @@ public class ConsumerRegistry {
 
         for (String clientId : clientIds) {
             try {
-                server.send(clientId, resetMsg).get();
+                awaitSend(server.send(clientId, resetMsg));
                 log.debug("Sent RESET to consumer {} for topic {}", clientId, topic);
             } catch (Exception e) {
                 log.error("Failed to send RESET to consumer {} for topic {}", clientId, topic, e);
@@ -510,7 +519,7 @@ public class ConsumerRegistry {
 
         for (String clientId : clientIds) {
             try {
-                server.send(clientId, readyMsg).get();
+                awaitSend(server.send(clientId, readyMsg));
                 log.debug("Sent READY to consumer {} for topic {}", clientId, topic);
             } catch (Exception e) {
                 log.error("Failed to send READY to consumer {} for topic {}", clientId, topic, e);
@@ -532,7 +541,7 @@ public class ConsumerRegistry {
                 topicPayload
         );
         try {
-            server.send(clientId, readyMsg).get();
+            awaitSend(server.send(clientId, readyMsg));
             log.info("event=refresh.ready_sent_late_joiner clientId={} topic={}", clientId, topic);
         } catch (Exception e) {
             log.error("Failed to send refresh READY to consumer {} for topic {}", clientId, topic, e);
@@ -560,7 +569,7 @@ public class ConsumerRegistry {
                     String groupTopic = consumer.getGroup() + ":" + consumer.getTopic();
                     if (ackedGroupTopics.contains(groupTopic)) {
                         try {
-                            server.send(clientId, readyMsg).get();
+                            awaitSend(server.send(clientId, readyMsg));
                             log.info("event=refresh.ready_sent clientId={} topic={}", clientId, topic);
                         } catch (Exception e) {
                             log.error("Failed to send refresh READY to consumer {} for topic {}", clientId, topic, e);
@@ -572,6 +581,19 @@ public class ConsumerRegistry {
     }
 
     // ==================== UTILITY METHODS ====================
+
+    private void awaitSend(CompletableFuture<Void> future) throws Exception {
+        try {
+            future.get(NETWORK_SEND_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw e;
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw e;
+        }
+    }
 
     /**
      * Check if consumer is legacy.

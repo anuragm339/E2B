@@ -9,13 +9,20 @@ import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 /**
@@ -34,11 +41,19 @@ public class TopologyManager {
     private final String nodeId;
     private final ScheduledExecutorService scheduler;
     private final TopologyPropertiesStore propertiesStore;
+    // Lightweight HTTP client used ONLY for probing a candidate parent's /health
+    // before tearing down the live connection to the current parent.
+    private final HttpClient probeHttp = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(2))
+            .build();
+    // Package-private so unit tests can swap a deterministic probe.
+    java.util.function.Predicate<String> parentReachableProbe = this::probeParentReachableHttp;
 
     private volatile String currentParentUrl;
     private volatile TopologyResponse currentTopology;
     private volatile Function<MessageRecord, Boolean> messageHandler;
-    private volatile boolean running;
+    private final AtomicBoolean running = new AtomicBoolean();
+    private final AtomicBoolean queryInFlight = new AtomicBoolean();
 
     public TopologyManager(
             CloudRegistryClient registryClient,
@@ -57,8 +72,6 @@ public class TopologyManager {
             t.setName("TopologyManager");
             return t;
         });
-        this.running = false;
-
         // Initialize properties store
         Path dataDirPath = Paths.get(dataDir);
         this.propertiesStore = new TopologyPropertiesStore(dataDirPath);
@@ -75,8 +88,10 @@ public class TopologyManager {
             return;
         }
 
+        if (!running.compareAndSet(false, true)) {
+            return;
+        }
         log.info("Starting topology manager...");
-        running = true;
 
         // Schedule periodic registry queries
         scheduler.scheduleWithFixedDelay(
@@ -99,7 +114,7 @@ public class TopologyManager {
      * Query Cloud Registry and update topology if changed
      */
     private void queryAndUpdateTopology() {
-        if (!running) {
+        if (!running.get() || !queryInFlight.compareAndSet(false, true)) {
             return;
         }
 
@@ -107,15 +122,23 @@ public class TopologyManager {
             log.debug("Querying Cloud Registry for topology...");
 
             registryClient.getTopology(registryUrl, nodeId).whenComplete((topology, ex) -> {
-                if (ex != null) {
-//                    log.error("Failed to query Cloud Registry", ex);
-                    return;
-                }
+                try {
+                    if (!running.get()) {
+                        return;
+                    }
+                    if (ex != null) {
+                        log.warn("Failed to query Cloud Registry", ex);
+                        return;
+                    }
 
-                handleTopologyUpdate(topology);
+                    handleTopologyUpdate(topology);
+                } finally {
+                    queryInFlight.set(false);
+                }
             });
 
         } catch (Exception e) {
+            queryInFlight.set(false);
             log.error("Error in queryAndUpdateTopology", e);
         }
     }
@@ -142,16 +165,22 @@ public class TopologyManager {
                 return;
             }
 
-            // If parent changed, reconnect
+            // If parent changed, keep the old connection live until the new parent
+            // has passed the reachability probe.
             if (!newParentUrl.equals(currentParentUrl)) {
-                log.info("Parent changed from {} to {}", currentParentUrl, newParentUrl);
+                log.info("Parent change requested: {} -> {}", currentParentUrl, newParentUrl);
 
-                // Disconnect from old parent
+                // 1) Probe new parent BEFORE touching the live connection.
+                if (!parentReachableProbe.test(newParentUrl)) {
+                    log.warn("Cannot reach new parent {}; keeping connection to {}",
+                            newParentUrl, currentParentUrl);
+                    return;
+                }
+
+                // Probe succeeded — tear down old and connect to the new parent.
                 if (currentParentUrl != null) {
                     disconnectFromParent();
                 }
-
-                // Connect to new parent
                 connectToParent(newParentUrl);
             }
 
@@ -163,25 +192,26 @@ public class TopologyManager {
     }
 
     /**
-     * Connect to parent broker
+     * Connect to parent broker. Returns a future that completes when the underlying
+     * connector future resolves and currentParentUrl plus the handler are committed.
      */
-    private void connectToParent(String parentUrl) {
+    private CompletableFuture<Void> connectToParent(String parentUrl) {
         log.info("Connecting to parent: {}", parentUrl);
-
+        CompletableFuture<Void> done = new CompletableFuture<>();
         pipeConnector.connectToParent(parentUrl).whenComplete((connection, ex) -> {
             if (ex != null) {
                 log.error("Failed to connect to parent: {}", parentUrl, ex);
+                done.completeExceptionally(ex);
                 return;
             }
-
             log.info("Connected to parent: {}", parentUrl);
             currentParentUrl = parentUrl;
-
-            // Register message handler
             if (messageHandler != null) {
                 pipeConnector.onDataReceived(messageHandler);
             }
+            done.complete(null);
         });
+        return done;
     }
 
     /**
@@ -191,6 +221,30 @@ public class TopologyManager {
         log.info("Disconnecting from parent: {}", currentParentUrl);
         pipeConnector.disconnect();
         currentParentUrl = null;
+    }
+
+    /**
+     * Quick HTTP GET to the candidate parent's /health endpoint with a short timeout.
+     * Returns true iff the parent responds with a 2xx. Used before tearing down the
+     * live connection so a flaky/stale registry response can't strand the broker.
+     */
+    private boolean probeParentReachableHttp(String parentUrl) {
+        if (parentUrl == null || parentUrl.isBlank()) return false;
+        try {
+            HttpRequest req = HttpRequest.newBuilder(URI.create(parentUrl + "/health"))
+                    .timeout(Duration.ofSeconds(3))
+                    .GET()
+                    .build();
+            HttpResponse<Void> resp = probeHttp.send(req, HttpResponse.BodyHandlers.discarding());
+            boolean ok = resp.statusCode() / 100 == 2;
+            if (!ok) {
+                log.warn("Probe of {}/health returned HTTP {}", parentUrl, resp.statusCode());
+            }
+            return ok;
+        } catch (Exception e) {
+            log.warn("Probe of {}/health failed: {}", parentUrl, e.toString());
+            return false;
+        }
     }
 
     /**
@@ -207,14 +261,32 @@ public class TopologyManager {
         return currentParentUrl;
     }
 
+    /**
+     * This broker's stable node identifier (from broker.nodeId config).
+     */
+    public String getNodeId() {
+        return nodeId;
+    }
+
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down topology manager...");
-        running = false;
+        if (!running.compareAndSet(true, false)) {
+            return;
+        }
         scheduler.shutdown();
 
         if (currentParentUrl != null) {
             disconnectFromParent();
+        }
+
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
         }
 
         log.info("Topology manager shutdown complete");

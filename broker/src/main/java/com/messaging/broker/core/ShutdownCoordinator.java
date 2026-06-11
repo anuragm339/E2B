@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Coordinates graceful shutdown of managed executor services.
@@ -23,12 +24,15 @@ public class ShutdownCoordinator {
 
     private final List<ExecutorService> executors = new ArrayList<>();
     private final List<ScheduledExecutorService> schedulers = new ArrayList<>();
+    private final AtomicBoolean shutdownStarted = new AtomicBoolean();
 
     @Inject
     public ShutdownCoordinator(
             @Named("ackExecutor") ExecutorService ackExecutor,
             @Named("ackStorageExecutor") ExecutorService ackStorageExecutor,
             @Named("storageExecutor") ExecutorService storageExecutor,
+            @Named("compactionExecutor") ExecutorService compactionExecutor,
+            @Named("registryExecutor") ExecutorService registryExecutor,
             @Named("consumerScheduler") ScheduledExecutorService consumerScheduler,
             @Named("dataRefreshScheduler") ScheduledExecutorService dataRefreshScheduler,
             @Named("flushScheduler") ScheduledExecutorService flushScheduler) {
@@ -37,6 +41,8 @@ public class ShutdownCoordinator {
         this.executors.add(ackExecutor);
         this.executors.add(ackStorageExecutor);
         this.executors.add(storageExecutor);
+        this.executors.add(compactionExecutor);
+        this.executors.add(registryExecutor);
 
         // Register schedulers (shutdown before executors)
         this.schedulers.add(consumerScheduler);
@@ -53,6 +59,9 @@ public class ShutdownCoordinator {
      */
     @PreDestroy
     public void shutdown() {
+        if (!shutdownStarted.compareAndSet(false, true)) {
+            return;
+        }
         log.info("Starting graceful shutdown of {} schedulers and {} executors...",
                 schedulers.size(), executors.size());
 

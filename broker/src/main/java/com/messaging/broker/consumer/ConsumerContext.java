@@ -5,6 +5,8 @@ import com.messaging.common.annotation.RetryPolicy;
 import com.messaging.common.api.ErrorHandler;
 import com.messaging.common.api.MessageHandler;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 /**
  * Consumer metadata and state tracking
  */
@@ -21,7 +23,9 @@ public class ConsumerContext {
     private final long fixedRetryIntervalMs;
 
     private volatile long currentOffset;
-    private volatile int consecutiveFailures;
+    // AtomicInteger prevents lost-update races when the delivery scheduler and error paths
+    // mutate the counter concurrently (same precedent as RemoteConsumer).
+    private final AtomicInteger consecutiveFailures = new AtomicInteger(0);
     private volatile long lastFailureTime;
     private volatile boolean paused;
 
@@ -43,7 +47,6 @@ public class ConsumerContext {
         this.maxRetryDelayMs = annotation.maxRetryDelayMs();
         this.fixedRetryIntervalMs = annotation.fixedRetryIntervalMs();
         this.currentOffset = 0L;
-        this.consecutiveFailures = 0;
         this.lastFailureTime = 0L;
         this.paused = false;
     }
@@ -97,16 +100,16 @@ public class ConsumerContext {
     }
 
     public int getConsecutiveFailures() {
-        return consecutiveFailures;
+        return consecutiveFailures.get();
     }
 
     public void incrementFailures() {
-        ++consecutiveFailures;
+        consecutiveFailures.incrementAndGet();
         lastFailureTime = System.currentTimeMillis();
     }
 
     public void resetFailures() {
-        consecutiveFailures = 0;
+        consecutiveFailures.set(0);
         lastFailureTime = 0L;
     }
 
@@ -129,8 +132,9 @@ public class ConsumerContext {
     public long calculateRetryDelay() {
         switch (retryPolicy) {
             case EXPONENTIAL_THEN_FIXED:
-                if (consecutiveFailures <= maxExponentialRetries) {
-                    long delay = initialRetryDelayMs * (long) Math.pow(2.0, consecutiveFailures - 1);
+                int failures = consecutiveFailures.get();
+                if (failures <= maxExponentialRetries) {
+                    long delay = initialRetryDelayMs * (long) Math.pow(2.0, failures - 1);
                     return Math.min(delay, maxRetryDelayMs);
                 }
                 return fixedRetryIntervalMs;
@@ -170,6 +174,6 @@ public class ConsumerContext {
     @Override
     public String toString() {
         return String.format("ConsumerContext{id=%s, topic=%s, group=%s, offset=%d, failures=%d, paused=%b}",
-                consumerId, topic, group, currentOffset, consecutiveFailures, paused);
+                consumerId, topic, group, currentOffset, consecutiveFailures.get(), paused);
     }
 }

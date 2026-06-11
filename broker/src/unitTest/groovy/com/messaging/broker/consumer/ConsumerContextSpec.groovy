@@ -6,6 +6,10 @@ import com.messaging.common.api.MessageHandler
 import com.messaging.common.api.NoOpErrorHandler
 import spock.lang.Specification
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
 class ConsumerContextSpec extends Specification {
 
     def "calculates retry delay for each retry policy"() {
@@ -56,6 +60,31 @@ class ConsumerContextSpec extends Specification {
         context.consecutiveFailures == 0
         context.lastFailureTime == 0L
         context.toString().contains("prices-v1")
+    }
+
+    def "concurrent failure increments are not lost"() {
+        given:
+        int taskCount = 200
+        def context = contextFor(RetryPolicy.EXPONENTIAL_THEN_FIXED, Stub(MessageHandler))
+        def executor = Executors.newFixedThreadPool(8)
+        def start = new CountDownLatch(1)
+        def futures = (0..<taskCount).collect {
+            executor.submit {
+                start.await()
+                context.incrementFailures()
+            }
+        }
+
+        when:
+        start.countDown()
+        futures*.get(5, TimeUnit.SECONDS)
+
+        then:
+        context.consecutiveFailures == taskCount
+        context.lastFailureTime > 0L
+
+        cleanup:
+        executor.shutdownNow()
     }
 
     private static ConsumerContext contextFor(RetryPolicy policy, MessageHandler handler) {

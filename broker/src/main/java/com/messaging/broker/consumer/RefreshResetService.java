@@ -1,7 +1,7 @@
 package com.messaging.broker.consumer;
 
 import com.messaging.broker.ack.AckReconciliationScheduler;
-import com.messaging.broker.ack.RocksDbAckStore;
+import com.messaging.broker.ack.AckStore;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.monitoring.RefreshEventLogger;
 import com.messaging.broker.consumer.ConsumerRegistry;
@@ -24,7 +24,7 @@ public class RefreshResetService implements ResetPhase {
     private final DataRefreshMetrics metrics;
     private final RefreshStateStore stateStore;
     private final RefreshEventLogger refreshLogger;
-    private final RocksDbAckStore ackStore;
+    private final AckStore ackStore;
     private final AckReconciliationScheduler reconciliationScheduler;
 
     public RefreshResetService(
@@ -32,7 +32,7 @@ public class RefreshResetService implements ResetPhase {
             DataRefreshMetrics metrics,
             RefreshStateStore stateStore,
             RefreshEventLogger refreshLogger,
-            RocksDbAckStore ackStore,
+            AckStore ackStore,
             AckReconciliationScheduler reconciliationScheduler) {
         this.remoteConsumers = remoteConsumers;
         this.metrics = metrics;

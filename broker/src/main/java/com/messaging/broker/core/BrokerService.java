@@ -1,7 +1,7 @@
 package com.messaging.broker.core;
 
 import com.messaging.broker.ack.AckStoreSeeder;
-import com.messaging.broker.compaction.RocksDbCompactionIndex;
+import com.messaging.broker.compaction.CompactionIndex;
 import com.messaging.broker.handler.DisconnectHandler;
 import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.handler.MessageHandlerRegistry;
@@ -23,13 +23,9 @@ import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Inject;
-import jakarta.inject.Named;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Main broker service that wires storage and network together
@@ -46,9 +42,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final BrokerMetrics metrics;
     private final MessageHandlerRegistry handlerRegistry;
     private final DisconnectHandler disconnectHandler;
-    private final ExecutorService ackExecutor;
+    private final ShutdownCoordinator shutdownCoordinator;
     private final AckStoreSeeder ackStoreSeeder;
-    private final RocksDbCompactionIndex compactionIndex;
+    private final CompactionIndex compactionIndex;
     private final int serverPort;
     private final boolean ackStoreSeedOnStartupEnabled;
 
@@ -62,9 +58,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             BrokerMetrics metrics,
             MessageHandlerRegistry handlerRegistry,
             DisconnectHandler disconnectHandler,
-            @Named("ackExecutor") ExecutorService ackExecutor,
+            ShutdownCoordinator shutdownCoordinator,
             AckStoreSeeder ackStoreSeeder,
-            RocksDbCompactionIndex compactionIndex,
+            CompactionIndex compactionIndex,
             @Value("${broker.network.port:9092}") int serverPort,
             @Value("${ack-store.seed-on-startup.enabled:true}") boolean ackStoreSeedOnStartupEnabled) {
 
@@ -76,7 +72,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.metrics = metrics;
         this.handlerRegistry = handlerRegistry;
         this.disconnectHandler = disconnectHandler;
-        this.ackExecutor = ackExecutor;
+        this.shutdownCoordinator = shutdownCoordinator;
         this.ackStoreSeeder = ackStoreSeeder;
         this.compactionIndex = compactionIndex;
         this.serverPort = serverPort;
@@ -112,7 +108,11 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             try {
                 ackStoreSeeder.seed();
             } catch (Exception e) {
-                log.warn("AckStoreSeeder failed — continuing startup without backfill", e);
+                // Degrade, don't brick: a transient RocksDB problem (disk full, leftover lock)
+                // must not make a store device unbootable. The reconciliation scheduler
+                // detects and reports any ACK gaps the failed seeding would have closed.
+                log.error("ACK store seeding failed — continuing startup with possibly " +
+                        "incomplete ACK state; reconciliation will surface any gaps", e);
             }
         } else {
             log.info("AckStoreSeeder skipped at startup because ack-store.seed-on-startup.enabled=false");
@@ -176,6 +176,19 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // Use topic from record, fallback to default if not set
             String topic = record.getTopic();
 
+            // Duplicate guard: parent offsets are monotonically increasing per topic, so a
+            // record at or below the topic's storage head was already stored — the parent
+            // re-sent it (poll retry after a mid-stream failure). Re-appending it would create
+            // duplicate physical records with the same offset and break the sorted-index
+            // invariant. Treat as success so the pipe offset advances past it.
+            long topicHead = storage.getCurrentOffset(topic, 0);
+            if (record.getOffset() > 0 && record.getOffset() <= topicHead) {
+                log.info("event=pipe_message.duplicate_skipped topic={} offset={} storageHead={}",
+                        topic, record.getOffset(), topicHead);
+                metrics.stopE2ETimer(e2eSample);
+                return true;
+            }
+
             Timer.Sample storageSample = metrics.startStorageWriteTimer();
             long offset = storage.append(topic, 0, record);
             metrics.stopStorageWriteTimer(storageSample);
@@ -236,19 +249,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     public void shutdown() {
         log.info("Shutting down broker...");
 
-        // Shutdown ACK executor first to stop accepting new ACKs
-        log.info("Shutting down ACK executor...");
-        ackExecutor.shutdown();
-        try {
-            if (!ackExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
-                log.warn("ACK executor did not terminate in time, forcing shutdown");
-                ackExecutor.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            log.warn("Interrupted while waiting for ACK executor shutdown", e);
-            ackExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
+        // Stop network ingress before draining executors so no new ACK tasks are accepted.
+        server.shutdown();
 
         // Stop adaptive delivery manager
         adaptiveDeliveryManager.stop();
@@ -259,8 +261,9 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         // Stop consumer delivery
         consumerDelivery.shutdown();
 
-        // Shutdown server and storage
-        server.shutdown();
+        // Drain the centrally owned executor beans after all producers have stopped.
+        shutdownCoordinator.shutdown();
+
         try {
             storage.close();
         } catch (Exception e) {

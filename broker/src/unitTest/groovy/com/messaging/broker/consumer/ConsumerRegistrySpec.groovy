@@ -167,12 +167,9 @@ class ConsumerRegistrySpec extends Specification {
 
         then:
         !delivered
-        1 * pendingAckStore.putPendingBatchIfAbsent("legacy-client", batch) >> true
-        1 * pendingAckStore.recordSendTime("legacy-client", _ as Long)
-        1 * pendingAckStore.startTimer("legacy-client", _ as Timer.Sample)
-        1 * pendingAckStore.removePendingBatch("legacy-client")
-        1 * pendingAckStore.removeTimer("legacy-client")
-        1 * pendingAckStore.removeClient("legacy-client")
+        1 * pendingAckStore.reservePendingBatch(
+                "legacy-client", batch, _ as Timer.Sample, _ as Long) >> 7L
+        1 * pendingAckStore.claimPendingDelivery("legacy-client", 7L)
         1 * metrics.recordConsumerFailure("legacy-client", "prices-v1", "svc")
     }
 
@@ -189,8 +186,8 @@ class ConsumerRegistrySpec extends Specification {
 
         readinessService.isLegacyConsumerReady("legacy-client") >> true
         pendingAckStore.getPendingBatch("legacy-client") >> null >>  batch >> batch
-        pendingAckStore.putPendingBatchIfAbsent("legacy-client", batch) >> true
-        pendingAckStore.getSendTime("legacy-client") >> 123L
+        pendingAckStore.reservePendingBatch(
+                "legacy-client", batch, _ as Timer.Sample, _ as Long) >> 7L
         registrationService.getConsumersByClient("legacy-client") >> [legacy]
         legacyDeliveryManager.buildMergedBatch(["prices-v1"], "svc", 1024) >> batch
         metrics.startConsumerDeliveryTimer() >> Mock(Timer.Sample)

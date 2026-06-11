@@ -16,6 +16,8 @@ import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Manages READY_ACK workflow with retry handling.
@@ -26,6 +28,7 @@ public class ConsumerReadinessManager implements ConsumerReadinessService {
     private static final Logger log = LoggerFactory.getLogger(ConsumerReadinessManager.class);
     private static final int MAX_READY_RETRIES = 3;
     private static final long READY_RETRY_DELAY_MS = 5000; // 5 seconds
+    private static final long SEND_TIMEOUT_SECONDS = 10;
 
     private final ReadyStateStore readyStateStore;
     private final NetworkServer server;
@@ -82,6 +85,9 @@ public class ConsumerReadinessManager implements ConsumerReadinessService {
 
         ScheduledFuture<?> retryTask = scheduler.schedule(() -> {
             try {
+                if (isReady(clientId, topic, group)) {
+                    return;
+                }
                 byte[] payload = topic != null ? topic.getBytes(StandardCharsets.UTF_8) : new byte[0];
 
                 // Send READY message again
@@ -90,14 +96,19 @@ public class ConsumerReadinessManager implements ConsumerReadinessService {
                     System.currentTimeMillis(),
                     payload
                 );
-                server.send(clientId, readyMessage).get();
+                awaitSend(server.send(clientId, readyMessage));
 
                 log.info("🔄 READY retry {}/{} sent to {}",
                     retryCount + 1, MAX_READY_RETRIES, retryKey);
 
                 // Schedule next retry
-                scheduleReadyRetry(clientId, topic, group, retryCount + 1);
+                if (!isReady(clientId, topic, group)) {
+                    scheduleReadyRetry(clientId, topic, group, retryCount + 1);
+                }
 
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("READY retry interrupted for {}", retryKey);
             } catch (Exception e) {
                 log.error("Failed to send READY retry to {}: {}", retryKey, e.getMessage());
             }
@@ -122,5 +133,25 @@ public class ConsumerReadinessManager implements ConsumerReadinessService {
             return clientId;
         }
         return clientId + ":" + group + ":" + topic;
+    }
+
+    private boolean isReady(String clientId, String topic, String group) {
+        return topic == null
+                ? readyStateStore.isLegacyConsumerReady(clientId)
+                : readyStateStore.isModernConsumerTopicReady(
+                        clientId, DeliveryKey.of(group, topic));
+    }
+
+    private void awaitSend(CompletableFuture<Void> future) throws Exception {
+        try {
+            future.get(SEND_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw e;
+        } catch (InterruptedException e) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw e;
+        }
     }
 }

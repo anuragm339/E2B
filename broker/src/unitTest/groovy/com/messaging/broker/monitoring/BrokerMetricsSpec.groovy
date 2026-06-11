@@ -111,7 +111,6 @@ class BrokerMetricsSpec extends Specification {
         def timeSinceDelivery = metrics.getTimeSinceLastDelivery("group-a", "prices-v1")
         def timeSinceAck = metrics.getTimeSinceLastAck("group-a", "prices-v1")
         metrics.completePendingAck("prices-v1", "group-a")
-        metrics.removeConsumerMetrics("client-1", "prices-v1", "group-a")
 
         then:
         counter("broker.consumer.messages.sent", "topic", "prices-v1", "group", "group-a").count() == 5d
@@ -137,6 +136,19 @@ class BrokerMetricsSpec extends Specification {
         timeSinceAck >= 0
         metrics.getTimeSinceLastDelivery("group-a", "unknown-topic") == -1
         metrics.getTimeSinceLastAck("group-a", "unknown-topic") == -1
+
+        when:
+        metrics.removeConsumerMetrics("client-1", "prices-v1", "group-a")
+
+        then:
+        registry.find("broker.consumer.messages.sent")
+                .tags("topic", "prices-v1", "group", "group-a").meter() == null
+        registry.find("broker.consumer.offset")
+                .tags("topic", "prices-v1", "group", "group-a").meter() == null
+        registry.find("broker.consumer.pending_ack_age_seconds")
+                .tags("topic", "prices-v1", "group", "group-a").meter() == null
+        registry.find("ack.reconciliation.missing.keys")
+                .tags("topic", "prices-v1", "group", "group-a").meter() == null
     }
 
     private Counter counter(String name, String... tags) {

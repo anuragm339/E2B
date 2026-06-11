@@ -433,6 +433,7 @@ class RefreshCoordinatorSpec extends Specification {
         def context = new RefreshContext("topic", ["groupA:topic"] as Set)
         context.setState(RefreshState.REPLAYING)
         context.setRefreshId("refresh-1")
+        context.setLastReplayProgressTime(java.time.Instant.now().minusSeconds(601))
         coordinator.@activeRefreshes.put("topic", context)
         def replayTask = Mock(java.util.concurrent.ScheduledFuture)
         coordinator.@replayCheckTasks.put("topic", replayTask)
@@ -503,6 +504,7 @@ class RefreshCoordinatorSpec extends Specification {
         def context = new RefreshContext("topic", ["groupA:topic"] as Set)
         context.setState(RefreshState.REPLAYING)
         context.setRefreshId("refresh-abort")
+        context.setLastReplayProgressTime(java.time.Instant.now().minusSeconds(601))
         coordinator.@activeRefreshes.put("topic", context)
         // deliberately NO entries in resetRetryTasks or replayCheckTasks
 

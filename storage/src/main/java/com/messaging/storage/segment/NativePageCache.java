@@ -54,11 +54,21 @@ final class NativePageCache {
     }
 
     static void dropCache(FileChannel channel) {
-        if (!ENABLED || channel == null) return;
+        dropCacheRange(channel, 0, 0); // len 0 = whole file
+    }
+
+    /**
+     * Advise the kernel to drop cached pages for {@code [offset, offset+len)} of the file.
+     * {@code len == 0} means "to end of file". Used by the periodic flush to evict
+     * already-fsynced cold pages of the ACTIVE segment while keeping the hot tail
+     * (recently appended, still being delivered) cached.
+     */
+    static void dropCacheRange(FileChannel channel, long offset, long len) {
+        if (!ENABLED || channel == null || offset < 0 || len < 0) return;
         try {
             FileDescriptor fd = (FileDescriptor) channelFdField.get(channel);
             int nativeFd = (int) fdIntField.get(fd);
-            libc.posix_fadvise(nativeFd, 0, 0, POSIX_FADV_DONTNEED);
+            libc.posix_fadvise(nativeFd, offset, len, POSIX_FADV_DONTNEED);
         } catch (Exception e) {
             log.debug("posix_fadvise failed: {}", e.getMessage());
         }

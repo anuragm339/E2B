@@ -61,6 +61,47 @@ class TopologyManagerSpec extends Specification {
         manager.getCurrentParentUrl() == "http://parent-2"
     }
 
+    def "topology switch is skipped when the new parent is unreachable"() {
+        given: "broker connected to parent-1; probe returns false for parent-2"
+        def registryClient = Mock(CloudRegistryClient)
+        def pipeConnector = new FakePipeConnector()
+        def manager = new TopologyManager(registryClient, pipeConnector, "http://registry", "node-1", tempDir.toString())
+        manager.parentReachableProbe = { String url -> url.contains('parent-1') } as java.util.function.Predicate
+
+        when: "first topology brings parent-1 up successfully"
+        invokeHandleTopologyUpdate(manager, ["http://parent-1"])
+        waitForConnect(pipeConnector, 1)
+        Thread.sleep(50)
+
+        and: "then registry returns an unreachable parent-2"
+        invokeHandleTopologyUpdate(manager, ["http://parent-2"])
+        Thread.sleep(50)
+
+        then: "broker is still connected to parent-1"
+        pipeConnector.disconnectCalls == 0
+        pipeConnector.connectCalls == 1
+        manager.getCurrentParentUrl() == 'http://parent-1'
+    }
+
+    private static void waitForConnect(FakePipeConnector p, int target) {
+        long deadline = System.currentTimeMillis() + 2000
+        while (p.connectCalls < target && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10)
+        }
+    }
+
+    private static void invokeHandleTopologyUpdate(TopologyManager manager, List<String> parents) {
+        def topology = new com.messaging.common.model.TopologyResponse()
+        topology.setNodeId("node-1")
+        topology.setRequestToFollow(parents)
+        topology.setRole(com.messaging.common.model.TopologyResponse.NodeRole.L2)
+        topology.setTopologyVersion("1.0")
+        def method = TopologyManager.class.getDeclaredMethod("handleTopologyUpdate",
+                com.messaging.common.model.TopologyResponse.class)
+        method.setAccessible(true)
+        method.invoke(manager, topology)
+    }
+
     private static void invokeConnectToParent(TopologyManager manager, String parentUrl) {
         def method = TopologyManager.class.getDeclaredMethod("connectToParent", String.class)
         method.setAccessible(true)
@@ -78,7 +119,6 @@ class TopologyManagerSpec extends Specification {
         int disconnectCalls = 0
         boolean dataHandlerSet = false
         String lastParentUrl
-
         @Override
         CompletableFuture<PipeConnection> connectToParent(String parentUrl) {
             connectCalls++

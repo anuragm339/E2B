@@ -27,12 +27,12 @@ public class AckStoreSeeder {
     private static final int READ_BATCH_SIZE = 500;
 
     private final ConsumerOffsetTracker offsetTracker;
-    private final RocksDbAckStore ackStore;
+    private final AckStore ackStore;
     private final StorageEngine storage;
 
     public AckStoreSeeder(
             ConsumerOffsetTracker offsetTracker,
-            RocksDbAckStore ackStore,
+            AckStore ackStore,
             StorageEngine storage) {
         this.offsetTracker = offsetTracker;
         this.ackStore = ackStore;
@@ -103,12 +103,19 @@ public class AckStoreSeeder {
             List<AckRecord> acks = new ArrayList<>();
             long syntheticAckTime = System.currentTimeMillis();
 
+            // One range scan per chunk instead of one RocksDB point-get per record —
+            // startup seeding over a large consumed history was a point-get storm.
+            long chunkFirst = records.get(0).getOffset();
+            long chunkLastExclusive = records.get(records.size() - 1).getOffset() + 1;
+            java.util.Set<Long> ackedInChunk =
+                    ackStore.getAckedOffsetsInRange(topic, group, chunkFirst, chunkLastExclusive);
+
             for (MessageRecord r : records) {
                 if (r.getOffset() >= committedOffset) {
                     continue;
                 }
                 // Only backfill if no entry exists — never overwrite a real ACK
-                if (ackStore.get(topic, group, r.getOffset()) == null) {
+                if (!ackedInChunk.contains(r.getOffset())) {
                     topics.add(topic);
                     groups.add(group);
                     acks.add(new AckRecord(r.getOffset(), syntheticAckTime));

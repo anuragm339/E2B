@@ -145,9 +145,15 @@ public class RefreshContext {
     }
 
     public boolean recordReplayProgress(String consumerId, long offset) {
-        Long previous = consumerOffsets.get(consumerId);
-        if (previous == null || offset > previous) {
-            consumerOffsets.put(consumerId, offset);
+        AtomicBoolean advanced = new AtomicBoolean();
+        consumerOffsets.compute(consumerId, (id, previous) -> {
+            if (previous == null || offset > previous) {
+                advanced.set(true);
+                return offset;
+            }
+            return previous;
+        });
+        if (advanced.get()) {
             lastReplayProgressTime = Instant.now();
             return true;
         }
@@ -167,11 +173,11 @@ public class RefreshContext {
     }
 
     // Downtime tracking methods
-    public void recordShutdown(Instant time) {
+    public synchronized void recordShutdown(Instant time) {
         this.lastShutdownTime = time;
     }
 
-    public void recordStartup(Instant time) {
+    public synchronized void recordStartup(Instant time) {
         if (lastShutdownTime != null) {
             downtimePeriods.add(new DowntimePeriod(lastShutdownTime, time));
             lastShutdownTime = null;

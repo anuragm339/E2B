@@ -26,6 +26,8 @@ class CompactionRestartRecoveryJourneySpec extends BrokerSystemTestSupport {
         def base = super.brokerProperties()
         base['compaction.rocksdb.path']     = "${dataDir}/compaction-index-restart"
         base['broker.storage.segment-size'] = '128'
+        base['compaction.max-process-cpu-usage'] = '100.0'
+        base['compaction.max-heap-usage']        = '100.0'
         return base
     }
 

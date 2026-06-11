@@ -28,12 +28,14 @@ class SubscribeHandlerSpec extends Specification {
     def "modern subscribe registers new consumer sends ack and startup ready"() {
         given:
         remoteConsumers.registerConsumer("client-1", "prices-v1", "group-a", false, "trace-1") >> true
+        remoteConsumers.getConsumersByClient("client-1") >> [new Object()]
 
         when:
         handler.handle("client-1", subscribe([topic: "prices-v1", group: "group-a"]), "trace-1")
 
         then:
         1 * metrics.recordConsumerConnection()
+        1 * metrics.recordConsumerClientConnection()
         1 * remoteConsumers.sendStartupReadyToModernConsumer("client-1", "prices-v1", "group-a")
         1 * server.send("client-1", { BrokerMessage msg -> msg.type == BrokerMessage.MessageType.ACK }) >> CompletableFuture.completedFuture(null)
     }
@@ -77,8 +79,11 @@ class SubscribeHandlerSpec extends Specification {
         legacyClientConfig.serviceTopics = [svc: ["prices-v1", "orders-v1"]]
         remoteConsumers.registerConsumer("legacy-client", "prices-v1", "svc", true, "trace-5") >> true
         remoteConsumers.registerConsumer("legacy-client", "orders-v1", "svc", true, "trace-5") >> true
+        remoteConsumers.getConsumersByClient("legacy-client") >> [new Object(), new Object()]
         refreshCoordinator.isRefreshActive("prices-v1") >> true
         refreshCoordinator.isRefreshActive("orders-v1") >> true
+        refreshCoordinator.registerLateJoiningConsumer("prices-v1", "svc:prices-v1") >> false
+        refreshCoordinator.registerLateJoiningConsumer("orders-v1", "svc:orders-v1") >> true
 
         def readyContext = new RefreshContext("prices-v1", ["svc:prices-v1"] as Set)
         readyContext.setState(RefreshState.READY_SENT)
@@ -92,6 +97,7 @@ class SubscribeHandlerSpec extends Specification {
 
         then:
         2 * metrics.recordConsumerConnection()
+        1 * metrics.recordConsumerClientConnection()
         1 * remoteConsumers.markLegacyConsumerReady("legacy-client")
         1 * remoteConsumers.sendRefreshReadyToConsumer("legacy-client", "prices-v1")
         // PASS 1 registers late joiners for ALL active states before opening the gate
@@ -105,6 +111,7 @@ class SubscribeHandlerSpec extends Specification {
         given:
         legacyClientConfig.serviceTopics = [svc: ["prices-v1"]]
         remoteConsumers.registerConsumer("legacy-client", "prices-v1", "svc", true, "trace-6") >> true
+        remoteConsumers.getConsumersByClient("legacy-client") >> [new Object()]
         refreshCoordinator.isRefreshActive("prices-v1") >> false
 
         when:
@@ -112,6 +119,7 @@ class SubscribeHandlerSpec extends Specification {
 
         then:
         1 * metrics.recordConsumerConnection()
+        1 * metrics.recordConsumerClientConnection()
         1 * remoteConsumers.sendStartupReadyToLegacyConsumer("legacy-client")
         0 * server.send(_, _)
     }

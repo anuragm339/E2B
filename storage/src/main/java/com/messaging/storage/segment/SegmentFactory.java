@@ -22,6 +22,7 @@ public interface SegmentFactory {
      * @param topic Topic name
      * @param partition Partition number
      * @param baseOffset Starting offset for this segment
+     * @param maxSegmentSize Maximum segment size in bytes
      * @param metadataStore Metadata store for tracking segment metadata
      * @return Newly created segment
      * @throws StorageException if creation fails

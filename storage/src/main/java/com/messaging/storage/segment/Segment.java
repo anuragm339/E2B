@@ -115,6 +115,23 @@ public class Segment {
             if (logSize == 0 && indexSize == 0) {
                 writeFileHeaders();
                 return INDEX_ENTRY_SIZE; // new files always use v2 (16-byte entries)
+            } else if (logSize >= FILE_HEADER_SIZE && indexSize == 0) {
+                // Crash window: log header (and possibly a partial record) was written but the
+                // index header never made it to disk. Validate the log header FIRST — a file
+                // with garbage magic is corruption, not a crash artifact, and must still be
+                // rejected. Then re-initialise the index header; recoverIndex() truncates any
+                // unindexed log bytes back to the header (B7-3).
+                validateLogHeader();
+                log.warn("B7-3 crash recovery: index file is empty but log has {} bytes for {} — " +
+                         "re-initialising index header; orphaned log bytes will be truncated",
+                         logSize, indexPath);
+                ByteBuffer indexHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
+                indexHeader.put(INDEX_MAGIC);
+                indexHeader.putShort(INDEX_FORMAT_VERSION);
+                indexHeader.flip();
+                indexChannel.write(indexHeader, 0);
+                indexChannel.force(false);
+                return INDEX_ENTRY_SIZE;
             } else if (logSize >= FILE_HEADER_SIZE && indexSize >= FILE_HEADER_SIZE) {
                 return validateFileHeaders();
             } else {
@@ -174,34 +191,7 @@ public class Segment {
      */
     private int validateFileHeaders() throws StorageException {
         try {
-            // Validate log header
-            ByteBuffer logHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
-            logChannel.read(logHeader, 0);
-            logHeader.flip();
-
-            byte[] logMagic = new byte[4];
-            logHeader.get(logMagic);
-            short logVersion = logHeader.getShort();
-
-            if (!java.util.Arrays.equals(logMagic, LOG_MAGIC)) {
-                throw ExceptionLogger.logAndThrow(log,
-                    StorageException.corruption("Invalid log file magic bytes")
-                        .withTopic(topic)
-                        .withPartition(partition)
-                        .withSegmentPath(logPath.toString())
-                        .withContext("expectedMagic", "MLOG")
-                        .withContext("actualMagic", new String(logMagic, StandardCharsets.UTF_8)));
-            }
-
-            if (logVersion != FORMAT_VERSION) {
-                throw ExceptionLogger.logAndThrow(log,
-                    StorageException.corruption("Unsupported log file version")
-                        .withTopic(topic)
-                        .withPartition(partition)
-                        .withSegmentPath(logPath.toString())
-                        .withContext("expectedVersion", FORMAT_VERSION)
-                        .withContext("actualVersion", logVersion));
-            }
+            validateLogHeader();
 
             // Validate index header
             ByteBuffer indexHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
@@ -246,6 +236,47 @@ public class Segment {
     }
 
     /**
+     * Validate the log file's magic bytes and format version.
+     */
+    private void validateLogHeader() throws StorageException {
+        try {
+            ByteBuffer logHeader = ByteBuffer.allocate(FILE_HEADER_SIZE);
+            logChannel.read(logHeader, 0);
+            logHeader.flip();
+
+            byte[] logMagic = new byte[4];
+            logHeader.get(logMagic);
+            short logVersion = logHeader.getShort();
+
+            if (!java.util.Arrays.equals(logMagic, LOG_MAGIC)) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.corruption("Invalid log file magic bytes")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(logPath.toString())
+                        .withContext("expectedMagic", "MLOG")
+                        .withContext("actualMagic", new String(logMagic, StandardCharsets.UTF_8)));
+            }
+
+            if (logVersion != FORMAT_VERSION) {
+                throw ExceptionLogger.logAndThrow(log,
+                    StorageException.corruption("Unsupported log file version")
+                        .withTopic(topic)
+                        .withPartition(partition)
+                        .withSegmentPath(logPath.toString())
+                        .withContext("expectedVersion", FORMAT_VERSION)
+                        .withContext("actualVersion", logVersion));
+            }
+        } catch (IOException | MessagingException e) {
+            throw ExceptionLogger.logAndThrow(log,
+                StorageException.ioError("Failed to validate log header", e)
+                    .withTopic(topic)
+                    .withPartition(partition)
+                    .withSegmentPath(logPath.toString()));
+        }
+    }
+
+    /**
      * Recover in-memory state (nextOffset, recordCount) from the index file.
      * @throws StorageException if the index file is missing, empty, or unreadable
      */
@@ -258,12 +289,18 @@ public class Segment {
             if (indexSize > FILE_HEADER_SIZE) {
                 recoverFromIndexFile(indexSize);
             } else {
-                throw new StorageException(ErrorCode.STORAGE_INDEX_CORRUPTION,
-                        "Index file is empty for segment at baseOffset=" + baseOffset +
-                        ". Log records do not store offsets, so recovery without the index is not possible.")
-                        .withTopic(topic)
-                        .withPartition(partition)
-                        .withSegmentPath(indexPath.toString());
+                // Empty index with non-empty log: a crash landed between the log write and the
+                // first index write. Log records do not store offsets, so the orphaned bytes are
+                // unrecoverable — truncate them rather than refusing to start the broker. The
+                // parent will re-send anything lost (pipe offset only advances after append).
+                log.warn("B7-3 crash recovery: index is empty but log has {} bytes beyond header " +
+                         "for segment baseOffset={} — truncating log to header; orphaned records " +
+                         "will be re-fetched from the parent",
+                         logPosition - FILE_HEADER_SIZE, baseOffset);
+                logChannel.truncate(FILE_HEADER_SIZE);
+                this.logPosition = FILE_HEADER_SIZE;
+                this.nextOffset = baseOffset;
+                this.recordCount = 0;
             }
         } catch (StorageException e) {
             throw e;
@@ -299,6 +336,7 @@ public class Segment {
             // If the log file is larger, the extra bytes are a partial write from a crash
             // between log-write and index-write — they must be truncated.
             long expectedLogEnd = FILE_HEADER_SIZE;
+            long actualLogSize = logChannel.size();
 
             while (position < indexSize) {
                 buffer.clear();
@@ -311,11 +349,22 @@ public class Segment {
                 int recordSize = buffer.getInt();
                 // CRC field (4 bytes) is present in legacy format but ignored
 
+                // B7-4 fix (inverse of B7-2): the index entry points past the end of the log
+                // file — the index write became durable while the log bytes did not. Entries
+                // are written in ascending log position, so this and all later entries are
+                // invalid. Stop here; the index is truncated below.
+                long entryEnd = logPos + (long) recordSize;
+                if (entryEnd > actualLogSize) {
+                    log.warn("B7-4 crash recovery: index entry at position {} references log bytes " +
+                             "[{}, {}) beyond log size {} — truncating index to last valid entry",
+                             position, logPos, entryEnd, actualLogSize);
+                    break;
+                }
+
                 if (offset > highestOffset) {
                     highestOffset = offset;
                 }
                 // Track the end of the last fully-indexed record in the log file
-                long entryEnd = logPos + (long) recordSize;
                 if (entryEnd > expectedLogEnd) {
                     expectedLogEnd = entryEnd;
                 }
@@ -324,13 +373,19 @@ public class Segment {
             }
 
             this.nextOffset = highestOffset + 1;
-            // Calculate recordCount from number of index entries read
+            // Calculate recordCount from number of index entries accepted
             this.recordCount = (int) ((position - FILE_HEADER_SIZE) / effectiveIndexEntrySize);
+
+            // B7-4: drop index entries that reference log bytes that never became durable
+            // (or a torn partial entry at the tail).
+            if (position < indexSize) {
+                indexChannel.truncate(position);
+                indexChannel.force(false);
+            }
 
             // B7-2 fix: truncate log file if it has bytes beyond what the index knows about.
             // This removes any partial record written before a crash that prevented the
             // corresponding index entry from being written and fsynced.
-            long actualLogSize = logChannel.size();
             if (actualLogSize > expectedLogEnd) {
                 log.warn("B7-2 crash recovery: log file has {} orphaned bytes beyond last indexed record " +
                          "(logSize={}, expectedLogEnd={}). Truncating to remove partial write.",
@@ -364,6 +419,14 @@ public class Segment {
         }
 
         long offset = record.getOffset();
+
+        // Pipe offsets must be monotonically increasing within a topic. A lower offset here
+        // means a duplicate or out-of-order record slipped past the ingest guard — appending
+        // it would regress nextOffset and break the sorted-index invariant binary search needs.
+        if (offset < nextOffset && recordCount > 0) {
+            log.warn("event=segment.non_monotonic_append topic={} partition={} offset={} nextOffset={} " +
+                     "— index ordering invariant at risk", topic, partition, offset, nextOffset);
+        }
 
         // baseOffset is IMMUTABLE - set only during construction
         // DO NOT update it here, as it would corrupt loaded segments
@@ -442,9 +505,10 @@ public class Segment {
             // Increment record count for next write
             recordCount++;
 
-            // Force to disk for durability
-            logChannel.force(false);
-            indexChannel.force(false);
+            // No per-record fsync: forcing both channels on every append costs two fsyncs
+            // per message and destroys flash (eMMC/SD) endurance on POS hardware. Durability
+            // is provided by the periodic flush (SegmentManager.flushActiveSegment), the
+            // force(true) on seal/close, and crash recovery (B7-2/B7-3/B7-4 truncation).
         } catch (IOException | MessagingException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.writeFailed(topic, partition, e)
@@ -545,7 +609,7 @@ public class Segment {
                 int logPosition = searchBuffer.getInt();
                 int recordSize = searchBuffer.getInt();
 
-                IndexEntry entry = new IndexEntry(entryOffset, logPosition, recordSize);
+                IndexEntry entry = new IndexEntry(entryOffset, logPosition, recordSize, filePosition);
 
                 if (entryOffset == targetOffset) {
                     // Exact match found
@@ -661,6 +725,56 @@ public class Segment {
         }
     }
 
+    public int getPartition() {
+        return partition;
+    }
+
+    public String getTopic() {
+        return topic;
+    }
+
+    /**
+     * Force buffered log + index bytes to disk. Called periodically by the storage engine's
+     * flush scheduler (group commit) instead of fsyncing on every append.
+     */
+    public synchronized void flush() {
+        flush(-1L);
+    }
+
+    /**
+     * Force buffered bytes to disk and optionally evict already-flushed cold pages from the
+     * page cache, keeping the last {@code cacheTailKeepBytes} hot (consumers deliver from
+     * the tail; older pages are only re-read on catch-up or compaction).
+     *
+     * <p>Docker counts page cache against the container's memory limit, so on a constrained
+     * POS device an active segment ingesting steadily can push the container's reported
+     * memory to its cgroup limit between segment seals. The pages dropped here are clean
+     * (just fsynced) — the kernel re-faults them from disk if needed.
+     *
+     * @param cacheTailKeepBytes hot tail to keep cached; negative disables cache eviction
+     */
+    public synchronized void flush(long cacheTailKeepBytes) {
+        if (!active) {
+            return;
+        }
+        try {
+            logChannel.force(false);
+            indexChannel.force(false);
+        } catch (IOException e) {
+            log.error("Periodic flush failed for segment baseOffset={} at {}", baseOffset, logPath, e);
+            return;
+        }
+
+        if (cacheTailKeepBytes >= 0) {
+            long coldEnd = logPosition - cacheTailKeepBytes;
+            if (coldEnd > FILE_HEADER_SIZE) {
+                // Index pages are deliberately kept cached — every delivery binary-searches
+                // the index, and the whole index is small (16 B per record).
+                NativePageCache.dropCacheRange(logChannel, 0, coldEnd);
+            }
+        }
+    }
+
     /**
      * Seal the segment (make it read-only)
      */
@@ -727,11 +841,11 @@ public class Segment {
             log.debug("Added first entry to batch: offset={}, recordSize={}, logPosition={}, recordCount={}",
                       firstEntry.offset, firstEntry.recordSize, firstEntry.logPosition, recordCount);
 
-            // Now scan forward from the next index entry to accumulate more records
-            // We need to find where firstEntry is in the index, then continue from there
-            long currentIndexPos = FILE_HEADER_SIZE;
+            // Continue the scan from the entry AFTER the one binary search located.
+            // (Previously this rescanned the whole index from byte 0 to re-find firstEntry —
+            // O(n) 16-byte positioned reads per batch call on large segments.)
+            long currentIndexPos = firstEntry.indexFilePosition + effectiveIndexEntrySize;
             ByteBuffer scanBuffer = ByteBuffer.allocate(effectiveIndexEntrySize);
-            boolean foundFirstEntry = false;
 
             // Sequential scan through index file
             while (currentIndexPos < indexSize) {
@@ -748,16 +862,6 @@ public class Segment {
                 int logPosition = scanBuffer.getInt();
                 int recordSize = scanBuffer.getInt();
                 // CRC field (4 bytes) present in legacy format is ignored
-
-                // Skip until we find our first entry
-                if (!foundFirstEntry) {
-                    if (offset == firstEntry.offset) {
-                        foundFirstEntry = true;
-                        // Skip this entry as we already added it above
-                    }
-                    currentIndexPos += effectiveIndexEntrySize;
-                    continue;
-                }
 
                 // Calculate what the batch size would be if we add this record
                 // totalBytes = (endOfLastRecord) - firstLogPosition
@@ -828,14 +932,16 @@ public class Segment {
      * Used during binary search through index file for offset lookups.
      */
     private static class IndexEntry {
-        final long offset;      // Message offset (from cloud-server, can have gaps)
-        final int logPosition;  // Position in log file where record starts
-        final int recordSize;   // Size of log record in bytes
+        final long offset;          // Message offset (from cloud-server, can have gaps)
+        final int logPosition;      // Position in log file where record starts
+        final int recordSize;       // Size of log record in bytes
+        final long indexFilePosition; // Byte position of this entry in the index file
 
-        IndexEntry(long offset, int logPosition, int recordSize) {
+        IndexEntry(long offset, int logPosition, int recordSize, long indexFilePosition) {
             this.offset = offset;
             this.logPosition = logPosition;
             this.recordSize = recordSize;
+            this.indexFilePosition = indexFilePosition;
         }
     }
 

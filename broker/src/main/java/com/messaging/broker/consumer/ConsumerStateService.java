@@ -12,6 +12,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public interface ConsumerStateService {
 
+    long beginDelivery(DeliveryKey key);
+
+    void setOriginalOffset(DeliveryKey key, long generation, long originalOffset);
+
+    PendingDelivery claimPendingDelivery(DeliveryKey key);
+
+    PendingDelivery claimPendingDelivery(DeliveryKey key, long expectedGeneration);
+
+    boolean scheduleTimeout(
+            DeliveryKey key,
+            long expectedGeneration,
+            ScheduledFuture<?> task);
+
+    boolean completeDelivery(DeliveryKey key, long expectedGeneration);
+
     /**
      * Mark delivery as in-flight and return status tracker.
      *

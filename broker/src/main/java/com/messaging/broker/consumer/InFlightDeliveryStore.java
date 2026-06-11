@@ -13,6 +13,39 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public interface InFlightDeliveryStore {
 
     /**
+     * Start a new delivery generation after the caller has claimed the in-flight flag.
+     */
+    long beginDelivery(DeliveryKey key);
+
+    /**
+     * Record the offset that must be restored if the active generation times out.
+     */
+    void setOriginalOffset(DeliveryKey key, long generation, long originalOffset);
+
+    /**
+     * Atomically claim the current pending delivery for ACK processing.
+     */
+    PendingDelivery claimPendingDelivery(DeliveryKey key);
+
+    /**
+     * Atomically claim a pending delivery only when the expected generation is still active.
+     */
+    PendingDelivery claimPendingDelivery(DeliveryKey key, long expectedGeneration);
+
+    /**
+     * Register a timeout only if the expected generation is still pending.
+     */
+    boolean scheduleTimeout(
+            DeliveryKey key,
+            long expectedGeneration,
+            ScheduledFuture<?> task);
+
+    /**
+     * Clear state and release in-flight only if the expected generation is still active.
+     */
+    boolean completeDelivery(DeliveryKey key, long expectedGeneration);
+
+    /**
      * Mark delivery as in-flight.
      *
      * @param key Delivery key

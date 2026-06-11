@@ -9,6 +9,7 @@ import spock.lang.Specification
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.RejectedExecutionException
 
 class BatchAckHandlerSpec extends Specification {
 
@@ -62,6 +63,18 @@ class BatchAckHandlerSpec extends Specification {
         then:
         noExceptionThrown()
         1 * remoteConsumers.handleBatchAck("client-1", "prices-v1", "group-a")
+    }
+
+    def "closes connection when the ACK executor rejects work"() {
+        given:
+        ackExecutor.execute(_ as Runnable) >> { throw new RejectedExecutionException("saturated") }
+
+        when:
+        handler.handle("client-1", message(topicGroupPayload("prices-v1", "group-a", 0, false)), "trace-8")
+
+        then:
+        1 * server.closeConnection("client-1")
+        0 * remoteConsumers.handleBatchAck(_, _, _)
     }
 
     private static BrokerMessage message(byte[] payload) {

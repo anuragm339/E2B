@@ -67,6 +67,9 @@ public class CompactionRewriter {
          *  The scheduler must NOT advance the checkpoint in this case so the segment is revisited
          *  on the next run, when the tombstone may have finally expired. */
         public final boolean hadUnexpiredTombstones;
+        /** True when the whole window was removed with no replacement segment — consumers
+         *  committed inside that range will be force-reset. Drives an alertable metric. */
+        public final boolean allRecordsDeleted;
 
         public CompactionResult(
                 int recordsRemoved,
@@ -76,6 +79,19 @@ public class CompactionRewriter {
                 long bytesReclaimed,
                 int segmentsReplaced,
                 boolean hadUnexpiredTombstones) {
+            this(recordsRemoved, tombstonesRemoved, bytesRead, bytesWritten, bytesReclaimed,
+                 segmentsReplaced, hadUnexpiredTombstones, false);
+        }
+
+        public CompactionResult(
+                int recordsRemoved,
+                int tombstonesRemoved,
+                long bytesRead,
+                long bytesWritten,
+                long bytesReclaimed,
+                int segmentsReplaced,
+                boolean hadUnexpiredTombstones,
+                boolean allRecordsDeleted) {
             this.recordsRemoved       = recordsRemoved;
             this.tombstonesRemoved    = tombstonesRemoved;
             this.bytesRead            = bytesRead;
@@ -83,6 +99,7 @@ public class CompactionRewriter {
             this.bytesReclaimed       = bytesReclaimed;
             this.segmentsReplaced     = segmentsReplaced;
             this.hadUnexpiredTombstones = hadUnexpiredTombstones;
+            this.allRecordsDeleted    = allRecordsDeleted;
         }
     }
 
@@ -102,7 +119,7 @@ public class CompactionRewriter {
             String topic,
             int partition,
             SegmentManager segmentManager,
-            RocksDbCompactionIndex compactionIndex,
+            CompactionIndex compactionIndex,
             int tombstoneRetentionDays) throws MessagingException {
 
         if (candidates.isEmpty()) {
@@ -245,7 +262,7 @@ public class CompactionRewriter {
                 return new CompactionResult(
                         removedCount, tombstonesRemovedCount,
                         bytesStreamedIn, 0L, reclaimedBytes,
-                        candidates.size(), false);
+                        candidates.size(), false, true);
             }
 
             // ── Flush, fsync, and rename staging files ───────────────────────
@@ -299,7 +316,7 @@ public class CompactionRewriter {
             String msgKey,
             long recordOffset,
             MessageRecord record,
-            RocksDbCompactionIndex compactionIndex,
+            CompactionIndex compactionIndex,
             int tombstoneRetentionDays) {
 
         // Null-keyed records are never indexed, so they are never eligible for deletion

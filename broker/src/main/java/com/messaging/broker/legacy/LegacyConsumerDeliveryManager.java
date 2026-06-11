@@ -101,8 +101,11 @@ public class LegacyConsumerDeliveryManager {
 
             for (String topic : topics) {
                 try {
-                    // Get starting offset for this topic
-                    long committedOffset = offsetTracker.getOffset(consumerGroup + ":" + topic);
+                    // Get starting offset for this topic. getCommittedOffset returns -1 when
+                    // nothing was ever committed, making the start-from-earliest branch below
+                    // reachable for brand-new groups (getOffset's default of 0 silently skipped
+                    // the record at offset 0 forever).
+                    long committedOffset = offsetTracker.getCommittedOffset(consumerGroup + ":" + topic);
                     long earliestOffset = storage.getEarliestOffset(topic, 0);
                     long currentOffset = storage.getCurrentOffset(topic, 0);
                     committedOffsets.put(topic, committedOffset);
@@ -165,7 +168,7 @@ public class LegacyConsumerDeliveryManager {
                     if (hasMore) {
                         IndexEntry firstEntry = cursor.peek();
                         if (firstEntry != null) {
-                            log.info("event=legacy_delivery.cursor_ready group={} topic={} startOffset={} " +
+                            log.debug("event=legacy_delivery.cursor_ready group={} topic={} startOffset={} " +
                                      "firstCursorOffset={} committedOffset={} currentOffset={} earliestOffset={}",
                                     consumerGroup, topic, startOffset, firstEntry.offset,
                                     committedOffset, currentOffset, earliestOffset);
@@ -231,7 +234,7 @@ public class LegacyConsumerDeliveryManager {
                                         .toList();
                                 MessageRecord firstFetched = fetched.get(0);
                                 MessageRecord lastFetched = fetched.get(fetched.size() - 1);
-                                log.info("event=legacy_delivery.prefetch group={} topic={} requestOffset={} " +
+                                log.debug("event=legacy_delivery.prefetch group={} topic={} requestOffset={} " +
                                          "fetchedCount={} firstFetchedOffset={} lastFetchedOffset={}",
                                         consumerGroup, topic, nextEntry.offset, fetched.size(),
                                         firstFetched.getOffset(), lastFetched.getOffset());
@@ -375,6 +378,7 @@ public class LegacyConsumerDeliveryManager {
                              "topic={} staleOffset={} earliestBase={} " +
                              "reason=segment_compacted_away — consumer skipped ahead to earliest available segment",
                              topic, startOffset, earliestBase);
+                    metrics.recordConsumerOffsetForceReset(topic, "segment_compacted_away");
                     return new TopicCursor(topic, earliestPath, earliestBase);
                 }
             }
@@ -390,14 +394,14 @@ public class LegacyConsumerDeliveryManager {
         TopicCursor cursor = new TopicCursor(topic, indexPath, startOffset);
         IndexEntry initialEntry = cursor.peek();
         if (initialEntry != null) {
-            log.info("event=legacy_delivery.cursor_created topic={} indexFile={} startOffset={} initialOffset={}",
+            log.debug("event=legacy_delivery.cursor_created topic={} indexFile={} startOffset={} initialOffset={}",
                     topic, indexPath.getFileName(), startOffset, initialEntry.offset);
             if (initialEntry.offset < startOffset) {
                 log.warn("event=legacy_delivery.cursor_seek_mismatch topic={} indexFile={} startOffset={} initialOffset={}",
                         topic, indexPath.getFileName(), startOffset, initialEntry.offset);
             }
         } else {
-            log.info("event=legacy_delivery.cursor_created_empty topic={} indexFile={} startOffset={}",
+            log.debug("event=legacy_delivery.cursor_created_empty topic={} indexFile={} startOffset={}",
                     topic, indexPath.getFileName(), startOffset);
         }
 
@@ -420,7 +424,7 @@ public class LegacyConsumerDeliveryManager {
             cursor = new TopicCursor(topic, nextPath, startOffset);
             IndexEntry nextInitialEntry = cursor.peek();
             if (nextInitialEntry != null) {
-                log.info("event=legacy_delivery.cursor_gap_fallback topic={} indexFile={} startOffset={} initialOffset={}",
+                log.debug("event=legacy_delivery.cursor_gap_fallback topic={} indexFile={} startOffset={} initialOffset={}",
                         topic, nextPath.getFileName(), startOffset, nextInitialEntry.offset);
                 if (nextInitialEntry.offset < startOffset) {
                     log.warn("event=legacy_delivery.cursor_gap_fallback_mismatch topic={} indexFile={} " +
@@ -428,7 +432,7 @@ public class LegacyConsumerDeliveryManager {
                             topic, nextPath.getFileName(), startOffset, nextInitialEntry.offset);
                 }
             } else {
-                log.info("event=legacy_delivery.cursor_gap_fallback_empty topic={} indexFile={} startOffset={}",
+                log.debug("event=legacy_delivery.cursor_gap_fallback_empty topic={} indexFile={} startOffset={}",
                         topic, nextPath.getFileName(), startOffset);
             }
         }

@@ -4,6 +4,9 @@ import spock.lang.Specification
 import spock.lang.TempDir
 
 import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class DeliveryStateStoreSpec extends Specification {
 
@@ -50,5 +53,39 @@ class DeliveryStateStoreSpec extends Specification {
         cleanup:
         store.shutdown()
         reloaded.shutdown()
+    }
+
+    def "concurrent partial updates preserve both delivery-state fields"() {
+        given:
+        def store = new DeliveryStateStore(tempDir.toString())
+        def executor = Executors.newFixedThreadPool(2)
+
+        when:
+        100.times { iteration ->
+            store.saveState("group:topic", 0L, 0L)
+            def start = new CountDownLatch(1)
+            def offsetUpdate = executor.submit {
+                start.await()
+                store.updateAckedOffset("group:topic", iteration + 1L)
+            }
+            def inFlightUpdate = executor.submit {
+                start.await()
+                store.updateInFlightUntil("group:topic", 10_000L + iteration)
+            }
+            start.countDown()
+            offsetUpdate.get(2, TimeUnit.SECONDS)
+            inFlightUpdate.get(2, TimeUnit.SECONDS)
+
+            def state = store.getState("group:topic")
+            assert state.lastAckedOffset == iteration + 1L
+            assert state.inFlightUntil == 10_000L + iteration
+        }
+
+        then:
+        noExceptionThrown()
+
+        cleanup:
+        executor.shutdownNow()
+        store.shutdown()
     }
 }

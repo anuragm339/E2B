@@ -71,6 +71,7 @@ public class SegmentMetadataStore {
             // Create indices
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_topic_partition ON segment_metadata(topic, partition)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_base_offset ON segment_metadata(base_offset)");
+
         }
     }
 
@@ -82,8 +83,8 @@ public class SegmentMetadataStore {
      */
     public synchronized void saveSegment(SegmentMetadata metadata) throws StorageException {
         String sql = """
-            INSERT OR REPLACE INTO segment_metadata 
-            (topic, partition, base_offset, max_offset, log_file_path, index_file_path, 
+            INSERT OR REPLACE INTO segment_metadata
+            (topic, partition, base_offset, max_offset, log_file_path, index_file_path,
              size_bytes, record_count, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """;
@@ -99,7 +100,7 @@ public class SegmentMetadataStore {
             stmt.setLong(8, metadata.getRecordCount());
             stmt.setString(9, metadata.getCreatedAt().toString());
             stmt.setString(10, Instant.now().toString());
-            
+
             stmt.executeUpdate();
             log.debug("Saved segment metadata: topic={}, partition={}, baseOffset={}",
                     metadata.getTopic(), metadata.getPartition(), metadata.getBaseOffset());
@@ -121,31 +122,21 @@ public class SegmentMetadataStore {
     public synchronized List<SegmentMetadata> getSegments(String topic, int partition) throws StorageException {
         String sql = """
             SELECT topic, partition, base_offset, max_offset, log_file_path, index_file_path,
-                   size_bytes, record_count, created_at, updated_at
+                   size_bytes, record_count, created_at
             FROM segment_metadata
             WHERE topic = ? AND partition = ?
             ORDER BY base_offset ASC
         """;
 
         List<SegmentMetadata> segments = new ArrayList<>();
-        
+
         try (PreparedStatement stmt = connection.prepareStatement(sql)) {
             stmt.setString(1, topic);
             stmt.setInt(2, partition);
-            
+
             ResultSet rs = stmt.executeQuery();
             while (rs.next()) {
-                segments.add(SegmentMetadata.builder()
-                        .topic(rs.getString("topic"))
-                        .partition(rs.getInt("partition"))
-                        .baseOffset(rs.getLong("base_offset"))
-                        .maxOffset(rs.getLong("max_offset"))
-                        .logFilePath(rs.getString("log_file_path"))
-                        .indexFilePath(rs.getString("index_file_path"))
-                        .sizeBytes(rs.getLong("size_bytes"))
-                        .recordCount(rs.getLong("record_count"))
-                        .createdAt(Instant.parse(rs.getString("created_at")))
-                        .build());
+                segments.add(mapRow(rs));
             }
         } catch (SQLException e) {
             StorageException ex = new StorageException(ErrorCode.STORAGE_METADATA_ERROR,
@@ -157,6 +148,20 @@ public class SegmentMetadataStore {
         }
 
         return segments;
+    }
+
+    private SegmentMetadata mapRow(ResultSet rs) throws SQLException {
+        return SegmentMetadata.builder()
+                .topic(rs.getString("topic"))
+                .partition(rs.getInt("partition"))
+                .baseOffset(rs.getLong("base_offset"))
+                .maxOffset(rs.getLong("max_offset"))
+                .logFilePath(rs.getString("log_file_path"))
+                .indexFilePath(rs.getString("index_file_path"))
+                .sizeBytes(rs.getLong("size_bytes"))
+                .recordCount(rs.getLong("record_count"))
+                .createdAt(Instant.parse(rs.getString("created_at")))
+                .build();
     }
 
     /**
