@@ -203,6 +203,29 @@ public class RocksDbCompactionIndex implements CompactionIndex {
         return result;
     }
 
+    /**
+     * Streaming prefix-scan over all entries for {@code topic} — O(1) memory.
+     * Meta keys ({@code __meta__|...}) live outside the {@code topic|} prefix and are
+     * never visited.
+     */
+    @Override
+    public void forEachEntry(String topic, IndexEntryConsumer consumer) {
+        byte[] prefix = (topic + "|").getBytes(StandardCharsets.UTF_8);
+        try (RocksIterator iter = db.newIterator(cf)) {
+            iter.seek(prefix);
+            while (iter.isValid()) {
+                byte[] rawKey = iter.key();
+                if (!startsWith(rawKey, prefix)) break;
+
+                String msgKey = new String(rawKey, prefix.length, rawKey.length - prefix.length,
+                        StandardCharsets.UTF_8);
+                long[] value = decode(iter.value());
+                consumer.accept(msgKey, value[0], value[1]);
+                iter.next();
+            }
+        }
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private byte[] buildKey(String topic, String msgKey) {

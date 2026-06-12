@@ -70,4 +70,21 @@ public interface CompactionIndex {
      * Used by {@code CompactionRewriter} to decide which records survive a sweep.
      */
     Map<String, long[]> getLatestOffsetsForTopic(String topic);
+
+    /**
+     * Stream every entry for {@code topic} to {@code consumer} without materialising a map.
+     *
+     * <p>Exists for the pipe-consistency keyspace digest: at millions of live keys,
+     * {@link #getLatestOffsetsForTopic} would allocate hundreds of MB of heap; this method is
+     * O(1) memory. Iteration order is implementation-defined (the digest is order-independent).
+     * Entries observed during a concurrent {@link #updateKey} may reflect either the old or the
+     * new offset — callers must tolerate that (the digest protocol does).
+     */
+    void forEachEntry(String topic, IndexEntryConsumer consumer);
+
+    /** Callback for {@link #forEachEntry}. */
+    @FunctionalInterface
+    interface IndexEntryConsumer {
+        void accept(String msgKey, long latestOffset, long latestTimestampMs);
+    }
 }

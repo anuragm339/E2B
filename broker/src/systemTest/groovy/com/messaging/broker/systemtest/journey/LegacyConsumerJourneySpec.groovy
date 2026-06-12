@@ -36,11 +36,11 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
     protected String defaultTopic() { '__unused_legacy_only__' }
 
     /**
-     * Connect as 'price-quote-service' and complete the startup handshake (READY → ACK)
+     * Connect as 'price-quote' and complete the startup handshake (READY → ACK)
      * before each test so the client is in normal delivery mode from the start.
      */
     def setup() {
-        legacyClient = LegacyConsumerClient.connect('127.0.0.1', brokerTcpPort, 'price-quote-service')
+        legacyClient = LegacyConsumerClient.connect('127.0.0.1', brokerTcpPort, 'price-quote')
         // Broker sends a startup READY immediately after registration
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             assert legacyClient.received.any { it instanceof ReadyEvent }
@@ -49,7 +49,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         def registry = brokerCtx.getBean(ConsumerRegistry)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             def legacyConsumers = registry.getAllConsumers().findAll {
-                it.legacy && it.group == 'price-quote-service'
+                it.legacy && it.group == 'price-quote'
             }
             assert !legacyConsumers.isEmpty()
             assert legacyConsumers.every { registry.isLegacyConsumerReady(it.clientId) }
@@ -64,7 +64,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
     // ── Scenario 1: Registration ──────────────────────────────────────────────
 
     def "legacy client is auto-subscribed to all topics mapped to its serviceName"() {
-        // 'price-quote-service' maps to 6 topics in application.yml:
+        // 'price-quote' maps to 6 topics in application.yml:
         //   prices-v1, reference-data-v5, non-promotable-products, prices-v4, minimum-price, deposit
         given:
         def registry = brokerCtx.getBean(ConsumerRegistry)
@@ -72,7 +72,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         expect: "broker created one consumer registration per mapped topic, all in the same group"
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             def legacyConsumers = registry.getAllConsumers().findAll {
-                it.legacy && it.group == 'price-quote-service'
+                it.legacy && it.group == 'price-quote'
             }
             assert legacyConsumers.size() >= 6
             def topics = legacyConsumers*.topic.toSet()
@@ -124,8 +124,8 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         and: "offsets advance in ConsumerOffsetTracker for all delivered topics"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            def priceOffset = offsetTracker.getOffset('price-quote-service:prices-v1')
-            def refOffset   = offsetTracker.getOffset('price-quote-service:reference-data-v5')
+            def priceOffset = offsetTracker.getOffset('price-quote:prices-v1')
+            def refOffset   = offsetTracker.getOffset('price-quote:reference-data-v5')
             assert priceOffset > 0
             assert refOffset > 0
         }
@@ -133,8 +133,8 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         and: "RocksDB has ACK entries for both delivered legacy topic offsets"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert ackStore.get('prices-v1', 'price-quote-service', 1L) != null
-            assert ackStore.get('reference-data-v5', 'price-quote-service', 1L) != null
+            assert ackStore.get('prices-v1', 'price-quote', 1L) != null
+            assert ackStore.get('reference-data-v5', 'price-quote', 1L) != null
         }
     }
 
@@ -159,7 +159,7 @@ class LegacyConsumerJourneySpec extends BrokerSystemTestSupport {
         legacyClient.received.findAll { it instanceof BatchEvent }.each { legacyClient.sendAck() }
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert offsetTracker.getOffset('price-quote-service:prices-v1') >= 2L
+            assert offsetTracker.getOffset('price-quote:prices-v1') >= 2L
         }
         waitForStableValue(2000) {
             legacyClient.received

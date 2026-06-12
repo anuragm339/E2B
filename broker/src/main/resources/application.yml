@@ -193,6 +193,29 @@ ack-store:
     enabled: ${ACK_RECONCILIATION_ENABLED:true}
     auto-sync-enabled: ${ACK_RECONCILIATION_AUTO_SYNC:false}
 
+# Pipe-consistency detection (detect-only audit of this node vs its parent / the cloud).
+# Fail-closed: with enabled=false the served endpoints answer 404 (indistinguishable from an
+# older build) and the admin trigger answers 503. Zero steady-state cost — nothing runs,
+# nothing is stored, and the ingest/delivery hot paths are untouched, unless a check is
+# explicitly triggered via POST /admin/pipe-consistency/check.
+pipe:
+  consistency:
+    enabled: ${PIPE_CONSISTENCY_ENABLED:false}
+    buckets: ${PIPE_CONSISTENCY_BUCKETS:64}                      # digest buckets; raise for multi-million-key topics
+    scan-yield-every: ${PIPE_CONSISTENCY_SCAN_YIELD_EVERY:10000} # cooperative yield cadence during index scans
+    max-drilldown-buckets: ${PIPE_CONSISTENCY_MAX_DRILLDOWN_BUCKETS:8}   # above this, report divergence without key-level detail
+    max-classify-entries: ${PIPE_CONSISTENCY_MAX_CLASSIFY_ENTRIES:1000}  # cap per-check classification batch
+    max-bucket-entries: ${PIPE_CONSISTENCY_MAX_BUCKET_ENTRIES:100000}    # server-side cap on one bucket response
+    max-concurrent-scans: ${PIPE_CONSISTENCY_MAX_CONCURRENT_SCANS:2}     # parent-side guard; excess children get 429
+    # Automatic detection — runs check?topic=all on a fixed cadence (only when enabled=true above).
+    # Skips (never queues) when: a check is running, the parent is unassigned (offline POS),
+    # or heap pressure is high. The admin API works regardless of schedule.enabled.
+    schedule:
+      enabled: ${PIPE_CONSISTENCY_SCHEDULE_ENABLED:true}
+      interval: ${PIPE_CONSISTENCY_SCHEDULE_INTERVAL:6h}
+      initial-delay: ${PIPE_CONSISTENCY_SCHEDULE_INITIAL_DELAY:10m}
+      target: ${PIPE_CONSISTENCY_SCHEDULE_TARGET:parent}   # parent | cloud
+
 compaction-index:
   # Backend selection. Supported: rocks (default), memory. New backends are added by implementing
   # com.messaging.broker.compaction.CompactionIndex and annotating with @Requires(property="compaction-index.backend").
@@ -219,6 +242,7 @@ logger:
     com.messaging.broker.handler: INFO  # Subscribe / READY_ACK / RESET_ACK lifecycle events
     com.messaging.broker.legacy: INFO  # Legacy consumer lifecycle; merge internals stay DEBUG
     com.messaging.broker.compaction: INFO  # Compaction run lifecycle, per-topic results, heap stats
+    com.messaging.broker.consistency: INFO  # Pipe-consistency scheduled runs, per-topic verdicts
     com.messaging.pipe: INFO  # Pipe connect/pause/resume and failures; poll traffic stays DEBUG
     com.messaging.storage.segment: INFO  # Segment replace/remove events with offset and heap context
     io.netty: ERROR  # Only show Netty errors

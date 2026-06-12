@@ -51,11 +51,24 @@ public class Segment {
     // Thread-local buffers for reads (to avoid allocation)
     private final ThreadLocal<ByteBuffer> readBuffer = ThreadLocal.withInitial(() -> ByteBuffer.allocate(WRITE_BUFFER_SIZE));
 
-    private long nextOffset;
-    private long logPosition; // Current write position in log file
-    private long recordCount; // Number of records actually in this segment (for dense indexing)
-    private boolean active;
+    // volatile: written under synchronized append/seal but read lock-free by delivery threads
+    // (watermark gates, getBatchFileRegion range checks). Plain fields had no JMM visibility
+    // guarantee and risk torn 64-bit reads on 32-bit JVMs.
+    private volatile long nextOffset;
+    private volatile long logPosition; // Current write position in log file
+    private volatile long recordCount; // Number of records actually in this segment (for dense indexing)
+    private volatile boolean active;
     private final int effectiveIndexEntrySize; // INDEX_ENTRY_SIZE (v2) or INDEX_ENTRY_SIZE_LEGACY (v1)
+
+    // Lease counting for zero-copy delivery: getBatchFileRegion() hands the segment's OWN
+    // logChannel to Netty, and the transfer happens long after SegmentManager's read lock is
+    // released. Compaction closing the channel mid-sendfile caused ClosedChannelException →
+    // consumer connection resets on every compaction under load. close() now defers the
+    // actual channel close until all outstanding batch leases are released (Netty always
+    // calls BatchFileRegion.close() via deallocate()).
+    private final java.util.concurrent.atomic.AtomicInteger batchLeases =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private volatile boolean closeRequested;
 
     public Segment(Path logPath, Path indexPath, long baseOffset, long maxSize, String topic, int partition) throws StorageException {
         this.baseOffset = baseOffset;
@@ -898,7 +911,12 @@ public class Segment {
             log.debug("Created zero-copy batch: offset={}-{}, bytes={}, records={}, firstLogPos={}",
                       startOffset, lastOffset, totalBytes, recordCount, firstLogPosition);
 
-            return new BatchFileRegion(topic, logChannel, recordCount, totalBytes, firstEntry.offset, lastOffset, firstLogPosition);
+            // Lease the channel for the duration of the network transfer (released by
+            // BatchFileRegion.close()); keeps a concurrent compaction close from yanking
+            // the channel mid-sendfile.
+            batchLeases.incrementAndGet();
+            return new BatchFileRegion(topic, logChannel, recordCount, totalBytes,
+                    firstEntry.offset, lastOffset, firstLogPosition, this::releaseBatchLease);
         } catch (IOException | MessagingException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.readFailed(topic, partition, startOffset, e)
@@ -910,13 +928,27 @@ public class Segment {
 
 
     /**
-     * Close the segment and release resources
+     * Close the segment and release resources.
+     *
+     * <p>When zero-copy batch transfers are still in flight (outstanding leases), the channel
+     * close is DEFERRED until the last lease is released — the file may already be unlinked by
+     * compaction, which is safe on POSIX (the open FD keeps serving reads).
      */
     public void close() throws MessagingException {
+        seal();
+        closeRequested = true;
+        if (batchLeases.get() == 0) {
+            closeChannels();
+        } else {
+            log.info("Deferring channel close for segment baseOffset={} — {} in-flight batch transfer(s)",
+                    baseOffset, batchLeases.get());
+        }
+    }
+
+    private synchronized void closeChannels() throws MessagingException {
         try {
-            seal();
-            logChannel.close();
-            indexChannel.close();
+            if (logChannel.isOpen()) logChannel.close();
+            if (indexChannel.isOpen()) indexChannel.close();
         } catch (IOException e) {
             throw ExceptionLogger.logAndThrow(log,
                 StorageException.ioError("Failed to close segment", e)
@@ -924,6 +956,16 @@ public class Segment {
                     .withPartition(partition)
                     .withSegmentPath(logPath.toString())
                     .withContext("operation", "close"));
+        }
+    }
+
+    private void releaseBatchLease() {
+        if (batchLeases.decrementAndGet() == 0 && closeRequested) {
+            try {
+                closeChannels();
+            } catch (MessagingException e) {
+                log.warn("Deferred segment close failed for baseOffset={}", baseOffset, e);
+            }
         }
     }
 
@@ -959,9 +1001,18 @@ public class Segment {
         private final long firstOffset; // actual offset of first record in batch (-1 if empty)
         private final long lastOffset;
         private final long filePosition;  // position in log file where payload starts
+        private final Runnable onClose;   // releases the segment's batch lease (null for empty batches)
+        private final java.util.concurrent.atomic.AtomicBoolean closed =
+                new java.util.concurrent.atomic.AtomicBoolean();
 
         public BatchFileRegion(String topic, FileChannel fileChannel,
                                int recordCount, long totalBytes, long firstOffset, long lastOffset, long filePosition) {
+            this(topic, fileChannel, recordCount, totalBytes, firstOffset, lastOffset, filePosition, null);
+        }
+
+        public BatchFileRegion(String topic, FileChannel fileChannel,
+                               int recordCount, long totalBytes, long firstOffset, long lastOffset,
+                               long filePosition, Runnable onClose) {
             this.topic = topic;
             this.fileChannel = fileChannel;
             this.recordCount = recordCount;
@@ -969,6 +1020,7 @@ public class Segment {
             this.firstOffset = firstOffset;
             this.lastOffset = lastOffset;
             this.filePosition = filePosition;
+            this.onClose = onClose;
         }
 
         @Override public String getTopic()      { return topic; }
@@ -991,9 +1043,13 @@ public class Segment {
 
         @Override
         public void close() throws IOException {
-            // The FileChannel belongs to the Segment that created this batch — closing it
-            // here would close the segment's shared read/write channel. Lifecycle is managed
-            // by Segment.close(), not by individual batch deliveries.
+            // The FileChannel belongs to the Segment that created this batch — never close it
+            // here. Releasing the lease lets a DEFERRED Segment.close() (compaction replaced
+            // this segment mid-transfer) finally close the channel once the last in-flight
+            // transfer completes. Idempotent: Netty's deallocate() and error paths may both call.
+            if (closed.compareAndSet(false, true) && onClose != null) {
+                onClose.run();
+            }
         }
     }
 

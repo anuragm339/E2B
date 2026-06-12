@@ -123,7 +123,7 @@ class CompactionDeliveryRecoveryJourneySpec extends BrokerSystemTestSupport {
         scheduler.compact() // seals the segment; drv-A..F all survive (unique keys)
 
         and: "connect legacy client AFTER first compaction so delivery starts with index populated"
-        legacyClient = LegacyConsumerClient.connect('127.0.0.1', brokerTcpPort, 'price-quote-service')
+        legacyClient = LegacyConsumerClient.connect('127.0.0.1', brokerTcpPort, 'price-quote')
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             assert legacyClient.received.any { it instanceof ReadyEvent }
         }
@@ -196,7 +196,7 @@ class CompactionDeliveryRecoveryJourneySpec extends BrokerSystemTestSupport {
         then: "committed offset advances to head (≥ 10)"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 15, delay: 0.3).eventually {
-            assert offsetTracker.getOffset('price-quote-service:prices-v1') >= 10L
+            assert offsetTracker.getOffset('price-quote:prices-v1') >= 10L
         }
 
         and: "all 10 record keys were delivered (no gap across the compaction boundary)"

@@ -33,7 +33,7 @@ class AckReconciliationSchedulerSpec extends Specification {
 
     def setup() {
         scheduler = new AckReconciliationScheduler(
-                registrationService, storage, ackStore, metrics, offsetTracker, true, false)
+                registrationService, storage, ackStore, metrics, offsetTracker, { Runnable t -> t.run() } as java.util.concurrent.Executor, true, false)
     }
 
     def "reconcile counts missing offsets correctly when some are absent from RocksDB"() {
@@ -103,7 +103,7 @@ class AckReconciliationSchedulerSpec extends Specification {
     def "reconcile is a no-op when enabled=false"() {
         given:
         scheduler = new AckReconciliationScheduler(
-                registrationService, storage, ackStore, metrics, offsetTracker, false, false)
+                registrationService, storage, ackStore, metrics, offsetTracker, { Runnable t -> t.run() } as java.util.concurrent.Executor, false, false)
 
         when:
         scheduler.reconcile()
