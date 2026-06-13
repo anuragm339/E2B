@@ -119,7 +119,7 @@ class CompactionRaceWindowLegacyDeliveryJourneySpec extends BrokerSystemTestSupp
         // versions before the index is built — hasIndexedKeysForTopic() returns false and
         // the filter fast-path returns the unfiltered batch, causing the final assertion
         // ('crw-A delivered at most once') to fail.
-        legacyClient = LegacyConsumerClient.connect('127.0.0.1', brokerTcpPort, 'price-quote-service')
+        legacyClient = LegacyConsumerClient.connect('127.0.0.1', brokerTcpPort, 'price-quote')
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
             assert legacyClient.received.any { it instanceof ReadyEvent }
         }
@@ -224,7 +224,7 @@ class CompactionRaceWindowLegacyDeliveryJourneySpec extends BrokerSystemTestSupp
         then: "committed offset advances past the compacted segment range (≥ offset 10)"
         def offsetTracker = brokerCtx.getBean(ConsumerOffsetTracker)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            assert offsetTracker.getOffset('price-quote-service:prices-v1') >= 10L
+            assert offsetTracker.getOffset('price-quote:prices-v1') >= 10L
         }
 
         and: "crw-A was delivered at most once across all batches (delivery filter deduped superseded versions)"

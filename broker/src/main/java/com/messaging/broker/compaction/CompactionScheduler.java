@@ -97,6 +97,25 @@ public class CompactionScheduler {
     @Scheduled(
         fixedDelay   = "${compaction.schedule.interval:24h}",
         initialDelay = "${compaction.schedule.initial-delay:5m}")
+    public void compactScheduled() {
+        if (!compactionRunning.compareAndSet(false, true)) {
+            log.info("event=compaction_run_skipped reason=already_running");
+            metrics.recordCompactionSkipped("already_running");
+            return;
+        }
+        // Offload — never run a minutes-long sweep INLINE on Micronaut's shared scheduled
+        // pool: together with a long reconciliation it can starve the 1-second segment-fsync
+        // flusher that shares that pool, silently growing the power-cut data-loss window.
+        // The single-threaded compactionExecutor also serializes compaction with manual
+        // triggers and pipe-consistency checks — heavy background work never overlaps.
+        compactionExecutor.execute(this::runClaimedCompaction);
+    }
+
+    /**
+     * Synchronous compaction run — file changes are complete when this returns.
+     * Used by journey specs and any caller that needs completion semantics; the scheduled
+     * path above offloads instead.
+     */
     public void compact() {
         if (!compactionRunning.compareAndSet(false, true)) {
             log.info("event=compaction_run_skipped reason=already_running");

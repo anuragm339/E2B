@@ -7,6 +7,8 @@ import com.messaging.broker.handler.MessageHandler;
 import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
@@ -114,7 +116,7 @@ public class DataHandler implements MessageHandler {
                 }
             });
 
-        } catch (IllegalArgumentException e) {
+        } catch (MessagingException e) {
             log.error("DATA validation failed from client {}: {}, traceId={}", clientId, e.getMessage(), traceId);
             server.closeConnection(clientId);
         } catch (Exception e) {
@@ -128,13 +130,13 @@ public class DataHandler implements MessageHandler {
      */
     private String safeGetText(JsonNode node, String fieldName, String clientId) {
         if (!node.has(fieldName)) {
-            throw new IllegalArgumentException(
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_MESSAGE_DATA,
                 String.format("Missing required field '%s' from client %s", fieldName, clientId)
             );
         }
         JsonNode field = node.get(fieldName);
         if (field == null || field.isNull()) {
-            throw new IllegalArgumentException(
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_MESSAGE_DATA,
                 String.format("Field '%s' is null from client %s", fieldName, clientId)
             );
         }

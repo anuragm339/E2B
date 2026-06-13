@@ -50,6 +50,7 @@ public class AckReconciliationScheduler {
     private final AckStore ackStore;
     private final BrokerMetrics metrics;
     private final ConsumerOffsetTracker offsetTracker;
+    private final java.util.concurrent.Executor backgroundExecutor;
     private final boolean enabled;
     private final boolean autoSyncEnabled;
 
@@ -69,6 +70,7 @@ public class AckReconciliationScheduler {
             AckStore ackStore,
             BrokerMetrics metrics,
             ConsumerOffsetTracker offsetTracker,
+            @jakarta.inject.Named("compactionExecutor") java.util.concurrent.Executor backgroundExecutor,
             @Value("${ack-store.reconciliation.enabled:true}") boolean enabled,
             @Value("${ack-store.reconciliation.auto-sync-enabled:false}") boolean autoSyncEnabled) {
         this.registrationService = registrationService;
@@ -76,6 +78,7 @@ public class AckReconciliationScheduler {
         this.ackStore = ackStore;
         this.metrics = metrics;
         this.offsetTracker = offsetTracker;
+        this.backgroundExecutor = backgroundExecutor;
         this.enabled = enabled;
         this.autoSyncEnabled = autoSyncEnabled;
     }
@@ -108,6 +111,24 @@ public class AckReconciliationScheduler {
     @Scheduled(
             fixedDelay  = "${ack-store.reconciliation.interval:14m}",
             initialDelay = "${ack-store.reconciliation.initial-delay:10m}")
+    public void reconcileScheduled() {
+        if (!enabled) {
+            return;
+        }
+        // Offload — the first run (and every post-refresh run) scans the full consumed
+        // history and can take minutes; running it INLINE on Micronaut's shared scheduled
+        // pool can, together with a compaction sweep, starve the 1-second segment-fsync
+        // flusher. The single-threaded compactionExecutor serializes it with compaction
+        // and consistency checks instead.
+        backgroundExecutor.execute(() -> {
+            try {
+                reconcile();
+            } catch (Throwable t) {
+                log.error("Scheduled ACK reconciliation failed", t);
+            }
+        });
+    }
+
     public void reconcile() {
         if (!enabled) {
             return;

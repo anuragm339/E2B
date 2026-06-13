@@ -195,7 +195,7 @@ public class LegacyTestClient {
     public static void main(String[] args) {
         String brokerHost = System.getenv().getOrDefault("BROKER_HOST", "localhost");
         int brokerPort = Integer.parseInt(System.getenv().getOrDefault("BROKER_PORT", "9092"));
-        String serviceName = System.getenv().getOrDefault("SERVICE_NAME", "price-quote-service");
+        String serviceName = System.getenv().getOrDefault("SERVICE_NAME", "price-quote");
 
         LegacyTestClient client = new LegacyTestClient(brokerHost, brokerPort, serviceName);
 

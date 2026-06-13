@@ -104,6 +104,16 @@ public class InMemoryCompactionIndex implements CompactionIndex {
         return result;
     }
 
+    @Override
+    public void forEachEntry(String topic, IndexEntryConsumer consumer) {
+        for (Map.Entry<TopicKey, long[]> entry : index.entrySet()) {
+            if (entry.getKey().topic.equals(topic)) {
+                long[] v = entry.getValue();
+                consumer.accept(entry.getKey().msgKey, v[0], v[1]);
+            }
+        }
+    }
+
     int indexSize() {
         return index.size();
     }

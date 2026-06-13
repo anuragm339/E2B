@@ -80,6 +80,13 @@ public class SegmentManager {
             Segment last = segments.lastEntry().getValue();
             if (!last.isFull(maxSegmentSize)) {
                 activeSegment.set(last);
+                // INVARIANT: the active segment must never live in the sealed-segments map.
+                // During normal operation createNewSegment() keeps them separate, but recovery
+                // used to leave the re-activated last segment in BOTH places — the compaction
+                // planner then selected the LIVE segment into a rewrite window right after a
+                // restart, sealed+deleted it, and every subsequent append for the topic failed
+                // forever with "Segment is not active" (stalling the whole pipe stream).
+                segments.remove(last.getBaseOffset());
             } else {
                 createNewSegment(last.getNextOffset());
             }
@@ -211,31 +218,50 @@ public class SegmentManager {
      * where the next record's actual offset should be the new segment base.
      */
     private void rollSegment(long nextBaseOffset) throws StorageException {
-        Segment current = activeSegment.get();
-        if (current == null) {
-            throw ExceptionLogger.logAndThrow(log,
-                new StorageException(ErrorCode.STORAGE_WRITE_FAILED, "No active segment")
-                    .withTopic(topic)
-                    .withPartition(partition));
+        // Reentrant: the append path already holds the write lock; forceRollActiveSegment
+        // historically did NOT, letting readers observe a half-rolled state. Acquire here so
+        // every roll has the same discipline regardless of caller.
+        segmentLock.writeLock().lock();
+        try {
+            Segment current = activeSegment.get();
+            if (current == null) {
+                throw ExceptionLogger.logAndThrow(log,
+                    new StorageException(ErrorCode.STORAGE_WRITE_FAILED, "No active segment")
+                        .withTopic(topic)
+                        .withPartition(partition));
+            }
+
+            // GUARD: rolling an empty segment to the same base would seal+map the current
+            // segment AND open a new active one on the SAME file path — two Segment objects
+            // sharing one file, where compacting the sealed twin unlinks the live active
+            // file (data loss after restart). An empty roll is always a no-op.
+            if (nextBaseOffset == current.getBaseOffset() && current.getRecordCount() == 0) {
+                log.warn("event=segment_manager.roll_skipped topic={} partition={} base={} " +
+                         "reason=empty_segment_same_base — rolling would create a same-file twin",
+                        topic, partition, nextBaseOffset);
+                return;
+            }
+
+            // Seal the current segment
+            current.seal();
+
+            // Add to segments map
+            segments.put(current.getBaseOffset(), current);
+
+            // Save metadata for sealed segment
+            saveSegmentMetadata(current);
+
+            // Reset append counter for new active segment
+            appendsSinceMetadataUpdate.set(0);
+
+            // Create new active segment
+            createNewSegment(nextBaseOffset);
+
+            log.info("Rolled segment: topic={}, partition={}, newBaseOffset={}",
+                    topic, partition, nextBaseOffset);
+        } finally {
+            segmentLock.writeLock().unlock();
         }
-
-        // Seal the current segment
-        current.seal();
-
-        // Add to segments map
-        segments.put(current.getBaseOffset(), current);
-
-        // Save metadata for sealed segment
-        saveSegmentMetadata(current);
-
-        // Reset append counter for new active segment
-        appendsSinceMetadataUpdate.set(0);
-
-        // Create new active segment
-        createNewSegment(nextBaseOffset);
-
-        log.info("Rolled segment: topic={}, partition={}, newBaseOffset={}",
-                topic, partition, nextBaseOffset);
     }
 
     /**
@@ -541,10 +567,19 @@ public class SegmentManager {
     }
 
     /**
-     * Get inactive segments (for compaction)
+     * Get inactive segments (for compaction).
+     * Defensively excludes the active segment even though the map invariant says it can
+     * never be present — compacting the live write target bricks the topic's ingest.
      */
     public List<Segment> getInactiveSegments() {
-        return new ArrayList<>(segments.values());
+        Segment active = activeSegment.get();
+        List<Segment> result = new ArrayList<>(segments.size());
+        for (Segment s : segments.values()) {
+            if (s != active) {
+                result.add(s);
+            }
+        }
+        return result;
     }
 
     public Segment getActiveSegment() {
@@ -607,7 +642,10 @@ public class SegmentManager {
         appendLock.lock();
         try {
             Segment active = activeSegment.get();
-            if (active == null || active.getSize() == 0) {
+            // recordCount, not size: a fresh segment is 6 bytes (file header), so a size==0
+            // check never skipped — empty segments were force-rolled into same-base twins
+            // sharing one file (see rollSegment guard).
+            if (active == null || active.getRecordCount() == 0) {
                 log.debug("forceRollActiveSegment: nothing to roll (topic={} partition={})", topic, partition);
                 return;
             }
@@ -623,6 +661,17 @@ public class SegmentManager {
      * Replace segments after compaction
      */
     public void replaceSegments(List<Segment> oldSegments, Segment newSegment) throws MessagingException {
+        // Same guard removeSegments() always had: replacing the ACTIVE segment would seal and
+        // delete the live write target while activeSegment still references it — every append
+        // for the topic then fails permanently with "Segment is not active".
+        Segment active = activeSegment.get();
+        for (Segment old : oldSegments) {
+            if (old == active) {
+                throw new StorageException(ErrorCode.STORAGE_WRITE_FAILED,
+                        "Cannot replace active segment baseOffset=" + old.getBaseOffset())
+                        .withTopic(topic).withPartition(partition);
+            }
+        }
         // Keep the write-lock scope to the in-memory map mutation only.
         // Once old segments are removed from the map, no new reader can reach them.
         // Existing readers have already drained because they hold the read lock that blocks
@@ -642,7 +691,18 @@ public class SegmentManager {
         saveSegmentMetadata(newSegment);
 
         for (Segment old : oldSegments) {
-            cleanupDetachedSegment(old);
+            // Identity care when the replacement shares the old segment's base and/or path:
+            //  - same BASE (every compaction window starts at the window's first base): the
+            //    metadata row is keyed by base and was just upserted for the NEW segment —
+            //    deleting it would erase the replacement's metadata.
+            //  - same PATH (re-compaction of an unadvanced window ATOMIC_MOVEs onto the same
+            //    .compacted.log): deleting it would unlink the JUST-INSTALLED file — silent
+            //    data loss on the next restart.
+            // Old files at a DIFFERENT path (X.log -> X.compacted.log) must still be deleted,
+            // or recovery would find both and double-load the base.
+            boolean deleteMetadata = old.getBaseOffset() != newSegment.getBaseOffset();
+            boolean deleteFiles = !old.getLogPath().equals(newSegment.getLogPath());
+            cleanupDetachedSegment(old, deleteMetadata, deleteFiles);
         }
 
         String closedOffsets = oldSegments.stream()
@@ -684,7 +744,7 @@ public class SegmentManager {
         }
 
         for (Segment old : segments) {
-            cleanupDetachedSegment(old);
+            cleanupDetachedSegment(old, true, true);
         }
 
         String deletedOffsets = segments.stream()
@@ -699,24 +759,39 @@ public class SegmentManager {
                  topic, partition, deletedOffsets, segments.size(), heapUsedMB, heapMaxMB);
     }
 
-    private void cleanupDetachedSegment(Segment old) {
+    /**
+     * Close a segment detached from the map. The delete flags are false when the replacement
+     * segment shares the old segment's base offset (metadata row) or file path (on-disk file)
+     * — deleting those would destroy the replacement's artifacts (see replaceSegments).
+     */
+    private void cleanupDetachedSegment(Segment old, boolean deleteMetadata, boolean deleteFiles) {
         try {
             old.close();
         } catch (MessagingException e) {
             log.error("Failed to close detached segment at offset {}", old.getBaseOffset(), e);
         }
 
-        try {
-            metadataStore.deleteSegment(topic, partition, old.getBaseOffset());
-        } catch (Exception e) {
-            log.error("Failed to delete segment metadata for offset {}", old.getBaseOffset(), e);
+        if (deleteMetadata) {
+            try {
+                metadataStore.deleteSegment(topic, partition, old.getBaseOffset());
+            } catch (Exception e) {
+                log.error("Failed to delete segment metadata for offset {}", old.getBaseOffset(), e);
+            }
         }
 
-        try {
-            Files.deleteIfExists(old.getLogPath());
-            Files.deleteIfExists(old.getIndexPath());
-        } catch (IOException e) {
-            log.error("Failed to delete segment files for offset {}", old.getBaseOffset(), e);
+        if (deleteFiles) {
+            try {
+                Files.deleteIfExists(old.getLogPath());
+                Files.deleteIfExists(old.getIndexPath());
+            } catch (IOException e) {
+                log.error("Failed to delete segment files for offset {}", old.getBaseOffset(), e);
+            }
+        }
+
+        if (!deleteMetadata || !deleteFiles) {
+            log.info("event=segment_cleanup.partial topic={} partition={} base={} " +
+                     "deletedMetadata={} deletedFiles={} reason=replacement_shares_identity",
+                    topic, partition, old.getBaseOffset(), deleteMetadata, deleteFiles);
         }
     }
 

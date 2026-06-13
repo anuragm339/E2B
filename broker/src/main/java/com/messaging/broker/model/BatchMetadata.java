@@ -1,5 +1,8 @@
 package com.messaging.broker.model;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
+
 import java.util.Objects;
 
 /**
@@ -20,16 +23,20 @@ public record BatchMetadata(
     public BatchMetadata {
         Objects.requireNonNull(topic, "topic cannot be null");
         if (startOffset < 0) {
-            throw new IllegalArgumentException("startOffset cannot be negative: " + startOffset);
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_OFFSET,
+                    "startOffset cannot be negative: " + startOffset);
         }
         if (endOffset < startOffset) {
-            throw new IllegalArgumentException("endOffset (" + endOffset + ") cannot be less than startOffset (" + startOffset + ")");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_OFFSET,
+                    "endOffset (" + endOffset + ") cannot be less than startOffset (" + startOffset + ")");
         }
         if (messageCount < 0) {
-            throw new IllegalArgumentException("messageCount cannot be negative: " + messageCount);
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "messageCount cannot be negative: " + messageCount);
         }
         if (totalBytes < 0) {
-            throw new IllegalArgumentException("totalBytes cannot be negative: " + totalBytes);
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "totalBytes cannot be negative: " + totalBytes);
         }
     }
 

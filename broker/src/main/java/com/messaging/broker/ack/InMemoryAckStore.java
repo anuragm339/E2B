@@ -1,5 +1,7 @@
 package com.messaging.broker.ack;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import io.micronaut.context.annotation.Requires;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -38,7 +40,8 @@ public class InMemoryAckStore implements AckStore {
     @Override
     public void put(String topic, String group, long offset, AckRecord record) {
         if (offset < 0) {
-            throw new IllegalArgumentException("ACK store offset must be >= 0, got: " + offset);
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_OFFSET,
+                    "ACK store offset must be >= 0, got: " + offset);
         }
         store.put(new Key(topic, group, offset), record);
     }
@@ -51,11 +54,12 @@ public class InMemoryAckStore implements AckStore {
     @Override
     public void putBatch(String[] topics, String[] groups, AckRecord[] records) {
         if (topics.length != groups.length || topics.length != records.length) {
-            throw new IllegalArgumentException("ACK batch arrays must have equal lengths");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "ACK batch arrays must have equal lengths");
         }
         for (int i = 0; i < topics.length; i++) {
             if (records[i].offset < 0) {
-                throw new IllegalArgumentException(
+                throw new MessagingException(ErrorCode.VALIDATION_INVALID_OFFSET,
                         "ACK store offset must be >= 0, got: " + records[i].offset);
             }
             store.put(new Key(topics[i], groups[i], records[i].offset), records[i]);

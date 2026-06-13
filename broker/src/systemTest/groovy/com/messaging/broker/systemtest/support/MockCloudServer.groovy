@@ -43,6 +43,21 @@ class MockCloudServer {
     private final AtomicInteger topologyFetchCount = new AtomicInteger()
     private final AtomicInteger pollCount = new AtomicInteger()
 
+    // ── Pipe-consistency stub state (parent/verifier role in escalation journeys) ──
+    // verifierCandidates: included in the topology response (registry contract field).
+    // consistencyHead: served by /pipe/consistency/head and used to clamp digests (-1 = no data).
+    // consistencyEntries: msgKey -> latestOffset; source for digest/bucket answers.
+    // physicallyPresentOffsets: classify's record-presence answers.
+    volatile List<String> verifierCandidates = []
+    volatile long consistencyHead = -1L
+    final Map<String, Long> consistencyEntries = new java.util.concurrent.ConcurrentHashMap<>()
+    final Set<Long> physicallyPresentOffsets = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    private final AtomicInteger headProbeCount = new AtomicInteger()
+    private final AtomicInteger digestCount = new AtomicInteger()
+
+    int getHeadProbeCount() { headProbeCount.get() }
+    int getDigestCount() { digestCount.get() }
+
     private MockCloudServer(ServerSocket ss, int port) {
         this.serverSocket = ss
         this.port = port
@@ -140,8 +155,19 @@ class MockCloudServer {
 
             if (path.startsWith('/registry/topology')) {
                 serveTopology(out)
+            } else if (path.startsWith('/health')) {
+                // TopologyManager probes parentUrl + /health BEFORE committing a topology
+                // update; without this the broker never caches the topology (and with it,
+                // the verifier candidates).
+                sendJson(out, 200, '{"status":"healthy"}'.getBytes('UTF-8'))
             } else if (path.startsWith('/pipe/poll')) {
                 servePipePoll(out)
+            } else if (path.startsWith('/pipe/consistency/head')) {
+                serveConsistencyHead(out)
+            } else if (path.startsWith('/pipe/consistency/digest')) {
+                serveConsistencyDigest(out, path)
+            } else if (path.startsWith('/pipe/consistency/bucket')) {
+                serveConsistencyBucket(out, path)
             } else {
                 sendText(out, 404, 'Not Found')
             }
@@ -159,13 +185,73 @@ class MockCloudServer {
     private void serveTopology(DataOutputStream out) {
         topologyFetchCount.incrementAndGet()
         def body = MAPPER.writeValueAsBytes([
-            nodeId         : 'mock-cloud-node',
-            role           : 'L2',
-            requestToFollow: [baseUrl],
-            topologyVersion: 'system-test-1',
-            topics         : []
+            nodeId            : 'mock-cloud-node',
+            role              : 'L2',
+            requestToFollow   : [baseUrl],
+            verifierCandidates: verifierCandidates,
+            topologyVersion   : 'system-test-1',
+            topics            : []
         ])
         sendJson(out, 200, body)
+    }
+
+    // ── Pipe-consistency stub endpoints ──────────────────────────────────────
+    // Digest math delegates to the broker's real KeyspaceDigest so the stub can never
+    // drift from production hashing.
+
+    private void serveConsistencyHead(DataOutputStream out) {
+        headProbeCount.incrementAndGet()
+        sendJson(out, 200, ("{\"head\":${consistencyHead}}").getBytes('UTF-8'))
+    }
+
+    private static long queryParam(String path, String name, long defaultValue) {
+        def m = (path =~ /[?&]${name}=([^&]+)/)
+        m.find() ? Long.parseLong(m.group(1)) : defaultValue
+    }
+
+    private void serveConsistencyDigest(DataOutputStream out, String path) {
+        digestCount.incrementAndGet()
+        long watermark = queryParam(path, 'watermark', 0L)
+        int buckets = (int) queryParam(path, 'buckets', 64L)
+        long effective = Math.min(watermark, consistencyHead)
+
+        long[] digests = new long[buckets]
+        int[] counts = new int[buckets]
+        consistencyEntries.each { String key, Long offset ->
+            if (offset <= effective) {
+                long h = com.messaging.broker.consistency.KeyspaceDigest.hash64(key)
+                int b = com.messaging.broker.consistency.KeyspaceDigest.bucketOf(h, buckets)
+                digests[b] ^= com.messaging.broker.consistency.KeyspaceDigest.contribution(h, offset)
+                counts[b]++
+            }
+        }
+        def body = MAPPER.writeValueAsBytes([
+            parentHead        : consistencyHead,
+            effectiveWatermark: effective,
+            digests           : digests as List,
+            counts            : counts as List
+        ])
+        sendJson(out, 200, body)
+    }
+
+    private void serveConsistencyBucket(DataOutputStream out, String path) {
+        long watermark = queryParam(path, 'watermark', 0L)
+        int buckets = (int) queryParam(path, 'buckets', 64L)
+        long effective = Math.min(watermark, consistencyHead)
+        def wantedMatcher = (path =~ /[?&]bucket=([^&]+)/)
+        Set<Integer> wanted = wantedMatcher.find()
+                ? wantedMatcher.group(1).split(',').collect { it.trim() as int } as Set
+                : ([] as Set)
+
+        Map<String, List<Map>> entriesByBucket = wanted.collectEntries { [(it.toString()): []] }
+        consistencyEntries.each { String key, Long offset ->
+            if (offset <= effective) {
+                long h = com.messaging.broker.consistency.KeyspaceDigest.hash64(key)
+                int b = com.messaging.broker.consistency.KeyspaceDigest.bucketOf(h, buckets)
+                entriesByBucket[b.toString()]?.add([h: h, o: offset])
+            }
+        }
+        sendJson(out, 200, MAPPER.writeValueAsBytes([entries: entriesByBucket]))
     }
 
     private void servePipePoll(DataOutputStream out) {

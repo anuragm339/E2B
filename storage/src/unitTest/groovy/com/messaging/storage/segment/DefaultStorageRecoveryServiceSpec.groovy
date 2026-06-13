@@ -113,4 +113,42 @@ class DefaultStorageRecoveryServiceSpec extends Specification {
         then:
         thrown(StorageException)
     }
+
+    def "duplicate base offsets prefer the compacted file instead of nondeterministic shadowing"() {
+        given: 'a crash between compaction finalise and cleanup left BOTH files for base 0'
+        def plain = new com.messaging.storage.segment.Segment(
+                tempDir.resolve('00000000000000000000.log'),
+                tempDir.resolve('00000000000000000000.index'),
+                0L, 1073741824L, 'dup-topic', 0)
+        plain.append(record(0L, 'old-key', 'pre-compaction'))
+        plain.close()
+
+        def compacted = new com.messaging.storage.segment.Segment(
+                tempDir.resolve('00000000000000000000.compacted.log'),
+                tempDir.resolve('00000000000000000000.compacted.index'),
+                0L, 1073741824L, 'dup-topic', 0)
+        compacted.append(record(0L, 'new-key', 'post-compaction'))
+        compacted.close()
+
+        when:
+        def result = recoveryService.recoverSegments(tempDir, 'dup-topic', 0, 1073741824L)
+
+        then: 'exactly one segment for base 0, and it is the compacted (post-swap) one'
+        result.getSegments().size() == 1
+        result.getSegments()[0].getLogPath().getFileName().toString() == '00000000000000000000.compacted.log'
+        result.getSegments()[0].read(0L).getMsgKey() == 'new-key'
+
+        cleanup:
+        result?.getSegments()?.each { it.close() }
+    }
+
+    private static com.messaging.common.model.MessageRecord record(long offset, String key, String data) {
+        def r = new com.messaging.common.model.MessageRecord()
+        r.setOffset(offset)
+        r.setMsgKey(key)
+        r.setData(data)
+        r.setEventType(com.messaging.common.model.EventType.MESSAGE)
+        r.setCreatedAt(java.time.Instant.now())
+        return r
+    }
 }

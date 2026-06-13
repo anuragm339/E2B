@@ -1,5 +1,6 @@
 package com.messaging.broker.handler
 
+import com.messaging.common.exception.MessagingException
 import spock.lang.Specification
 
 class ValidationResultSpec extends Specification {
@@ -80,7 +81,7 @@ class ValidationResultSpec extends Specification {
         (result as ValidationResult.Warning).correctedOffset()
 
         then:
-        thrown(IllegalStateException)
+        thrown(MessagingException)
     }
 
     def "success result should be singleton-like"() {

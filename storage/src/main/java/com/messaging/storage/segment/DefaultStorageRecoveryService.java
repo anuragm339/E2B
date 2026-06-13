@@ -13,7 +13,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -80,6 +82,37 @@ public class DefaultStorageRecoveryService implements StorageRecoveryService {
         }
 
         // Sort by filename (which contains offset)
+        logFiles.sort(Path::compareTo);
+
+        // Deduplicate by base offset: a crash between compaction's finalise and cleanup can
+        // leave BOTH X.log and X.compacted.log on disk. Loading both used to make the second
+        // silently shadow the first in SegmentManager's map (nondeterministic data view) and
+        // leak the loser's open channels. The compacted file is the post-swap source of truth.
+        Map<Long, Path> byBase = new LinkedHashMap<>();
+        for (Path logPath : logFiles) {
+            String name = logPath.getFileName().toString();
+            long base;
+            try {
+                base = extractOffsetFromFilename(name);
+            } catch (StorageException e) {
+                log.error("Skipping unparseable segment filename: {}", name);
+                continue;
+            }
+            Path existing = byBase.get(base);
+            if (existing == null) {
+                byBase.put(base, logPath);
+            } else {
+                boolean preferNew = name.endsWith(".compacted.log");
+                Path winner = preferNew ? logPath : existing;
+                Path loser = preferNew ? existing : logPath;
+                byBase.put(base, winner);
+                log.warn("Duplicate segment files for baseOffset={}: keeping {} and IGNORING {} " +
+                         "(crash between compaction finalise and cleanup) — delete the ignored " +
+                         "file manually after verifying the kept one",
+                        base, winner.getFileName(), loser.getFileName());
+            }
+        }
+        logFiles = new ArrayList<>(byBase.values());
         logFiles.sort(Path::compareTo);
 
         List<Segment> segments = new ArrayList<>();

@@ -100,6 +100,10 @@ class BlackBoxMockCloudServer {
                 serveTopology(out)
             } else if (path.startsWith('/pipe/poll')) {
                 servePipePoll(out)
+            } else if (path.startsWith('/pipe/consistency/head')) {
+                sendJson(out, 200, ("{\"head\":${consistencyHead}}").getBytes('UTF-8'))
+            } else if (path.startsWith('/pipe/consistency/digest')) {
+                serveConsistencyDigest(out, path)
             } else {
                 sendText(out, 404, 'Not Found')
             }
@@ -118,6 +122,36 @@ class BlackBoxMockCloudServer {
             topics         : []
         ])
         sendJson(out, 200, body)
+    }
+
+    // ── Pipe-consistency stub (parent role for cross-process consistency checks) ──
+    // Digest math delegates to the production KeyspaceDigest so the stub can never drift.
+    volatile long consistencyHead = -1L
+    final Map<String, Long> consistencyEntries = new java.util.concurrent.ConcurrentHashMap<>()
+
+    private void serveConsistencyDigest(DataOutputStream out, String path) {
+        def wm = (path =~ /[?&]watermark=(\d+)/)
+        def bk = (path =~ /[?&]buckets=(\d+)/)
+        long watermark = wm.find() ? (wm.group(1) as long) : 0L
+        int buckets = bk.find() ? (bk.group(1) as int) : 64
+        long effective = Math.min(watermark, consistencyHead)
+
+        long[] digests = new long[buckets]
+        int[] counts = new int[buckets]
+        consistencyEntries.each { String key, Long offset ->
+            if (offset <= effective) {
+                long h = com.messaging.broker.consistency.KeyspaceDigest.hash64(key)
+                int b = com.messaging.broker.consistency.KeyspaceDigest.bucketOf(h, buckets)
+                digests[b] ^= com.messaging.broker.consistency.KeyspaceDigest.contribution(h, offset)
+                counts[b]++
+            }
+        }
+        sendJson(out, 200, MAPPER.writeValueAsBytes([
+            parentHead        : consistencyHead,
+            effectiveWatermark: effective,
+            digests           : digests as List,
+            counts            : counts as List
+        ]))
     }
 
     private void servePipePoll(DataOutputStream out) {

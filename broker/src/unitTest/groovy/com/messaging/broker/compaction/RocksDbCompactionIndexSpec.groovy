@@ -25,6 +25,28 @@ class RocksDbCompactionIndexSpec extends Specification {
 
     // ── updateKey / isSuperseded ───────────────────────────────────────────────
 
+    def "updateKey PROPAGATES a backend write failure instead of swallowing it"() {
+        given: 'a SharedRocksDb whose underlying db fails the put (e.g. disk full)'
+        def failingDb = Mock(org.rocksdb.RocksDB) {
+            get(*_) >> null
+            put(*_) >> { throw new org.rocksdb.RocksDBException('disk full') }
+        }
+        def failingShared = Stub(SharedRocksDb) {
+            getDb() >> failingDb
+            getCompactionHandle() >> Mock(org.rocksdb.ColumnFamilyHandle)
+            getWriteOptions() >> null
+        }
+        def failingIndex = new RocksDbCompactionIndex(failingShared)
+
+        when:
+        failingIndex.updateKey("prices-v1", "product-abc", 5L, 1L)
+
+        then: 'caller (handlePipeMessage) sees a structured StorageException so the pipe offset is NOT advanced'
+        def e = thrown(com.messaging.common.exception.StorageException)
+        e.errorCode == com.messaging.common.exception.ErrorCode.STORAGE_METADATA_ERROR
+        e.cause instanceof org.rocksdb.RocksDBException
+    }
+
     def "isSuperseded returns false when no entry exists for key"() {
         expect:
         !index.isSuperseded("prices-v1", "product-abc", 0L)

@@ -1,4 +1,6 @@
 package com.messaging.broker.consumer;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -70,7 +72,8 @@ public class FlushingPropertiesStore implements PropertiesStore {
      */
     public void start() {
         if (stopped.get()) {
-            throw new IllegalStateException(description + " store has already been stopped");
+            throw new MessagingException(ErrorCode.BROKER_INVALID_STATE,
+                    description + " store has already been stopped");
         }
         if (!started.compareAndSet(false, true)) {
             return;

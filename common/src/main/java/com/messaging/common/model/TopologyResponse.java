@@ -5,10 +5,14 @@ import java.util.List;
 /**
  * Response from cloud registry for topology query
  */
+@com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
 public class TopologyResponse {
     private String nodeId;
     private NodeRole role;
     private List<String> requestToFollow;  // Ordered list of parent URLs to try
+    // All POS in this store eligible to answer consistency verification (preference-ordered).
+    // Optional: old registries omit it; consumers fall back to requestToFollow[1..].
+    private List<String> verifierCandidates;
     private String cloudDataUrl;           // For root broker only
     private String cloudDataUrlFallback;   // For root broker only
     private String topologyVersion;
@@ -39,6 +43,14 @@ public class TopologyResponse {
 
     public void setRequestToFollow(List<String> requestToFollow) {
         this.requestToFollow = requestToFollow;
+    }
+
+    public List<String> getVerifierCandidates() {
+        return verifierCandidates;
+    }
+
+    public void setVerifierCandidates(List<String> verifierCandidates) {
+        this.verifierCandidates = verifierCandidates;
     }
 
     public String getCloudDataUrl() {

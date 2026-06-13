@@ -1,5 +1,6 @@
 package com.messaging.network.legacy;
 
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.network.legacy.ProtocolDetectionService;
 import com.messaging.network.legacy.events.EventType;
@@ -58,7 +59,7 @@ public class DefaultProtocolDetectionService implements ProtocolDetectionService
                 // For other ordinals (1-7), check if they make sense as first message
                 // Legacy clients should send REGISTER first, so 1-7 as first byte
                 // is more likely to be modern protocol
-            } catch (IllegalArgumentException e) {
+            } catch (MessagingException e) {
                 // Invalid EventType - fall through to modern check
             }
         }

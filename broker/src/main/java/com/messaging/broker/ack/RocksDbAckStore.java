@@ -1,6 +1,8 @@
 package com.messaging.broker.ack;
 
 import com.messaging.broker.compaction.SharedRocksDb;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import io.micronaut.context.annotation.Requires;
 import jakarta.inject.Singleton;
 import org.rocksdb.*;
@@ -87,7 +89,8 @@ public class RocksDbAckStore implements AckStore {
     @Override
     public void putBatch(String[] topics, String[] groups, AckRecord[] records) {
         if (topics.length != groups.length || topics.length != records.length) {
-            throw new IllegalArgumentException("ACK batch arrays must have equal lengths");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "ACK batch arrays must have equal lengths");
         }
         if (topics.length == 0) {
             return;
@@ -189,7 +192,8 @@ public class RocksDbAckStore implements AckStore {
 
     private byte[] buildKey(String topic, String group, long offset) {
         if (offset < 0) {
-            throw new IllegalArgumentException("ACK store offset must be >= 0, got: " + offset);
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_OFFSET,
+                    "ACK store offset must be >= 0, got: " + offset);
         }
         return (topic + "|" + group + "|" + String.format("%020d", offset))
                 .getBytes(StandardCharsets.UTF_8);

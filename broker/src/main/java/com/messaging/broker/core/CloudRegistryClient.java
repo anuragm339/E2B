@@ -1,6 +1,7 @@
 package com.messaging.broker.core;
 
 import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.TopologyResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -79,17 +80,15 @@ public class CloudRegistryClient {
                 return topology;
 
             } catch (MessagingException e) {
-                // Lambda limitation: Supplier cannot throw checked exceptions
-                // Wrap in RuntimeException - CompletableFuture will propagate as CompletionException
-                throw new RuntimeException("Failed to query Cloud Registry - see cause for details", e);
+                // Unchecked — propagates out of the Supplier and completes the future
+                // exceptionally (CompletableFuture surfaces it as CompletionException).
+                throw ExceptionLogger.logAndThrow(log, e);
             } catch (Exception e) {
-                // Wrap unexpected exceptions
                 MessagingException ex = new MessagingException(ErrorCode.REGISTRY_TOPOLOGY_FETCH_FAILED,
                     "Failed to query Cloud Registry", e);
                 ex.withContext("registryUrl", registryUrl);
                 ex.withContext("nodeId", nodeId);
-                // Lambda limitation: Wrap in RuntimeException
-                throw new RuntimeException("Failed to query Cloud Registry - see cause for details", ex);
+                throw ExceptionLogger.logAndThrow(log, ex);
             }
         }, registryExecutor);
     }

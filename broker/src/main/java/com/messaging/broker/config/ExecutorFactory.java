@@ -1,5 +1,8 @@
 package com.messaging.broker.config;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
 import io.micronaut.context.annotation.Factory;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Named;
@@ -187,7 +190,9 @@ public class ExecutorFactory {
 
     private void validatePositive(String property, int value) {
         if (value <= 0) {
-            throw new IllegalArgumentException(property + " must be > 0");
+            throw ExceptionLogger.logAndThrow(log,
+                    new MessagingException(ErrorCode.BROKER_INVALID_CONFIGURATION,
+                            property + " must be > 0"));
         }
     }
 }

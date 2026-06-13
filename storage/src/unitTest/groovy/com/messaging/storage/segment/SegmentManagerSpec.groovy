@@ -323,6 +323,94 @@ class SegmentManagerSpec extends Specification {
         manager?.close()
     }
 
+    def "restart never exposes the re-activated segment to compaction"() {
+        given: 'a manager with data, closed cleanly (simulating a broker restart)'
+        def manager = newManager('restart-topic', 10 * 1024 * 1024L)
+        3.times { i -> manager.append(createRecord(i, "key-$i", 'data')) }
+        manager.close()
+
+        when: 'the manager is reconstructed from disk'
+        def reopened = newManager('restart-topic', 10 * 1024 * 1024L)
+
+        then: 'the last segment is active again and is NOT offered to the compaction planner'
+        reopened.getActiveSegment() != null
+        reopened.getActiveSegment().getBaseOffset() == 0L
+        reopened.getInactiveSegments().isEmpty()
+
+        and: 'appends still work after reopen'
+        reopened.append(createRecord(3L, 'key-3', 'data')) == 3L
+
+        when: 'compaction (incorrectly) tries to replace the active segment — the bug that bricked ingest'
+        reopened.replaceSegments([reopened.getActiveSegment()], reopened.getActiveSegment())
+
+        then: 'it is refused outright instead of sealing+deleting the live write target'
+        def e = thrown(com.messaging.common.exception.StorageException)
+        e.message.contains('Cannot replace active segment')
+
+        cleanup:
+        reopened?.close()
+    }
+
+    def "force-rolling an empty active segment is a no-op instead of creating a same-file twin"() {
+        given: 'a fresh manager whose active segment holds only the 6-byte file header'
+        def manager = newManager('empty-roll-topic', 10 * 1024 * 1024L)
+
+        when: 'force-roll is invoked repeatedly (e.g. compaction trigger on an idle topic)'
+        3.times { manager.forceRollActiveSegment() }
+
+        then: 'nothing rolled — no sealed twin sharing the active file path'
+        manager.getInactiveSegments().isEmpty()
+        manager.getAllSegments().size() == 1
+
+        when: 'data arrives and force-roll runs again'
+        manager.append(createRecord(0L, 'k', 'd'))
+        manager.forceRollActiveSegment()
+
+        then: 'a real roll happens and the new active segment has a DIFFERENT base'
+        manager.getInactiveSegments().size() == 1
+        manager.getActiveSegment().getBaseOffset() != manager.getInactiveSegments()[0].getBaseOffset()
+
+        cleanup:
+        manager?.close()
+    }
+
+    def "same-base compaction replacement never deletes the replacement's file or metadata"() {
+        given: 'a manager with one sealed segment at base 0'
+        def manager = newManager('samebase-topic', 10 * 1024 * 1024L)
+        manager.append(createRecord(0L, 'k0', 'd0'))
+        manager.append(createRecord(1L, 'k1', 'd1'))
+        manager.forceRollActiveSegment()
+        def sealed = manager.getInactiveSegments()[0]
+
+        and: 'a compacted replacement at the SAME base on the .compacted path (first compaction)'
+        def dir = sealed.getLogPath().getParent()
+        def compacted = new Segment(dir.resolve('00000000000000000000.compacted.log'),
+                dir.resolve('00000000000000000000.compacted.index'), 0L, 10 * 1024 * 1024L, 'samebase-topic', 0)
+        compacted.append(createRecord(1L, 'k1', 'd1'))
+        compacted.seal()
+
+        when:
+        manager.replaceSegments([sealed], compacted)
+
+        then: 'old plain files deleted, compacted file intact, metadata row for base 0 survives'
+        !java.nio.file.Files.exists(dir.resolve('00000000000000000000.log'))
+        java.nio.file.Files.exists(dir.resolve('00000000000000000000.compacted.log'))
+        manager.getInactiveSegments()[0].is(compacted)
+
+        when: 'a RE-compaction of the unadvanced window replaces same base AND same path'
+        def recompacted = new Segment(dir.resolve('00000000000000000000.compacted.log'),
+                dir.resolve('00000000000000000000.compacted.index'), 0L, 10 * 1024 * 1024L, 'samebase-topic', 0)
+        recompacted.seal()
+        manager.replaceSegments([compacted], recompacted)
+
+        then: 'the shared file is NOT unlinked — the bug deleted the just-installed segment'
+        java.nio.file.Files.exists(dir.resolve('00000000000000000000.compacted.log'))
+        manager.getInactiveSegments()[0].is(recompacted)
+
+        cleanup:
+        manager?.close()
+    }
+
     private SegmentManager newManager(String topic, long maxSize) {
         def partitionDir = tempDir.resolve(topic).resolve("partition-0")
         def metadataStore = new SegmentMetadataStore(tempDir.resolve(topic))

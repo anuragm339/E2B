@@ -13,6 +13,7 @@ import com.messaging.broker.core.TopologyManager;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
 import com.messaging.common.exception.NetworkException;
 import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.BrokerMessage;
@@ -90,15 +91,12 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             storage.recover();
             log.info("Storage recovered");
         } catch (StorageException e) {
-            // Framework limitation: ApplicationEventListener cannot throw checked exceptions
-            // Wrap in RuntimeException to propagate and fail application startup
-            throw new RuntimeException("Storage recovery failed - see cause for details", e);
+            // MessagingException is unchecked, so it propagates straight out of this
+            // ApplicationEventListener callback and fails application startup as intended.
+            throw ExceptionLogger.logAndThrow(log, e);
         } catch (Exception e) {
-            log.error("Failed to recover storage", e);
-            StorageException storageEx = new StorageException(ErrorCode.STORAGE_RECOVERY_FAILED,
-                "Storage recovery failed during broker initialization", e);
-            // Framework limitation: Wrap in RuntimeException to fail application startup
-            throw new RuntimeException("Storage recovery failed - see cause for details", storageEx);
+            throw ExceptionLogger.logAndThrow(log, new StorageException(ErrorCode.STORAGE_RECOVERY_FAILED,
+                "Storage recovery failed during broker initialization", e));
         }
 
         // Backfill RocksDB ACK entries for records consumed before ACK tracking existed.
@@ -129,8 +127,8 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             server.start(serverPort);
             log.info("Broker ready on port {}", serverPort);
         } catch (NetworkException e) {
-            // Framework limitation: Wrap in RuntimeException to fail application startup
-            throw new RuntimeException("Network server startup failed - see cause for details", e);
+            // Unchecked MessagingException propagates out of startup and fails the boot.
+            throw ExceptionLogger.logAndThrow(log, e);
         }
 
         // Start consumer delivery
@@ -183,6 +181,13 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // invariant. Treat as success so the pipe offset advances past it.
             long topicHead = storage.getCurrentOffset(topic, 0);
             if (record.getOffset() > 0 && record.getOffset() <= topicHead) {
+                // Heal the index even when skipping the storage write: a crash (or lost
+                // RocksDB WAL tail on power cut) between append and updateKey leaves the
+                // record in segments but not in the index — the parent's re-send is the
+                // ONE chance to repair that gap. updateKey is idempotent and monotone, so
+                // for genuine duplicates this is a no-op.
+                compactionIndex.updateKey(topic, record.getMsgKey(), record.getOffset(),
+                        record.getCreatedAt().toEpochMilli());
                 log.info("event=pipe_message.duplicate_skipped topic={} offset={} storageHead={}",
                         topic, record.getOffset(), topicHead);
                 metrics.stopE2ETimer(e2eSample);

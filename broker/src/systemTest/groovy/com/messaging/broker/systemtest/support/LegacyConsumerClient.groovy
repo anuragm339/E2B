@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * inbound Events on a background thread so test assertions can poll {@code received}.
  *
  * Usage:
- *   def client = LegacyConsumerClient.connect('127.0.0.1', port, 'price-quote-service')
+ *   def client = LegacyConsumerClient.connect('127.0.0.1', port, 'price-quote')
  *   pollingConditions.eventually { assert client.received.any { it instanceof ReadyEvent } }
  *   client.sendAck()
  *   ...

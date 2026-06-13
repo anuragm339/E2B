@@ -7,8 +7,14 @@ import java.util.Map;
 /**
  * Base exception for all messaging system errors.
  * Provides rich context for debugging, monitoring, and alerting.
+ *
+ * <p>Unchecked ({@code extends RuntimeException}) so every layer — value objects, hot-path
+ * decoders, framework callbacks that cannot declare {@code throws} — can raise a structured,
+ * code-carrying exception without polluting signatures or breaking public APIs. Existing
+ * {@code throws}/{@code catch} declarations remain valid; the project still catches these at
+ * its boundaries (handlers, {@code BrokerService}, the delivery loop).
  */
-public class MessagingException extends Exception {
+public class MessagingException extends RuntimeException {
 
     private final ErrorCode errorCode;
     private final Instant timestamp;

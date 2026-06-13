@@ -48,7 +48,7 @@ class BrokerLegacyConsumerIntegrationSpec extends Specification implements TestP
     LegacyConsumerClient legacy
 
     def setup() {
-        legacy = LegacyConsumerClient.connect('127.0.0.1', tcpPort, 'price-quote-service')
+        legacy = LegacyConsumerClient.connect('127.0.0.1', tcpPort, 'price-quote')
     }
 
     def cleanup() {
@@ -76,7 +76,7 @@ class BrokerLegacyConsumerIntegrationSpec extends Specification implements TestP
         expect: "legacy registration creates subscriptions and broker sends startup READY"
         conditions.eventually {
             assert remoteConsumers.getAllConsumers().findAll {
-                it.legacy && it.group == 'price-quote-service'
+                it.legacy && it.group == 'price-quote'
             }.size() > 0
             assert legacy.received.any { it instanceof ReadyEvent }
         }
@@ -84,10 +84,10 @@ class BrokerLegacyConsumerIntegrationSpec extends Specification implements TestP
         when: "legacy consumer acknowledges startup READY, then reset offset to force re-delivery"
         legacy.sendAck()
         legacy.received.clear()
-        offsetTracker.updateOffset('price-quote-service:prices-v1', -1L)
+        offsetTracker.updateOffset('price-quote:prices-v1', -1L)
 
         def clientId = remoteConsumers.getAllConsumers()
-            .find { it.legacy && it.group == 'price-quote-service' && it.topic == 'prices-v1' }
+            .find { it.legacy && it.group == 'price-quote' && it.topic == 'prices-v1' }
             .clientId
 
         then: "broker delivers a merged batch via adaptive delivery"
@@ -106,7 +106,7 @@ class BrokerLegacyConsumerIntegrationSpec extends Specification implements TestP
 
         then: "offset advances to storage head"
         conditions.eventually {
-            assert offsetTracker.getOffset('price-quote-service:prices-v1') == storageHead
+            assert offsetTracker.getOffset('price-quote:prices-v1') == storageHead
         }
     }
 

@@ -1,9 +1,21 @@
 package com.messaging.broker.core
 
+import com.messaging.broker.ack.AckStoreSeeder
+import com.messaging.broker.compaction.CompactionIndex
+import com.messaging.broker.consumer.AdaptiveBatchDeliveryManager
+import com.messaging.broker.consumer.ConsumerDeliveryManager
+import com.messaging.broker.handler.DisconnectHandler
+import com.messaging.broker.handler.MessageHandlerRegistry
+import com.messaging.broker.monitoring.BrokerMetrics
+import com.messaging.common.api.NetworkServer
+import com.messaging.common.api.StorageEngine
+import com.messaging.common.model.EventType
+import com.messaging.common.model.MessageRecord
 import spock.lang.Specification
 
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 
 /**
  * Unit tests for BrokerService - testing BROKER-2 (ACK Handler OOM) and other fixes
@@ -17,6 +29,69 @@ class BrokerServiceSpec extends Specification {
     def "broker service test setup verification"() {
         expect: "basic Spock test infrastructure works"
         true
+    }
+
+    // ===== Pipe ingest: storage ↔ compaction-index sync invariant =====
+
+    StorageEngine storage = Mock()
+    CompactionIndex compactionIndex = Mock()
+
+    private BrokerService brokerService() {
+        new BrokerService(storage, Mock(NetworkServer), Mock(ConsumerDeliveryManager),
+                Mock(AdaptiveBatchDeliveryManager), Mock(TopologyManager), Mock(BrokerMetrics),
+                Mock(MessageHandlerRegistry), Mock(DisconnectHandler), Mock(ShutdownCoordinator),
+                Mock(AckStoreSeeder), compactionIndex, 9092, false)
+    }
+
+    private static MessageRecord pipeRecord(long offset) {
+        new MessageRecord(offset, 'prices-v1', 0, 'key-1', EventType.MESSAGE, 'payload',
+                Instant.ofEpochMilli(42L))
+    }
+
+    def "pipe message is appended to storage AND the compaction index, then ACKed"() {
+        given:
+        def service = brokerService()
+        storage.getCurrentOffset('prices-v1', 0) >> 5L
+
+        when:
+        def stored = service.handlePipeMessage(pipeRecord(6L))
+
+        then: 'both halves of the ingest write happen — segments and index stay in sync'
+        1 * storage.append('prices-v1', 0, _) >> 6L
+        1 * compactionIndex.updateKey('prices-v1', 'key-1', 6L, 42L)
+        stored
+    }
+
+    def "duplicate pipe re-send skips the storage write but still heals the compaction index"() {
+        given: 'parent re-sends offset 6 which storage already holds (head = 6)'
+        def service = brokerService()
+        storage.getCurrentOffset('prices-v1', 0) >> 6L
+
+        when:
+        def stored = service.handlePipeMessage(pipeRecord(6L))
+
+        then: 'no duplicate physical record, but the index gap from a crash between append and updateKey is repaired'
+        0 * storage.append(*_)
+        1 * compactionIndex.updateKey('prices-v1', 'key-1', 6L, 42L)
+        stored
+    }
+
+    def "failed compaction-index write fails the whole ingest so the pipe offset does not advance"() {
+        given:
+        def service = brokerService()
+        storage.getCurrentOffset('prices-v1', 0) >> 5L
+        storage.append('prices-v1', 0, _) >> 6L
+        compactionIndex.updateKey(*_) >> {
+            throw new com.messaging.common.exception.StorageException(
+                    com.messaging.common.exception.ErrorCode.STORAGE_METADATA_ERROR,
+                    'CompactionIndex write failed')
+        }
+
+        when:
+        def stored = service.handlePipeMessage(pipeRecord(6L))
+
+        then: 'false → HttpPipeConnector keeps the offset, the parent re-sends, the dedupe branch heals the index'
+        !stored
     }
 
     // ===== BROKER-2: ACK Handler OOM Vulnerability Tests =====

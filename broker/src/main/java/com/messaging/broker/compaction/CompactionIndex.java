@@ -1,5 +1,7 @@
 package com.messaging.broker.compaction;
 
+import com.messaging.common.exception.StorageException;
+
 import java.util.Map;
 
 /**
@@ -26,8 +28,13 @@ public interface CompactionIndex {
      * <p>When the call <em>does</em> advance the index, implementations must also record that
      * the previously-latest offset is now stale so {@link #shouldFilterDelivery} can return
      * {@code true} until the compaction sweep removes it.
+     *
+     * <p>Implementations MUST throw a {@link StorageException} when the backend write fails —
+     * callers on the ingest path treat the whole record as failed and retry, keeping the index
+     * in lockstep with storage. Swallowing the failure silently desynchronises the two.
+     * (Implementations that cannot fail — e.g. the in-memory index — narrow the throws clause away.)
      */
-    void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs);
+    void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs) throws StorageException;
 
     /**
      * Returns {@code true} when a strictly newer record exists for {@code (topic, msgKey)}
@@ -70,4 +77,21 @@ public interface CompactionIndex {
      * Used by {@code CompactionRewriter} to decide which records survive a sweep.
      */
     Map<String, long[]> getLatestOffsetsForTopic(String topic);
+
+    /**
+     * Stream every entry for {@code topic} to {@code consumer} without materialising a map.
+     *
+     * <p>Exists for the pipe-consistency keyspace digest: at millions of live keys,
+     * {@link #getLatestOffsetsForTopic} would allocate hundreds of MB of heap; this method is
+     * O(1) memory. Iteration order is implementation-defined (the digest is order-independent).
+     * Entries observed during a concurrent {@link #updateKey} may reflect either the old or the
+     * new offset — callers must tolerate that (the digest protocol does).
+     */
+    void forEachEntry(String topic, IndexEntryConsumer consumer);
+
+    /** Callback for {@link #forEachEntry}. */
+    @FunctionalInterface
+    interface IndexEntryConsumer {
+        void accept(String msgKey, long latestOffset, long latestTimestampMs);
+    }
 }
