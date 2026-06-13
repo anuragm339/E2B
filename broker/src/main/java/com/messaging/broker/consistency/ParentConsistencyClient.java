@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
 import io.micronaut.http.HttpRequest;
 import io.micronaut.http.HttpResponse;
 import io.micronaut.http.HttpStatus;
@@ -64,10 +66,23 @@ public class ParentConsistencyClient {
         public final Map<Long, Boolean> offsets;
         /** msgKey -> index state on parent */
         public final Map<String, KeyState> keys;
+        /**
+         * True when the answering node's keyspace is complete and never expires (the cloud) —
+         * its ABSENT answers then prove a key was fabricated, not merely unseen. POS parents
+         * never set this (they may legitimately lack keys that expired before they were
+         * provisioned).
+         */
+        public final boolean authoritative;
 
         public ClassifyResponse(Map<Long, Boolean> offsets, Map<String, KeyState> keys) {
+            this(offsets, keys, false);
+        }
+
+        public ClassifyResponse(Map<Long, Boolean> offsets, Map<String, KeyState> keys,
+                                boolean authoritative) {
             this.offsets = offsets;
             this.keys = keys;
+            this.authoritative = authoritative;
         }
     }
 
@@ -84,6 +99,16 @@ public class ParentConsistencyClient {
     @Inject
     public ParentConsistencyClient(@Client("/") HttpClient httpClient) {
         this.httpClient = httpClient;
+    }
+
+    /**
+     * Cheap head probe for verifier-candidate filtering — no scan on the target.
+     * Throws (network / 404-unsupported) like the other calls; escalation treats any
+     * failure as "skip this candidate".
+     */
+    public long fetchHead(String baseUrl, String topic) {
+        JsonNode json = getJson(baseUrl + "/pipe/consistency/head?topic=" + topic);
+        return json.path("head").asLong(-1);
     }
 
     public DigestResponse fetchDigest(String baseUrl, String topic, long watermark, int buckets) {
@@ -140,7 +165,8 @@ public class ParentConsistencyClient {
         Map<String, KeyState> keyResults = new HashMap<>();
         json.path("keys").fields().forEachRemaining(e ->
                 keyResults.put(e.getKey(), KeyState.valueOf(e.getValue().asText())));
-        return new ClassifyResponse(offsetResults, keyResults);
+        return new ClassifyResponse(offsetResults, keyResults,
+                json.path("authoritative").asBoolean(false));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -161,11 +187,13 @@ public class ParentConsistencyClient {
             if (e.getStatus() == HttpStatus.NOT_FOUND) {
                 throw new UnsupportedParentException(url);
             }
-            throw new RuntimeException("Consistency call failed: " + url + " -> " + e.getStatus(), e);
+            throw new NetworkException(ErrorCode.NETWORK_RECEIVE_FAILED,
+                    "Consistency call failed: " + url + " -> " + e.getStatus(), e);
         } catch (UnsupportedParentException e) {
             throw e;
         } catch (Exception e) {
-            throw new RuntimeException("Consistency call failed: " + url, e);
+            throw new NetworkException(ErrorCode.NETWORK_CONNECTION_FAILED,
+                    "Consistency call failed: " + url, e);
         }
     }
 

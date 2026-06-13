@@ -1,5 +1,6 @@
 package com.messaging.broker.model
 
+import com.messaging.common.exception.MessagingException
 import spock.lang.Specification
 
 class SubscribeRequestSpec extends Specification {
@@ -154,7 +155,7 @@ class SubscribeRequestSpec extends Specification {
         SubscribeRequest.legacy("client-1", "service-1", [])
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("topics list cannot be empty")
     }
 

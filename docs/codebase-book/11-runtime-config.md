@@ -200,3 +200,6 @@ Tests disable or delay pipe/compaction/reconciliation where isolation requires i
 | `schedule.interval` | `6h` | cadence of automatic all-topics checks |
 | `schedule.initial-delay` | `10m` | first automatic check after startup |
 | `schedule.target` | `parent` | `parent` or `cloud` |
+| `escalation.enabled` | `true` | clamp-persistence escalation to in-store verifiers |
+| `escalation.after-clamped-checks` | `2` | consecutive clamped checks before escalating |
+| `escalation.max-candidates` | `5` | head-probe budget per escalation |

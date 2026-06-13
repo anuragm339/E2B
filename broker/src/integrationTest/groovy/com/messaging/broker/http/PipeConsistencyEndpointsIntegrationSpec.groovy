@@ -23,6 +23,15 @@ class PipeConsistencyEndpointsIntegrationSpec extends BrokerHttpSpecSupport {
         assert json(response).success == true
     }
 
+    def "head endpoint answers the storage head without any scan"() {
+        given:
+        seedTopic('pc-head-topic', 4)   // offsets 0..3
+
+        expect:
+        json(get('/pipe/consistency/head?topic=pc-head-topic')).head == 3
+        json(get('/pipe/consistency/head?topic=no-such-topic')).head == -1
+    }
+
     def "digest endpoint returns bucket digests matching a local computation"() {
         given: 'records in storage and index entries at known offsets'
         seedTopic('pc-digest-topic', 5)   // offsets 0..4

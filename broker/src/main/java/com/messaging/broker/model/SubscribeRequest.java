@@ -1,5 +1,8 @@
 package com.messaging.broker.model;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
+
 import java.util.List;
 import java.util.Objects;
 
@@ -58,7 +61,8 @@ public sealed interface SubscribeRequest {
             Objects.requireNonNull(serviceName, "serviceName cannot be null");
             Objects.requireNonNull(topics, "topics cannot be null");
             if (topics.isEmpty()) {
-                throw new IllegalArgumentException("topics list cannot be empty");
+                throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                        "topics list cannot be empty");
             }
             // Make defensive copy to ensure immutability
             topics = List.copyOf(topics);

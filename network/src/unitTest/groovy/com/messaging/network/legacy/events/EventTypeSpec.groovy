@@ -1,5 +1,6 @@
 package com.messaging.network.legacy.events
 
+import com.messaging.common.exception.NetworkException
 import spock.lang.Specification
 
 class EventTypeSpec extends Specification {
@@ -16,7 +17,7 @@ class EventTypeSpec extends Specification {
         EventType.get(99)
 
         then:
-        def ex = thrown(IllegalArgumentException)
+        def ex = thrown(NetworkException)
         ex.message.contains('Invalid event type ordinal')
     }
 }

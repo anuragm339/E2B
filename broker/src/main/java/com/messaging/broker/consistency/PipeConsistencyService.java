@@ -60,6 +60,13 @@ public class PipeConsistencyService {
     private final int scanYieldEvery;
     private final int maxDrilldownBuckets;
     private final int maxClassifyEntries;
+    private final boolean escalationEnabled;
+    private final int escalateAfterClampedChecks;
+    private final int maxEscalationCandidates;
+
+    // Consecutive clamped outcomes per topic — escalation fires only when a clamp PERSISTS
+    // (most clamps self-heal: the new parent is catching up and passes the watermark soon).
+    private final Map<String, Integer> clampStreaks = new ConcurrentHashMap<>();
 
     private final AtomicBoolean running = new AtomicBoolean();
     private final Map<String, PipeConsistencyReport> latestByTopic = new ConcurrentHashMap<>();
@@ -67,6 +74,7 @@ public class PipeConsistencyService {
     private final Map<String, AtomicInteger> stateGauges = new ConcurrentHashMap<>();
     private final Map<String, java.util.concurrent.atomic.AtomicLong> missingGauges = new ConcurrentHashMap<>();
     private final Map<String, java.util.concurrent.atomic.AtomicLong> zombieGauges = new ConcurrentHashMap<>();
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> fabricatedGauges = new ConcurrentHashMap<>();
     private final Map<String, java.util.concurrent.atomic.AtomicLong> lastCheckEpoch = new ConcurrentHashMap<>();
     private final Counter checksTotal;
     private final Counter inconsistentTotal;
@@ -84,7 +92,10 @@ public class PipeConsistencyService {
             @Value("${pipe.consistency.buckets:64}") int buckets,
             @Value("${pipe.consistency.scan-yield-every:10000}") int scanYieldEvery,
             @Value("${pipe.consistency.max-drilldown-buckets:8}") int maxDrilldownBuckets,
-            @Value("${pipe.consistency.max-classify-entries:1000}") int maxClassifyEntries) {
+            @Value("${pipe.consistency.max-classify-entries:1000}") int maxClassifyEntries,
+            @Value("${pipe.consistency.escalation.enabled:true}") boolean escalationEnabled,
+            @Value("${pipe.consistency.escalation.after-clamped-checks:2}") int escalateAfterClampedChecks,
+            @Value("${pipe.consistency.escalation.max-candidates:5}") int maxEscalationCandidates) {
         this.storage = storage;
         this.compactionIndex = compactionIndex;
         this.client = client;
@@ -96,6 +107,9 @@ public class PipeConsistencyService {
         this.scanYieldEvery = scanYieldEvery;
         this.maxDrilldownBuckets = Math.max(1, maxDrilldownBuckets);
         this.maxClassifyEntries = Math.max(16, maxClassifyEntries);
+        this.escalationEnabled = escalationEnabled;
+        this.escalateAfterClampedChecks = Math.max(1, escalateAfterClampedChecks);
+        this.maxEscalationCandidates = Math.max(1, maxEscalationCandidates);
         this.checksTotal = Counter.builder("pipe.consistency.checks")
                 .description("Pipe-consistency topic checks run").register(meterRegistry);
         this.inconsistentTotal = Counter.builder("pipe.consistency.inconsistent")
@@ -132,6 +146,7 @@ public class PipeConsistencyService {
             List<PipeConsistencyReport> reports = new ArrayList<>(topics.size());
             for (String topic : topics) {
                 PipeConsistencyReport report = checkTopic(topic, targetUrl);
+                report = trackClampAndMaybeEscalate(topic, targetUrl, report);
                 record(report);
                 reports.add(report);
             }
@@ -139,6 +154,75 @@ public class PipeConsistencyService {
         } finally {
             running.set(false);
         }
+    }
+
+    // ── Escalation: a clamped parent cannot verify our full watermark ─────────
+
+    /**
+     * A clamped outcome (CONSISTENT_UP_TO or clamped INCONCLUSIVE) means the parent's head is
+     * below ours — only possible after a reshuffle assigned us a parent that is behind. The
+     * tail above the clamp is unverified. Most clamps self-heal (the parent is catching up),
+     * so the first {@code escalateAfterClampedChecks - 1} occurrences just mark the report
+     * {@code verificationPending}. A PERSISTENT clamp escalates to the registry-provided
+     * in-store verifier candidates: probe heads cheaply (no scan), run the full check against
+     * the first candidate whose head covers our watermark. The store-top always qualifies
+     * eventually (all in-store data descends from it), so the cloud is never involved.
+     */
+    private PipeConsistencyReport trackClampAndMaybeEscalate(
+            String topic, String originalTarget, PipeConsistencyReport report) {
+        boolean clamped = (report.state == State.CONSISTENT_UP_TO || report.state == State.INCONCLUSIVE)
+                && report.effectiveWatermark < report.watermark;
+        if (!clamped) {
+            clampStreaks.remove(topic);
+            return report;
+        }
+
+        report.verificationPending = true;
+        int streak = clampStreaks.merge(topic, 1, Integer::sum);
+        if (!escalationEnabled || streak < escalateAfterClampedChecks) {
+            return report;
+        }
+
+        long watermark = report.watermark;
+        int probed = 0;
+        for (String candidate : topologyManager.getVerifierCandidates()) {
+            String candidateUrl = stripTrailingSlash(candidate);
+            if (candidateUrl == null || candidateUrl.equals(originalTarget)) {
+                continue; // the clamped parent cannot verify — that is why we are here
+            }
+            if (++probed > maxEscalationCandidates) {
+                break;
+            }
+            long candidateHead;
+            try {
+                candidateHead = client.fetchHead(candidateUrl, topic);
+            } catch (Exception e) {
+                log.info("event=pipe_consistency.escalation_candidate_skipped topic={} candidate={} reason={}",
+                        topic, candidateUrl, e.getMessage());
+                continue; // down or unsupported — exactly why the registry sends a LIST
+            }
+            if (candidateHead < watermark) {
+                log.debug("event=pipe_consistency.escalation_candidate_behind topic={} candidate={} head={} watermark={}",
+                        topic, candidateUrl, candidateHead, watermark);
+                continue;
+            }
+
+            log.info("event=pipe_consistency.escalating topic={} from={} to={} clampStreak={}",
+                    topic, originalTarget, candidateUrl, streak);
+            PipeConsistencyReport escalatedReport = checkTopic(topic, candidateUrl);
+            escalatedReport.escalatedFrom = originalTarget;
+            if (escalatedReport.state == State.CONSISTENT || escalatedReport.state == State.INCONSISTENT) {
+                clampStreaks.remove(topic); // full verdict obtained
+            } else {
+                escalatedReport.verificationPending = true; // candidate raced behind — keep pending
+            }
+            return escalatedReport;
+        }
+
+        log.info("event=pipe_consistency.escalation_exhausted topic={} watermark={} clampStreak={} " +
+                "— no reachable in-store verifier covers the watermark yet (self-heals as they catch up)",
+                topic, watermark, streak);
+        return report;
     }
 
     // ── Per-topic check ───────────────────────────────────────────────────────
@@ -200,7 +284,8 @@ public class PipeConsistencyService {
             }
 
             drillDown(topic, targetUrl, report.effectiveWatermark, mismatched, report);
-            boolean inconsistent = report.missingKeys + report.staleKeys + report.zombieKeys > 0;
+            boolean inconsistent = report.missingKeys + report.staleKeys
+                    + report.zombieKeys + report.fabricatedKeys > 0;
             report.state = inconsistent ? State.INCONSISTENT
                     : (clamped ? State.CONSISTENT_UP_TO : State.CONSISTENT);
             report.refreshRecommended = inconsistent;
@@ -211,9 +296,7 @@ public class PipeConsistencyService {
             report.error = e.getMessage();
             return report;
         } catch (Exception e) {
-            boolean network = e.getCause() instanceof java.io.IOException
-                    || e.getMessage() != null && e.getMessage().contains("Connect");
-            report.state = network ? State.UNREACHABLE : State.ERROR;
+            report.state = looksLikeNetworkOutage(e) ? State.UNREACHABLE : State.ERROR;
             report.error = e.getMessage();
             log.warn("event=pipe_consistency.check_failed topic={} target={} state={}",
                     topic, targetUrl, report.state, e);
@@ -221,6 +304,28 @@ public class PipeConsistencyService {
         } finally {
             report.durationMs = System.currentTimeMillis() - startMs;
         }
+    }
+
+    /**
+     * A reachability failure (parent offline) → UNREACHABLE; anything else → ERROR. Walks the
+     * whole cause chain so the verdict is the same whether the failure arrives raw or wrapped in
+     * a {@link com.messaging.common.exception.NetworkException} from {@link ParentConsistencyClient}.
+     */
+    private static boolean looksLikeNetworkOutage(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof java.io.IOException) {
+                return true;
+            }
+            String m = t.getMessage();
+            if (m != null && (m.contains("Connect") || m.contains("connect")
+                    || m.contains("refused") || m.contains("timed out"))) {
+                return true;
+            }
+            if (t.getCause() == t) {
+                break;  // guard against self-referential cause chains
+            }
+        }
+        return false;
     }
 
     private List<Integer> mismatchedBuckets(KeyspaceDigest.Result mine, DigestResponse parent) {
@@ -352,6 +457,12 @@ public class PipeConsistencyService {
                 // Beyond-watermark: pure lag. At-or-below: ingest raced the check — also benign
                 // (the next check converges).
                 report.laggingKeys++;
+            } else if (classified.authoritative) {
+                // An AUTHORITATIVE verifier (the cloud — complete, never-expiring keyspace)
+                // has no entry at all: this key cannot legitimately exist anywhere in the
+                // fleet. Fabricated / corrupted index — a real inconsistency.
+                report.fabricatedKeys++;
+                addSample(report, "fabricated key=" + key + " (authoritative verifier never had it)");
             } else {
                 report.extraKeys++;
                 addSample(report, "extra key=" + key + " (parent has no entry — lineage artifact)");
@@ -392,6 +503,9 @@ public class PipeConsistencyService {
         topicGauge(zombieGauges, "pipe.consistency.zombie.keys",
                 "Zombie keys (deletes missed while offline) found by the last check", report.topic)
                 .set(report.zombieKeys);
+        topicGauge(fabricatedGauges, "pipe.consistency.fabricated.keys",
+                "Fabricated keys (an authoritative verifier never had) found by the last check", report.topic)
+                .set(report.fabricatedKeys);
         topicGauge(lastCheckEpoch, "pipe.consistency.last.check.epoch",
                 "Epoch seconds of the last completed check", report.topic)
                 .set(report.checkedAtMs / 1000);

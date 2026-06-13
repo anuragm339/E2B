@@ -74,6 +74,25 @@ public class PipeConsistencyController {
         this.scanPermits = new Semaphore(Math.max(1, maxConcurrentScans));
     }
 
+    /**
+     * Cheap head probe — lets a child filter verifier candidates (head >= its watermark)
+     * before asking anyone to run a digest scan. O(1): in-memory storage head, no scan,
+     * no semaphore.
+     */
+    @Get("/head")
+    @Produces(MediaType.APPLICATION_JSON)
+    public HttpResponse<String> head(@QueryValue String topic) {
+        if (!enabled) {
+            return HttpResponse.notFound();
+        }
+        try {
+            return HttpResponse.ok("{\"head\":" + storage.getCurrentOffset(topic, 0) + "}");
+        } catch (Exception e) {
+            log.error("event=pipe_consistency.head_failed topic={}", topic, e);
+            return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
     @Get("/digest")
     @Produces(MediaType.APPLICATION_JSON)
     public HttpResponse<String> digest(

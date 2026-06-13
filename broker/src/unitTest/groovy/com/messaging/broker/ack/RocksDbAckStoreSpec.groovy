@@ -1,6 +1,7 @@
 package com.messaging.broker.ack
 
 import com.messaging.broker.compaction.SharedRocksDb
+import com.messaging.common.exception.MessagingException
 import org.rocksdb.ColumnFamilyHandle
 import org.rocksdb.RocksDB
 import org.rocksdb.RocksDBException
@@ -150,7 +151,7 @@ class RocksDbAckStoreSpec extends Specification {
                 [new AckRecord(1L, 10L)] as AckRecord[])
 
         then:
-        thrown(IllegalArgumentException)
+        thrown(MessagingException)
     }
 
     def "getAckedOffsetsInRange returns only offsets inside the half-open range"() {

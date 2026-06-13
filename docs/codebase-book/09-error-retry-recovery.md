@@ -4,7 +4,7 @@ Related: [Overview](01-system-overview.md), [POS state](07-pos-machine-state.md)
 
 ## Exception Model
 
-Shared exception hierarchy:
+Shared exception hierarchy (all **unchecked** — `MessagingException extends RuntimeException`):
 
 - `MessagingException`
 - `StorageException`
@@ -15,11 +15,24 @@ Shared exception hierarchy:
 
 Sources: `common/src/main/java/com/messaging/common/exception/`.
 
-Exceptions can carry context through `MessagingException.withContext`. `ExceptionLogger.java` formats shared logging.
+Exceptions can carry context through `MessagingException.withContext`. `ExceptionLogger.java`
+formats shared logging; `ExceptionLogger.logAndThrow(log, ex)` logs at ERROR and rethrows.
+
+**Convention (enforced):** code raises a `MessagingException` subclass with an `ErrorCode` — never
+a bare `IllegalArgumentException` / `IllegalStateException` / `RuntimeException`. Because the base
+is unchecked, every layer can comply without `throws` pollution: value objects (`DeliveryKey`,
+`ConsumerKey`, `BatchMetadata`, `SubscribeRequest`) and hot-path decoders (`EventType.get`,
+`EventFactory`) throw structured exceptions with no signature ripple into the read path. Existing
+`catch`/`throws` declarations remain valid; the project catches these at its boundaries (message
+handlers, `BrokerService` startup, the delivery loop). Generic validation/lifecycle guards use
+`VALIDATION_INVALID_ARGUMENT` / `BROKER_INVALID_STATE`.
 
 ## Startup Failures
 
-- Storage recovery failure is fatal and wrapped in `RuntimeException`: `BrokerService.java`.
+- Storage recovery / network-startup failure is fatal: `BrokerService` rethrows the
+  `StorageException` / `NetworkException` via `ExceptionLogger.logAndThrow`. Being unchecked, it
+  propagates straight out of the `ServerStartupEvent` listener and fails the boot (no
+  `RuntimeException` wrapper needed).
 - TCP bind failure is fatal: `NettyTcpServer.java`, `BrokerService.java`.
 - ACK seeding failure is non-fatal; reconciliation is expected to expose gaps.
 - Registry absence/failure is non-fatal; topology manager can continue without a parent.

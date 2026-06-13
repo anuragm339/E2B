@@ -42,6 +42,7 @@ public class PipeConsistencyReport {
     public int missingKeys;           // parent has key<=W (record physically present), child has nothing
     public int staleKeys;             // parent has key@o<=W (record present), child has older offset
     public int zombieKeys;            // parent's latest for key was compacted away (deleted upstream), child still holds a version
+    public int fabricatedKeys;        // child holds keys an AUTHORITATIVE verifier (cloud) never had — corrupted/injected index
 
     // Benign / informational
     public int laggingKeys;           // child-extra keys whose parent latest is beyond W — pure lag
@@ -52,6 +53,16 @@ public class PipeConsistencyReport {
     public List<String> samples;
 
     public boolean refreshRecommended; // any real inconsistency cannot self-heal via pipe replay
+
+    /**
+     * True when the watermark was clamped (parent behind this node) and the tail above the
+     * clamp is awaiting verification — either by the parent catching up (next checks) or by
+     * escalation to another in-store verifier once the clamp persists.
+     */
+    public boolean verificationPending;
+    /** Set when an in-store verifier (not the original parent) delivered this verdict. */
+    public String escalatedFrom;
+
     public long durationMs;
     public long checkedAtMs;
     public String error;

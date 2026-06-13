@@ -1,5 +1,8 @@
 package com.messaging.network.legacy.events;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
+
 import java.io.DataInputStream;
 import java.io.IOException;
 
@@ -35,7 +38,8 @@ public class EventFactory {
             case EOF:
                 return (T) EOFEvent.from(dataInputStream);
             default:
-                throw new IllegalArgumentException("Unknown event type: " + type);
+                throw new NetworkException(ErrorCode.NETWORK_DECODING_ERROR,
+                        "Unknown event type: " + type);
         }
     }
 }

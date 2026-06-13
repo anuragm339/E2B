@@ -18,6 +18,7 @@ Every design, implementation, bug fix, refactoring, and optimization must satisf
 8. Handle compaction scenarios safely.
 9. Prefer simple solutions over complex solutions.
 10. If information is missing, stop and ask questions.
+11. Always throw the project's own `MessagingException` (never bare JDK exceptions). See [EXCEPTION HANDLING RULES](#exception-handling-rules).
 
 ---
 
@@ -204,6 +205,30 @@ Report:
 * Coverage gaps
 
 Never claim success without verification.
+
+---
+
+## EXCEPTION HANDLING RULES
+
+Always raise the project's own exceptions. Never throw a bare JDK exception
+(`RuntimeException`, `IllegalArgumentException`, `IllegalStateException`,
+`UnsupportedOperationException`, etc.) from production code.
+
+* Throw a `MessagingException` (or a subclass: `StorageException`, `NetworkException`,
+  `ConsumerException`, `DataRefreshException`) carrying an appropriate `ErrorCode`.
+* `MessagingException extends RuntimeException` — it is **unchecked**, so any layer can throw
+  it without `throws`-clause pollution or breaking public APIs / the message-decode hot path.
+  Do NOT revert it to a checked `Exception`.
+* When a logger is in scope, throw via `ExceptionLogger.logAndThrow(log, ex)` (logs at ERROR
+  and rethrows). Value objects / pure validators with no logger may throw the exception directly.
+* Pick the most specific `ErrorCode`. For generic argument validation use
+  `VALIDATION_INVALID_ARGUMENT`; for lifecycle/state guards use `BROKER_INVALID_STATE`. Add a
+  new `ErrorCode` only when no existing one fits.
+* Attach debugging context with `withContext(...)`.
+* When changing what a method throws, update every matching `catch` in lockstep — some catches
+  are deliberate control flow (e.g. handler input validation, legacy protocol detection).
+* Exceptions are a Java-internal concern only; they are never serialized over the wire. This
+  rule has no effect on the legacy/binary protocol or on client libraries.
 
 ---
 

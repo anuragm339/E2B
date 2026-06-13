@@ -27,9 +27,14 @@ class PipeConsistencyServiceSpec extends Specification {
 
     def setup() {
         topology.getCurrentParentUrl() >> PARENT
-        service = new PipeConsistencyService(
+        service = serviceWith(2)   // escalate after 2 consecutive clamped checks
+    }
+
+    private PipeConsistencyService serviceWith(int escalateAfter) {
+        new PipeConsistencyService(
                 storage, childIndex, client, topology, new SimpleMeterRegistry(),
-                'http://cloud:8080', true, BUCKETS, 0, 8, 1000)
+                'http://cloud:8080', true, BUCKETS, 0, 8, 1000,
+                true, escalateAfter, 5)
     }
 
     // ── Helpers simulating the parent side from parentIndex ───────────────────
@@ -149,6 +154,38 @@ class PipeConsistencyServiceSpec extends Specification {
         report.state == State.INCONSISTENT
     }
 
+    def "fabricated keys: authoritative ABSENT is INCONSISTENT, plain parent ABSENT stays a warning"() {
+        given: 'child holds a key within its watermark that the verifier never had'
+        childIndex.updateKey(TOPIC, 'a', 1L, 1L)
+        parentIndex.updateKey(TOPIC, 'a', 1L, 1L)
+        childIndex.updateKey(TOPIC, 'injected-key', 3L, 1L)
+        storage.getCurrentOffset(TOPIC, 0) >> 5L
+
+        when: 'the verifier is AUTHORITATIVE (cloud — complete, never-expiring keyspace)'
+        def report = service.runCheck(TOPIC, 'parent')[0]
+
+        then:
+        1 * client.fetchDigest(PARENT, TOPIC, 5L, BUCKETS) >> { parentDigest(5L, 5L) }
+        1 * client.fetchBuckets(*_) >> { u, t, w, b, ids -> parentBuckets(5L, ids) }
+        1 * client.classify(PARENT, TOPIC, 5L, [], ['injected-key']) >>
+                new ClassifyResponse([:], ['injected-key': KeyState.ABSENT], true)
+        report.state == State.INCONSISTENT
+        report.fabricatedKeys == 1
+        report.refreshRecommended
+
+        when: 'the same answer from a NON-authoritative POS parent (may be freshly provisioned)'
+        def report2 = service.runCheck(TOPIC, 'parent')[0]
+
+        then:
+        1 * client.fetchDigest(PARENT, TOPIC, 5L, BUCKETS) >> { parentDigest(5L, 5L) }
+        1 * client.fetchBuckets(*_) >> { u, t, w, b, ids -> parentBuckets(5L, ids) }
+        1 * client.classify(PARENT, TOPIC, 5L, [], ['injected-key']) >>
+                new ClassifyResponse([:], ['injected-key': KeyState.ABSENT], false)
+        report2.state == State.CONSISTENT
+        report2.extraKeys == 1
+        report2.fabricatedKeys == 0
+    }
+
     def "child-extra key superseded beyond the watermark is benign lag"() {
         given: 'child has key-L@4; parent already advanced key-L to 20 (beyond W=10)'
         childIndex.updateKey(TOPIC, 'key-L', 4L, 1L)
@@ -226,6 +263,136 @@ class PipeConsistencyServiceSpec extends Specification {
         1 * client.fetchDigest(PARENT, TOPIC, 2000L, BUCKETS) >> { parentDigest(2000L, 150L) }
         clampedReport.state == State.INCONCLUSIVE
         !clampedReport.refreshRecommended
+    }
+
+    // ── Escalation: clamped parent → registry verifier candidates ─────────────
+
+    def "first clamped check only marks verificationPending — no escalation probes"() {
+        given:
+        ['a': 1L].each { k, o -> childIndex.updateKey(TOPIC, k, o, 1L); parentIndex.updateKey(TOPIC, k, o, 1L) }
+        childIndex.updateKey(TOPIC, 'newer', 9L, 1L)
+        storage.getCurrentOffset(TOPIC, 0) >> 9L
+
+        when:
+        def report = service.runCheck(TOPIC, 'parent')[0]
+
+        then: 'parent clamps to head 5'
+        1 * client.fetchDigest(PARENT, TOPIC, 9L, BUCKETS) >> { parentDigest(9L, 5L) }
+        0 * client.fetchHead(*_)
+        report.state == State.CONSISTENT_UP_TO
+        report.verificationPending
+    }
+
+    def "persistent clamp escalates: dead candidate skipped, behind candidate skipped, qualified one verifies"() {
+        given: 'parent stuck at head 5; this node at 9'
+        ['a': 1L].each { k, o -> childIndex.updateKey(TOPIC, k, o, 1L); parentIndex.updateKey(TOPIC, k, o, 1L) }
+        childIndex.updateKey(TOPIC, 'newer', 9L, 1L)
+        storage.getCurrentOffset(TOPIC, 0) >> 9L
+        topology.getVerifierCandidates() >> ['http://dead:8081', 'http://behind:8081', 'http://good:8081']
+
+        and: 'the qualified verifier holds the same state through offset 9'
+        def verifierIndex = new com.messaging.broker.compaction.InMemoryCompactionIndex()
+        verifierIndex.updateKey(TOPIC, 'a', 1L, 1L)
+        verifierIndex.updateKey(TOPIC, 'newer', 9L, 1L)
+
+        when: 'check 1 (pending) then check 2 (escalates)'
+        service.runCheck(TOPIC, 'parent')
+        def report = service.runCheck(TOPIC, 'parent')[0]
+
+        then:
+        2 * client.fetchDigest(PARENT, TOPIC, 9L, BUCKETS) >> { parentDigest(9L, 5L) }
+        1 * client.fetchHead('http://dead:8081', TOPIC) >> { throw new RuntimeException('connection refused') }
+        1 * client.fetchHead('http://behind:8081', TOPIC) >> 4L
+        1 * client.fetchHead('http://good:8081', TOPIC) >> 12L
+        1 * client.fetchDigest('http://good:8081', TOPIC, 9L, BUCKETS) >> {
+            def r = KeyspaceDigest.compute(verifierIndex, TOPIC, 9L, BUCKETS, 0)
+            new DigestResponse(12L, 9L, r.digests, r.counts)
+        }
+
+        and: 'full verdict from the in-store verifier, lineage recorded'
+        report.state == State.CONSISTENT
+        report.escalatedFrom == PARENT
+        report.target == 'http://good:8081'
+        !report.verificationPending
+    }
+
+    def "escalation finds real divergence on the verifier"() {
+        given: 'parent stuck; verifier has a key this node is missing'
+        childIndex.updateKey(TOPIC, 'a', 1L, 1L)
+        parentIndex.updateKey(TOPIC, 'a', 1L, 1L)
+        childIndex.updateKey(TOPIC, 'newer', 9L, 1L)
+        storage.getCurrentOffset(TOPIC, 0) >> 9L
+        topology.getVerifierCandidates() >> ['http://good:8081']
+
+        def verifierIndex = new com.messaging.broker.compaction.InMemoryCompactionIndex()
+        verifierIndex.updateKey(TOPIC, 'a', 1L, 1L)
+        verifierIndex.updateKey(TOPIC, 'newer', 9L, 1L)
+        verifierIndex.updateKey(TOPIC, 'missed', 7L, 1L)   // child never stored this
+
+        def verifierBuckets = { long w, List<Integer> ids ->
+            Map<Integer, List<ParentConsistencyClient.BucketEntry>> result = ids.collectEntries { [(it): []] }
+            verifierIndex.forEachEntry(TOPIC) { k, o, ts ->
+                if (o <= w) {
+                    long h = KeyspaceDigest.hash64(k)
+                    result[KeyspaceDigest.bucketOf(h, BUCKETS)]?.add(new ParentConsistencyClient.BucketEntry(h, o))
+                }
+            }
+            result
+        }
+
+        when:
+        service.runCheck(TOPIC, 'parent')
+        def report = service.runCheck(TOPIC, 'parent')[0]
+
+        then:
+        2 * client.fetchDigest(PARENT, TOPIC, 9L, BUCKETS) >> { parentDigest(9L, 5L) }
+        1 * client.fetchHead('http://good:8081', TOPIC) >> 12L
+        1 * client.fetchDigest('http://good:8081', TOPIC, 9L, BUCKETS) >> {
+            def r = KeyspaceDigest.compute(verifierIndex, TOPIC, 9L, BUCKETS, 0)
+            new DigestResponse(12L, 9L, r.digests, r.counts)
+        }
+        1 * client.fetchBuckets('http://good:8081', TOPIC, 9L, BUCKETS, _) >> { u, t, w, b, ids -> verifierBuckets(9L, ids) }
+        1 * client.classify('http://good:8081', TOPIC, 9L, [7L], []) >>
+                new ClassifyResponse([(7L): true], [:])
+
+        report.state == State.INCONSISTENT
+        report.missingKeys == 1
+        report.escalatedFrom == PARENT
+    }
+
+    def "all candidates behind or empty list keeps verificationPending"() {
+        given:
+        childIndex.updateKey(TOPIC, 'newer', 9L, 1L)
+        storage.getCurrentOffset(TOPIC, 0) >> 9L
+        topology.getVerifierCandidates() >> ['http://behind:8081']
+        client.fetchHead('http://behind:8081', TOPIC) >> 4L
+
+        when: 'two consecutive clamped checks'
+        service.runCheck(TOPIC, 'parent')
+        def report = service.runCheck(TOPIC, 'parent')[0]
+
+        then:
+        2 * client.fetchDigest(PARENT, TOPIC, 9L, BUCKETS) >> { parentDigest(9L, 5L) }
+        report.verificationPending
+        report.state == State.CONSISTENT_UP_TO || report.state == State.INCONCLUSIVE
+    }
+
+    def "an unclamped check resets the clamp streak"() {
+        given:
+        ['a': 1L].each { k, o -> childIndex.updateKey(TOPIC, k, o, 1L); parentIndex.updateKey(TOPIC, k, o, 1L) }
+        storage.getCurrentOffset(TOPIC, 0) >> 1L
+        topology.getVerifierCandidates() >> ['http://good:8081']
+
+        when: 'clamp, then clean check, then clamp again — never two in a row'
+        client.fetchDigest(PARENT, TOPIC, 1L, BUCKETS) >>> [
+                parentDigest(1L, 0L),   // clamped (parent head 0)
+                parentDigest(1L, 1L),   // clean — resets streak
+                parentDigest(1L, 0L)    // clamped again — streak back to 1
+        ]
+        3.times { service.runCheck(TOPIC, 'parent') }
+
+        then: 'escalation never fires'
+        0 * client.fetchHead(*_)
     }
 
     def "unreachable parent reports UNREACHABLE"() {

@@ -1,5 +1,7 @@
 package com.messaging.broker.compaction;
 
+import com.messaging.common.exception.StorageException;
+
 import java.util.Map;
 
 /**
@@ -26,8 +28,13 @@ public interface CompactionIndex {
      * <p>When the call <em>does</em> advance the index, implementations must also record that
      * the previously-latest offset is now stale so {@link #shouldFilterDelivery} can return
      * {@code true} until the compaction sweep removes it.
+     *
+     * <p>Implementations MUST throw a {@link StorageException} when the backend write fails —
+     * callers on the ingest path treat the whole record as failed and retry, keeping the index
+     * in lockstep with storage. Swallowing the failure silently desynchronises the two.
+     * (Implementations that cannot fail — e.g. the in-memory index — narrow the throws clause away.)
      */
-    void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs);
+    void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs) throws StorageException;
 
     /**
      * Returns {@code true} when a strictly newer record exists for {@code (topic, msgKey)}

@@ -1,5 +1,8 @@
 package com.messaging.broker.model;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
+
 import java.util.Objects;
 
 /**
@@ -32,16 +35,18 @@ public record DeliveryKey(String group, String topic) {
      *
      * @param key String in format "group:topic"
      * @return DeliveryKey instance
-     * @throws IllegalArgumentException if format is invalid
+     * @throws MessagingException if format is invalid
      */
     public static DeliveryKey parse(String key) {
         if (key == null || key.isEmpty()) {
-            throw new IllegalArgumentException("DeliveryKey string cannot be null or empty");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "DeliveryKey string cannot be null or empty");
         }
 
         String[] parts = key.split(":", 2);
         if (parts.length != 2) {
-            throw new IllegalArgumentException("Invalid DeliveryKey format: " + key + " (expected group:topic)");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "Invalid DeliveryKey format: " + key + " (expected group:topic)");
         }
 
         return of(parts[0], parts[1]);

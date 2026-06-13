@@ -1,5 +1,6 @@
 package com.messaging.broker.ack
 
+import com.messaging.common.exception.MessagingException
 import spock.lang.Specification
 import spock.lang.Subject
 
@@ -64,7 +65,7 @@ class InMemoryAckStoreSpec extends Specification {
         store.putBatch(['t'] as String[], ['g', 'g'] as String[], [new AckRecord(0L, 0L)] as AckRecord[])
 
         then:
-        thrown(IllegalArgumentException)
+        thrown(MessagingException)
     }
 
     def "put rejects negative offsets"() {
@@ -72,7 +73,7 @@ class InMemoryAckStoreSpec extends Specification {
         store.put('t', 'g', -1L, new AckRecord(0L, 0L))
 
         then:
-        thrown(IllegalArgumentException)
+        thrown(MessagingException)
     }
 
     def "clearByTopicAndGroup removes only entries for the matching pair"() {

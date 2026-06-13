@@ -1,5 +1,6 @@
 package com.messaging.broker.config
 
+import com.messaging.common.exception.MessagingException
 import spock.lang.Specification
 
 import java.util.concurrent.CountDownLatch
@@ -36,12 +37,12 @@ class ExecutorFactorySpec extends Specification {
         new ExecutorFactory().storageExecutor(0, 10)
 
         then:
-        thrown(IllegalArgumentException)
+        thrown(MessagingException)
 
         when:
         new ExecutorFactory().ackStorageExecutor(1, 0)
 
         then:
-        thrown(IllegalArgumentException)
+        thrown(MessagingException)
     }
 }

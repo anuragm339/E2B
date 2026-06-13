@@ -2,6 +2,8 @@ package com.messaging.broker.consumer;
 
 import com.messaging.broker.model.DeliveryKey;
 import com.messaging.broker.consumer.InFlightDeliveryStore;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import jakarta.inject.Singleton;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -49,7 +51,8 @@ public class InMemoryInFlightDeliveryStore implements InFlightDeliveryStore {
         synchronized (lockFor(key)) {
             AtomicBoolean inFlight = inFlightDeliveries.get(key);
             if (inFlight == null || !inFlight.get()) {
-                throw new IllegalStateException("Delivery generation requires an in-flight claim for " + key);
+                throw new MessagingException(ErrorCode.BROKER_INVALID_STATE,
+                        "Delivery generation requires an in-flight claim for " + key);
             }
             long generation = nextGeneration.incrementAndGet();
             activeGenerations.put(key, generation);

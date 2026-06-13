@@ -11,6 +11,8 @@ import com.messaging.broker.legacy.LegacyClientConfig;
 import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.broker.monitoring.LogMdc;
 import com.messaging.common.api.NetworkServer;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.BrokerMessage;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
@@ -177,7 +179,7 @@ public class SubscribeHandler implements MessageHandler {
                 }
             }
 
-        } catch (IllegalArgumentException e) {
+        } catch (MessagingException e) {
             log.error("SUBSCRIBE validation failed for client {}: {}, traceId={}", clientId, e.getMessage(), traceId);
             server.closeConnection(clientId);
         } catch (Exception e) {
@@ -351,19 +353,19 @@ public class SubscribeHandler implements MessageHandler {
      */
     private String safeGetText(JsonNode node, String fieldName, String clientId) {
         if (!node.has(fieldName)) {
-            throw new IllegalArgumentException(
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_MESSAGE_DATA,
                 String.format("Missing required field '%s' from client %s", fieldName, clientId)
             );
         }
         JsonNode field = node.get(fieldName);
         if (field == null || field.isNull()) {
-            throw new IllegalArgumentException(
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_MESSAGE_DATA,
                 String.format("Field '%s' is null from client %s", fieldName, clientId)
             );
         }
         String value = field.asText();
         if (value.isBlank()) {
-            throw new IllegalArgumentException(
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_MESSAGE_DATA,
                 String.format("Field '%s' is blank from client %s", fieldName, clientId)
             );
         }

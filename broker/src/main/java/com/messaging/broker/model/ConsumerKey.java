@@ -1,5 +1,8 @@
 package com.messaging.broker.model;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
+
 import java.util.Objects;
 
 /**
@@ -34,16 +37,18 @@ public record ConsumerKey(String clientId, String topic, String group) {
      *
      * @param key String in format "clientId:topic:group"
      * @return ConsumerKey instance
-     * @throws IllegalArgumentException if format is invalid
+     * @throws MessagingException if format is invalid
      */
     public static ConsumerKey parse(String key) {
         if (key == null || key.isEmpty()) {
-            throw new IllegalArgumentException("ConsumerKey string cannot be null or empty");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "ConsumerKey string cannot be null or empty");
         }
 
         String[] parts = key.split(":", 3);
         if (parts.length != 3) {
-            throw new IllegalArgumentException("Invalid ConsumerKey format: " + key + " (expected clientId:topic:group)");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "Invalid ConsumerKey format: " + key + " (expected clientId:topic:group)");
         }
 
         return of(parts[0], parts[1], parts[2]);

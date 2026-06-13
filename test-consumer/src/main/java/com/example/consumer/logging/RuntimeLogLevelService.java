@@ -3,6 +3,8 @@ package com.example.consumer.logging;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.LoggerContext;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import jakarta.inject.Singleton;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +35,8 @@ public class RuntimeLogLevelService {
         String normalized = normalizeFeature(feature);
         List<String> loggers = featureLoggers.get(normalized);
         if (loggers == null) {
-            throw new IllegalArgumentException("Unknown logging feature: " + feature);
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "Unknown logging feature: " + feature);
         }
         return describeFeature(normalized, loggers);
     }
@@ -42,7 +45,8 @@ public class RuntimeLogLevelService {
         String normalizedFeature = normalizeFeature(feature);
         List<String> loggers = featureLoggers.get(normalizedFeature);
         if (loggers == null) {
-            throw new IllegalArgumentException("Unknown logging feature: " + feature);
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "Unknown logging feature: " + feature);
         }
         Level level = parseLevel(levelName);
         for (String loggerName : loggers) {
@@ -74,7 +78,7 @@ public class RuntimeLogLevelService {
 
     private Level parseLevel(String value) {
         if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException("Missing log level");
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT, "Missing log level");
         }
         String normalized = value.trim().toUpperCase(Locale.ROOT);
         return switch (normalized) {
@@ -85,7 +89,8 @@ public class RuntimeLogLevelService {
             case "ERROR" -> Level.ERROR;
             case "OFF" -> Level.OFF;
             case "INHERIT", "DEFAULT", "RESET" -> null;
-            default -> throw new IllegalArgumentException("Unsupported log level: " + value);
+            default -> throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "Unsupported log level: " + value);
         };
     }
 

@@ -1,5 +1,6 @@
 package com.messaging.broker.model
 
+import com.messaging.common.exception.MessagingException
 import spock.lang.Specification
 
 class ConsumerKeySpec extends Specification {
@@ -106,7 +107,7 @@ class ConsumerKeySpec extends Specification {
         ConsumerKey.parse(null)
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("cannot be null or empty")
     }
 
@@ -115,7 +116,7 @@ class ConsumerKeySpec extends Specification {
         ConsumerKey.parse("")
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("cannot be null or empty")
     }
 
@@ -124,7 +125,7 @@ class ConsumerKeySpec extends Specification {
         ConsumerKey.parse("client-1:topic-1")
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("Invalid ConsumerKey format")
         e.message.contains("expected clientId:topic:group")
     }
@@ -134,7 +135,7 @@ class ConsumerKeySpec extends Specification {
         ConsumerKey.parse("client-1")
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("Invalid ConsumerKey format")
     }
 }

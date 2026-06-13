@@ -194,13 +194,27 @@ Binary/JSON/zero-copy codecs, handlers, protocol detection, legacy event codecs/
 | Spec | Source set | Covers |
 |---|---|---|
 | `consistency/KeyspaceDigestSpec` | unitTest | digest order-independence, watermark filter, single-key bucket flip, count asymmetry, hash determinism |
-| `consistency/PipeConsistencyServiceSpec` | unitTest | consistent path (1 network call), missing vs benign-dead-key, stale vs zombie, lag classification, watermark clamp, UNREACHABLE/UNSUPPORTED_PARENT, single-flight, all-topics walk |
+| `consistency/PipeConsistencyServiceSpec` | unitTest | consistent path (1 network call), missing vs benign-dead-key, stale vs zombie, fabricated (authoritative ABSENT → INCONSISTENT, non-authoritative → extraKeys), lag classification, watermark clamp, UNREACHABLE/UNSUPPORTED_PARENT, single-flight, all-topics walk |
 | `compaction/CompactionIndexForEachEntrySpec` | unitTest | streaming iteration contract on both index backends, meta-key exclusion |
 | `http/PipeConsistencyEndpointsIntegrationSpec` | integrationTest | digest/bucket/classify against real storage+index, admin trigger + report polling, input validation |
 | `http/PipeConsistencyDisabledIntegrationSpec` | integrationTest | fail-closed 404/503 contract with feature disabled |
 | `consistency/PipeConsistencySchedulerSpec` | unitTest | auto-run fires all-topics check; skip reasons (disabled/running/offline/memory-pressure); cloud target needs no parent; throwing check contained |
 
-Coverage gaps: two-broker (parent↔child) journey, cloud contract test, drill-down cap paths (413 / max-drilldown-buckets) only unit-covered.
+| `journey/PipeConsistencyEscalationJourneySpec` | journeyTest | real broker: clamp→pending→escalation, head-probe filtering of behind candidate, full verdict from qualified verifier, streak reset |
+| `blackbox/PipeConsistencySystemSpec` | systemTest | cross-process: subprocess broker + real pipe ingest + admin HTTP trigger + CONSISTENT verdict vs stub parent |
+
+Escalation unit coverage in `PipeConsistencyServiceSpec`: pending-first-clamp, dead/behind
+candidate skip, escalated INCONSISTENT, all-behind stays pending, streak reset.
+Cloud-server: `PipeConsistencyEndpointTest` (8 tests incl. head + verifierCandidates contract).
+
+Pipe-ingest sync invariant (segments ↔ compaction index, added 2026-06-12):
+`core/BrokerServiceSpec` (unitTest) — append+updateKey both fire on success; duplicate
+re-send skips the storage write but heals the index; throwing `updateKey` fails the ingest
+so the pipe offset is not advanced. `compaction/RocksDbCompactionIndexSpec` — `updateKey`
+propagates a backend `RocksDBException` as `IllegalStateException` instead of swallowing.
+`ConsistencyTamperTestController` has NO specs by design (throwaway fault-injection tool).
+
+Coverage gaps: drill-down cap paths (413 / max-drilldown-buckets) only unit-covered.
 
 Note: the two legacy integration failures listed above (and the `price-quote-service` naming) were
 resolved on 2026-06-11 — specs now use the fleet's `price-quote` service name; `./gradlew

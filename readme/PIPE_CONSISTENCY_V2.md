@@ -235,3 +235,16 @@ unreachable), `pipe.consistency.missing_keys{topic}`, `pipe.consistency.zombie_k
   difference within a bucket — probability ≪ 10⁻⁹ at million-key scale.
 - v1's per-record CRC "data integrity" goal (bit-rot detection) is explicitly NOT a goal
   of v2; that belongs to the deferred storage-CRC work item.
+
+## 9. Escalation (added 2026-06-12) — broker ahead of a reshuffled parent
+
+A clamped watermark means the parent cannot verify this node's tail — only possible after
+re-parenting. Because all in-store data descends from the store-top node, the store-top's
+head ≥ every in-store head: some LAN verifier can ALWAYS cover the watermark; the cloud is
+never needed. Flow: clamp → `verificationPending` (most clamps self-heal as the parent
+catches up) → after `escalation.after-clamped-checks` consecutive clamps, probe the
+registry-provided `verifierCandidates` (topology response field; full store list so dead
+nodes are skippable) with the O(1) `/pipe/consistency/head` endpoint and run the full check
+against the first candidate whose head covers the watermark (`escalatedFrom` recorded).
+All candidates behind/down → stay pending (self-heals). `INCONCLUSIVE` thereby leaves the
+steady state — it survives only when no reachable verifier covers the watermark.

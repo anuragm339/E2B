@@ -2,6 +2,8 @@ package com.example.consumer.service;
 
 import com.example.consumer.legacy.LegacyWireManager;
 import com.example.consumer.legacy.events.*;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
 import com.messaging.common.model.BrokerMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,7 +57,8 @@ public class LegacyBrokerConnection implements BrokerConnection {
 
     @Override
     public BrokerMessage nextMessage() throws IOException {
-        throw new UnsupportedOperationException("Legacy connection does not support BrokerMessage");
+        throw new MessagingException(ErrorCode.BROKER_INVALID_STATE,
+                "Legacy connection does not support BrokerMessage");
     }
 
     @Override

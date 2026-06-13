@@ -107,6 +107,18 @@ with intact segments makes the node deliver superseded records and report falsel
 inconsistent against any peer. Failure mode is loud, not silent. Follow-up: an offline
 rebuild/spot-check admin tool reusing `CompactionSegmentReader`.
 
+Segment↔index divergence windows on the pipe ingest path (`handlePipeMessage` writes
+segments then the index then returns true → pipe offset advances) — two of three closed:
+
+| Window | Status |
+| --- | --- |
+| `RocksDbCompactionIndex.updateKey` swallowed `RocksDBException` → ingest "succeeded", record in segments but never indexed | CLOSED — updateKey throws a structured `StorageException` (`STORAGE_METADATA_ERROR`) via `ExceptionLogger.logAndThrow`; ingest returns false, pipe retries the record (`CompactionIndex.updateKey` now declares `throws StorageException`; implementations MUST throw on backend failure) |
+| Crash (or lost RocksDB WAL tail on power cut) between `append` and `updateKey` → parent re-sends, dedupe branch skipped the index write forever | CLOSED — the duplicate-skip branch now heals the index (`updateKey` is idempotent/monotone, no-op for genuine duplicates) |
+| At-rest RocksDB loss/corruption with intact segments | OPEN — fails loud via the consistency check; rebuild tool backlogged (above) |
+
+Producer `DataHandler` path with throwing updateKey is safe: no ACK → producer retries →
+the retried append gets a new offset that supersedes the orphan.
+
 ### POS Refresh And Reconnect
 
 One full journey run retained a reconnected group's pending ACK beyond timeout and never reached READY; isolated rerun passed.

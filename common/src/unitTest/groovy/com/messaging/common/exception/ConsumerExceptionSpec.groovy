@@ -6,11 +6,11 @@ class ConsumerExceptionSpec extends Specification {
 
     def "notRegistered sets group and topic context"() {
         when:
-        def ex = ConsumerException.notRegistered('price-quote-service', 'prices-v1')
+        def ex = ConsumerException.notRegistered('price-quote', 'prices-v1')
 
         then:
         ex.errorCode == ErrorCode.CONSUMER_NOT_REGISTERED
-        ex.context.consumerGroup == 'price-quote-service'
+        ex.context.consumerGroup == 'price-quote'
         ex.context.topic == 'prices-v1'
     }
 

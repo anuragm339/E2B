@@ -1,5 +1,6 @@
 package com.messaging.broker.model
 
+import com.messaging.common.exception.MessagingException
 import spock.lang.Specification
 
 class DeliveryKeySpec extends Specification {
@@ -83,7 +84,7 @@ class DeliveryKeySpec extends Specification {
         DeliveryKey.parse(null)
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("cannot be null or empty")
     }
 
@@ -92,7 +93,7 @@ class DeliveryKeySpec extends Specification {
         DeliveryKey.parse("")
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("cannot be null or empty")
     }
 
@@ -101,7 +102,7 @@ class DeliveryKeySpec extends Specification {
         DeliveryKey.parse("group-1-topic-1")
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("Invalid DeliveryKey format")
         e.message.contains("expected group:topic")
     }

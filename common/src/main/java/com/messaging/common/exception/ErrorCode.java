@@ -68,6 +68,7 @@ public enum ErrorCode {
     BROKER_PARTITION_NOT_FOUND(5006, "BROKER", "Partition not found", false),
     BROKER_INVALID_CONFIGURATION(5007, "BROKER", "Invalid broker configuration", false),
     BROKER_RESOURCE_EXHAUSTED(5008, "BROKER", "Broker resources exhausted", false),
+    BROKER_INVALID_STATE(5009, "BROKER", "Invalid broker/component state", false),
 
     // ==================== REGISTRY ERRORS (6xxx) ====================
     REGISTRY_CONNECTION_FAILED(6001, "REGISTRY", "Failed to connect to cloud registry", true),
@@ -90,6 +91,7 @@ public enum ErrorCode {
     VALIDATION_INVALID_MESSAGE_DATA(8005, "VALIDATION", "Invalid message data", false),
     VALIDATION_MESSAGE_TOO_LARGE(8006, "VALIDATION", "Message size exceeds limit", false),
     VALIDATION_INVALID_CONSUMER_GROUP(8007, "VALIDATION", "Invalid consumer group name", false),
+    VALIDATION_INVALID_ARGUMENT(8008, "VALIDATION", "Invalid argument", false),
 
     // ==================== CONCURRENCY ERRORS (9xxx) ====================
     CONCURRENCY_LOCK_TIMEOUT(9001, "CONCURRENCY", "Failed to acquire lock within timeout", true),

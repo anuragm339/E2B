@@ -2,6 +2,9 @@ package com.example.consumer.service;
 
 import com.example.consumer.config.LegacyConfig;
 import com.example.consumer.legacy.events.*;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.MessagingException;
 import io.micronaut.context.annotation.Requires;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.context.event.ApplicationEventListener;
@@ -55,8 +58,8 @@ public class LegacyConsumerService implements ApplicationEventListener<ServerSta
         try {
             connect();
         } catch (Exception e) {
-            log.error("event=legacy_consumer.start_failed service={}", legacyConfig.getServiceName(), e);
-            throw new RuntimeException("Failed to start legacy consumer", e);
+            throw ExceptionLogger.logAndThrow(log, new MessagingException(
+                    ErrorCode.CONSUMER_SUBSCRIPTION_FAILED, "Failed to start legacy consumer", e));
         }
     }
 

@@ -1,5 +1,8 @@
 package com.messaging.broker.compaction;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.StorageException;
 import io.micronaut.context.annotation.Requires;
 import jakarta.inject.Singleton;
 import org.rocksdb.*;
@@ -56,7 +59,8 @@ public class RocksDbCompactionIndex implements CompactionIndex {
      * the index if it carries a lower offset).
      */
     @Override
-    public void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs) {
+    public void updateKey(String topic, String msgKey, long newOffset, long newTimestampMs)
+            throws StorageException {
         if (msgKey == null) return;  // records without a key are not tracked for compaction
         byte[] key = buildKey(topic, msgKey);
         updateLock.lock();
@@ -71,7 +75,15 @@ public class RocksDbCompactionIndex implements CompactionIndex {
             }
             db.put(cf, writeOptions, key, encode(newOffset, newTimestampMs));
         } catch (RocksDBException e) {
-            log.error("CompactionIndex updateKey failed for topic={} key={}", topic, msgKey, e);
+            // PROPAGATE as a structured StorageException — swallowing this let the caller treat
+            // the ingest as successful and advance the pipe offset past a record that exists in
+            // segments but never made it into the index (silent divergence the consistency check
+            // would later flag as self-inflicted). Failing the ingest makes the pipe retry.
+            StorageException ex = new StorageException(ErrorCode.STORAGE_METADATA_ERROR,
+                    "CompactionIndex write failed", e).withTopic(topic);
+            ex.withContext("msgKey", msgKey);
+            ex.withContext("newOffset", newOffset);
+            throw ExceptionLogger.logAndThrow(log, ex);
         } finally {
             updateLock.unlock();
         }

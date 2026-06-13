@@ -23,6 +23,11 @@ Detect-only audit of this node against its parent/the cloud. Fail-closed: every 
 answers `404` when `pipe.consistency.enabled=false` (default); the cloud must mirror the
 three served endpoints. Design: `readme/PIPE_CONSISTENCY_V2.md`.
 
+### `GET /pipe/consistency/head`
+
+- O(1) head probe (in-memory storage head, no scan, no semaphore) — lets a child filter
+  verifier candidates before asking anyone to digest-scan. `{head: N}`, `404` when disabled.
+
 ### `GET /pipe/consistency/digest`
 
 - Controller: `broker/src/main/java/com/messaging/broker/http/PipeConsistencyController.java`
@@ -41,7 +46,22 @@ three served endpoints. Design: `readme/PIPE_CONSISTENCY_V2.md`.
 
 - Body: `{topic, watermark, offsets[], keys[]}`
 - Success: `offsets` → record-at-exact-offset physically readable (distinguishes missed data
-  from expired tombstones); `keys` → `PRESENT_BEYOND_WATERMARK | PRESENT_AT_OR_BELOW_WATERMARK | ABSENT`
+  from expired tombstones); `keys` → `PRESENT_BEYOND_WATERMARK | PRESENT_AT_OR_BELOW_WATERMARK | ABSENT`;
+  `authoritative: true` only when the answering node's keyspace is complete and never expires
+  (the cloud sets it; POS brokers never do). An authoritative `ABSENT` proves the child key
+  was fabricated/corrupted (`fabricatedKeys`, INCONSISTENT); a non-authoritative `ABSENT`
+  stays a benign `extraKeys` warning (a freshly provisioned parent may simply lack history).
+
+### Escalation (clamped parent → in-store verifiers)
+
+A clamped watermark (parent behind this node — only possible after a reshuffle) marks the
+report `verificationPending`. When the clamp persists `escalation.after-clamped-checks`
+consecutive checks, the broker probes the registry-provided `verifierCandidates` (cached
+from the existing topology poll; dead/behind candidates skipped via the head probe) and
+obtains the FULL verdict from the first one whose head covers the watermark
+(`escalatedFrom` records the original parent). LAN-only; the cloud is never called.
+The registry's topology response carries `verifierCandidates` (omitted when empty —
+brokers fall back to `requestToFollow[1..]`).
 
 ### `POST /admin/pipe-consistency/check?topic=all|T&target=parent|cloud`
 
@@ -55,7 +75,14 @@ three served endpoints. Design: `readme/PIPE_CONSISTENCY_V2.md`.
   INCONSISTENT | INCONCLUSIVE | UNREACHABLE | UNSUPPORTED_PARENT | ERROR`
   (`INCONCLUSIVE` = drill-down cap exceeded at a clamped watermark — divergence may be
   benign child-ahead, e.g. the dev cloud's loopback replay); counts for missing/stale/
-  zombie/lagging/extra/child-newer keys and `refreshRecommended`
+  zombie/fabricated/lagging/extra/child-newer keys and `refreshRecommended`
+
+### `POST /test/consistency/tamper-index` — TEMPORARY, delete after validation
+
+- Controller: `broker/src/main/java/com/messaging/broker/http/ConsistencyTamperTestController.java`
+- Query: `topic`, `removeCount` (delete first N compaction-index entries → next check vs
+  cloud shows `missingKeys`), `addCount` (insert fake keys at the topic head → `fabricatedKeys`)
+- Fault-injection tool for live INCONSISTENT validation only; no specs by design.
 
 ## Refresh API
 

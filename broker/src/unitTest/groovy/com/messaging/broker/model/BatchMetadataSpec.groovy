@@ -1,5 +1,6 @@
 package com.messaging.broker.model
 
+import com.messaging.common.exception.MessagingException
 import spock.lang.Specification
 
 class BatchMetadataSpec extends Specification {
@@ -93,7 +94,7 @@ class BatchMetadataSpec extends Specification {
         new BatchMetadata("topic-1", 0, -1L, 10L, 10, 1000L)
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("startOffset cannot be negative")
     }
 
@@ -102,7 +103,7 @@ class BatchMetadataSpec extends Specification {
         new BatchMetadata("topic-1", 0, 100L, 50L, 10, 1000L)
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("endOffset")
         e.message.contains("cannot be less than startOffset")
     }
@@ -112,7 +113,7 @@ class BatchMetadataSpec extends Specification {
         new BatchMetadata("topic-1", 0, 0L, 10L, -1, 1000L)
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("messageCount cannot be negative")
     }
 
@@ -121,7 +122,7 @@ class BatchMetadataSpec extends Specification {
         new BatchMetadata("topic-1", 0, 0L, 10L, 10, -1L)
 
         then:
-        def e = thrown(IllegalArgumentException)
+        def e = thrown(MessagingException)
         e.message.contains("totalBytes cannot be negative")
     }
 

@@ -13,6 +13,7 @@ class PipeConsistencyDisabledIntegrationSpec extends BrokerHttpSpecSupport {
 
     def "all consistency endpoints are dark by default"() {
         expect:
+        get('/pipe/consistency/head?topic=t').statusCode() == 404
         get('/pipe/consistency/digest?topic=t&watermark=1&buckets=8').statusCode() == 404
         get('/pipe/consistency/bucket?topic=t&watermark=1&buckets=8&bucket=0').statusCode() == 404
         post('/pipe/consistency/classify', [topic: 't', watermark: 1, offsets: [], keys: []]).statusCode() == 404

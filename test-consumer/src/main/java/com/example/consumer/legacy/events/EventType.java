@@ -1,5 +1,8 @@
 package com.example.consumer.legacy.events;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.NetworkException;
+
 public enum EventType {
     REGISTER,
     MESSAGE,
@@ -12,7 +15,8 @@ public enum EventType {
 
     public static EventType get(int typeOrdinal) {
         if(typeOrdinal<0 || typeOrdinal>=values().length) {
-            throw new IllegalArgumentException("Invalid event type ordinal: " + typeOrdinal);
+            throw new NetworkException(ErrorCode.NETWORK_DECODING_ERROR,
+                    "Invalid event type ordinal: " + typeOrdinal);
         }
         return values()[typeOrdinal];
     }

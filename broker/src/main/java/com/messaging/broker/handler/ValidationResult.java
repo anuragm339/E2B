@@ -1,5 +1,8 @@
 package com.messaging.broker.handler;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.MessagingException;
+
 /**
  * Sealed interface representing the result of a validation operation.
  *
@@ -69,7 +72,8 @@ public sealed interface ValidationResult
             if (correctedValue instanceof Long) {
                 return (Long) correctedValue;
             }
-            throw new IllegalStateException("Corrected value is not a Long: " + correctedValue.getClass());
+            throw new MessagingException(ErrorCode.VALIDATION_INVALID_ARGUMENT,
+                    "Corrected value is not a Long: " + correctedValue.getClass());
         }
     }
 

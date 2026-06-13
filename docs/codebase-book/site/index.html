@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Interactive architecture and operations guide for the Kafka-like messaging provider.">
+  <title>Messaging Provider · Codebase Book</title>
+  <link rel="stylesheet" href="assets/styles.css">
+  <script>
+    const preferredTheme = localStorage.getItem("codebase-book-theme");
+    if (preferredTheme) document.documentElement.dataset.theme = preferredTheme;
+  </script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <a class="brand-mark" href="#/" aria-label="Codebase Book home">MP</a>
+        <div>
+          <strong>Codebase Book</strong>
+          <span>Messaging provider</span>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav" aria-label="Book chapters">
+        <a class="nav-home" href="#/">
+          <span class="nav-number">⌂</span>
+          <span>Overview</span>
+        </a>
+        <div class="nav-label">How it works</div>
+        <div id="workflow-nav"></div>
+        <div class="nav-label">Chapters</div>
+        <div id="chapter-nav"></div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <span class="status-dot"></span>
+        <span>Generated from Markdown</span>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="topbar-leading">
+          <button class="icon-button mobile-only" id="menu-button" type="button" aria-label="Open navigation">☰</button>
+          <div class="breadcrumbs" id="breadcrumbs">
+            <span>Codebase Book</span>
+            <span>/</span>
+            <strong>Overview</strong>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button class="search-trigger" id="search-trigger" type="button">
+            <span>Search architecture, APIs, classes…</span>
+            <kbd>/</kbd>
+          </button>
+          <button class="icon-button" id="theme-button" type="button" aria-label="Toggle color theme">◐</button>
+        </div>
+      </header>
+
+      <div class="reading-progress" aria-hidden="true"><span id="reading-progress"></span></div>
+      <main id="view" tabindex="-1"></main>
+    </div>
+  </div>
+
+  <div class="mobile-backdrop" id="mobile-backdrop"></div>
+
+  <dialog class="search-dialog" id="search-dialog">
+    <div class="search-box">
+      <span class="search-icon" aria-hidden="true">⌕</span>
+      <input id="search-input" type="search" autocomplete="off" placeholder="Search the complete codebase book…">
+      <kbd>Esc</kbd>
+    </div>
+    <div class="search-hint" id="search-hint">Search by feature, API path, class, topic, state, or failure.</div>
+    <div class="search-results" id="search-results"></div>
+  </dialog>
+
+  <script src="assets/content.js"></script>
+  <script src="assets/app.js"></script>
+</body>
+</html>

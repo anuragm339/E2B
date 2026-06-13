@@ -250,6 +250,28 @@ public class TopologyManager {
     /**
      * Get current topology
      */
+    /**
+     * POS in this store eligible to answer consistency verification when the current parent
+     * cannot (clamped watermark). Preference-ordered, cached from the last registry topology
+     * poll. Falls back to the tail of requestToFollow for registries that don't send the
+     * dedicated field yet. Never contains the current parent at position guarantees — callers
+     * filter it themselves. Empty when topology is unknown (offline since boot).
+     */
+    public java.util.List<String> getVerifierCandidates() {
+        TopologyResponse topology = currentTopology;
+        if (topology == null) {
+            return java.util.List.of();
+        }
+        if (topology.getVerifierCandidates() != null && !topology.getVerifierCandidates().isEmpty()) {
+            return java.util.List.copyOf(topology.getVerifierCandidates());
+        }
+        List<String> parents = topology.getRequestToFollow();
+        if (parents == null || parents.size() <= 1) {
+            return java.util.List.of();
+        }
+        return java.util.List.copyOf(parents.subList(1, parents.size()));
+    }
+
     public TopologyResponse getCurrentTopology() {
         return currentTopology;
     }

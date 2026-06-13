@@ -216,7 +216,7 @@ See [API catalog](04-api-catalog.md).
 
 ## Pipe Consistency Detection
 
-- **Business purpose:** Detect (never repair) whether this POS holds everything its parent holds per topic — missed records, stale keys, and zombie keys (deletes missed while offline past tombstone retention) — despite both sides compacting independently.
+- **Business purpose:** Detect (never repair) whether this POS holds everything its parent holds per topic — missed records, stale keys, zombie keys (deletes missed while offline past tombstone retention), and fabricated keys (entries an authoritative verifier — the cloud — never had: corrupted/injected index) — despite both sides compacting independently.
 - **Entry point:** `broker/src/main/java/com/messaging/broker/consistency/PipeConsistencyService.java`.
 - **Main files:** `KeyspaceDigest.java`, `ParentConsistencyClient.java`, `PipeConsistencyReport.java`, `http/PipeConsistencyController.java`, `http/PipeConsistencyAdminController.java`, `CompactionIndex.forEachEntry` (both backends).
 - **Flow:** admin POST → resolve target (`TopologyManager.getCurrentParentUrl()` or registry URL) → per topic: child scans its compaction index into 64 XOR-bucket digests at its own watermark → one GET to the parent → equal digests ⇒ CONSISTENT; else fetch mismatched buckets (one request/scan) → classify differences via parent record physical-presence + index state → report + Micrometer gauges.
