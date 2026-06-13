@@ -22,6 +22,8 @@ This book is a source-backed map of the repository. Start with the chapter that 
 13. [Risks and edge cases](13-risk-and-edge-cases.md)
 14. [Glossary](14-glossary.md)
 15. [Open questions](15-open-questions.md)
+16. [Pipe consistency: system design](16-pipe-consistency-system-design.md)
+17. [Performance tuning (throughput profile)](17-performance-tuning.md)
 
 ## Features
 
