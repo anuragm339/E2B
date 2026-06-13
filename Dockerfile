@@ -5,16 +5,6 @@ FROM gradle:8.5-jdk17 AS builder
 
 WORKDIR /build
 
-# Copy CA certificate and import it into JDK trust store
-# This is required for Maven Central access during Gradle build
-COPY mvnrepository.com.pem /tmp/mvnrepository.com.pem
-RUN keytool -import -trustcacerts -noprompt \
-    -alias messaging_maven_ca \
-    -file /tmp/mvnrepository.com.pem \
-    -keystore /opt/java/openjdk/lib/security/cacerts \
-    -storepass changeit && \
-    rm /tmp/mvnrepository.com.pem
-
 # Copy gradle files first for better caching
 COPY settings.gradle build.gradle ./
 COPY gradle gradle/
