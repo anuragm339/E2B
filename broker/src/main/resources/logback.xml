@@ -60,6 +60,10 @@
         <appender-ref ref="DEBUG_FILE"/>
     </appender>
 
+    <!-- Mirrors WARN/ERROR into the in-memory ErrorRecorder for GET /admin/status/errors.
+         Filters to WARN+ above in code; reads the DI bean via its static bridge. -->
+    <appender name="STATUS_ERRORS" class="com.messaging.broker.monitoring.StatusErrorAppender"/>
+
     <logger name="com.messaging.broker" level="${BROKER_APP_LOG_LEVEL}"/>
     <logger name="com.messaging.broker.consumer.BatchDeliveryService" level="${BROKER_DELIVERY_LOG_LEVEL}"/>
     <logger name="com.messaging.broker.consumer.BatchAckService" level="${BROKER_ACK_LOG_LEVEL}"/>
@@ -78,5 +82,6 @@
         <appender-ref ref="STDOUT"/>
         <appender-ref ref="ASYNC_INFO"/>
         <appender-ref ref="ASYNC_DEBUG"/>
+        <appender-ref ref="STATUS_ERRORS"/>
     </root>
 </configuration>

@@ -2,6 +2,7 @@ package com.messaging.broker.consumer;
 import com.messaging.broker.consumer.BatchDeliveryService;
 import com.messaging.broker.consumer.RefreshGatePolicy;
 import com.messaging.broker.monitoring.DataRefreshMetrics;
+import com.messaging.broker.monitoring.RefreshHistoryRecorder;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.inject.Singleton;
@@ -267,6 +268,10 @@ public class RefreshCoordinator {
 
             activeRefreshes.remove(topic);
             log.info("Refresh aborted and cleaned up for topic: {}", topic);
+            RefreshHistoryRecorder abortHist = RefreshHistoryRecorder.instance();
+            if (abortHist != null) {
+                abortHist.record(context, "ABORTED");
+            }
         }
     }
 
@@ -349,6 +354,10 @@ public class RefreshCoordinator {
 
             if (transition.isSuccess()) {
                 readyService.completeRefresh(topic, context);
+                RefreshHistoryRecorder doneHist = RefreshHistoryRecorder.instance();
+                if (doneHist != null) {
+                    doneHist.record(context, "COMPLETED");
+                }
 
                 // Cancel the READY timeout — no more retries needed now that all ACKs are in.
                 ScheduledFuture<?> readyTask = readyTimeoutTasks.remove(topic);
