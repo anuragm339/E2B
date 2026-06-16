@@ -482,10 +482,16 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
         try {
             sendFuture.get(timeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
+            // #14: cancel(true) on the CompletableFuture does NOT cancel the underlying Netty
+            // write — it would still land and collide with the retry, corrupting the consumer's
+            // stateful decoder. Close the connection (same as sendBatch's failure path) so the
+            // in-flight write is aborted and the consumer reconnects with a clean decoder.
             sendFuture.cancel(true);
+            server.closeConnection(consumer.getClientId());
             throw e;
         } catch (InterruptedException e) {
             sendFuture.cancel(true);
+            server.closeConnection(consumer.getClientId());
             Thread.currentThread().interrupt();
             throw e;
         }

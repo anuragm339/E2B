@@ -93,7 +93,10 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
     private final Map<String, ConsumerMetadata> consumers = new ConcurrentHashMap<>();
 
     // Map: topic -> List<MessageHandler> (for routing messages to all handlers for that topic)
-    private final Map<String, List<MessageHandler>> topicToHandlers = new ConcurrentHashMap<>();
+    // #13: keyed by "topic:group" (NOT topic). Each @Consumer handler belongs to exactly one
+    // group, so routing must be per topic:group — otherwise a delivery on group A's connection
+    // would also be dispatched to group B's handler for the same topic.
+    private final Map<String, List<MessageHandler>> topicGroupToHandlers = new ConcurrentHashMap<>();
     // Map: topic -> Set<String> groups (to know all topic:group combinations we need to connect)
     private final Map<String, Set<String>> topicToGroups = new ConcurrentHashMap<>();
 
@@ -181,7 +184,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         // FIX #1: Build topic -> handlers and topic -> groups mappings (supports multiple groups per topic)
         for (String topic : topics) {
             // Add handler to list (may have multiple handlers for same topic)
-            topicToHandlers.computeIfAbsent(topic, k -> new java.util.ArrayList<>()).add(handler);
+            topicGroupToHandlers.computeIfAbsent(topic + ":" + group, k -> new java.util.ArrayList<>()).add(handler);
 
             // Add group to set (may have multiple groups for same topic)
             topicToGroups.computeIfAbsent(topic, k -> new java.util.HashSet<>()).add(group);
@@ -477,7 +480,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
             switch (message.getType()) {
                 case DATA:
                 case BATCH_HEADER:
-                    handleDataMessage(topic, message);
+                    handleDataMessage(topicGroup, message);
                     break;
 
                 case ACK:
@@ -512,7 +515,8 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
      * B1-7 FIX: Handle DATA message for a specific topic
      * FIX #1: Route to ALL handlers registered for this topic (may have multiple groups)
      */
-    private void handleDataMessage(String topic, BrokerMessage message) {
+    private void handleDataMessage(String topicGroup, BrokerMessage message) {
+        String topic = topicGroup.split(":", 2)[0];
         try {
             byte[] payload = message.getPayload();
 
@@ -523,8 +527,9 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                 records = parseRawBatch(payload);
             }
 
-            // Route to ALL handlers registered for this topic
-            List<MessageHandler> handlers = topicToHandlers.get(topic);
+            // #13: route ONLY to handlers for THIS topic:group — a batch that arrived on group A's
+            // connection must not be delivered into group B's handler for the same topic.
+            List<MessageHandler> handlers = topicGroupToHandlers.get(topicGroup);
             if (handlers != null && !handlers.isEmpty()) {
                 for (MessageHandler handler : handlers) {
                     try {
@@ -576,8 +581,9 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
             log.info("Received RESET for topic:group '{}', preparing to receive refreshed data", topicGroup);
 
-            // Call onReset on ALL handlers for this topic (may have multiple groups)
-            List<MessageHandler> handlers = topicToHandlers.get(messageTopic);
+            // #13: call onReset only on handlers for THIS topic:group — group B must not be
+            // reset just because group A refreshed.
+            List<MessageHandler> handlers = topicGroupToHandlers.get(topicGroup);
             if (handlers != null && !handlers.isEmpty()) {
                 for (MessageHandler handler : handlers) {
                     try {
@@ -644,8 +650,8 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
             log.info("Received READY for topic:group '{}', refresh complete", topicGroup);
 
-            // Call onReady on ALL handlers for this topic (may have multiple groups)
-            List<MessageHandler> handlers = topicToHandlers.get(messageTopic);
+            // #13: call onReady only on handlers for THIS topic:group.
+            List<MessageHandler> handlers = topicGroupToHandlers.get(topicGroup);
             if (handlers != null && !handlers.isEmpty()) {
                 for (MessageHandler handler : handlers) {
                     try {

@@ -258,6 +258,9 @@ public class FileChannelStorageEngine implements StorageEngine, BatchReadableSto
      * @throws StorageException if manager creation fails
      */
     private SegmentManager getOrCreateManager(String topic, int partition) throws StorageException {
+        // Defense-in-depth: topic becomes a filesystem path segment below (dataDir.resolve(topic)),
+        // so reject path-traversal names here — the single sink every topic flows through.
+        com.messaging.common.validation.TopicNames.validate(topic);
         TopicPartition tp = new TopicPartition(topic, partition);
 
         // Check if manager already exists

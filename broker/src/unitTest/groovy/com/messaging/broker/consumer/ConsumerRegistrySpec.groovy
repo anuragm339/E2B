@@ -90,7 +90,7 @@ class ConsumerRegistrySpec extends Specification {
         !registry.deliverBatch(legacy, 1024)
     }
 
-    def "startup ready senders schedule retries and swallow send failures"() {
+    def "startup ready senders schedule the retry even when the initial send fails (and swallow the failure)"() {
         given:
         server.send("legacy-client", _ as BrokerMessage) >> CompletableFuture.completedFuture(null)
         server.send("modern-client", _ as BrokerMessage) >> CompletableFuture.failedFuture(new RuntimeException("boom"))
@@ -100,8 +100,11 @@ class ConsumerRegistrySpec extends Specification {
         registry.sendStartupReadyToModernConsumer("modern-client", "prices-v1", "group-a")
 
         then:
+        // #12: the retry must be scheduled regardless of the initial-send outcome — otherwise a
+        // failed first send leaves that consumer stuck not-ready forever. The send failure is
+        // still swallowed (no exception propagates out of the when: block).
         1 * readinessService.scheduleReadyRetry("legacy-client", null, null, 0)
-        0 * readinessService.scheduleReadyRetry("modern-client", "prices-v1", "group-a", 0)
+        1 * readinessService.scheduleReadyRetry("modern-client", "prices-v1", "group-a", 0)
     }
 
     def "sendStartupReadyToAllConsumers routes by protocol"() {

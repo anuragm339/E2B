@@ -450,11 +450,12 @@ public class ConsumerRegistry {
             );
             awaitSend(server.send(clientId, readyMessage));
             log.debug("Sent READY to legacy consumer: {}", clientId);
-
-            // Schedule retry if no ACK received
-            readinessService.scheduleReadyRetry(clientId, null, null, 0);
         } catch (Exception e) {
             log.error("Failed to send READY to legacy consumer {}", clientId, e);
+        } finally {
+            // #12: schedule the retry regardless of the initial-send outcome — a failed first
+            // send must still be retried or the consumer never becomes ready. Self-cancels on ACK.
+            readinessService.scheduleReadyRetry(clientId, null, null, 0);
         }
     }
 
@@ -471,11 +472,11 @@ public class ConsumerRegistry {
             );
             awaitSend(server.send(clientId, readyMessage));
             log.debug("Sent READY to modern consumer: {}:{}:{}", clientId, topic, group);
-
-            // Schedule retry if no ACK received
-            readinessService.scheduleReadyRetry(clientId, topic, group, 0);
         } catch (Exception e) {
             log.error("Failed to send READY to modern consumer {}:{}:{}", clientId, topic, group, e);
+        } finally {
+            // #12: schedule the retry regardless of the initial-send outcome (see legacy variant).
+            readinessService.scheduleReadyRetry(clientId, topic, group, 0);
         }
     }
 

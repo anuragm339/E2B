@@ -111,6 +111,12 @@ public class ConsumerReadinessManager implements ConsumerReadinessService {
                 log.warn("READY retry interrupted for {}", retryKey);
             } catch (Exception e) {
                 log.error("Failed to send READY retry to {}: {}", retryKey, e.getMessage());
+                // #12: a failed send must NOT terminate the retry chain. Reschedule (bounded by
+                // MAX_READY_RETRIES, checked at the top) so a transient send blip still recovers
+                // — otherwise this consumer is stuck not-ready and never receives deliveries.
+                if (!isReady(clientId, topic, group)) {
+                    scheduleReadyRetry(clientId, topic, group, retryCount + 1);
+                }
             }
         }, READY_RETRY_DELAY_MS, TimeUnit.MILLISECONDS);
 

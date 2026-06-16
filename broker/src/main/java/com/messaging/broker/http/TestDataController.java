@@ -4,6 +4,7 @@ import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.EventType;
 import com.messaging.common.model.MessageRecord;
 import com.messaging.broker.consumer.ConsumerRegistry;
+import io.micronaut.context.annotation.Requires;
 import io.micronaut.http.annotation.*;
 import jakarta.inject.Inject;
 import org.slf4j.Logger;
@@ -20,6 +21,9 @@ import java.util.Map;
  * Test endpoint to load data from SQLite file and publish to consumers
  * Useful for testing data ingestion and consumer delivery
  */
+// Dev/test-only ingestion + arbitrary-SQLite-path tooling. Disabled unless explicitly enabled
+// (broker.test-endpoints.enabled=true) so it is never exposed in production (P0 hardening).
+@Requires(property = "broker.test-endpoints.enabled", value = "true")
 @Controller("/test")
 public class TestDataController {
     private static final Logger log = LoggerFactory.getLogger(TestDataController.class);

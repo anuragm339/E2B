@@ -1,5 +1,8 @@
 broker:
   nodeId: test-broker
+  # Tests inject data via /test/* endpoints, which are gated off by default in production (P0 #6).
+  test-endpoints:
+    enabled: true
   network:
     port: 19092
     threads:

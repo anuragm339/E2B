@@ -180,7 +180,18 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // duplicate physical records with the same offset and break the sorted-index
             // invariant. Treat as success so the pipe offset advances past it.
             long topicHead = storage.getCurrentOffset(topic, 0);
-            if (record.getOffset() > 0 && record.getOffset() <= topicHead) {
+            boolean alreadyStored = record.getOffset() > 0 && record.getOffset() <= topicHead;
+            // P0 #2: offset 0 is BOTH the producer "unset" sentinel and a legitimate first parent
+            // offset, so the > 0 guard never skips it. A broker parent (PipeServer) reads inclusively
+            // and re-serves its offset-0 record on every poll; SegmentManager then renumbers it to a
+            // fresh, ever-growing offset -> unbounded storage growth. Detect the re-delivery by key:
+            // an already-indexed key means the offset-0 record was already stored, so skip it. The
+            // genuine first delivery has no index entry and proceeds normally below.
+            if (!alreadyStored && record.getOffset() == 0
+                    && compactionIndex.getLatestOffsetAndTimestamp(topic, record.getMsgKey()) != null) {
+                alreadyStored = true;
+            }
+            if (alreadyStored) {
                 // Heal the index even when skipping the storage write: a crash (or lost
                 // RocksDB WAL tail on power cut) between append and updateKey leaves the
                 // record in segments but not in the index — the parent's re-send is the

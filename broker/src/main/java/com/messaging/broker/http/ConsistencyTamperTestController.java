@@ -2,6 +2,7 @@ package com.messaging.broker.http;
 
 import com.messaging.broker.compaction.SharedRocksDb;
 import com.messaging.common.api.StorageEngine;
+import io.micronaut.context.annotation.Requires;
 import io.micronaut.http.HttpResponse;
 import io.micronaut.http.MediaType;
 import io.micronaut.http.annotation.Controller;
@@ -35,6 +36,7 @@ import java.util.List;
  *
  * No specs by design — this controller is throwaway.
  */
+@Requires(property = "broker.test-endpoints.enabled", value = "true")
 @Controller("/test/consistency")
 public class ConsistencyTamperTestController {
 
