@@ -95,11 +95,19 @@ public class ConsumerRegistrationManager implements ConsumerRegistrationService 
         try {
             long storageHead = storage.getCurrentOffset(deliveryKey.topic(), 0);
 
-            // Consumer offsets use "next-to-deliver" semantics (lastProcessed + 1), while
-            // getCurrentOffset() returns the LAST stored offset. A restored offset equal to
-            // storageHead + 1 means the consumer is fully caught up — this is valid and must
-            // NOT be clamped. Only clamp when the restored offset is strictly beyond the next
-            // writable position (storageHead + 1), which would indicate a corrupted offset file.
+            // getCurrentOffset() returns the LAST stored offset (-1 when empty). Two consumer
+            // conventions share this single persisted offset (see codebase-book 05-data-model
+            // "Offset conventions"):
+            //   - LEGACY  consumers store the LAST-delivered offset  → caught up at storageHead.
+            //   - MODERN  consumers store the NEXT-to-deliver offset → caught up at storageHead + 1.
+            // The highest value that is valid under EITHER convention is therefore storageHead + 1,
+            // so only a restored offset strictly beyond that is treated as a corrupted offset file.
+            //
+            // On corruption we clamp DOWN to storageHead — the at-least-once-safe floor for both:
+            // for a legacy consumer it is exactly "caught up"; for a modern consumer it re-delivers
+            // at most the single record at storageHead (a tolerable duplicate) rather than risk
+            // skipping it. Clamping to storageHead + 1 instead would assume the consumer already
+            // holds the last record and could silently skip it when the offset file is corrupt.
             if (restoredOffset > storageHead + 1) {
                 LogContext context = LogContext.builder()
                         .traceId(traceId)
