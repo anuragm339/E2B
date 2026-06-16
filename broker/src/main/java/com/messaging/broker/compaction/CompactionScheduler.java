@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -108,7 +109,17 @@ public class CompactionScheduler {
         // flusher that shares that pool, silently growing the power-cut data-loss window.
         // The single-threaded compactionExecutor also serializes compaction with manual
         // triggers and pipe-consistency checks — heavy background work never overlaps.
-        compactionExecutor.execute(this::runClaimedCompaction);
+        //
+        // F2: the single-flight guard was claimed above. If the offload is rejected (executor shut
+        // down — only reachable at shutdown for this unbounded single-thread executor), reset the
+        // guard so runClaimedCompaction's finally never runs and compaction is not wedged
+        // "already_running" forever. Mirrors triggerAsync().
+        try {
+            compactionExecutor.execute(this::runClaimedCompaction);
+        } catch (RejectedExecutionException e) {
+            compactionRunning.set(false);
+            log.warn("Compaction offload rejected; reset single-flight guard", e);
+        }
     }
 
     /**

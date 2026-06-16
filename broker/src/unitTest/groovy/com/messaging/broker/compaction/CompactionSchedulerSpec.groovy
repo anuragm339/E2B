@@ -256,4 +256,26 @@ class CompactionSchedulerSpec extends Specification {
         !scheduler.isCompactionRunning()
         1 * storage.getTopicNames() >> []
     }
+
+    def "F2: a rejected scheduled-compaction offload resets the single-flight guard (not wedged forever)"() {
+        given: "an executor that rejects the offload, as it would once shut down"
+        def executor = { Runnable task ->
+            throw new java.util.concurrent.RejectedExecutionException("executor shut down")
+        } as java.util.concurrent.Executor
+        def metrics = Mock(com.messaging.broker.monitoring.BrokerMetrics)
+        def scheduler = new CompactionScheduler(
+                Mock(StorageEngine), Mock(SegmentAccess), Mock(CompactionCheckpointStore),
+                Mock(CompactionPlanner), Mock(CompactionRewriter), Mock(RocksDbCompactionIndex),
+                metrics,
+                Stub(MemoryMonitor) { getHeapUsagePercent() >> 0.0d; isMemoryPressureHigh() >> false },
+                executor,
+                true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
+
+        when: "the scheduled run claims the guard then the offload is rejected"
+        scheduler.compactScheduled()
+
+        then: "the guard is released — before F2 it stayed true and blocked every later run as 'already_running'"
+        noExceptionThrown()
+        !scheduler.isCompactionRunning()
+    }
 }
