@@ -84,7 +84,7 @@ Compaction:
 - `CompactionCheckpointStoreSpec`
 - `CompactionPlannerSpec`
 - `CompactionRewriterSpec`
-- `CompactionSchedulerSpec`
+- `CompactionSchedulerSpec` (incl. `F2:` — a rejected offload resets the single-flight guard)
 - `InMemoryCompactionIndexSpec`
 - `RocksDbCompactionIndexSpec`
 
@@ -106,7 +106,7 @@ Consumer/delivery/refresh:
 - `InMemoryPendingAckStoreSpec`
 - `PropertiesFileStoreSpec`
 - `RefreshContextSpec`
-- `RefreshCoordinatorSpec`
+- `RefreshCoordinatorSpec` (incl. `F1:` specs — each refresh timer survives a throwing collaborator and still reschedules/re-arms)
 - `RefreshInitiatorSpec`
 - `RefreshReadyServiceSpec`
 - `RefreshRecoveryServiceSpec`
@@ -176,6 +176,14 @@ Binary/JSON/zero-copy codecs, handlers, protocol detection, legacy event codecs/
 ### Client
 
 `client/src/integrationTest/groovy/com/messaging/client/ClientConsumerManagerIntegrationSpec.groovy` verifies discovery, connection, subscribe, data/control routing, and lifecycle.
+
+`ClientConsumerManagerRoutingSpec` covers per-topic:group DATA routing (#13) and #1 ACK ordering:
+a `BATCH_ACK` is sent only after every handler's `handleBatch` succeeds, and is withheld when a
+handler throws (so the broker redelivers).
+
+Network-layer #1 coverage lives in `network/.../codec/BatchAckHandlerIntegrationSpec` (the handler
+unwraps the batch and emits **no** outbound ack) and `network/.../tcp/NettyTcpIntegrationSpec`
+(`sendBatch` delivers records to the application and a raw client sends no automatic BATCH_ACK).
 
 ## Coverage Gaps
 

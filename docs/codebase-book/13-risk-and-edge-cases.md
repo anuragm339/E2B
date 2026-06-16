@@ -37,6 +37,72 @@ Operational signature when running an unfixed build: repeating
 `CRITICAL: Failed to store pipe message at offset N ... Segment is not active` with the
 same offset, starting minutes after a broker restart.
 
+### Compaction Single-Flight Guard Leak On Rejected Offload (FIXED 2026-06-16)
+
+`CompactionScheduler.compactScheduled` claims the `compactionRunning` single-flight guard
+(`compareAndSet(false,true)`) and then offloads the run with `compactionExecutor.execute(...)`. The
+guard is normally released by `runClaimedCompaction`'s `finally`, but if `execute()` threw
+`RejectedExecutionException` the offloaded task never ran, the `finally` never executed, and the
+guard stayed `true` — every later run would skip as `already_running` forever, so compaction would
+halt and segments/tombstones accumulate (disk fills on a POS device). `triggerAsync` already guarded
+this; `compactScheduled` did not. Fixed by wrapping the offload in `try/catch
+(RejectedExecutionException)` that resets the guard. Low real-world likelihood — the
+`compactionExecutor` is a single-thread executor with an unbounded queue, so `execute()` only
+rejects after shutdown — but the guard keeps the flag honest. Regression spec:
+`CompactionSchedulerSpec."F2: a rejected scheduled-compaction offload resets the single-flight guard"`.
+
+### Refresh Scheduled-Task Guards (FIXED 2026-06-16)
+
+`RefreshCoordinator` drives four refresh-lifecycle timers on a shared `ScheduledThreadPool(2)`. On a
+`ScheduledThreadPoolExecutor`, an uncaught throw from a task silently cancels that task's schedule
+(periodic) or skips its re-arm (one-shot) while the pool keeps running — work stops with no crash.
+Only `scheduleReplayCheck` guarded its body; the other three did not:
+
+- `retryResetBroadcast` (RESET retry, `scheduleWithFixedDelay`) — a throw cancelled the whole
+  periodic schedule → RESET never retried → refresh could stall in `RESET_SENT`.
+- `checkReadyAckTimeout` (READY timeout, one-shot self-reschedule) — a throw skipped the
+  self-reschedule → stuck `READY_SENT`, no further READY re-sends.
+- `abortRefreshIfStuck` (abort watchdog, one-shot + re-arm) — a throw lost the **last-resort abort
+  itself** → a stuck refresh never reached a terminal state.
+
+Because the pipe by design never resumes until the refresh completes, losing any of these could
+leave ingestion **paused until a broker restart**. Fixed by guarding each: `retryResetBroadcast`
+and `checkReadyAckTimeout` swallow `Exception` around their risky call (the periodic re-run /
+self-reschedule then survives), and a new `runAbortWatchdog` wrapper catches a throwing
+`abortRefreshIfStuck` and **re-arms** the watchdog for another window (re-arm is refreshId-guarded,
+so a completed/replaced refresh does not loop). Regression specs in `RefreshCoordinatorSpec`
+(`F1: ...`) assert each timer survives a throwing collaborator and still reschedules/re-arms.
+
+### Consumer ACK Before Processing (FIXED 2026-06-16)
+
+The client acknowledged batches **before** the application processed them, breaking at-least-once.
+The network `BatchAckHandler` flushed `BATCH_ACK(topic, group)` the instant a zero-copy batch was
+decoded — i.e. before `ClientMessageHandler` forwarded the records and before any handler's
+`handleBatch` ran. The broker treats that ack as proof of delivery and commits the next offset, so a
+handler that threw (or a consumer that crashed) between decode and processing **silently lost** data
+the broker would never resend. The same hazard applied to the refresh control acks: `RESET_ACK`
+and `READY_ACK` were sent regardless of whether `onReset`/`onReady` actually succeeded, so a
+half-reset or half-activated consumer could let a refresh complete (and the pipe resume) against
+state it never applied.
+
+Fixed by moving every client ack to *after* successful processing:
+
+- `network/.../codec/BatchAckHandler` now only unwraps `BatchDecodedEvent` into its record list and
+  forwards it — it sends nothing on the wire.
+- `ClientConsumerManager.handleDataMessage` sends `BATCH_ACK` (via `sendBatchAck`) only if **every**
+  handler's `handleBatch` succeeded; on any failure, or when no handler is registered, it withholds
+  the ack and the broker's ack-timeout reverts the offset and redelivers.
+- `handleResetMessage`/`handleReadyMessage` withhold `RESET_ACK`/`READY_ACK` when any
+  `onReset`/`onReady` throws, so a failed refresh times out and aborts (ingestion stays paused, by
+  design) instead of proceeding against un-reset consumers.
+
+Regression specs: `ClientConsumerManagerRoutingSpec` (ack sent on success, withheld on handler
+failure), `network/.../codec/BatchAckHandlerIntegrationSpec` (unwrap, no outbound ack),
+`network/.../tcp/NettyTcpIntegrationSpec` (raw client sends no automatic BATCH_ACK). Operational
+signature on an unfixed build: data marked delivered/committed on the broker that the consumer
+never actually applied, with no redelivery — i.e. silent gaps after a handler exception or consumer
+crash.
+
 ### Segment Lifecycle Audit (2026-06-12) — five more state-machine bugs FIXED
 
 Found by a systematic walk of every active/sealed/compact/replace/recover transition after
@@ -151,14 +217,14 @@ Sources: `HttpPipeConnector.java`, `PipeServer.java`, `TopologyManager.java`, `P
 
 ### Offset Semantics
 
-- Modern offsets are next-to-deliver; legacy offsets are last-acknowledged.
-- `allConsumersCaughtUp` reads one property representation for both.
+- Modern offsets are next-to-deliver; legacy offsets are last-acknowledged. Full table and per-site analysis: [Data model — Offset conventions](05-data-model.md#offset-conventions-legacy-vs-modern--dual-convention).
+- `allConsumersCaughtUp` reads one property representation for both. It is written for the **legacy** convention (`offset == head` ⇒ caught up), which is correct for the deployed fleet. **Verdict (reviewed 2026-06-16): do NOT "consistency-fix" it toward next-to-deliver (`<= head`).** A legacy offset caps at `head`, so that would make caught-up unreachable and **stall refresh completion → ingestion paused forever**. Same reasoning blocks clamping registration to `head + 1`.
 - `CommitOffsetHandler` clamps to storage head, not head plus one.
-- Registration clamps a corrupt value above head+1 back to head, intentionally allowing replay.
+- Registration clamps a corrupt value above head+1 back to head, intentionally allowing replay — the at-least-once-safe floor (legacy: exactly caught-up; modern: at most one duplicate, never a skip).
 
 Sources: `BatchDeliveryService.java`, `LegacyConsumerDeliveryManager.java`, `ConsumerRegistry.java`, `CommitOffsetHandler.java`, `ConsumerRegistrationManager.java`.
 
-Impact: off-by-one mistakes can skip or redeliver records.
+Impact: off-by-one mistakes can skip or redeliver records. The modern path is off-by-one only at the single boundary `offset == head` (metrics undercount by 1; caught-up declared one record early) — cosmetic today because the fleet runs legacy. A true unification is a behavioral change to legacy ACK persistence/delivery/recovery, not a comment cleanup.
 
 ### Storage Integrity
 
