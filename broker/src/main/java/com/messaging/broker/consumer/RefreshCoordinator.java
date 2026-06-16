@@ -176,7 +176,7 @@ public class RefreshCoordinator {
         if (context != null) {
             String refreshId = context.getRefreshId();
             ScheduledFuture<?> watchdog = scheduler.schedule(
-                    () -> abortRefreshIfStuck(topic, refreshId),
+                    () -> runAbortWatchdog(topic, refreshId, false),
                     REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             // compute() atomically replaces any previous watchdog entry, cancelling the old one.
             // This prevents a stale watchdog from a rapid force-cancel + restart sequence leaking
@@ -188,6 +188,29 @@ public class RefreshCoordinator {
         }
 
         return result;
+    }
+
+    /**
+     * F1: run the abort watchdog so an unchecked throw in the abort logic can never silently lose
+     * the safety net. The watchdog is a one-shot {@code scheduler.schedule}; if its task throws,
+     * ScheduledThreadPoolExecutor stores the throwable in a Future nobody reads and the watchdog is
+     * simply gone — a stuck refresh would then never be aborted and, because the pipe does not
+     * resume until the refresh completes, ingestion stays paused until a broker restart. On any
+     * Exception we log and re-arm for another window instead (re-arm itself is refreshId-guarded,
+     * so a completed/replaced refresh does not loop). Errors (OOM etc.) stay fatal.
+     */
+    private void runAbortWatchdog(String topic, String refreshId, boolean allowAbortFromReadySent) {
+        try {
+            abortRefreshIfStuck(topic, refreshId, allowAbortFromReadySent);
+        } catch (Exception e) {
+            log.error("Abort watchdog failed for topic={} refreshId={} — re-arming for another window",
+                    topic, refreshId, e);
+            try {
+                rearmAbortWatchdog(topic, refreshId, allowAbortFromReadySent);
+            } catch (Exception rearmEx) {
+                log.error("Failed to re-arm abort watchdog for topic={} refreshId={}", topic, refreshId, rearmEx);
+            }
+        }
     }
 
     /**
@@ -431,7 +454,7 @@ public class RefreshCoordinator {
 
     private void rearmAbortWatchdog(String topic, String refreshId, boolean allowAbortFromReadySent) {
         ScheduledFuture<?> rearm = scheduler.schedule(
-                () -> abortRefreshIfStuck(topic, refreshId, allowAbortFromReadySent),
+                () -> runAbortWatchdog(topic, refreshId, allowAbortFromReadySent),
                 REFRESH_ABORT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         RefreshContext current = activeRefreshes.get(topic);
         if (current != null && refreshId.equals(current.getRefreshId())) {
@@ -496,7 +519,14 @@ public class RefreshCoordinator {
         RefreshContext context = activeRefreshes.get(topic);
         if (context == null) return;
 
-        resetService.retryResetBroadcast(topic, context);
+        // F1: this runs on a scheduleWithFixedDelay task; an unchecked throw would cancel the whole
+        // periodic schedule, so RESET would never be retried and the refresh could stall in
+        // RESET_SENT with the pipe paused. Swallow Exception so the periodic schedule is retained.
+        try {
+            resetService.retryResetBroadcast(topic, context);
+        } catch (Exception e) {
+            log.error("RESET retry failed for topic {}; periodic schedule retained", topic, e);
+        }
     }
 
     /**
@@ -537,7 +567,14 @@ public class RefreshCoordinator {
         RefreshContext context = activeRefreshes.get(topic);
         if (context == null) return;
 
-        readyService.checkReadyAckTimeout(topic, context);
+        // F1: guard the timeout check so a throw cannot skip the self-reschedule below. This is a
+        // one-shot task that re-arms itself; if readyService.checkReadyAckTimeout threw, the chain
+        // would die and a stuck READY_SENT refresh would keep the pipe paused until restart.
+        try {
+            readyService.checkReadyAckTimeout(topic, context);
+        } catch (Exception e) {
+            log.error("READY-ack timeout check failed for topic {}; rescheduling next check", topic, e);
+        }
 
         // If still waiting for ACKs, schedule another check so newly connected consumers get READY
         if (context.getState() == RefreshState.READY_SENT && !context.allReadyAcksReceived()) {
