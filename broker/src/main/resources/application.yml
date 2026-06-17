@@ -42,6 +42,12 @@ endpoints:
 broker:
   nodeId: ${NODE_ID:local-001}
 
+  # Refresh READY delivery-freshness gate. A refresh is only allowed to reach READY (and the
+  # broker reported healthy/green) once a real delivery reached a consumer within this window,
+  # unless the topic is legitimately empty (healthy-idle). 0 disables the gate. Default 6h.
+  refresh:
+    delivery-freshness-window-ms: ${REFRESH_DELIVERY_FRESHNESS_WINDOW_MS:21600000}
+
   # Self-status error API (/admin/status/errors*). The ring captures WARN+ERROR; this sets the
   # DEFAULT minimum level the endpoints SHOW (ERROR keeps the views error-focused). Override per
   # call with ?level=WARN — no restart needed.

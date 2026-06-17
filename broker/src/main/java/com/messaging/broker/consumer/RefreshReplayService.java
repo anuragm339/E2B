@@ -9,6 +9,8 @@ import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.DataRefreshException;
 import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
+import io.micronaut.context.annotation.Value;
+import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,28 +31,38 @@ public class RefreshReplayService implements ReplayPhase {
     private final StorageEngine storage;
     private final DataRefreshMetrics metrics;
     private final RefreshEventLogger refreshLogger;
+    private final DeliveryFreshnessTracker deliveryFreshness;
+    // READY is held until a real delivery happened within this window (or the topic is empty).
+    // 0 disables the gate (legacy/test constructor). Default 6h.
+    private final long freshnessWindowMs;
 
+    @Inject
     public RefreshReplayService(
             ConsumerRegistry remoteConsumers,
             StorageEngine storage,
             DataRefreshMetrics metrics,
-            RefreshEventLogger refreshLogger) {
+            RefreshEventLogger refreshLogger,
+            DeliveryFreshnessTracker deliveryFreshness,
+            @Value("${broker.refresh.delivery-freshness-window-ms:21600000}") long freshnessWindowMs) {
         this.remoteConsumers = remoteConsumers;
         this.storage = storage;
         this.metrics = metrics;
         this.refreshLogger = refreshLogger;
+        this.deliveryFreshness = deliveryFreshness;
+        this.freshnessWindowMs = freshnessWindowMs;
     }
 
     /**
      * Backward-compatible constructor for tests that only verify replay gating
-     * and metric calls, not storage-head-based gap updates.
+     * and metric calls, not storage-head-based gap updates. Passes a null freshness
+     * tracker and window 0, which disables the delivery-freshness gate.
      */
     @Deprecated
     public RefreshReplayService(
             ConsumerRegistry remoteConsumers,
             DataRefreshMetrics metrics,
             RefreshEventLogger refreshLogger) {
-        this(remoteConsumers, null, metrics, refreshLogger);
+        this(remoteConsumers, null, metrics, refreshLogger, null, 0L);
     }
 
     @Override
@@ -96,6 +108,17 @@ public class RefreshReplayService implements ReplayPhase {
         boolean allResetAcksReceived = context.allResetAcksReceived();
 
         if (allCaughtUp && allResetAcksReceived) {
+            // Delivery-freshness gate: caught-up alone is not enough to go READY/green. Require that
+            // fresh data actually reached a consumer recently, UNLESS the topic legitimately has
+            // nothing to deliver (empty head) — the healthy-idle exception. Guards against a refresh
+            // that "completes" without any real delivery (e.g. silently broken delivery path).
+            if (!deliveryFreshGateSatisfied(topic)) {
+                log.info("event=refresh.ready_gated topic={} refreshId={} reason=no_recent_delivery "
+                                + "windowMs={} lastDeliveryMs={} — holding READY",
+                        topic, context.getRefreshId(), freshnessWindowMs,
+                        deliveryFreshness != null ? deliveryFreshness.getLastSuccessfulDeliveryMs() : -1);
+                return false;
+            }
             LogContext progressContext = LogContext.builder()
                     .topic(topic)
                     .custom("refreshId", context.getRefreshId())
@@ -167,5 +190,35 @@ public class RefreshReplayService implements ReplayPhase {
     @Override
     public boolean allConsumersCaughtUp(String topic, Set<String> ackedConsumers) {
         return remoteConsumers.allConsumersCaughtUp(topic, ackedConsumers);
+    }
+
+    /**
+     * The READY delivery-freshness gate. Returns true (READY allowed) when either a real delivery
+     * happened within the configured window, or the topic has nothing to deliver.
+     *
+     * <p>Disabled (always true) when the tracker is absent or the window is non-positive — the
+     * legacy/test constructor and an explicit opt-out. {@code getCurrentOffset} returns the last
+     * stored offset and {@code -1} for an empty topic, so {@code head < 0} is the healthy-idle case.
+     *
+     * <p>NOTE: this is the steady-state/LOCAL-refresh gate. Download-refresh will layer a per-topic
+     * bootstrap watermark on top so a mid-bootstrap empty topic cannot satisfy the head&lt;0 branch.
+     */
+    private boolean deliveryFreshGateSatisfied(String topic) {
+        if (deliveryFreshness == null || freshnessWindowMs <= 0) {
+            return true; // gate disabled (legacy/test ctor)
+        }
+        long head = -1;
+        try {
+            if (storage != null) {
+                head = storage.getCurrentOffset(topic, 0);
+            }
+        } catch (Exception e) {
+            log.debug("deliveryFreshGate: could not read head for topic {}: {}", topic, e.getMessage());
+            head = -1;
+        }
+        if (head < 0) {
+            return true; // healthy-idle: nothing to deliver
+        }
+        return deliveryFreshness.deliveredWithin(freshnessWindowMs, System.currentTimeMillis());
     }
 }

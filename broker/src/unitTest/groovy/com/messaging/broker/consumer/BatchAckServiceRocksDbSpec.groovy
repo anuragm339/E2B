@@ -38,7 +38,7 @@ class BatchAckServiceRocksDbSpec extends Specification {
         service = new BatchAckService(
                 stateService, pendingAckStore, offsetTracker, metrics, storage,
                 registrationService, legacyDeliveryManager, consumerLogger,
-                ackStore, syncStorageExecutor, true)
+                ackStore, syncStorageExecutor, new DeliveryFreshnessTracker(), true)
     }
 
     // ── Modern ACK path ───────────────────────────────────────────────────────

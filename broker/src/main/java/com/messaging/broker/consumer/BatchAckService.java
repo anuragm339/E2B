@@ -55,6 +55,7 @@ public class BatchAckService implements ConsumerAckService {
     private final ConsumerEventLogger consumerLogger;
     private final AckStore ackStore;
     private final ExecutorService ackStorageExecutor;
+    private final DeliveryFreshnessTracker deliveryFreshness;
     private final boolean liveReplayEnabled;
 
     @Inject
@@ -69,6 +70,7 @@ public class BatchAckService implements ConsumerAckService {
             ConsumerEventLogger consumerLogger,
             AckStore ackStore,
             @Named("ackStorageExecutor") ExecutorService ackStorageExecutor,
+            DeliveryFreshnessTracker deliveryFreshness,
             @Value("${ack-store.live-replay.enabled:true}") boolean liveReplayEnabled) {
         this.stateService = stateService;
         this.pendingAckStore = pendingAckStore;
@@ -80,6 +82,7 @@ public class BatchAckService implements ConsumerAckService {
         this.consumerLogger = consumerLogger;
         this.ackStore = ackStore;
         this.ackStorageExecutor = ackStorageExecutor;
+        this.deliveryFreshness = deliveryFreshness;
         this.liveReplayEnabled = liveReplayEnabled;
     }
 
@@ -126,6 +129,12 @@ public class BatchAckService implements ConsumerAckService {
             RemoteConsumer consumer = consumerOpt.get();
             long oldOffset = consumer.getCurrentOffset();
             offsetTracker.updateOffset(group + ":" + topic, committedOffset);
+
+            // Real delivery confirmed: stamp the per-consumer field (previously never written —
+            // StatusController state derivation depended on it) and the broker-wide freshness clock
+            // that gates refresh READY.
+            consumer.lastDeliveryAttempt = System.currentTimeMillis();
+            deliveryFreshness.markDelivered();
 
             // Update metrics
             metrics.updateConsumerOffset(clientId, topic, group, committedOffset);
@@ -318,6 +327,8 @@ public class BatchAckService implements ConsumerAckService {
 
                 // Update last successful delivery timestamp for stuck detection
                 metrics.updateConsumerLastDeliveryTime(clientId, topic, group);
+                // Broker-wide freshness clock (gates refresh READY) — legacy delivery counts too.
+                deliveryFreshness.markDelivered();
 
                 // Update offset, ACK time, and ACK count
                 metrics.updateConsumerOffset(clientId, topic, group, offset);
