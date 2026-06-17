@@ -5,6 +5,7 @@ import com.messaging.broker.consumer.ConsumerRegistry
 import com.messaging.broker.consumer.ConsumerStateService
 import com.messaging.broker.consumer.PendingAckStore
 import com.messaging.broker.consumer.RefreshCoordinator
+import com.messaging.broker.consumer.RemoteConsumer
 import com.messaging.broker.core.TopologyManager
 import com.messaging.broker.monitoring.ErrorRecorder
 import com.messaging.broker.monitoring.RefreshHistoryRecorder
@@ -157,5 +158,30 @@ class StatusControllerStorageSpec extends Specification {
         m.containsKey("recentMaxMs")
         !m.containsKey("maxMs")                                     // renamed to recentMaxMs
         Math.abs((m.avgMs as double) - ((m.totalMs as double) / 2.0d)) < 0.5d   // avgMs == totalMs/count
+    }
+
+    def "offsetLag is computed from the COMMITTED offset, so a caught-up legacy consumer reads 0 not head"() {
+        given: "a controller wired with controllable registry + storage"
+        def registry = Mock(ConsumerRegistry)
+        def st = Mock(StorageEngine)
+        def ctl = new StatusController(
+                Mock(PipeConsistencyService), topology, registry, st, segmentAccess,
+                Mock(PendingAckStore), Mock(HttpPipeConnector), Mock(MeterRegistry),
+                Mock(ConsumerStateService), Mock(ErrorRecorder), Mock(RefreshCoordinator),
+                Mock(RefreshHistoryRecorder), "ERROR")
+
+        and: "a caught-up legacy consumer whose RemoteConsumer.currentOffset is stale (10) but committed == head"
+        def caughtUp = Mock(RemoteConsumer) { getTopic() >> "t1"; getGroup() >> "g1"; getCurrentOffset() >> 10L }
+        st.getCurrentOffset("t1", 0) >> 1207489L
+        registry.getCommittedOffset("g1:t1") >> 1207489L
+
+        and: "a consumer that is genuinely behind"
+        def behind = Mock(RemoteConsumer) { getTopic() >> "t2"; getGroup() >> "g2"; getCurrentOffset() >> 0L }
+        st.getCurrentOffset("t2", 0) >> 1000L
+        registry.getCommittedOffset("g2:t2") >> 700L
+
+        expect: "caught-up reads 0 (NOT head - stale current = ~1.2M); behind reads head - committed"
+        ctl.offsetLag(caughtUp) == 0L
+        ctl.offsetLag(behind) == 300L
     }
 }

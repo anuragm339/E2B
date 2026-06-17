@@ -613,7 +613,12 @@ public class StatusController {
                 long head = storage.getCurrentOffset(topic, 0);
                 long current = c.getCurrentOffset();
                 long committed = consumerRegistry.getCommittedOffset(c.getGroup() + ":" + topic);
-                long lag = Math.max(0, head - current);
+                // Lag from the COMMITTED (offset-tracker) offset, not RemoteConsumer.getCurrentOffset():
+                // the legacy delivery path only updates the offset tracker, so `current` is stale for
+                // legacy consumers and made caught-up consumers read a head-sized lag. This is an
+                // OFFSET GAP (head - committed), not a record count — sparse parent offsets mean it
+                // over-counts when behind, but it is 0 when caught up. See ch.19.
+                long lag = Math.max(0, head - committed);
                 long lastAttempt = c.lastDeliveryAttempt;
                 long lastDeliveryAgeMs = lastAttempt == 0 ? -1 : now - lastAttempt;
                 int failures = c.getConsecutiveFailures();
@@ -923,8 +928,9 @@ public class StatusController {
                 m.put("group", c.getGroup());
                 m.put("legacy", c.isLegacy());
                 m.put("currentOffset", current);
-                m.put("ackedOffset", consumerRegistry.getCommittedOffset(c.getGroup() + ":" + topic));
-                m.put("lag", Math.max(0, head - current));
+                long committed = consumerRegistry.getCommittedOffset(c.getGroup() + ":" + topic);
+                m.put("ackedOffset", committed);
+                m.put("lag", Math.max(0, head - committed));   // offset gap from committed (see /consumers)
                 consumers.add(m);
             }
             Map<String, Object> body = new LinkedHashMap<>();
@@ -969,8 +975,7 @@ public class StatusController {
             long maxLag = 0;
             for (RemoteConsumer c : consumerRegistry.getAllConsumers()) {
                 total++;
-                long head = storage.getCurrentOffset(c.getTopic(), 0);
-                long lag = Math.max(0, head - c.getCurrentOffset());
+                long lag = offsetLag(c);   // committed-based (correct for legacy)
                 maxLag = Math.max(maxLag, lag);
                 long lastAttempt = c.lastDeliveryAttempt;
                 if (lag > 0 && (lastAttempt == 0 || now - lastAttempt >= STALE_DELIVERY_MS)) {
@@ -1047,10 +1052,11 @@ public class StatusController {
             Map<String, Object> pipeM = new LinkedHashMap<>();
             pipeM.put("fetchLatency", timerStats("pipe_fetch_latency_seconds"));
 
-            // Worst consumers by lag (computed — correct for legacy; the latency metric is modern-only).
+            // Worst consumers by lag, from the COMMITTED (offset-tracker) offset so legacy consumers
+            // are correct (RemoteConsumer.getCurrentOffset() is only maintained on the modern path).
             List<Map<String, Object>> withLag = new ArrayList<>();
             for (RemoteConsumer c : consumerRegistry.getAllConsumers()) {
-                long lag = Math.max(0, storage.getCurrentOffset(c.getTopic(), 0) - c.getCurrentOffset());
+                long lag = offsetLag(c);
                 if (lag <= 0) {
                     continue;
                 }
@@ -1076,6 +1082,19 @@ public class StatusController {
             log.error("event=status.performance_failed", e);
             return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
         }
+    }
+
+    /**
+     * Per-consumer offset lag = {@code head - committed}, using the COMMITTED (offset-tracker) offset
+     * — which both legacy and modern delivery keep current — NOT {@code RemoteConsumer.getCurrentOffset()},
+     * which only the modern path updates (so it was stale for legacy and showed caught-up consumers a
+     * head-sized lag). This is an OFFSET GAP, not a record count: with sparse parent offsets it
+     * over-counts while behind, but it is 0 when caught up. Package-private for direct unit testing.
+     */
+    long offsetLag(RemoteConsumer c) {
+        long head = storage.getCurrentOffset(c.getTopic(), 0);
+        long committed = consumerRegistry.getCommittedOffset(c.getGroup() + ":" + c.getTopic());
+        return Math.max(0, head - committed);
     }
 
     private Map<String, Object> timerStats(String name) {

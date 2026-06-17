@@ -86,6 +86,15 @@ default poll IO-free. Tests: `StatusControllerStorageSpec`.
 `state` ∈ `RECEIVING` / `IDLE` (lag=0, healthy) / `NO_DATA_YET` / `STALLED` (lag>0, not
 flowing), each with a computed `reason`.
 
+> **Lag definition (fixed):** `lag = head − committed` where `committed` is the **offset-tracker**
+> offset (`StatusController.offsetLag`). It is NOT `head − RemoteConsumer.getCurrentOffset()`: the
+> **legacy** delivery path only updates the offset tracker and never calls `setCurrentOffset`, so the
+> old formula used a stale offset and reported caught-up legacy consumers a head-sized lag. `lag` is
+> an **offset GAP**, not a record count — because parent offsets are **sparse**, the gap over-counts
+> the actual records pending while a consumer is behind, but it is `0` when caught up. (The Prometheus
+> `broker.consumer.lag` gauge still has the legacy-source issue on the modern-only delivery path; the
+> status API is now correct.)
+
 > **Fidelity:** `ConsumerRegistry` holds only **connected** consumers
 > (`broker/.../consumer/ConsumerRegistry.java:173`), so `DISCONNECTED` **cannot be derived**
 > here — a vanished consumer is simply absent. Reporting `DISCONNECTED` would need a separate
