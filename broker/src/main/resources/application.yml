@@ -42,6 +42,13 @@ endpoints:
 broker:
   nodeId: ${NODE_ID:local-001}
 
+  # Self-status error API (/admin/status/errors*). The ring captures WARN+ERROR; this sets the
+  # DEFAULT minimum level the endpoints SHOW (ERROR keeps the views error-focused). Override per
+  # call with ?level=WARN — no restart needed.
+  status:
+    errors:
+      default-level: ${STATUS_ERRORS_DEFAULT_LEVEL:ERROR}
+
   registry:
     url: ${REGISTRY_URL:http://localhost:8080}
     auth:

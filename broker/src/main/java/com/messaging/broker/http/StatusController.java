@@ -12,16 +12,22 @@ import com.messaging.broker.consumer.RemoteConsumer;
 import com.messaging.broker.core.TopologyManager;
 import com.messaging.broker.legacy.MergedBatch;
 import com.messaging.broker.model.DeliveryKey;
+import com.messaging.broker.monitoring.ErrorExplainer;
 import com.messaging.broker.monitoring.ErrorRecorder;
+import com.messaging.broker.monitoring.FailedMessageRecorder;
 import com.messaging.broker.monitoring.RefreshHistoryRecorder;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.model.MessageRecord;
+import com.messaging.storage.segment.Segment;
+import com.messaging.storage.segment.SegmentAccess;
+import com.messaging.storage.segment.SegmentManager;
 import com.messaging.common.model.TopologyResponse;
 import com.messaging.pipe.HttpPipeConnector;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
+import io.micronaut.context.annotation.Value;
 import io.micronaut.http.HttpResponse;
 import io.micronaut.http.MediaType;
 import io.micronaut.http.annotation.Controller;
@@ -33,6 +39,9 @@ import jakarta.inject.Inject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.EnumMap;
 import java.util.HashSet;
@@ -65,6 +74,7 @@ public class StatusController {
     private final TopologyManager topologyManager;
     private final ConsumerRegistry consumerRegistry;
     private final StorageEngine storage;
+    private final SegmentAccess segmentAccess;
     private final PendingAckStore pendingAckStore;
     private final HttpPipeConnector pipeConnector;
     private final MeterRegistry meterRegistry;
@@ -72,6 +82,7 @@ public class StatusController {
     private final ErrorRecorder errorRecorder;
     private final RefreshCoordinator refreshCoordinator;
     private final RefreshHistoryRecorder refreshHistory;
+    private final String errorsDefaultLevel;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Inject
@@ -79,17 +90,20 @@ public class StatusController {
                            TopologyManager topologyManager,
                            ConsumerRegistry consumerRegistry,
                            StorageEngine storage,
+                           SegmentAccess segmentAccess,
                            PendingAckStore pendingAckStore,
                            HttpPipeConnector pipeConnector,
                            MeterRegistry meterRegistry,
                            ConsumerStateService consumerStateService,
                            ErrorRecorder errorRecorder,
                            RefreshCoordinator refreshCoordinator,
-                           RefreshHistoryRecorder refreshHistory) {
+                           RefreshHistoryRecorder refreshHistory,
+                           @Value("${broker.status.errors.default-level:ERROR}") String errorsDefaultLevel) {
         this.consistencyService = consistencyService;
         this.topologyManager = topologyManager;
         this.consumerRegistry = consumerRegistry;
         this.storage = storage;
+        this.segmentAccess = segmentAccess;
         this.pendingAckStore = pendingAckStore;
         this.pipeConnector = pipeConnector;
         this.meterRegistry = meterRegistry;
@@ -97,6 +111,8 @@ public class StatusController {
         this.errorRecorder = errorRecorder;
         this.refreshCoordinator = refreshCoordinator;
         this.refreshHistory = refreshHistory;
+        this.errorsDefaultLevel = (errorsDefaultLevel == null || errorsDefaultLevel.isBlank())
+                ? "ERROR" : errorsDefaultLevel.trim().toUpperCase();
     }
 
     /**
@@ -225,8 +241,10 @@ public class StatusController {
     }
 
     /**
-     * GET /admin/status/errors?level=&code=&logger=&since=&limit= — recent WARN/ERROR events for
-     * THIS POS (most recent first), from the in-memory ring. Replaces {@code docker logs | grep}.
+     * GET /admin/status/errors?level=&code=&logger=&since=&limit= — recent events for THIS POS
+     * (most recent first), from the in-memory ring. {@code level} is a MINIMUM level and defaults
+     * to {@code broker.status.errors.default-level} (ERROR): pass {@code ?level=WARN} to also see
+     * warnings. Replaces {@code docker logs | grep}.
      */
     @Get("/errors")
     @Produces(MediaType.APPLICATION_JSON)
@@ -237,29 +255,21 @@ public class StatusController {
                                        @QueryValue(defaultValue = "100") int limit) {
         try {
             int capped = Math.max(1, Math.min(limit, 500));
+            String minLevel = level.isBlank() ? errorsDefaultLevel : level;
             List<ErrorRecorder.Entry> entries = errorRecorder.recent(
-                    level.isBlank() ? null : level,
+                    minLevel,
                     code.isBlank() ? null : code,
                     logger.isBlank() ? null : logger,
                     since, capped);
 
             List<Map<String, Object>> rows = new ArrayList<>(entries.size());
             for (ErrorRecorder.Entry e : entries) {
-                Map<String, Object> m = new LinkedHashMap<>();
-                m.put("ts", e.ts);
-                m.put("level", e.level);
-                m.put("logger", e.logger);
-                m.put("message", e.message);
-                m.put("errorCode", e.errorCode);
-                m.put("exceptionClass", e.exceptionClass);
-                if (e.context != null) {
-                    m.put("context", e.context);
-                }
-                rows.add(m);
+                rows.add(entryRow(e));
             }
 
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("nodeId", topologyManager.getNodeId());
+            body.put("level", minLevel);
             body.put("bufferSize", errorRecorder.size());
             body.put("returned", rows.size());
             body.put("errors", rows);
@@ -271,8 +281,8 @@ public class StatusController {
     }
 
     /**
-     * GET /admin/status/errors/summary — tally of recent errors by ErrorCode/exception/level
-     * with count + first/last-seen, highest count first.
+     * GET /admin/status/errors/summary — all-time tally by ErrorCode/exception/level, highest count
+     * first. (Lifetime counters, not level-filtered — for the level-aware ring view use /errors/top.)
      */
     @Get("/errors/summary")
     @Produces(MediaType.APPLICATION_JSON)
@@ -287,6 +297,122 @@ public class StatusController {
             log.error("event=status.errors_summary_failed", e);
             return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
         }
+    }
+
+    /**
+     * GET /admin/status/failed-messages — the most recent failed message records (bounded ring of
+     * {@value FailedMessageRecorder#MAX}): which record (topic/offset/key) failed, why, how many
+     * attempts, and disposition (RETRYING, or STUCK once it crosses the poison threshold). Repeated
+     * failures of the same record increment one entry's attempts instead of flooding the list — so
+     * a record with a climbing {@code attempts}/`STUCK` is the poison message to look at.
+     */
+    @Get("/failed-messages")
+    @Produces(MediaType.APPLICATION_JSON)
+    public HttpResponse<String> failedMessages() {
+        try {
+            FailedMessageRecorder fmr = FailedMessageRecorder.instance();
+            List<Map<String, Object>> rows = new ArrayList<>();
+            if (fmr != null) {
+                for (FailedMessageRecorder.Failure f : fmr.recent()) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("topic", f.topic);
+                    m.put("offset", f.offset);
+                    m.put("key", f.key);
+                    m.put("group", f.group);
+                    m.put("reason", f.reason);
+                    m.put("attempts", f.attempts);
+                    m.put("disposition", f.disposition());
+                    m.put("firstSeen", f.firstTs);
+                    m.put("lastSeen", f.lastTs);
+                    rows.add(m);
+                }
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("nodeId", topologyManager.getNodeId());
+            body.put("capacity", FailedMessageRecorder.MAX);
+            body.put("count", rows.size());
+            body.put("failedMessages", rows);
+            return HttpResponse.ok(objectMapper.writeValueAsString(body));
+        } catch (Exception e) {
+            log.error("event=status.failed_messages_failed", e);
+            return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
+    /**
+     * GET /admin/status/errors/top?level=&limit= — the top UNIQUE errors in the ring (highest count
+     * first), each with count, first/last seen, a sample message, and a sample {@code traceId} you
+     * can pass to /errors/trace to see the full chain. {@code level} is a MINIMUM level and defaults
+     * to ERROR; pass {@code ?level=WARN} to include warnings.
+     */
+    @Get("/errors/top")
+    @Produces(MediaType.APPLICATION_JSON)
+    public HttpResponse<String> errorsTop(@QueryValue(defaultValue = "") String level,
+                                          @QueryValue(defaultValue = "10") int limit) {
+        try {
+            String minLevel = level.isBlank() ? errorsDefaultLevel : level;
+            int capped = Math.max(1, Math.min(limit, 100));
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("nodeId", topologyManager.getNodeId());
+            body.put("level", minLevel);
+            body.put("bufferSize", errorRecorder.size());
+            body.put("top", errorRecorder.topUnique(minLevel, capped));
+            return HttpResponse.ok(objectMapper.writeValueAsString(body));
+        } catch (Exception e) {
+            log.error("event=status.errors_top_failed", e);
+            return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
+    /**
+     * GET /admin/status/errors/trace/{traceId}?level= — every captured entry sharing {@code traceId},
+     * in chronological order (start → end), so a single failure's whole logged chain reads top to
+     * bottom. {@code level} is a MINIMUM level and defaults to ERROR; pass {@code ?level=WARN} to
+     * include the warnings around the error.
+     */
+    @Get("/errors/trace/{traceId}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public HttpResponse<String> errorsTrace(@PathVariable String traceId,
+                                            @QueryValue(defaultValue = "") String level) {
+        try {
+            String minLevel = level.isBlank() ? errorsDefaultLevel : level;
+            List<ErrorRecorder.Entry> chain = errorRecorder.trace(traceId, minLevel);
+            List<Map<String, Object>> rows = new ArrayList<>(chain.size());
+            for (ErrorRecorder.Entry e : chain) {
+                rows.add(entryRow(e));
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("nodeId", topologyManager.getNodeId());
+            body.put("traceId", traceId);
+            body.put("level", minLevel);
+            body.put("count", rows.size());
+            body.put("chain", rows);
+            return HttpResponse.ok(objectMapper.writeValueAsString(body));
+        } catch (Exception e) {
+            log.error("event=status.errors_trace_failed traceId={}", traceId, e);
+            return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
+    /** Map a recorded entry to a JSON row (shared by /errors and /errors/trace). */
+    private Map<String, Object> entryRow(ErrorRecorder.Entry e) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("ts", e.ts);
+        m.put("level", e.level);
+        // what happened / how it surfaced / why — human-readable, derived from the recorded fields.
+        m.put("what", ErrorExplainer.what(e.errorCode, e.exceptionClass, e.message));
+        m.put("how", ErrorExplainer.how(e.logger, e.exceptionClass));
+        m.put("why", ErrorExplainer.why(e.errorCode, e.exceptionClass, e.message));
+        m.put("logger", e.logger);
+        m.put("message", e.message);
+        m.put("errorCode", e.errorCode);
+        m.put("exceptionClass", e.exceptionClass);
+        m.put("traceId", e.traceId);
+        if (e.topic != null) m.put("topic", e.topic);
+        if (e.group != null) m.put("group", e.group);
+        if (e.clientId != null) m.put("clientId", e.clientId);
+        if (e.context != null) m.put("context", e.context);
+        return m;
     }
 
     /**
@@ -647,6 +773,134 @@ public class StatusController {
     }
 
     /**
+     * GET /admin/status/storage?disk= — storage-layer view across all topics: per-topic offsets
+     * (head / durableMax / earliest), a durability lag (head − durableMax), segment counts, and
+     * in-memory byte totals, plus a grand roll-up. All fields are read from in-memory accessors
+     * (no file IO). Pass {@code disk=true} to ALSO sum the actual on-disk segment file sizes
+     * (log + index) — that does one stat() per segment file and is opt-in so the default poll
+     * stays zero-IO.
+     */
+    @Get("/storage")
+    @Produces(MediaType.APPLICATION_JSON)
+    public HttpResponse<String> storage(@QueryValue(defaultValue = "false") boolean disk) {
+        try {
+            List<Map<String, Object>> rows = new ArrayList<>();
+            long totSegments = 0L, totBytes = 0L, totDisk = 0L;
+            for (String t : new TreeSet<>(storage.getTopicNames())) {
+                Map<String, Object> m = topicStorageSummary(t, disk);
+                rows.add(m);
+                totSegments += asLong(m.get("totalSegments"));
+                totBytes    += asLong(m.get("totalBytes"));
+                totDisk     += asLong(m.get("diskBytesOnDisk"));
+            }
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("nodeId", topologyManager.getNodeId());
+            body.put("topicCount", rows.size());
+            body.put("totalSegments", totSegments);
+            body.put("totalBytes", totBytes);
+            if (disk) body.put("totalDiskBytes", totDisk);
+            body.put("diskSampled", disk);
+            body.put("topics", rows);
+            return HttpResponse.ok(objectMapper.writeValueAsString(body));
+        } catch (Exception e) {
+            log.error("event=status.storage_failed", e);
+            return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
+    /**
+     * GET /admin/status/storage/{topic}?disk= — the per-topic storage summary PLUS the full
+     * segment inventory: each segment's base/next offset, record count, in-memory size, and
+     * active/full flags. With {@code disk=true} each segment also reports its on-disk bytes.
+     */
+    @Get("/storage/{topic}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public HttpResponse<String> storageTopic(@PathVariable String topic,
+                                             @QueryValue(defaultValue = "false") boolean disk) {
+        try {
+            Map<String, Object> body = topicStorageSummary(topic, disk);
+            body.put("nodeId", topologyManager.getNodeId());
+
+            List<Map<String, Object>> segs = new ArrayList<>();
+            SegmentManager sm = segmentAccess.getSegmentManager(topic, 0);
+            if (sm != null) {
+                List<Segment> all = sm.getAllSegments();
+                all.sort(java.util.Comparator.comparingLong(Segment::getBaseOffset));
+                long maxSize = sm.getMaxSegmentSize();
+                for (Segment s : all) {
+                    Map<String, Object> sm2 = new LinkedHashMap<>();
+                    sm2.put("baseOffset", s.getBaseOffset());
+                    sm2.put("nextOffset", s.getNextOffset());
+                    sm2.put("recordCount", s.getRecordCount());
+                    sm2.put("sizeBytes", s.getSize());
+                    sm2.put("active", s.isActive());
+                    sm2.put("full", s.isFull(maxSize));
+                    sm2.put("logFile", s.getLogPath() == null ? null : s.getLogPath().getFileName().toString());
+                    if (disk) sm2.put("diskBytes", fileSize(s.getLogPath()) + fileSize(s.getIndexPath()));
+                    segs.add(sm2);
+                }
+            }
+            body.put("segments", segs);
+            return HttpResponse.ok(objectMapper.writeValueAsString(body));
+        } catch (Exception e) {
+            log.error("event=status.storage_topic_failed topic={}", topic, e);
+            return HttpResponse.serverError("{\"error\":\"" + e.getMessage() + "\"}");
+        }
+    }
+
+    /** Per-topic storage summary from in-memory accessors; sums on-disk file sizes only if {@code disk}. */
+    private Map<String, Object> topicStorageSummary(String topic, boolean disk) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("topic", topic);
+        long head = storage.getCurrentOffset(topic, 0);
+        long durable = storage.getMaxOffsetFromMetadata(topic, 0);
+        m.put("headOffset", head);
+        m.put("durableMaxOffset", durable);
+        m.put("earliestOffset", storage.getEarliestOffset(topic, 0));
+        m.put("durabilityLag", Math.max(0L, head - durable));
+
+        SegmentManager sm = segmentAccess.getSegmentManager(topic, 0);
+        if (sm == null) {
+            m.put("note", "no segment manager (topic not initialized)");
+            return m;
+        }
+        boolean hasActive = sm.getActiveSegment() != null;
+        int sealedCount = sm.getSealedSegmentCount();
+        long sealedBytes = sm.getSealedSegmentBytes();
+        long activeBytes = sm.getActiveSegmentSizeBytes();
+        m.put("partition", sm.getPartition());
+        m.put("hasActiveSegment", hasActive);
+        m.put("sealedSegmentCount", sealedCount);
+        m.put("totalSegments", sealedCount + (hasActive ? 1 : 0));
+        m.put("activeBytes", activeBytes);
+        m.put("sealedBytes", sealedBytes);
+        m.put("totalBytes", sealedBytes + activeBytes);
+        m.put("largestSegmentBytes", sm.getLargestSegmentBytes());
+        m.put("maxSegmentSize", sm.getMaxSegmentSize());
+        m.put("dataDir", String.valueOf(sm.getDataDir()));
+        if (disk) {
+            long d = 0L;
+            for (Segment s : sm.getAllSegments()) {
+                d += fileSize(s.getLogPath()) + fileSize(s.getIndexPath());
+            }
+            m.put("diskBytesOnDisk", d);
+        }
+        return m;
+    }
+
+    private static long fileSize(Path p) {
+        try {
+            return (p != null && Files.exists(p)) ? Files.size(p) : 0L;
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    private static long asLong(Object o) {
+        return (o instanceof Number) ? ((Number) o).longValue() : 0L;
+    }
+
+    /**
      * GET /admin/status/flow?topic=T — the per-topic offset chain on this POS.
      *
      * <p>{@code upstreamCursor} is the single GLOBAL pipe cursor, shown separately and NOT
@@ -827,9 +1081,15 @@ public class StatusController {
     private Map<String, Object> timerStats(String name) {
         Timer t = meterRegistry.find(name).timer();
         Map<String, Object> m = new LinkedHashMap<>();
+        // count/avgMs/totalMs are CUMULATIVE over every recorded sample since startup
+        // (avgMs == totalMs/count). max() is a Micrometer *decaying rolling-window* maximum
+        // (recent samples only), so it is surfaced as recentMaxMs — this is why a cumulative
+        // avgMs can legitimately read higher than recentMaxMs and is NOT a bug.
+        long count = t == null ? 0L : t.count();
+        m.put("count", count);
         m.put("avgMs", t == null ? 0.0 : round1(t.mean(TimeUnit.MILLISECONDS)));
-        m.put("maxMs", t == null ? 0.0 : round1(t.max(TimeUnit.MILLISECONDS)));
-        m.put("count", t == null ? 0L : t.count());
+        m.put("totalMs", t == null ? 0.0 : round1(t.totalTime(TimeUnit.MILLISECONDS)));
+        m.put("recentMaxMs", t == null ? 0.0 : round1(t.max(TimeUnit.MILLISECONDS)));
         return m;
     }
 

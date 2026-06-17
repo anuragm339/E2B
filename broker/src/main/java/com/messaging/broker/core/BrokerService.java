@@ -230,6 +230,11 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             // Log the error but return false instead of throwing
             log.error("CRITICAL: Failed to store pipe message at offset {}: {}",
                      record.getOffset(), e.getMessage(), e);
+            com.messaging.broker.monitoring.FailedMessageRecorder fmr =
+                    com.messaging.broker.monitoring.FailedMessageRecorder.instance();
+            if (fmr != null) {
+                fmr.record(record.getTopic(), record.getOffset(), record.getMsgKey(), null, "storage write failed");
+            }
             return false;  // Failure - caller will not advance offset
         }
     }

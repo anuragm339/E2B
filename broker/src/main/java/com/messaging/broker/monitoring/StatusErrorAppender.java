@@ -55,9 +55,16 @@ public class StatusErrorAppender extends AppenderBase<ILoggingEvent> {
                 }
             }
 
+            Map<String, String> mdc = event.getMDCPropertyMap();
+            String traceId = mdc == null ? null : mdc.get("traceId");
+            String topic = mdc == null ? null : mdc.get("topic");
+            String group = mdc == null ? null : mdc.get("group");
+            String clientId = mdc == null ? null : mdc.get("clientId");
+
             recorder.record(event.getTimeStamp(), event.getLevel().toString(),
                     event.getLoggerName(), event.getFormattedMessage(),
-                    errorCode, exceptionClass, context);
+                    errorCode, exceptionClass, context,
+                    traceId, topic, group, clientId);
         } catch (Exception ignored) {
             // The recorder must never disturb the logging path.
         }

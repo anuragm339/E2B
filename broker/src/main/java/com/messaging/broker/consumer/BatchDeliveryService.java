@@ -312,6 +312,15 @@ public class BatchDeliveryService implements ConsumerDeliveryService {
                     // REVERT consumer offset to prevent delivery gap
                     consumer.setCurrentOffset(claimed.originalOffset());
 
+                    // Record the failed (redelivering) batch so /admin/status/failed-messages shows
+                    // which records are struggling; repeated timeouts increment attempts -> STUCK.
+                    com.messaging.broker.monitoring.FailedMessageRecorder fmr =
+                            com.messaging.broker.monitoring.FailedMessageRecorder.instance();
+                    if (fmr != null) {
+                        fmr.record(consumer.getTopic(), claimed.originalOffset(), null,
+                                consumer.getGroup(), "consumer ack timeout (redelivering)");
+                    }
+
                     metrics.recordAckTimeout(consumer.getTopic(), consumer.getGroup());
                     metrics.completePendingAck(consumer.getTopic(), consumer.getGroup());
                     } finally {
