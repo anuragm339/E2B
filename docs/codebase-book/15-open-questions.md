@@ -58,6 +58,16 @@ Items below could not be confirmed from code or need an owner decision.
 5. Should `storage/src/test/java/com/messaging/storage/mmap/MMapStorageEngineTest.java` be moved into the custom unit source set or deleted?
 6. Are Gradle 9 deprecation warnings tracked?
 
+## Planned: Local message bus (`@Producer`)
+
+Design decisions still open for the planned local pub/sub bus — full context in
+[ch.18 Roadmap](18-roadmap-local-message-bus.md) (PLANNED, not implemented):
+
+1. Default `acks`: fire-and-forget (lightest on POS) vs wait-for-persist (safest)?
+2. Durability of locally-produced events across a POS reboot — segment store vs lighter transient path?
+3. Resource isolation — share the broker budget vs quota'd so the bus cannot starve cloud→till?
+4. Refresh gate scope — per-topic vs global; reject-and-retry vs block the caller?
+
 ## Documentation Maintenance
 
 Update this book when any of these change:

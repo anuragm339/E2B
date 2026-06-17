@@ -847,9 +847,91 @@ class RefreshCoordinatorSpec extends Specification {
         noExceptionThrown()
     }
 
+    // ── F1: scheduled refresh tasks must survive a throwing body (schedule/re-arm not lost) ──────
+
+    def "F1: retryResetBroadcast swallows a throwing reset service so the fixed-delay schedule survives"() {
+        given:
+        def resetService = Mock(ResetPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), resetService, Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.RESET_SENT)
+        coordinator.@activeRefreshes.put("topic", context)
+
+        when:
+        invokePrivate(coordinator, "retryResetBroadcast", "topic")
+
+        then: "the throw is caught — before F1 it would cancel the whole scheduleWithFixedDelay schedule"
+        1 * resetService.retryResetBroadcast("topic", context) >> { throw new RuntimeException("broadcast boom") }
+        noExceptionThrown()
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "F1: checkReadyAckTimeout swallows a throwing ready service and STILL reaches its self-reschedule"() {
+        given:
+        def readyService = Mock(ReadyPhase)
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), readyService,
+                Mock(RefreshRecovery), new RefreshStateMachine(), Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        // two expected acks, none received → the reschedule branch must run after the throw
+        def context = new RefreshContext("topic", ["groupA:topic", "groupB:topic"] as Set)
+        context.setState(RefreshState.READY_SENT)
+        coordinator.@activeRefreshes.put("topic", context)
+
+        when:
+        invokePrivate(coordinator, "checkReadyAckTimeout", "topic")
+
+        then: "the throw is caught AND the self-reschedule still fired (a ready-timeout task is registered)"
+        1 * readyService.checkReadyAckTimeout("topic", context) >> { throw new RuntimeException("ready boom") }
+        noExceptionThrown()
+        coordinator.@readyTimeoutTasks.containsKey("topic")
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
+    def "F1: runAbortWatchdog swallows a throwing abort and re-arms the watchdog (safety net never lost)"() {
+        given: "a state machine whose ABORTED transition throws — the abort body fails"
+        def stateMachine = Mock(RefreshStateMachine)
+        stateMachine.isTerminalState(_ as RefreshState) >> false
+        stateMachine.transition(_ as RefreshState, RefreshState.ABORTED) >> { throw new RuntimeException("abort boom") }
+        def coordinator = new RefreshCoordinator(
+                Mock(RefreshStarter), Mock(ResetPhase), Mock(ReplayPhase), Mock(ReadyPhase),
+                Mock(RefreshRecovery), stateMachine, Mock(RefreshGatePolicy),
+                Mock(BatchDeliveryService), Mock(ConsumerRegistry))
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.REPLAYING)
+        context.setRefreshId("refresh-x")
+        context.setLastReplayProgressTime(java.time.Instant.now().minusSeconds(601))  // stale → abort branch
+        coordinator.@activeRefreshes.put("topic", context)
+
+        when:
+        invokeRunAbortWatchdog(coordinator, "topic", "refresh-x", false)
+
+        then: "abort threw, but the guard caught it and re-armed the watchdog instead of losing it"
+        noExceptionThrown()
+        coordinator.@abortWatchdogTasks.containsKey("topic")
+
+        cleanup:
+        coordinator.shutdown()
+    }
+
     private static Object invokePrivate(Object target, String methodName, Object... args) {
         Method method = target.class.getDeclaredMethod(methodName, args.collect { it.class } as Class[])
         method.accessible = true
         method.invoke(target, args)
+    }
+
+    // runAbortWatchdog has a primitive boolean param, so invokePrivate's arg.class inference cannot
+    // resolve it — use an explicit signature with Boolean.TYPE.
+    private static void invokeRunAbortWatchdog(Object target, String topic, String refreshId, boolean allow) {
+        Method m = target.class.getDeclaredMethod("runAbortWatchdog", String, String, Boolean.TYPE)
+        m.accessible = true
+        m.invoke(target, topic, refreshId, allow)
     }
 }

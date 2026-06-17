@@ -450,11 +450,12 @@ public class ConsumerRegistry {
             );
             awaitSend(server.send(clientId, readyMessage));
             log.debug("Sent READY to legacy consumer: {}", clientId);
-
-            // Schedule retry if no ACK received
-            readinessService.scheduleReadyRetry(clientId, null, null, 0);
         } catch (Exception e) {
             log.error("Failed to send READY to legacy consumer {}", clientId, e);
+        } finally {
+            // #12: schedule the retry regardless of the initial-send outcome — a failed first
+            // send must still be retried or the consumer never becomes ready. Self-cancels on ACK.
+            readinessService.scheduleReadyRetry(clientId, null, null, 0);
         }
     }
 
@@ -471,11 +472,11 @@ public class ConsumerRegistry {
             );
             awaitSend(server.send(clientId, readyMessage));
             log.debug("Sent READY to modern consumer: {}:{}:{}", clientId, topic, group);
-
-            // Schedule retry if no ACK received
-            readinessService.scheduleReadyRetry(clientId, topic, group, 0);
         } catch (Exception e) {
             log.error("Failed to send READY to modern consumer {}:{}:{}", clientId, topic, group, e);
+        } finally {
+            // #12: schedule the retry regardless of the initial-send outcome (see legacy variant).
+            readinessService.scheduleReadyRetry(clientId, topic, group, 0);
         }
     }
 
@@ -629,6 +630,18 @@ public class ConsumerRegistry {
         try {
             long storageHead = storage.getCurrentOffset(topic, 0);
 
+            // storageHead is the LAST stored offset. This check uses the LEGACY convention, where
+            // the persisted offset is the LAST-delivered offset, so "caught up" is offset == head
+            // (i.e. NOT caught up only while offset < head). This is correct for the legacy fleet
+            // and is the convention used by the legacy delivery path (LegacyConsumerDeliveryManager
+            // start = committedOffset + 1, caught up when start > head).
+            //
+            // NOTE (dual convention): a MODERN consumer persists the NEXT-to-deliver offset, for
+            // which "caught up" is offset == head + 1; under that convention the boundary offset ==
+            // head is premature by one record. Do NOT tighten this to "<= storageHead" — that would
+            // make a legacy consumer (whose offset caps at head) never satisfy caught-up, stalling
+            // refresh completion and leaving ingestion paused forever. See codebase-book
+            // 05-data-model "Offset conventions".
             for (String groupTopic : consumerGroupTopics) {
                 long consumerOffset = offsetTracker.getOffset(groupTopic);
                 if (consumerOffset < storageHead) {

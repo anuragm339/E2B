@@ -426,12 +426,14 @@ class NettyTcpIntegrationSpec extends Specification {
     // sendBatch — zero-copy batch delivery (server → client)
     // =========================================================================
 
-    def "sendBatch delivers batch records and client responds with BATCH_ACK"() {
-        given:
+    def "sendBatch delivers batch records to the application and sends NO automatic BATCH_ACK (#1)"() {
+        given: "#1 — the network layer no longer acks on the wire; the BATCH_ACK is now the "
+        // application's responsibility (ClientConsumerManager), sent only after successful processing.
         def capturedClientId = null
         def registerLatch  = new CountDownLatch(1)
-        def batchAckLatch  = new CountDownLatch(1)
+        def dataLatch      = new CountDownLatch(1)
         def receivedAcks   = new CopyOnWriteArrayList<BrokerMessage>()
+        def deliveredData  = new CopyOnWriteArrayList<BrokerMessage>()
 
         server = new NettyTcpServer(2, 8)
         // First handler: capture clientId on SUBSCRIBE message
@@ -441,16 +443,22 @@ class NettyTcpIntegrationSpec extends Specification {
                 registerLatch.countDown()
             }
         } as NetworkServer.MessageHandler)
-        // Second handler: capture the BATCH_ACK that the client sends back
+        // Second handler: record any BATCH_ACK — with #1 a raw client (no app layer) must send none
         server.registerHandler({ clientId, incoming ->
             if (incoming.getType() == BrokerMessage.MessageType.BATCH_ACK) {
                 receivedAcks.add(incoming)
-                batchAckLatch.countDown()
             }
         } as NetworkServer.MessageHandler)
         server.start(testPort)
 
         def conn = new NettyTcpClient().connect("localhost", testPort).get(5, TimeUnit.SECONDS)
+        // Capture the batch delivered up to the application as a synthetic DATA message
+        conn.onMessage({ BrokerMessage msg ->
+            if (msg.getType() == BrokerMessage.MessageType.DATA) {
+                deliveredData.add(msg)
+                dataLatch.countDown()
+            }
+        } as java.util.function.Consumer)
         conn.send(brokerMsg(BrokerMessage.MessageType.SUBSCRIBE, 1L, "reg".getBytes())).get(5, TimeUnit.SECONDS)
         registerLatch.await(5, TimeUnit.SECONDS)
 
@@ -460,12 +468,16 @@ class NettyTcpIntegrationSpec extends Specification {
             [key: "k2", data: '{"v":2}']
         ])
         server.sendBatch(capturedClientId, "batch-group", batch).get(5, TimeUnit.SECONDS)
-        boolean gotAck = batchAckLatch.await(5, TimeUnit.SECONDS)
+        boolean gotData = dataLatch.await(5, TimeUnit.SECONDS)
 
-        then:
-        gotAck
-        !receivedAcks.isEmpty()
-        receivedAcks[0].getType() == BrokerMessage.MessageType.BATCH_ACK
+        then: "the batch is delivered up to the application layer"
+        gotData
+        !deliveredData.isEmpty()
+        deliveredData[0].getType() == BrokerMessage.MessageType.DATA
+
+        and: "the network layer sends NO automatic BATCH_ACK (acking is now the app's job)"
+        Thread.sleep(300)   // allow any erroneous late ack to arrive
+        receivedAcks.isEmpty()
 
         cleanup:
         conn?.disconnect()

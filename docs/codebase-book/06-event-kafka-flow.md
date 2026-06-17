@@ -114,18 +114,32 @@ DeliveryScheduler
   -> raw segment bytes via FileRegion
   -> ZeroCopyBatchDecoder
   -> BatchDecodedEvent
-  -> client BatchAckHandler sends BATCH_ACK(topic, group)
+  -> client BatchAckHandler unwraps records (does NOT ack)
+  -> ClientMessageHandler -> ClientConsumerManager.handleDataMessage
+  -> handler.handleBatch on every handler for topic:group
+  -> ONLY if all handlers succeed: client sends BATCH_ACK(topic, group)
   -> broker BatchAckHandler on ackExecutor
   -> BatchAckService commits next offset
   -> async per-record RocksDB ACK write
 ```
+
+**#1 (at-least-once):** the BATCH_ACK is sent **after** the application has processed the
+batch, not on the wire as it is decoded. The network `BatchAckHandler` used to flush the
+BATCH_ACK the moment a batch was decoded — i.e. *before* `handleBatch` ran — so a failing or
+crashing consumer handler lost data the broker had already committed. The ack now originates from
+`ClientConsumerManager.handleDataMessage` and is sent only if **every** handler's `handleBatch`
+succeeded. On any handler failure (or a missing handler) no ack is sent; the broker's ack-timeout
+reverts the offset and redelivers the batch. The same after-success rule applies to the refresh
+control acks: `RESET_ACK` is withheld if any `onReset` throws, and `READY_ACK` is withheld if any
+`onReady` throws, so a half-reset/half-activated consumer never lets the refresh proceed.
 
 Sources:
 
 - Scheduling: `DeliveryScheduler.java`, `TopicFairScheduler.java`
 - Broker delivery: `BatchDeliveryService.java`
 - Transport: `NettyTcpServer.java`
-- Client decode/ACK: `ZeroCopyBatchDecoder.java`, network `BatchAckHandler.java`
+- Client decode: `ZeroCopyBatchDecoder.java`, network `BatchAckHandler.java` (unwrap only)
+- Client ACK (after processing): `ClientConsumerManager.java` (`sendBatchAck`, `handleResetMessage`, `handleReadyMessage`)
 - Broker ACK: broker `BatchAckHandler.java`, `BatchAckService.java`
 
 ### Batch Header

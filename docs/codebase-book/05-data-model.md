@@ -194,6 +194,29 @@ Sources: `broker/src/main/java/com/messaging/broker/model/` and `broker/src/main
 
 These meanings are not interchangeable. See [Offset risks](13-risk-and-edge-cases.md#offset-semantics).
 
+### Offset conventions (legacy vs modern — DUAL convention)
+
+`StorageEngine.getCurrentOffset()` returns the **last stored offset** (`SegmentManager.getCurrentOffset` = `activeSegment.getNextOffset() - 1`; `-1` when empty). The **next writable** position is `head + 1`.
+
+The single per-`group:topic` persisted consumer offset (`ConsumerOffsetTracker`) carries **two different meanings** depending on which delivery path owns the consumer:
+
+| | **Legacy** consumer (the deployed fleet) | **Modern** consumer |
+|---|---|---|
+| Persisted offset means | **last-delivered** offset | **next-to-deliver** offset (last + 1) |
+| Delivery reads from | `committedOffset + 1` (`LegacyConsumerDeliveryManager.java:121`) | `committedOffset` inclusive (`BatchDeliveryService.java:183`) |
+| Persisted on ACK as | `maxOffset` of the batch (`LegacyConsumerDeliveryManager.java:613,629`) | `lastOffset + 1` (`BatchDeliveryService.java:263-266`) |
+| **Caught up when** | `offset == head` (`...:138` `start > head`) | `offset == head + 1` (`WatermarkGatePolicy.java:33` delivers while `offset <= head`) |
+
+Because both conventions share the same offset store, the broker's caught-up / lag / clamp helpers are written for the **legacy** convention (correct for the fleet) and are off-by-one for a modern consumer at the single boundary `offset == head`:
+
+- `ConsumerRegistry.allConsumersCaughtUp` (`:635`) — `offset < head` ⇒ not caught up. Correct for legacy; one record early for modern. **Do not tighten to `<= head`**: a legacy offset caps at `head`, so that would make caught-up unreachable and **stall refresh completion, leaving ingestion paused forever**. This gates `REPLAYING → READY` via `RefreshReplayService:95`.
+- Consumer-lag / replay-gap metrics `head - committedOffset` (`BatchAckService.java:151,331`, `BatchDeliveryService.java:371`, `RefreshReplayService.java:82`) — exact for legacy; undercount modern by 1. Metric-only.
+- Corrupt-offset clamp `ConsumerRegistrationManager.validateAndCorrectOffset` (`:103,113`) — only `offset > head + 1` is corrupt; it clamps **down to `head`**, the at-least-once-safe floor (exactly caught-up for legacy; at most one duplicate for modern, never a skip). Clamping to `head + 1` would risk silently skipping the last record on a corrupt file.
+
+A separate `ConsumerDeliveryManager` (`:118` `currentOffset >= headOffset` skip) serves only in-process `@Consumer`-annotated beans, not remote POS consumers, and is independent of the above.
+
+Unifying the two conventions is a behavioral change to legacy ACK persistence, delivery start, and crash recovery — **not** a comment cleanup — and risks restart re-delivery/skips on the live fleet. The flagged comparisons are intentionally legacy-correct; see the inline comments at `ConsumerRegistry.java:629` and `ConsumerRegistrationManager.java:94`.
+
 ## Data Ownership And Cleanup
 
 - `DeliveryBatch` ownership transfers to `NettyTcpServer.sendBatch`, which closes it from `BatchPayloadFileRegion.deallocate`.

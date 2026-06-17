@@ -1,61 +1,33 @@
 package com.messaging.network.codec;
 
-import com.messaging.common.model.BrokerMessage;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.nio.charset.StandardCharsets;
 
 /**
- * Handles batch decoded events by sending BATCH_ACK to broker.
- * Must be placed after ZeroCopyBatchDecoder in the pipeline.
+ * Unwraps a decoded zero-copy batch ({@link BatchDecodedEvent}) into its
+ * {@code List<ConsumerRecord>} and forwards it down the pipeline. Must be placed after
+ * {@code ZeroCopyBatchDecoder}; {@code ClientMessageHandler} downstream expects the unwrapped
+ * list, not the event, which is why this handler is retained.
  *
- * MULTI-GROUP FIX: BATCH_ACK now includes both topic and group for proper offset routing.
+ * <p><b>#1 (at-least-once):</b> this handler used to send the {@code BATCH_ACK} here — i.e.
+ * <i>before</i> the consumer application had processed the batch. That commits the offset on the
+ * broker regardless of whether the application succeeded, so a handler failure (or a crash) after
+ * the ack silently loses data the broker considers delivered. The {@code BATCH_ACK} is now sent by
+ * the application layer ({@code ClientConsumerManager}) only <i>after</i> {@code handler.handleBatch}
+ * succeeds; on failure no ack is sent and the broker's ack-timeout reverts the offset and
+ * redelivers.
  */
 public final class BatchAckHandler extends ChannelInboundHandlerAdapter {
 
-    private static final Logger log = LoggerFactory.getLogger(BatchAckHandler.class);
-
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-
         if (msg instanceof BatchDecodedEvent event) {
-
-            if (event.topic() != null && event.group() != null) {
-                // MULTI-GROUP FIX: Encode both topic and group in ACK payload
-                // Format: [topicLen:4][topic:var][groupLen:4][group:var]
-                byte[] topicBytes = event.topic().getBytes(StandardCharsets.UTF_8);
-                byte[] groupBytes = event.group().getBytes(StandardCharsets.UTF_8);
-
-                java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(4 + topicBytes.length + 4 + groupBytes.length);
-                buffer.putInt(topicBytes.length);
-                buffer.put(topicBytes);
-                buffer.putInt(groupBytes.length);
-                buffer.put(groupBytes);
-
-                BrokerMessage ack = new BrokerMessage(
-                        BrokerMessage.MessageType.BATCH_ACK,
-                        System.currentTimeMillis(),
-                        buffer.array()
-                );
-
-                ctx.channel().writeAndFlush(ack).addListener(f -> {
-                    if (f.isSuccess()) {
-                        log.debug("BATCH_ACK sent for topic={}, group={}", event.topic(), event.group());
-                    } else {
-                        log.error("Failed to send BATCH_ACK for topic={}, group={}", event.topic(), event.group(), f.cause());
-                    }
-                });
-            }
-
-            // Forward the records to the next handler
+            // Forward the unwrapped records. The BATCH_ACK is intentionally NOT sent here — it is
+            // sent after successful application processing (see class javadoc / #1).
             ctx.fireChannelRead(event.records());
             return;
         }
-
-        // Pass through other message types
+        // Pass through other message types unchanged.
         ctx.fireChannelRead(msg);
     }
 }

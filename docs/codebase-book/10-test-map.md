@@ -84,7 +84,7 @@ Compaction:
 - `CompactionCheckpointStoreSpec`
 - `CompactionPlannerSpec`
 - `CompactionRewriterSpec`
-- `CompactionSchedulerSpec`
+- `CompactionSchedulerSpec` (incl. `F2:` — a rejected offload resets the single-flight guard)
 - `InMemoryCompactionIndexSpec`
 - `RocksDbCompactionIndexSpec`
 
@@ -106,7 +106,7 @@ Consumer/delivery/refresh:
 - `InMemoryPendingAckStoreSpec`
 - `PropertiesFileStoreSpec`
 - `RefreshContextSpec`
-- `RefreshCoordinatorSpec`
+- `RefreshCoordinatorSpec` (incl. `F1:` specs — each refresh timer survives a throwing collaborator and still reschedules/re-arms)
 - `RefreshInitiatorSpec`
 - `RefreshReadyServiceSpec`
 - `RefreshRecoveryServiceSpec`
@@ -177,6 +177,14 @@ Binary/JSON/zero-copy codecs, handlers, protocol detection, legacy event codecs/
 
 `client/src/integrationTest/groovy/com/messaging/client/ClientConsumerManagerIntegrationSpec.groovy` verifies discovery, connection, subscribe, data/control routing, and lifecycle.
 
+`ClientConsumerManagerRoutingSpec` covers per-topic:group DATA routing (#13) and #1 ACK ordering:
+a `BATCH_ACK` is sent only after every handler's `handleBatch` succeeds, and is withheld when a
+handler throws (so the broker redelivers).
+
+Network-layer #1 coverage lives in `network/.../codec/BatchAckHandlerIntegrationSpec` (the handler
+unwraps the batch and emits **no** outbound ack) and `network/.../tcp/NettyTcpIntegrationSpec`
+(`sendBatch` delivers records to the application and a raw client sends no automatic BATCH_ACK).
+
 ## Coverage Gaps
 
 - No contract-test framework or suite.
@@ -198,6 +206,10 @@ Binary/JSON/zero-copy codecs, handlers, protocol detection, legacy event codecs/
 | `compaction/CompactionIndexForEachEntrySpec` | unitTest | streaming iteration contract on both index backends, meta-key exclusion |
 | `http/PipeConsistencyEndpointsIntegrationSpec` | integrationTest | digest/bucket/classify against real storage+index, admin trigger + report polling, input validation |
 | `http/PipeConsistencyDisabledIntegrationSpec` | integrationTest | fail-closed 404/503 contract with feature disabled |
+| `http/StatusControllerStorageSpec` | unitTest | `/admin/status/storage` roll-up (offsets, durabilityLag, segment counts/bytes, no-disk-IO default) and `/storage/{topic}` segment inventory (sorted by baseOffset, graceful when no segment manager) |
+| `monitoring/ErrorRecorderSpec` | unitTest | ERROR-default min-level filtering, top-unique grouping with sample traceId, chronological per-trace chain |
+| `monitoring/FailedMessageRecorderSpec` | unitTest | bounded 20-entry LRU failed-record registry: attempt counting, STUCK poison threshold, distinct offsets, newest-first |
+| `monitoring/ErrorExplainerSpec` | unitTest | what/how/why mapping from code/exception/message |
 | `consistency/PipeConsistencySchedulerSpec` | unitTest | auto-run fires all-topics check; skip reasons (disabled/running/offline/memory-pressure); cloud target needs no parent; throwing check contained |
 
 | `journey/PipeConsistencyEscalationJourneySpec` | journeyTest | real broker: clamp→pending→escalation, head-probe filtering of behind candidate, full verdict from qualified verifier, streak reset |

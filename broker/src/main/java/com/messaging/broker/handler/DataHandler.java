@@ -64,8 +64,9 @@ public class DataHandler implements MessageHandler {
             String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
             JsonNode json = objectMapper.readTree(payload);
 
-            // Extract required topic field
+            // Extract required topic field, and reject path-traversal names early (P0 hardening).
             String topic = safeGetText(json, "topic", clientId);
+            com.messaging.common.validation.TopicNames.validate(topic);
 
             // Extract fields
             String msgKey = json.has("msg_key") ? json.get("msg_key").asText() : "key_" + System.currentTimeMillis();

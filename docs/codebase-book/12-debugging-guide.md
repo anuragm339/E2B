@@ -49,6 +49,14 @@ Sources: broker `BatchAckHandler.java`, `BatchAckService.java`, `InMemoryInFligh
 
 Known signal: `ConsumerCrashDuringReplayJourneySpec` once logged pending ACK age above 25 seconds with a 5-second timeout; exact rerun passed.
 
+**#1 (ack-after-process):** the client BATCH_ACK is now sent by `ClientConsumerManager` only after
+every handler's `handleBatch` succeeds — the network `BatchAckHandler` no longer acks on decode. So
+a batch that keeps redelivering is **expected** when the consumer's handler is throwing: look for
+client log `Not acking batch for topic:group '...' — a handler failed` (or `No handlers for
+topic:group '...'; not acking`). Likewise a refresh that times out can be a withheld control ack —
+`onReset failed ... withholding RESET_ACK` or `onReady failed ... withholding READY_ACK`. Fix the
+handler exception; the data is not lost (the broker reverts the offset and redelivers).
+
 ## Refresh Is Stuck
 
 Use:
@@ -63,6 +71,15 @@ By state:
 - `REPLAYING`: inspect `consumer-offsets.properties`, storage head, pending ACKs, and replay gap metric.
 - `READY_SENT`: inspect READY ACK set and client `onReady`; retry occurs every 10 seconds.
 - `ABORTED`: automatic operational recovery policy is not confirmed; inspect pipe/reconciliation state.
+
+**F1 (scheduled-task guards):** if a refresh hangs in a non-terminal state with no progress AND no
+abort after the 10-minute window, look for a logged throw from a refresh timer:
+`RESET retry failed for topic ...`, `READY-ack timeout check failed for topic ...`, or
+`Abort watchdog failed for topic ... — re-arming for another window`. Each refresh timer
+(`retryResetBroadcast`, `checkReadyAckTimeout`, `runAbortWatchdog`) now guards its body so an
+unchecked throw can no longer silently cancel its `ScheduledExecutorService` schedule/re-arm and
+strand the refresh (which would keep the pipe paused until a broker restart). A repeating
+`re-arming for another window` log means a deterministic throw in the abort path needs fixing.
 
 Files: `RefreshCoordinator.java`, phase services, `RefreshStateStore.java`.
 

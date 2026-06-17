@@ -9,10 +9,16 @@ import spock.lang.Specification
 
 import java.time.Instant
 
+/**
+ * #1 (at-least-once): BatchAckHandler must NOT send a BATCH_ACK — that ack moved to the application
+ * layer (ClientConsumerManager) and is now sent only AFTER successful processing. Here the handler's
+ * sole job is to unwrap the BatchDecodedEvent into its records and forward them downstream; no
+ * outbound message must ever be produced.
+ */
 @MicronautTest(startApplication = false)
 class BatchAckHandlerIntegrationSpec extends Specification {
 
-    def "BatchAckHandler sends BATCH_ACK with topic+group payload and forwards records"() {
+    def "BatchAckHandler forwards records and does NOT send a BATCH_ACK (#1)"() {
         given:
         def records = [
             new ConsumerRecord('key1', EventType.MESSAGE, '{"v":1}', Instant.now()),
@@ -24,22 +30,11 @@ class BatchAckHandlerIntegrationSpec extends Specification {
         when:
         channel.writeInbound(event)
 
-        then:
-        BrokerMessage ack = channel.readOutbound()
-        ack != null
-        ack.type == BrokerMessage.MessageType.BATCH_ACK
-
-        def bb = java.nio.ByteBuffer.wrap(ack.payload)
-        def topicLen = bb.getInt()
-        def topic = new String(ack.payload, 4, topicLen, 'UTF-8')
-        topic == 'test-topic'
-
-        bb.position(4 + topicLen)
-        def groupLen = bb.getInt()
-        def group = new String(ack.payload, 4 + topicLen + 4, groupLen, 'UTF-8')
-        group == 'test-group'
-
+        then: "the unwrapped records are forwarded downstream"
         channel.readInbound() == records
+
+        and: "no BATCH_ACK (or any other outbound message) is emitted on the wire"
+        channel.readOutbound() == null
 
         cleanup:
         channel.close()
@@ -61,7 +56,7 @@ class BatchAckHandlerIntegrationSpec extends Specification {
         channel.close()
     }
 
-    def "BatchAckHandler handles multiple consecutive batches"() {
+    def "BatchAckHandler unwraps multiple consecutive batches without acking"() {
         given:
         def records1 = [new ConsumerRecord('k1', EventType.MESSAGE, '{}', Instant.now())]
         def records2 = [new ConsumerRecord('k2', EventType.MESSAGE, '{}', Instant.now())]
@@ -71,11 +66,12 @@ class BatchAckHandlerIntegrationSpec extends Specification {
         channel.writeInbound(new BatchDecodedEvent(records1, 'topic-a', 'grp'))
         channel.writeInbound(new BatchDecodedEvent(records2, 'topic-b', 'grp'))
 
-        then:
-        (channel.readOutbound() as BrokerMessage).type == BrokerMessage.MessageType.BATCH_ACK
-        (channel.readOutbound() as BrokerMessage).type == BrokerMessage.MessageType.BATCH_ACK
+        then: "both batches are forwarded as their record lists"
         channel.readInbound() == records1
         channel.readInbound() == records2
+
+        and: "and nothing is sent back to the broker"
+        channel.readOutbound() == null
 
         cleanup:
         channel.close()

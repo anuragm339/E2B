@@ -193,6 +193,29 @@ public class HttpPipeConnector implements PipeConnector {
         return sinceLastMsg > 60_000 ? PipeHealth.DEGRADED : PipeHealth.HEALTHY;
     }
 
+    // ---- Read-only accessors for the self-status API (codebase-book ch.19) ----
+
+    /** Current pipe ingest cursor — a single GLOBAL upstream offset (the poll carries no topic). */
+    public long getCurrentOffset() {
+        return currentOffset;
+    }
+
+    /** True while pipe polling is paused for a data refresh. */
+    public boolean isPaused() {
+        return pausePipeCalls;
+    }
+
+    /** Current adaptive poll interval in ms (backs off when idle, tightens under load). */
+    public long getPollIntervalMs() {
+        return adaptiveDelay;
+    }
+
+    /** Epoch ms of the last successfully completed poll (NOT necessarily the last data record). */
+    public long getLastSuccessfulPollMs() {
+        PipeConnectionImpl c = connection;
+        return c == null ? 0L : c.lastMessageTime;
+    }
+
     @Override
     public void reconnect() {
         String parentUrl;

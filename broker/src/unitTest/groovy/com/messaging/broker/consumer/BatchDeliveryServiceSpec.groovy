@@ -176,6 +176,10 @@ class BatchDeliveryServiceSpec extends Specification {
         !result.delivered()
         sendFuture.isCancelled()
         1 * stateService.completeDelivery(deliveryKey, 1L) >> true
+        // #14: on a send timeout the connection is closed so the in-flight Netty write is aborted
+        // (cancelling the CompletableFuture alone can't stop the write) and the consumer's
+        // stateful decoder is reset — otherwise the late write collides with the retry.
+        1 * server.closeConnection("client-1")
     }
 
     def "deliverBatch succeeds records lag and refresh metrics during replay"() {

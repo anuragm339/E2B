@@ -202,7 +202,11 @@ public class LegacyConsumerDeliveryManager {
             }
 
             if (heap.isEmpty()) {
-                log.warn("event=legacy_delivery.empty_batch group={} topicsRequested={} " +
+                // DEBUG, not WARN: an empty merged batch is the normal "consumer is caught up,
+                // nothing new to send" steady state (topicStates show caught_up/cursor_exhausted).
+                // Genuine cursor failures are already logged at ERROR above. Logging this at WARN
+                // flooded the status error buffer with benign noise and buried real errors.
+                log.debug("event=legacy_delivery.empty_batch group={} topicsRequested={} " +
                          "reason=all_cursors_null_or_exhausted topicStates={} — no data will be sent to legacy consumer",
                          consumerGroup, topics.size(), topicStates);
                 return batch;

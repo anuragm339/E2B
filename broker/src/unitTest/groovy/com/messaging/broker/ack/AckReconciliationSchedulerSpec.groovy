@@ -221,4 +221,34 @@ class AckReconciliationSchedulerSpec extends Specification {
                 makeMsg(1L, "prices-v1", "key-B")
         ]
     }
+
+    def "a storage-read failure does NOT advance the checkpoint past the failed offset (#11)"() {
+        given: "committed=4; reads at 0-1 succeed but the read at offset 2 fails the first time"
+        registrationService.getAllConsumers() >> [makeConsumer("prices-v1", "group1")]
+        storage.getEarliestOffset("prices-v1", 0) >> 0L
+        offsetTracker.getOffset("group1:prices-v1") >> 4L   // committedOffset = 4
+        ackStore.getAckedOffsetsInRange(*_) >> ([0L, 1L, 2L, 3L] as Set)
+        storage.read("prices-v1", 0, 0L, 500) >> [
+                makeMsg(0L, "prices-v1", "key-A"),
+                makeMsg(1L, "prices-v1", "key-B")
+        ]
+        int read2Calls = 0
+        storage.read("prices-v1", 0, 2L, 500) >> {
+            read2Calls++
+            if (read2Calls == 1) {
+                throw new RuntimeException("disk read failed")
+            }
+            return [makeMsg(2L, "prices-v1", "key-C"), makeMsg(3L, "prices-v1", "key-D")]
+        }
+
+        and: "first run hits the read failure at offset 2 — checkpoint must stay at 2, not jump to 4"
+        scheduler.reconcile()
+
+        when: "the next run"
+        scheduler.reconcile()
+
+        then: "offset 2 is retried (read twice) — checkpoint stayed at 2, not committedOffset 4. " +
+                "With the bug it would jump to 4 and never re-read offset 2 (read2Calls would be 1)."
+        read2Calls == 2
+    }
 }

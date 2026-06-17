@@ -93,7 +93,10 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
     private final Map<String, ConsumerMetadata> consumers = new ConcurrentHashMap<>();
 
     // Map: topic -> List<MessageHandler> (for routing messages to all handlers for that topic)
-    private final Map<String, List<MessageHandler>> topicToHandlers = new ConcurrentHashMap<>();
+    // #13: keyed by "topic:group" (NOT topic). Each @Consumer handler belongs to exactly one
+    // group, so routing must be per topic:group — otherwise a delivery on group A's connection
+    // would also be dispatched to group B's handler for the same topic.
+    private final Map<String, List<MessageHandler>> topicGroupToHandlers = new ConcurrentHashMap<>();
     // Map: topic -> Set<String> groups (to know all topic:group combinations we need to connect)
     private final Map<String, Set<String>> topicToGroups = new ConcurrentHashMap<>();
 
@@ -181,7 +184,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
         // FIX #1: Build topic -> handlers and topic -> groups mappings (supports multiple groups per topic)
         for (String topic : topics) {
             // Add handler to list (may have multiple handlers for same topic)
-            topicToHandlers.computeIfAbsent(topic, k -> new java.util.ArrayList<>()).add(handler);
+            topicGroupToHandlers.computeIfAbsent(topic + ":" + group, k -> new java.util.ArrayList<>()).add(handler);
 
             // Add group to set (may have multiple groups for same topic)
             topicToGroups.computeIfAbsent(topic, k -> new java.util.HashSet<>()).add(group);
@@ -477,7 +480,7 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
             switch (message.getType()) {
                 case DATA:
                 case BATCH_HEADER:
-                    handleDataMessage(topic, message);
+                    handleDataMessage(topicGroup, message);
                     break;
 
                 case ACK:
@@ -512,7 +515,8 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
      * B1-7 FIX: Handle DATA message for a specific topic
      * FIX #1: Route to ALL handlers registered for this topic (may have multiple groups)
      */
-    private void handleDataMessage(String topic, BrokerMessage message) {
+    private void handleDataMessage(String topicGroup, BrokerMessage message) {
+        String topic = topicGroup.split(":", 2)[0];
         try {
             byte[] payload = message.getPayload();
 
@@ -523,9 +527,11 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                 records = parseRawBatch(payload);
             }
 
-            // Route to ALL handlers registered for this topic
-            List<MessageHandler> handlers = topicToHandlers.get(topic);
+            // #13: route ONLY to handlers for THIS topic:group — a batch that arrived on group A's
+            // connection must not be delivered into group B's handler for the same topic.
+            List<MessageHandler> handlers = topicGroupToHandlers.get(topicGroup);
             if (handlers != null && !handlers.isEmpty()) {
+                boolean allSucceeded = true;
                 for (MessageHandler handler : handlers) {
                     try {
                         handler.handleBatch(records);
@@ -534,15 +540,67 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                     } catch (Exception e) {
                         log.error("Error in consumer handler {} for topic '{}'",
                                 handler.getClass().getSimpleName(), topic, e);
+                        allSucceeded = false;
                     }
                 }
+                // #1 (at-least-once): ACK only AFTER every handler has processed the batch. The
+                // BATCH_ACK used to be sent by BatchAckHandler on the wire BEFORE this point, so a
+                // failing/crashing handler would lose data the broker had already committed. On any
+                // handler failure we now skip the ack — the broker's ack-timeout reverts the offset
+                // and redelivers.
+                if (allSucceeded) {
+                    sendBatchAck(topicGroup, records.size());
+                } else {
+                    log.warn("Not acking batch for topic:group '{}' — a handler failed; broker will "
+                            + "redeliver after ack-timeout", topicGroup);
+                }
             } else {
-                log.warn("No handlers found for topic '{}', dropping {} records", topic, records.size());
+                // No handler for this connection: do NOT ack unprocessed data — let it redeliver.
+                log.error("No handlers for topic:group '{}'; not acking {} records (will redeliver)",
+                        topicGroup, records.size());
             }
 
         } catch (Exception e) {
             log.error("Error handling DATA message for topic '{}'", topic, e);
         }
+    }
+
+    /**
+     * #1: send a BATCH_ACK for a topic:group AFTER its batch was successfully processed by every
+     * handler. Moved here from {@code BatchAckHandler} (which acked on the wire before processing).
+     * Payload mirrors RESET_ACK/READY_ACK: [topicLen:4][topic][groupLen:4][group].
+     */
+    private void sendBatchAck(String topicGroup, int recordCount) {
+        NettyTcpClient.Connection connection = connectionsPerTopicGroup.get(topicGroup);
+        if (connection == null) {
+            log.error("No connection found for topic:group '{}' to send BATCH_ACK ({} records will "
+                    + "redeliver)", topicGroup, recordCount);
+            return;
+        }
+        String[] parts = topicGroup.split(":", 2);
+        byte[] topicBytes = parts[0].getBytes(StandardCharsets.UTF_8);
+        byte[] groupBytes = (parts.length > 1 ? parts[1] : "").getBytes(StandardCharsets.UTF_8);
+
+        java.nio.ByteBuffer buffer = java.nio.ByteBuffer.allocate(4 + topicBytes.length + 4 + groupBytes.length);
+        buffer.putInt(topicBytes.length);
+        buffer.put(topicBytes);
+        buffer.putInt(groupBytes.length);
+        buffer.put(groupBytes);
+
+        BrokerMessage ack = new BrokerMessage(
+                BrokerMessage.MessageType.BATCH_ACK,
+                System.currentTimeMillis(),
+                buffer.array()
+        );
+
+        connection.send(ack).whenComplete((v, ex) -> {
+            if (ex != null) {
+                log.error("Failed to send BATCH_ACK for topic:group '{}'", topicGroup, ex);
+            } else {
+                log.debug("BATCH_ACK sent for topic:group '{}' after processing {} records",
+                        topicGroup, recordCount);
+            }
+        });
     }
 
 
@@ -576,8 +634,10 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
             log.info("Received RESET for topic:group '{}', preparing to receive refreshed data", topicGroup);
 
-            // Call onReset on ALL handlers for this topic (may have multiple groups)
-            List<MessageHandler> handlers = topicToHandlers.get(messageTopic);
+            // #13: call onReset only on handlers for THIS topic:group — group B must not be
+            // reset just because group A refreshed.
+            List<MessageHandler> handlers = topicGroupToHandlers.get(topicGroup);
+            boolean allSucceeded = true;
             if (handlers != null && !handlers.isEmpty()) {
                 for (MessageHandler handler : handlers) {
                     try {
@@ -587,8 +647,19 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                     } catch (Exception e) {
                         log.error("Error in consumer onReset handler {} for topic '{}'",
                                 handler.getClass().getSimpleName(), messageTopic, e);
+                        allSucceeded = false;
                     }
                 }
+            }
+
+            // #1: ACK the RESET only if every handler actually reset. If a handler threw, the
+            // consumer is NOT in a clean reset state — sending RESET_ACK would let the broker
+            // proceed to replay refreshed data onto a half-reset consumer. Withhold the ack so the
+            // refresh times out and aborts (leaving ingestion paused, by design) instead.
+            if (!allSucceeded) {
+                log.error("onReset failed for topic:group '{}' — withholding RESET_ACK; the refresh "
+                        + "will time out rather than replay onto a half-reset consumer", topicGroup);
+                return;
             }
 
             // N1 FIX: Get connection for THIS specific topic:group
@@ -644,8 +715,9 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
 
             log.info("Received READY for topic:group '{}', refresh complete", topicGroup);
 
-            // Call onReady on ALL handlers for this topic (may have multiple groups)
-            List<MessageHandler> handlers = topicToHandlers.get(messageTopic);
+            // #13: call onReady only on handlers for THIS topic:group.
+            List<MessageHandler> handlers = topicGroupToHandlers.get(topicGroup);
+            boolean allSucceeded = true;
             if (handlers != null && !handlers.isEmpty()) {
                 for (MessageHandler handler : handlers) {
                     try {
@@ -655,8 +727,19 @@ public class ClientConsumerManager implements ApplicationEventListener<ServerSta
                     } catch (Exception e) {
                         log.error("Error in consumer onReady handler {} for topic '{}'",
                                 handler.getClass().getSimpleName(), messageTopic, e);
+                        allSucceeded = false;
                     }
                 }
+            }
+
+            // #1: ACK the READY only if every handler completed onReady. If a handler threw, the
+            // consumer has not cleanly finished the refresh — withhold READY_ACK so the broker does
+            // not mark the refresh complete (and resume the pipe) against a consumer that failed to
+            // activate the refreshed data. The refresh then times out and aborts.
+            if (!allSucceeded) {
+                log.error("onReady failed for topic:group '{}' — withholding READY_ACK; refresh will "
+                        + "not be marked complete", topicGroup);
+                return;
             }
 
             // N1 FIX: Get connection for THIS specific topic:group

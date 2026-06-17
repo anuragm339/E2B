@@ -24,6 +24,8 @@ This book is a source-backed map of the repository. Start with the chapter that 
 15. [Open questions](15-open-questions.md)
 16. [Pipe consistency: system design](16-pipe-consistency-system-design.md)
 17. [Performance tuning (throughput profile)](17-performance-tuning.md)
+18. [Roadmap — Local message bus (`@Producer`)](18-roadmap-local-message-bus.md) — **PLANNED, not implemented**
+19. [Roadmap — Broker self-status API (`/admin/status/*`)](19-self-status-api.md) — **PLANNED, not implemented**
 
 ## Features
 

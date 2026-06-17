@@ -187,6 +187,9 @@ public class AckReconciliationScheduler {
         List<String> backfillGroups  = autoSyncEnabled ? new ArrayList<>() : null;
         List<AckRecord> backfillAcks = autoSyncEnabled ? new ArrayList<>() : null;
         long now = System.currentTimeMillis();
+        // Track whether the whole range was scanned. A storage-read FAILURE leaves the tail of
+        // the range unscanned; advancing the checkpoint past it would skip those records forever.
+        boolean scanCompleted = true;
 
         outer:
         while (offset < committedOffset) {
@@ -195,6 +198,7 @@ public class AckReconciliationScheduler {
                 records = storage.read(topic, 0, offset, BATCH_SIZE);
             } catch (Exception e) {
                 log.warn("Reconciliation: storage read failed for topic={} group={} offset={}", topic, group, offset, e);
+                scanCompleted = false;
                 break;
             }
 
@@ -229,11 +233,12 @@ public class AckReconciliationScheduler {
             offset = records.get(records.size() - 1).getOffset() + 1;
         }
 
-        // Advance checkpoint to committedOffset so the next run only scans new records.
-        // This is correct regardless of missingCount: any gaps found this run have already
-        // been reported (and backfilled if auto-sync is enabled). Re-scanning won't change
-        // their status — only new delivery failures after this point are actionable.
-        scanCheckpoints.put(checkpointKey, committedOffset);
+        // Advance the checkpoint so the next run only scans new records. On a FULL scan this is
+        // committedOffset (any gaps found were already reported/backfilled; re-scanning won't
+        // change their status). But if a storage read FAILED mid-scan, advance only to the last
+        // successfully-scanned offset, so the unscanned tail [offset, committedOffset) is retried
+        // next run instead of being silently skipped forever.
+        scanCheckpoints.put(checkpointKey, scanCompleted ? committedOffset : offset);
 
         metrics.updateReconciliationMissingKeys(topic, group, missingCount);
 
