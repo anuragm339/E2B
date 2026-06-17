@@ -34,7 +34,13 @@ broker's own in-process state — usable when Grafana/Prometheus are unavailable
 
 | Endpoint | Returns | Source | Status |
 |---|---|---|---|
-| `GET /admin/status/pipe` | `nodeId, role, parentUrl, upstreamCursor, health, lastSuccessfulPollAgeMs, pausedForRefresh, pollIntervalMs, fetchLatency{avgMs,maxMs}, receivedTotal, fetchErrorsTotal` | `HttpPipeConnector`, `TopologyManager`, pipe-fetch timer | New |
+| `GET /admin/status/pipe` | `nodeId, role, parentUrl, upstreamCursor, health, lastSuccessfulPollAgeMs, pausedForRefresh, pollIntervalMs, fetchLatency{count,avgMs,totalMs,recentMaxMs}, receivedTotal, fetchErrorsTotal` | `HttpPipeConnector`, `TopologyManager`, pipe-fetch timer | New |
+
+> **Timer fields:** `count`/`avgMs`/`totalMs` are **cumulative** since startup (`avgMs == totalMs/count`);
+> `recentMaxMs` is Micrometer's **decaying rolling-window** max, so a cumulative `avgMs` may read
+> higher than `recentMaxMs` — that is expected, not a bug. `fetchLatency.count` is the number of
+> poll round-trips recorded (`recordFetchLatency` runs in a `finally`), i.e. it counts **every** poll
+> — data, empty, and failed — **not** data downloads; it is non-zero whenever the poll loop runs.
 
 > **Fidelity:** `upstreamCursor` is a **single global** pipe cursor — the poll carries no
 > topic parameter (`pipe/.../HttpPipeConnector.java:294`) and the parent endpoint defaults to
@@ -50,8 +56,13 @@ broker's own in-process state — usable when Grafana/Prometheus are unavailable
 | `GET /admin/status/topics/{topic}` | above (no per-topic latency — storage timers are global) | as above | New |
 | `GET /admin/status/topics/{topic}/peek?fromOffset=O&limit=N` | up to N records read **forward** from `fromOffset` | `storage.read(...)` | New |
 | `GET /admin/status/topics/{topic}/key/{key}` | `{ key, offset, found }` | RocksDB compaction index | New |
+| `GET /admin/status/storage?disk=` | all-topics storage roll-up: totals (`topicCount, totalSegments, totalBytes`) + per topic `{headOffset, durableMaxOffset, earliestOffset, durabilityLag, sealedSegmentCount, totalSegments, activeBytes, sealedBytes, totalBytes, largestSegmentBytes, maxSegmentSize, dataDir}` | `SegmentAccess`/`SegmentManager` in-memory accessors | New |
+| `GET /admin/status/storage/{topic}?disk=` | the per-topic summary **plus** `segments[]`: `{baseOffset, nextOffset, recordCount, sizeBytes, active, full, logFile}` | `SegmentManager.getAllSegments()` + `Segment` | New |
 
-Cost: head/key O(1); peek bounded; **no full record counts (scan)**.
+Cost: head/key O(1); peek bounded; **no full record counts (scan)**. The `storage` views read in-memory
+segment state only (zero file IO); pass `disk=true` to additionally sum on-disk segment file sizes
+(`diskBytesOnDisk` / per-segment `diskBytes`) — one `stat()` per segment file, opt-in to keep the
+default poll IO-free. Tests: `StatusControllerStorageSpec`.
 
 > **Fidelity:** `StorageEngine.read` is **forward-only** (`common/.../StorageEngine.java:32`),
 > so a true "last N records" is not directly bounded — and the offset range is sparse after
@@ -134,18 +145,67 @@ but not *which* consumer is missing, and returns `NONE` once done (no history). 
 
 | Endpoint | Returns | Source | Status |
 |---|---|---|---|
-| `GET /admin/status/errors?level=&code=&logger=&since=&limit=` | recent feed: `ts, level, errorCode, component, message, context` | in-memory ring (logback appender, WARN+ERROR), enriched with `ErrorCode` when the throwable is a `MessagingException` | New |
-| `GET /admin/status/errors/summary` | tally: `code, count, firstSeen, lastSeen, topOffenders` | ring + `broker_errors_total{code}` counter | New |
+| `GET /admin/status/errors?level=&code=&logger=&since=&limit=` | recent feed: `ts, level, errorCode, exceptionClass, message, traceId, topic, group, clientId, context` | in-memory ring (logback appender, WARN+ERROR), enriched with `ErrorCode`+context for `MessagingException`, and with MDC `traceId`/topic/group/clientId | New |
+| `GET /admin/status/errors/top?level=&limit=` | **top unique errors**, highest count first, each as **`what` / `how` / `why`** (+ `count, level, firstSeen, lastSeen, sampleTraceId, error`) | ring grouped by signature, explained by `ErrorExplainer` | New |
+| `GET /admin/status/errors/trace/{traceId}?level=` | one failure's **full chain** for `traceId`, **chronological (start→end)**: `chain[]` of `{ts, level, logger, errorCode, message, …}` | ring filtered by traceId | New |
+| `GET /admin/status/errors/summary` | all-time tally: `code, count, firstSeen, lastSeen` (lifetime counters, not level-filtered) | `byCode` map | New |
+
+**What / how / why:** every error row is rendered in plain English by `ErrorExplainer` —
+`what` (the human message, `[CODE]` prefix stripped), `how` (`surfaced as <Exception> in <Component>`),
+`why` (ErrorCode `category`/`retriable` + a known cause for the exception, e.g. UnknownHostException →
+"host name could not be resolved (DNS)"). Example row:
+
+```json
+{ "what": "Failed to connect to remote",
+  "how":  "surfaced as UnknownHostException in HttpPipeConnector",
+  "why":  "host name could not be resolved (DNS); the upstream is unreachable",
+  "count": 4, "level": "ERROR", "lastSeen": 1781..., "sampleTraceId": "-" }
+```
+
+**Dedup signature:** repeats collapse into one incrementing count by identity — the `ErrorCode`,
+else a `[ERROR_CODE]` prefix in the message, else the **normalized message** (timestamps/UUIDs/numbers
+masked), else exception class, else level. This deliberately merges the *same* failure logged under
+different exception classes (e.g. one "Failed to connect" surfacing as `UnknownHostException` vs
+`NoRouteToHostException`, or a `REGISTRY_TOPOLOGY_FETCH_FAILED` arriving as `ReadTimeoutException` vs
+`HttpClientException`) instead of fragmenting it; the representative `exceptionClass` is still shown.
+
+**Level model:** `level` is a **minimum** — `ERROR` (the default) returns only errors; `WARN` returns
+WARN+ERROR. The default is set by `broker.status.errors.default-level` (default `ERROR`) and overridable
+per-call with `?level=WARN`, so the buffer keeps capturing WARN+ but the views stay error-focused
+unless asked. Workflow: `/errors/top` to see the worst offenders + grab a `sampleTraceId`, then
+`/errors/trace/{traceId}?level=WARN` to read that one failure's whole sequence top-to-bottom.
+
+> **Noise:** `legacy_delivery.empty_batch` (the benign "consumer caught up, nothing to send" state)
+> is logged at DEBUG, not WARN — otherwise it floods the ring and buries real errors. Genuine cursor
+> failures still log at ERROR.
 
 Cost: bounded ring (~500 entries); **in-memory → resets on restart** (rolling window, not
-durable history).
+durable history). `top`/`trace` compute from a ring snapshot on demand (no extra memory).
+
+### Failed messages — "which records failed?" (structured, not log text)
+
+`GET /admin/status/failed-messages` — a bounded registry (last **20**) of failed *data records*,
+distinct from the error-log mirror: one row per record with `topic, offset, key, group, reason,
+attempts, disposition (RETRYING|STUCK), firstSeen, lastSeen`. Keyed by `topic#offset`, so repeated
+failures of the **same** record increment one entry's `attempts` (a climbing count / `STUCK` is the
+poison message) rather than flooding the list. Fixed-size LRU — never grows.
+
+| Recorded at | Row |
+|---|---|
+| Consumer ack-timeout (batch reverted + redelivered) — `BatchDeliveryService` | `topic, offset=batchStart, key=null, group, reason="consumer ack timeout (redelivering)"` |
+| Pipe store failure — `BrokerService.handlePipeMessage` | `topic, offset, key, reason="storage write failed"` |
+
+Source: `FailedMessageRecorder` (eager `@Context` static bridge; call-sites record via
+`instance()`). Note: at-least-once means a "failed" record is reverted/redelivered, not dropped —
+so a `STUCK` row is a record that keeps failing, not a lost one. Consumer-side `handleBatch`
+exceptions are logged on the consumer, so here they appear only as the broker's ack-timeout.
 
 ## 8. Performance — "storage / read / write / pipe latency + worst consumer"
 
 | Endpoint | Returns | Source | Status |
 |---|---|---|---|
 | `GET /admin/status/performance` | `storage{read,write}, pipe{fetchLatency,freshness}, worstConsumers[{clientId,latency,reason}], verdict` | timers + consumer state | New |
-| `GET /admin/status/performance/storage` | read/write `avgMs·p99Ms·maxMs` + ops — **broker-global, not per-topic** (`BrokerMetrics.java:209`) | storage timers | New |
+| `GET /admin/status/performance/storage` | read/write `{count, avgMs, totalMs, recentMaxMs}` + ops — **broker-global, not per-topic** (`BrokerMetrics.java:209`) | storage timers | New |
 | `GET /admin/status/performance/pipe` | fetch latency, freshness, health | pipe timer | New |
 
 > **Fidelity:** `worstConsumers` ranks by `deliveryLatency`, which is **modern-path only** (see
