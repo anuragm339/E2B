@@ -56,6 +56,11 @@ broker:
     interval: ${SNAPSHOT_INTERVAL:6h}
     initial-delay: ${SNAPSHOT_INITIAL_DELAY:10m}
 
+  # Download-refresh bootstrap: safety cap on pull batches (terminates a synthetic looping cloud;
+  # a finite production source terminates earlier on 204).
+  bootstrap:
+    max-batches: ${BOOTSTRAP_MAX_BATCHES:100000}
+
   # Self-status error API (/admin/status/errors*). The ring captures WARN+ERROR; this sets the
   # DEFAULT minimum level the endpoints SHOW (ERROR keeps the views error-focused). Override per
   # call with ?level=WARN — no restart needed.
