@@ -36,18 +36,23 @@ public class DownloadRefreshOrchestrator {
     private final BootstrapSourceClient client;
     private final LocalStateCleaner cleaner;
     private final SnapshotRestorer restorer;
+    // Upper bound on a random delay before escalating to the cloud, so that a parent entering
+    // refresh doesn't fan its children into a synchronized cloud stampede. 0 disables.
+    private final long escalationJitterMs;
 
     public DownloadRefreshOrchestrator(
             @Value("${broker.storage.dataDir:./data}") String dataDir,
             TopologyManager topology,
             BootstrapSourceClient client,
             LocalStateCleaner cleaner,
-            SnapshotRestorer restorer) {
+            SnapshotRestorer restorer,
+            @Value("${broker.bootstrap.escalation-jitter-ms:30000}") long escalationJitterMs) {
         this.dataDir = dataDir;
         this.topology = topology;
         this.client = client;
         this.cleaner = cleaner;
         this.restorer = restorer;
+        this.escalationJitterMs = escalationJitterMs;
     }
 
     /** Decide where to bootstrap from, given the current parent (null when this node is root). */
@@ -70,6 +75,11 @@ public class DownloadRefreshOrchestrator {
         String parentUrl = topology.getCurrentParentUrl();
         BootstrapSource source = chooseSource(parentUrl);
         log.info("event=bootstrap.started source={} parentUrl={}", source, parentUrl);
+        // Jitter only the *escalation* case (had a parent, forced to the cloud) — not a root node,
+        // which always uses the cloud and has no herd to spread.
+        if (parentUrl != null && source == BootstrapSource.CLOUD) {
+            applyEscalationJitter();
+        }
         try {
             return switch (source) {
                 case SNAPSHOT -> bootstrapFromSnapshot(parentUrl);
@@ -109,5 +119,19 @@ public class DownloadRefreshOrchestrator {
         client.bulkFetchFromCloud(dataDir);
         log.info("event=bootstrap.completed source=CLOUD");
         return DownloadRefreshResult.ok(BootstrapSource.CLOUD, null);
+    }
+
+    /** Sleep a random 0..escalationJitterMs to de-synchronize a fan-out of children onto the cloud. */
+    private void applyEscalationJitter() {
+        if (escalationJitterMs <= 0) {
+            return;
+        }
+        long delay = java.util.concurrent.ThreadLocalRandom.current().nextLong(escalationJitterMs + 1);
+        log.info("event=bootstrap.escalation_jitter delayMs={}", delay);
+        try {
+            Thread.sleep(delay);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 }

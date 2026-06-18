@@ -13,7 +13,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
     SnapshotRestorer restorer = Mock()
 
     DownloadRefreshOrchestrator orchestrator = new DownloadRefreshOrchestrator(
-            "/tmp/data", topology, client, cleaner, restorer)
+            "/tmp/data", topology, client, cleaner, restorer, 0L) // jitter 0 in tests
 
     // ── source selection ─────────────────────────────────────────────────────
 

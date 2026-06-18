@@ -60,6 +60,9 @@ broker:
   # a finite production source terminates earlier on 204).
   bootstrap:
     max-batches: ${BOOTSTRAP_MAX_BATCHES:100000}
+    # Upper bound (ms) on a random delay before escalating to the cloud when the parent is mid-
+    # refresh, so a parent refresh doesn't fan its children into a synchronized cloud stampede.
+    escalation-jitter-ms: ${BOOTSTRAP_ESCALATION_JITTER_MS:30000}
 
   # Self-status error API (/admin/status/errors*). The ring captures WARN+ERROR; this sets the
   # DEFAULT minimum level the endpoints SHOW (ERROR keeps the views error-focused). Override per
