@@ -45,6 +45,7 @@ public class PipeConsistencyScheduler {
     private final PipeConsistencyService service;
     private final TopologyManager topologyManager;
     private final MemoryMonitor memoryMonitor;
+    private final io.micronaut.context.BeanProvider<com.messaging.broker.consumer.RefreshCoordinator> refreshCoordinator;
     private final ExecutorService compactionExecutor;
     private final boolean scheduleEnabled;
     private final String target;
@@ -54,12 +55,15 @@ public class PipeConsistencyScheduler {
             PipeConsistencyService service,
             TopologyManager topologyManager,
             MemoryMonitor memoryMonitor,
+            // Lazy (BeanProvider) to avoid an eager DI cycle through the refresh/consumer graph.
+            io.micronaut.context.BeanProvider<com.messaging.broker.consumer.RefreshCoordinator> refreshCoordinator,
             @Named("compactionExecutor") ExecutorService compactionExecutor,
             @Value("${pipe.consistency.schedule.enabled:true}") boolean scheduleEnabled,
             @Value("${pipe.consistency.schedule.target:parent}") String target) {
         this.service = service;
         this.topologyManager = topologyManager;
         this.memoryMonitor = memoryMonitor;
+        this.refreshCoordinator = refreshCoordinator;
         this.compactionExecutor = compactionExecutor;
         this.scheduleEnabled = scheduleEnabled;
         this.target = PipeConsistencyService.TARGET_CLOUD.equalsIgnoreCase(target)
@@ -110,6 +114,12 @@ public class PipeConsistencyScheduler {
         }
         if (memoryMonitor.isMemoryPressureHigh()) {
             return "memory_pressure";
+        }
+        // A refresh (especially download-refresh) intentionally wipes/rebuilds local data, so a
+        // local-vs-parent comparison mid-refresh would report massive false drift and could trigger
+        // a spurious escalation. Skip the whole audit while any refresh is in progress.
+        if (refreshCoordinator.get().isRefreshInProgress()) {
+            return "refresh_in_progress";
         }
         return null;
     }

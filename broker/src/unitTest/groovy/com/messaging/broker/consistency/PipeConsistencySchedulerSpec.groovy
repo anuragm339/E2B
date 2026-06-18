@@ -1,7 +1,9 @@
 package com.messaging.broker.consistency
 
+import com.messaging.broker.consumer.RefreshCoordinator
 import com.messaging.broker.core.TopologyManager
 import com.messaging.broker.monitoring.MemoryMonitor
+import io.micronaut.context.BeanProvider
 import spock.lang.Specification
 
 import java.util.concurrent.Executors
@@ -11,6 +13,8 @@ class PipeConsistencySchedulerSpec extends Specification {
     PipeConsistencyService service = Mock()
     TopologyManager topology = Mock()
     MemoryMonitor memory = Mock()
+    RefreshCoordinator refreshCoord = Mock()
+    BeanProvider<RefreshCoordinator> refreshProvider = Mock(BeanProvider) { get() >> refreshCoord }
     def directExecutor = Executors.newSingleThreadExecutor()
 
     def cleanup() {
@@ -18,7 +22,7 @@ class PipeConsistencySchedulerSpec extends Specification {
     }
 
     private PipeConsistencyScheduler scheduler(boolean enabled = true, String target = 'parent') {
-        new PipeConsistencyScheduler(service, topology, memory, directExecutor, enabled, target)
+        new PipeConsistencyScheduler(service, topology, memory, refreshProvider, directExecutor, enabled, target)
     }
 
     def "scheduled tick runs an all-topics check against the parent"() {
@@ -52,6 +56,17 @@ class PipeConsistencySchedulerSpec extends Specification {
         true            | false   | null            | false    | 'no_parent_offline'
         true            | false   | 'http://p:8081' | true     | 'memory_pressure'
         true            | false   | 'http://p:8081' | false    | null
+    }
+
+    def "skips the audit while a refresh is in progress"() {
+        given:
+        service.isRunning() >> false
+        topology.getCurrentParentUrl() >> 'http://parent:8081'
+        memory.isMemoryPressureHigh() >> false
+        refreshCoord.isRefreshInProgress() >> true
+
+        expect:
+        scheduler().skipReason() == 'refresh_in_progress'
     }
 
     def "cloud target does not require a parent to be assigned"() {
