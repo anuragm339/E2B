@@ -48,6 +48,14 @@ broker:
   refresh:
     delivery-freshness-window-ms: ${REFRESH_DELIVERY_FRESHNESS_WINDOW_MS:21600000}
 
+  # Data snapshot for POS->POS bootstrap. A parent-capable POS periodically builds a ZIP of pure
+  # topic data (served at /pipe/snapshot) so a child can bootstrap fast instead of streaming every
+  # record. Disabled by default; enable on nodes that act as a parent to other POS.
+  snapshot:
+    enabled: ${SNAPSHOT_ENABLED:false}
+    interval: ${SNAPSHOT_INTERVAL:6h}
+    initial-delay: ${SNAPSHOT_INITIAL_DELAY:10m}
+
   # Self-status error API (/admin/status/errors*). The ring captures WARN+ERROR; this sets the
   # DEFAULT minimum level the endpoints SHOW (ERROR keeps the views error-focused). Override per
   # call with ?level=WARN — no restart needed.
