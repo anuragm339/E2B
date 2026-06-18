@@ -1,7 +1,7 @@
 package com.messaging.pipe
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.messaging.common.api.StorageEngine
-import com.messaging.common.model.EventType
 import com.messaging.common.model.MessageRecord
 import io.micronaut.runtime.server.EmbeddedServer
 import io.micronaut.test.annotation.MockBean
@@ -16,11 +16,9 @@ import java.net.http.HttpResponse
 import java.time.Instant
 
 /**
- * Integration tests for PipeServer — the /pipe/poll HTTP endpoint.
- *
- * Uses @MicronautTest so the real Micronaut HTTP stack (routing, serialization,
- * query-param binding) is exercised.  StorageEngine is replaced with a Spock mock
- * via @MockBean so tests run without a real storage directory.
+ * Integration tests for the unified k-way-merge /pipe/poll over the real Micronaut HTTP stack:
+ * global merge across topics, per-topic cursor map in the X-Pipe-Cursors request/response header,
+ * and the no-duplicate guarantee across sequential polls.
  */
 @MicronautTest
 class PipeServerIntegrationSpec extends Specification {
@@ -31,175 +29,81 @@ class PipeServerIntegrationSpec extends Specification {
     @MockBean(StorageEngine)
     StorageEngine mockStorage() { Mock(StorageEngine) }
 
-    // Java HTTP client (no Micronaut context required — just a JDK helper)
     private final HttpClient http = HttpClient.newHttpClient()
+    private final ObjectMapper mapper = new ObjectMapper().findAndRegisterModules()
 
-    // =========================================================================
-    // Helpers
-    // =========================================================================
+    Map<String, List<MessageRecord>> backing = [:]
 
-    private HttpResponse<String> get(String path) {
-        def req = HttpRequest.newBuilder()
-            .uri(new URI("http://localhost:${embeddedServer.port}${path}"))
+    def setup() {
+        storage.read(_, _, _, _) >> { String t, int p, long from, int lim ->
+            backing.getOrDefault(t, []).findAll { it.offset >= from }.take(lim)
+        }
+        storage.getCurrentOffset(_, _) >> { String t, int p ->
+            def list = backing.getOrDefault(t, [])
+            list.isEmpty() ? -1L : list[-1].offset
+        }
+        storage.getTopicNames() >> { backing.keySet() }
+    }
+
+    private MessageRecord rec(long offset, String topic, String key) {
+        new MessageRecord(offset, topic, 0, key, com.messaging.common.model.EventType.MESSAGE, '{}', Instant.now())
+    }
+
+    private HttpResponse<String> poll(String cursorsJson = '{}', long offset = 0) {
+        // Always send the X-Pipe-Cursors header → merge mode (empty map "{}" = first poll).
+        def builder = HttpRequest.newBuilder()
+            .uri(new URI("http://localhost:${embeddedServer.port}/pipe/poll?offset=${offset}"))
             .timeout(java.time.Duration.ofSeconds(5))
-            .GET().build()
-        return http.send(req, HttpResponse.BodyHandlers.ofString())
+            .header(PipeServer.CURSORS_HEADER, cursorsJson)
+            .GET()
+        return http.send(builder.build(), HttpResponse.BodyHandlers.ofString())
     }
 
-    // =========================================================================
-    // GET /pipe/poll — empty storage
-    // =========================================================================
-
-    def "returns 204 No Content when storage has no records"() {
+    def "global poll k-way merges all topics ordered by offset, returns cursor + head headers"() {
         given:
-        storage.read('price-topic', 0, 0L, 100) >> []
+        backing['topic-a'] = [rec(10000L, 'topic-a', 'a0'), rec(11000L, 'topic-a', 'a1')]
+        backing['topic-b'] = [rec(20000L, 'topic-b', 'b0')]
 
         when:
-        def resp = get('/pipe/poll?offset=0&limit=100&topic=price-topic')
-
-        then:
-        resp.statusCode() == 204
-    }
-
-    // =========================================================================
-    // GET /pipe/poll — records present
-    // =========================================================================
-
-    def "returns 200 with JSON array when storage has records"() {
-        given:
-        def records = [
-            new MessageRecord('key-1', EventType.MESSAGE, '{"v":1}', Instant.now()),
-            new MessageRecord('key-2', EventType.MESSAGE, '{"v":2}', Instant.now())
-        ]
-        storage.read('price-topic', 0, 0L, 100) >> records
-
-        when:
-        def resp = get('/pipe/poll?offset=0&limit=100&topic=price-topic')
+        def resp = poll()
 
         then:
         resp.statusCode() == 200
         def body = resp.body()
-        body.startsWith('[')
-        body.endsWith(']')
-        body.contains('key-1')
-        body.contains('key-2')
+        body.indexOf('a0') < body.indexOf('a1')
+        body.indexOf('a1') < body.indexOf('b0')
+
+        and:
+        def cursors = mapper.readValue(resp.headers().firstValue(PipeServer.CURSORS_HEADER).get(), Map)
+        cursors['topic-a'] == 11000
+        cursors['topic-b'] == 20000
+        resp.headers().firstValue(PipeServer.HEADS_HEADER).isPresent()
     }
 
-    def "serialized JSON contains msgKey and eventType fields"() {
+    def "no duplicates: replaying the returned cursors yields only newly-arrived records"() {
         given:
-        def record = new MessageRecord('my-key', EventType.MESSAGE, '{"data":1}', Instant.now())
-        storage.read('my-topic', 0, 5L, 10) >> [record]
+        backing['topic-a'] = [rec(10000L, 'topic-a', 'a0')]
 
-        when:
-        def resp = get('/pipe/poll?offset=5&limit=10&topic=my-topic')
+        when: "drain, then more arrives, then poll with the returned cursors"
+        def first = poll()
+        backing['topic-a'] << rec(12000L, 'topic-a', 'a1')
+        def cursorHeader = first.headers().firstValue(PipeServer.CURSORS_HEADER).get()
+        def second = poll(cursorHeader)
 
         then:
-        resp.statusCode() == 200
-        def body = resp.body()
-        body.contains('my-key')
-        body.contains('MESSAGE')
+        second.statusCode() == 200
+        def records = mapper.readValue(second.body(), MessageRecord[])
+        records.collect { it.offset } == [12000L]
     }
 
-    def "DELETE event type is serialized correctly"() {
+    def "returns 204 when everything is caught up"() {
         given:
-        def record = new MessageRecord('del-key', EventType.DELETE, null, Instant.now())
-        storage.read('del-topic', 0, 0L, 100) >> [record]
+        backing['topic-a'] = [rec(5L, 'topic-a', 'a0')]
 
         when:
-        def resp = get('/pipe/poll?offset=0&limit=100&topic=del-topic')
-
-        then:
-        resp.statusCode() == 200
-        def body = resp.body()
-        body.contains('del-key')
-        body.contains('DELETE')
-    }
-
-    // =========================================================================
-    // GET /pipe/poll — offset and limit forwarded to storage
-    // =========================================================================
-
-    def "offset parameter is forwarded to storage.read"() {
-        given:
-        storage.read('offset-topic', 0, 42L, 100) >> []
-
-        when:
-        def resp = get('/pipe/poll?offset=42&limit=100&topic=offset-topic')
+        def resp = poll(mapper.writeValueAsString(['topic-a': 5L]))
 
         then:
         resp.statusCode() == 204
-        1 * storage.read('offset-topic', 0, 42L, 100) >> []
-    }
-
-    def "limit parameter is forwarded to storage.read"() {
-        given:
-        storage.read('limit-topic', 0, 0L, 5) >> []
-
-        when:
-        def resp = get('/pipe/poll?offset=0&limit=5&topic=limit-topic')
-
-        then:
-        resp.statusCode() == 204
-        1 * storage.read('limit-topic', 0, 0L, 5) >> []
-    }
-
-    def "topic parameter is forwarded to storage.read"() {
-        given:
-        storage.read('custom-topic', 0, 0L, 100) >> []
-
-        when:
-        def resp = get('/pipe/poll?offset=0&limit=100&topic=custom-topic')
-
-        then:
-        resp.statusCode() == 204
-        1 * storage.read('custom-topic', 0, 0L, 100) >> []
-    }
-
-    // =========================================================================
-    // GET /pipe/poll — error handling
-    // =========================================================================
-
-    def "returns 500 when storage throws an exception"() {
-        given:
-        storage.read('err-topic', 0, 0L, 100) >> { throw new RuntimeException("disk failure") }
-
-        when:
-        def resp = get('/pipe/poll?offset=0&limit=100&topic=err-topic')
-
-        then:
-        resp.statusCode() == 500
-    }
-
-    def "error response body contains error description"() {
-        given:
-        storage.read('err-topic2', 0, 0L, 100) >> { throw new RuntimeException("segment corrupt") }
-
-        when:
-        def resp = get('/pipe/poll?offset=0&limit=100&topic=err-topic2')
-
-        then:
-        resp.statusCode() == 500
-        resp.body().contains('segment corrupt')
-    }
-
-    // =========================================================================
-    // GET /pipe/poll — single record
-    // =========================================================================
-
-    def "single record is returned as a JSON array with one element"() {
-        given:
-        storage.read('single-topic', 0, 0L, 100) >> [
-            new MessageRecord('only-key', EventType.MESSAGE, '{}', Instant.now())
-        ]
-
-        when:
-        def resp = get('/pipe/poll?offset=0&limit=100&topic=single-topic')
-
-        then:
-        resp.statusCode() == 200
-        def body = resp.body()
-        body.startsWith('[')
-        body.endsWith(']')
-        body.contains('only-key')
     }
 }
