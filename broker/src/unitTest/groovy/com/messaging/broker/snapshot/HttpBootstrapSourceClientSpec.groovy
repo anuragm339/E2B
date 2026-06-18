@@ -14,7 +14,7 @@ import java.time.Instant
 class HttpBootstrapSourceClientSpec extends Specification {
 
     StorageEngine storage = Mock()
-    HttpBootstrapSourceClient client = new HttpBootstrapSourceClient(storage, "http://cloud", 1000)
+    HttpBootstrapSourceClient client = new HttpBootstrapSourceClient(storage, new BootstrapProgressTracker(), "http://cloud", 1000)
     ObjectMapper mapper = new ObjectMapper().findAndRegisterModules()
 
     def rec(long offset, String topic) {

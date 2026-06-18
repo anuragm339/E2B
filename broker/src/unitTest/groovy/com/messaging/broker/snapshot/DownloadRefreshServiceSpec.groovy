@@ -12,7 +12,7 @@ class DownloadRefreshServiceSpec extends Specification {
     RefreshCoordinator refreshCoordinator = Mock()
     StorageEngine storage = Mock()
 
-    DownloadRefreshService service = new DownloadRefreshService(orchestrator, refreshCoordinator, storage)
+    DownloadRefreshService service = new DownloadRefreshService(orchestrator, refreshCoordinator, storage, new BootstrapProgressTracker())
 
     def "SNAPSHOT success refreshes every topic from the manifest"() {
         given:

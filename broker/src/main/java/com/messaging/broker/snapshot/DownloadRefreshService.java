@@ -23,24 +23,30 @@ public class DownloadRefreshService {
     private final DownloadRefreshOrchestrator orchestrator;
     private final RefreshCoordinator refreshCoordinator;
     private final StorageEngine storage;
+    private final BootstrapProgressTracker progress;
 
     public DownloadRefreshService(
             DownloadRefreshOrchestrator orchestrator,
             RefreshCoordinator refreshCoordinator,
-            StorageEngine storage) {
+            StorageEngine storage,
+            BootstrapProgressTracker progress) {
         this.orchestrator = orchestrator;
         this.refreshCoordinator = refreshCoordinator;
         this.storage = storage;
+        this.progress = progress;
     }
 
     /** Source fresh data, then refresh consumers for every affected topic. Never throws. */
     public DownloadRefreshResult runBootstrapAndRefresh() {
+        progress.start("download-refresh", BootstrapProgressTracker.Phase.DOWNLOADING);
         DownloadRefreshResult result = orchestrator.bootstrap();
         if (!result.isSuccess()) {
+            progress.failed();
             log.warn("event=download_refresh.bootstrap_failed source={} err={} — skipping consumer refresh",
                     result.getSource(), result.getError());
             return result;
         }
+        progress.setPhase(BootstrapProgressTracker.Phase.REFRESHING);
         Collection<String> topics = (result.getManifest() != null)
                 ? result.getManifest().getTopicHeads().keySet()
                 : storage.getTopicNames();
@@ -53,6 +59,7 @@ public class DownloadRefreshService {
                 log.error("event=download_refresh.refresh_trigger_failed topic={} err={}", topic, e.toString());
             }
         }
+        progress.done();
         return result;
     }
 }

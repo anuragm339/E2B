@@ -35,7 +35,10 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
 
     static final String CURSORS_HEADER = "X-Pipe-Cursors";
 
+    static final String HEADS_HEADER = "X-Pipe-Heads";
+
     private final StorageEngine storage;
+    private final BootstrapProgressTracker progress;
     private final String cloudUrl;
     private final int maxBatches;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
@@ -45,11 +48,13 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
 
     public HttpBootstrapSourceClient(
             StorageEngine storage,
+            BootstrapProgressTracker progress,
             // Explicit cloud data URL for escalation (any node, incl. non-root). The chained default
             // (-> registry URL) is defined in application.yml since the cloud-server serves both.
             @Value("${broker.cloud.data-url:http://localhost:8080}") String cloudUrl,
             @Value("${broker.bootstrap.max-batches:100000}") int maxBatches) {
         this.storage = storage;
+        this.progress = progress;
         this.cloudUrl = cloudUrl;
         this.maxBatches = maxBatches;
     }
@@ -85,16 +90,28 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
     @Override
     public Path downloadSnapshot(String parentUrl, Path dataDir) {
         Path dest = dataDir.resolve("snapshots").resolve("incoming.zip");
+        progress.setPhase(BootstrapProgressTracker.Phase.DOWNLOADING);
         try {
             Files.createDirectories(dest.getParent());
-            HttpResponse<Path> resp = http.send(
-                    get(parentUrl + "/pipe/snapshot"),
-                    HttpResponse.BodyHandlers.ofFile(dest, StandardOpenOption.CREATE,
-                            StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING));
+            // Stream so we can report exact byte progress against Content-Length.
+            HttpResponse<java.io.InputStream> resp = http.send(
+                    get(parentUrl + "/pipe/snapshot"), HttpResponse.BodyHandlers.ofInputStream());
             if (resp.statusCode() != 200) {
                 throw new DataRefreshException(ErrorCode.DATA_REFRESH_SNAPSHOT_NOT_FOUND,
                         "Parent returned HTTP " + resp.statusCode() + " for snapshot download")
                         .withContext("parentUrl", parentUrl);
+            }
+            progress.setNumerator(0);
+            progress.setDenominator(resp.headers().firstValueAsLong("Content-Length").orElse(-1));
+            try (java.io.InputStream in = resp.body();
+                 java.io.OutputStream out = Files.newOutputStream(dest, StandardOpenOption.CREATE,
+                         StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                    progress.addNumerator(n);
+                }
             }
             log.info("event=bootstrap.snapshot_downloaded parentUrl={} dest={} bytes={}",
                     parentUrl, dest, sizeOf(dest));
@@ -109,9 +126,12 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
 
     @Override
     public void bulkFetchFromParent(String parentUrl, String dataDir) {
+        progress.setPhase(BootstrapProgressTracker.Phase.INGESTING);
         String cursors = "{}"; // empty map → every topic starts at the floor (0)
         for (int batch = 0; batch < maxBatches; batch++) {
             HttpResponse<String> resp = pollMerge(parentUrl, cursors);
+            // Offset-based % (approximate, sparse offsets): cursor-sum / head-sum.
+            progress.setDenominator(sumHeaderValues(resp, HEADS_HEADER));
             if (resp.statusCode() == 204) {
                 log.info("event=bootstrap.parent_pull_caught_up parentUrl={} batches={}", parentUrl, batch);
                 return;
@@ -122,13 +142,16 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
             }
             ingestRecords(parseRecords(resp.body()));
             cursors = resp.headers().firstValue(CURSORS_HEADER).orElse(cursors);
+            progress.setNumerator(sumValues(cursors));
         }
         log.warn("event=bootstrap.parent_pull_max_batches parentUrl={} maxBatches={}", parentUrl, maxBatches);
     }
 
     @Override
     public void bulkFetchFromCloud(String dataDir) {
+        progress.setPhase(BootstrapProgressTracker.Phase.INGESTING);
         long offset = 0;
+        long totalRecords = 0;
         for (int batch = 0; batch < maxBatches; batch++) {
             HttpResponse<String> resp = pollCloud(offset);
             if (resp.statusCode() == 204) {
@@ -144,6 +167,9 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
                 return;
             }
             ingestRecords(records);
+            // Cloud is looping/unbounded → record count only, no denominator (% stays unknown).
+            totalRecords += records.size();
+            progress.setNumerator(totalRecords);
             long maxOffset = offset;
             for (MessageRecord r : records) {
                 maxOffset = Math.max(maxOffset, r.getOffset());
@@ -154,6 +180,31 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
             offset = maxOffset;
         }
         log.warn("event=bootstrap.cloud_pull_max_batches maxBatches={} (synthetic looping cloud?)", maxBatches);
+    }
+
+    /** Sum the values of a JSON map header (e.g. X-Pipe-Heads), treating negatives/empties as 0. */
+    private long sumHeaderValues(HttpResponse<String> resp, String header) {
+        return resp.headers().firstValue(header).map(this::sumValues).orElse(-1L);
+    }
+
+    private long sumValues(String json) {
+        try {
+            if (json == null || json.isBlank()) {
+                return -1L;
+            }
+            long sum = 0;
+            boolean any = false;
+            for (Long v : objectMapper.<java.util.Map<String, Long>>readValue(json,
+                    new com.fasterxml.jackson.core.type.TypeReference<java.util.Map<String, Long>>() {}).values()) {
+                if (v != null && v > 0) {
+                    sum += v;
+                    any = true;
+                }
+            }
+            return any ? sum : -1L;
+        } catch (Exception e) {
+            return -1L;
+        }
     }
 
     /** Append a record unless it is already stored (offset-idempotent dedup). Package-private for tests. */

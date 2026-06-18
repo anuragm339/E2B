@@ -1,5 +1,6 @@
 package com.messaging.broker.http;
 
+import com.messaging.broker.snapshot.BootstrapProgressTracker;
 import com.messaging.broker.snapshot.DownloadRefreshResult;
 import com.messaging.broker.snapshot.DownloadRefreshService;
 import io.micronaut.http.MediaType;
@@ -29,12 +30,14 @@ public class DownloadRefreshController {
     private static final Logger log = LoggerFactory.getLogger(DownloadRefreshController.class);
 
     private final DownloadRefreshService service;
+    private final BootstrapProgressTracker progress;
     private final AtomicBoolean running = new AtomicBoolean(false);
     private volatile DownloadRefreshResult lastResult;
 
     @Inject
-    public DownloadRefreshController(DownloadRefreshService service) {
+    public DownloadRefreshController(DownloadRefreshService service, BootstrapProgressTracker progress) {
         this.service = service;
+        this.progress = progress;
     }
 
     @Post
@@ -61,6 +64,7 @@ public class DownloadRefreshController {
     public Map<String, Object> status() {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("running", running.get());
+        body.put("progress", progress.snapshot());
         DownloadRefreshResult r = lastResult;
         if (r == null) {
             body.put("lastRun", "none");
