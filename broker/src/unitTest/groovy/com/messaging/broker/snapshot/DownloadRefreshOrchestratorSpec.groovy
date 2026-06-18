@@ -114,6 +114,56 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         result.source == BootstrapSource.CLOUD
     }
 
+    def "SNAPSHOT path escalates to the cloud when the parent fails mid-download"() {
+        given:
+        topology.getCurrentParentUrl() >> "http://parent"
+        client.isParentHealthy("http://parent") >> true
+        client.snapshotAvailable("http://parent") >> true
+        client.downloadSnapshot(_, _) >> { throw new RuntimeException("parent died mid-download") }
+
+        when:
+        def result = orchestrator.bootstrap()
+
+        then: "falls back to a full cloud bootstrap"
+        1 * client.bulkFetchFromCloud("/tmp/data")
+        result.success
+        result.source == BootstrapSource.CLOUD
+    }
+
+    def "INCREMENTAL path escalates to the cloud when the parent pull fails mid-stream"() {
+        given:
+        topology.getCurrentParentUrl() >> "http://parent"
+        client.isParentHealthy("http://parent") >> true
+        client.snapshotAvailable("http://parent") >> false
+        client.bulkFetchFromParent(_, _) >> { throw new RuntimeException("parent entered refresh") }
+
+        when:
+        def result = orchestrator.bootstrap()
+
+        then:
+        1 * client.bulkFetchFromCloud("/tmp/data")
+        result.success
+        result.source == BootstrapSource.CLOUD
+    }
+
+    def "if cloud escalation ALSO fails, a failure result is returned (never thrown)"() {
+        given:
+        topology.getCurrentParentUrl() >> "http://parent"
+        client.isParentHealthy("http://parent") >> true
+        client.snapshotAvailable("http://parent") >> false
+        client.bulkFetchFromParent(_, _) >> { throw new RuntimeException("parent down") }
+        client.bulkFetchFromCloud(_) >> { throw new RuntimeException("cloud down too") }
+
+        when:
+        def result = orchestrator.bootstrap()
+
+        then:
+        noExceptionThrown()
+        !result.success
+        result.source == BootstrapSource.CLOUD
+        result.error.contains("cloud down too")
+    }
+
     def "a failure during sourcing is returned as a result, never thrown"() {
         given:
         topology.getCurrentParentUrl() >> null

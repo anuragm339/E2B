@@ -1,7 +1,6 @@
 package com.messaging.broker.snapshot;
 
 import com.messaging.broker.core.TopologyManager;
-import com.messaging.common.exception.DataRefreshException;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -75,23 +74,49 @@ public class DownloadRefreshOrchestrator {
         String parentUrl = topology.getCurrentParentUrl();
         BootstrapSource source = chooseSource(parentUrl);
         log.info("event=bootstrap.started source={} parentUrl={}", source, parentUrl);
-        // Jitter only the *escalation* case (had a parent, forced to the cloud) — not a root node,
-        // which always uses the cloud and has no herd to spread.
-        if (parentUrl != null && source == BootstrapSource.CLOUD) {
-            applyEscalationJitter();
-        }
         try {
-            return switch (source) {
-                case SNAPSHOT -> bootstrapFromSnapshot(parentUrl);
-                case INCREMENTAL_PARENT -> bootstrapIncremental(parentUrl);
-                case CLOUD -> bootstrapFromCloud();
-            };
-        } catch (DataRefreshException e) {
-            log.error("event=bootstrap.failed source={} code={} err={}", source, e.getErrorCode(), e.getMessage());
-            return DownloadRefreshResult.failure(source, e.getMessage());
+            switch (source) {
+                case SNAPSHOT:
+                    // Mid-stream parent failure (parent enters refresh / dies during download) —
+                    // escalate to the cloud rather than fail. The parent is unusable now.
+                    try {
+                        return bootstrapFromSnapshot(parentUrl);
+                    } catch (Exception e) {
+                        log.warn("event=bootstrap.parent_failed_midstream source=SNAPSHOT err={} — escalating to cloud",
+                                e.toString());
+                        return escalateToCloud();
+                    }
+                case INCREMENTAL_PARENT:
+                    try {
+                        return bootstrapIncremental(parentUrl);
+                    } catch (Exception e) {
+                        log.warn("event=bootstrap.parent_failed_midstream source=INCREMENTAL_PARENT err={} — escalating to cloud",
+                                e.toString());
+                        return escalateToCloud();
+                    }
+                case CLOUD:
+                default:
+                    // Escalation at selection (parent unhealthy) — jitter to avoid a cloud stampede.
+                    // A root node (no parent) has no herd, so no jitter.
+                    if (parentUrl != null) {
+                        applyEscalationJitter();
+                    }
+                    return bootstrapFromCloud();
+            }
         } catch (Exception e) {
             log.error("event=bootstrap.failed source={} err={}", source, e.toString(), e);
             return DownloadRefreshResult.failure(source, e.toString());
+        }
+    }
+
+    /** Full cloud bootstrap used when a parent path fails mid-stream. Jittered, self-contained. */
+    private DownloadRefreshResult escalateToCloud() {
+        try {
+            applyEscalationJitter();
+            return bootstrapFromCloud();
+        } catch (Exception e) {
+            log.error("event=bootstrap.cloud_escalation_failed err={}", e.toString(), e);
+            return DownloadRefreshResult.failure(BootstrapSource.CLOUD, e.toString());
         }
     }
 

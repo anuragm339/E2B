@@ -73,6 +73,11 @@ broker:
 
   registry:
     url: ${REGISTRY_URL:http://localhost:8080}
+
+  # Cloud data URL for download-refresh cloud-escalation (any node, incl. non-root). Defaults to the
+  # registry URL because the cloud-server serves both /registry/topology and /pipe/poll.
+  cloud:
+    data-url: ${CLOUD_DATA_URL:${REGISTRY_URL:http://localhost:8080}}
     auth:
       bearer-token: ${AUTH_BEARER_TOKEN:}  # Optional bearer token for registry and pipe HTTP calls
 

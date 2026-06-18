@@ -45,7 +45,9 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
 
     public HttpBootstrapSourceClient(
             StorageEngine storage,
-            @Value("${broker.registry.url:http://localhost:8080}") String cloudUrl,
+            // Explicit cloud data URL for escalation (any node, incl. non-root). The chained default
+            // (-> registry URL) is defined in application.yml since the cloud-server serves both.
+            @Value("${broker.cloud.data-url:http://localhost:8080}") String cloudUrl,
             @Value("${broker.bootstrap.max-batches:100000}") int maxBatches) {
         this.storage = storage;
         this.cloudUrl = cloudUrl;
