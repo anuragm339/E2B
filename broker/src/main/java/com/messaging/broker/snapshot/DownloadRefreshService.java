@@ -41,7 +41,7 @@ public class DownloadRefreshService {
 
     /** Backward-compatible entry point — auto-selected download refresh. */
     public DownloadRefreshResult runBootstrapAndRefresh() {
-        return runRefresh(RefreshType.DOWNLOAD);
+        return runRefresh(RefreshType.PIPE_AND_PROVIDER_REFRESH);
     }
 
     /**

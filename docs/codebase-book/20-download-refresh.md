@@ -16,10 +16,10 @@ Plain terms: "wipe my data and get a fresh copy from above." A neighbour POS wit
 
 | Condition | Source |
 |---|---|
-| No parent (root node) | `CLOUD` |
-| Parent `/health` DOWN (mid-refresh / unreachable) | `CLOUD` (escalate) |
-| Parent has a snapshot (`/pipe/snapshot/info`) | `SNAPSHOT` |
-| Otherwise | `INCREMENTAL_PARENT` |
+| No parent (root node) | `CLOUD_SYNC` |
+| Parent `/health` DOWN (mid-refresh / unreachable) | `CLOUD_SYNC` (escalate) |
+| Parent has a snapshot (`/pipe/snapshot/info`) | `PIPE_AND_PROVIDER_FILE_DOWNLOAD` |
+| Otherwise | `PIPE_AND_PROVIDER_STREAM` |
 
 A parent reports `/health` DOWN during any refresh (`RefreshHealthIndicator`), so "don't source from a refreshing parent" falls out of the existing health probe.
 
@@ -28,11 +28,11 @@ A parent reports `/health` DOWN during any refresh (`RefreshHealthIndicator`), s
 `POST /admin/download-refresh` → `DownloadRefreshController` (async, single-flight, virtual thread) → `DownloadRefreshService.runBootstrapAndRefresh`:
 
 1. `DownloadRefreshOrchestrator.bootstrap()` re-sources data (blocking, synchronous):
-   - **SNAPSHOT**: `downloadSnapshot` (stream to `snapshots/incoming.zip`) → `SnapshotRestorer.restore` (stage → atomic per-topic swap) → `LocalStateCleaner.clearState`. Crash-safe: download + swap happen *before* clearing ack/offset state, so a failed download leaves live data intact.
-   - **INCREMENTAL_PARENT**: `clearState` + `clearTopicData` → k-way-merge pull from the parent (`/pipe/poll` with `X-Pipe-Cursors`) until 204.
-   - **CLOUD**: `clearState` + `clearTopicData` → global pull from the cloud from offset 0.
+   - **PIPE_AND_PROVIDER_FILE_DOWNLOAD**: `downloadSnapshot` (stream to `snapshots/incoming.zip`) → `SnapshotRestorer.restore` (stage → atomic per-topic swap) → `LocalStateCleaner.clearState`. Crash-safe: download + swap happen *before* clearing ack/offset state, so a failed download leaves live data intact.
+   - **PIPE_AND_PROVIDER_STREAM**: `clearState` + `clearTopicData` → k-way-merge pull from the parent (`/pipe/poll` with `X-Pipe-Cursors`) until 204.
+   - **CLOUD_SYNC**: `clearState` + `clearTopicData` → global pull from the cloud from offset 0.
    - **Mid-stream escalation**: if a parent path fails partway (parent enters refresh / dies), escalate to a jittered cloud bootstrap instead of failing.
-2. On success, trigger `RefreshCoordinator.startRefresh(topic)` for every affected topic — from the snapshot manifest (SNAPSHOT) or the topics present in storage (incremental/cloud). The existing RESET→replay→READY then delivers the fresh copy, gated by the [delivery-freshness gate](#delivery-freshness-gate).
+2. On success, trigger `RefreshCoordinator.startRefresh(topic)` for every affected topic — from the snapshot manifest (file-download) or the topics present in storage (incremental/cloud). The existing RESET→replay→READY then delivers the fresh copy, gated by the [delivery-freshness gate](#delivery-freshness-gate).
 
 ## The snapshot
 
@@ -84,22 +84,26 @@ A refresh may reach READY (and the broker report healthy/green) only once a real
 | `broker.bootstrap.max-batches` | `100000` | Pull-loop safety cap (finite source ends on 204) |
 | `broker.bootstrap.escalation-jitter-ms` | `30000` | Cloud-escalation jitter (anti-stampede) |
 | `broker.cloud.data-url` | → registry url | Cloud target for escalation (any node) |
+| `broker.bare-metal.exit-code` | `70` | BARE_METAL `System.exit` code (non-zero for the supervisor) |
+| `broker.bare-metal.settle-ms` | `500` | Delay before teardown so the admin response flushes |
 
 ## Refresh type (caller-chosen)
 
-The refresh is type-driven: `POST /admin/download-refresh` takes `?type=` or a JSON body `{"type":..}` (`RefreshType.from`, default `DOWNLOAD`). `DownloadRefreshService.runRefresh(type)` dispatches:
+The refresh is type-driven: `POST /admin/download-refresh` takes `?type=` or a JSON body `{"type":..}` (`RefreshType.from`, default `PIPE_AND_PROVIDER_REFRESH`). `DownloadRefreshService.runRefresh(type)` dispatches:
 
 | `type` | Behavior |
 |---|---|
 | `LOCAL` | Replay the node's own segments to consumers — no download (the original refresh). |
-| `DOWNLOAD` | Wipe + re-source, **auto-selecting** the source (default). |
-| `SNAPSHOT` / `INCREMENTAL` / `CLOUD` | Wipe + re-source, **forcing** that source (`RefreshType.forcedSource` → `DownloadRefreshOrchestrator.bootstrap(forced)`). |
+| `PIPE_AND_PROVIDER_REFRESH` | Wipe + re-source from the provider, **auto-resolving** file-download vs stream (default). |
+| `PIPE_AND_PROVIDER_FILE_DOWNLOAD` / `PIPE_AND_PROVIDER_STREAM` | Advanced: wipe + re-source, **forcing** that provider source. |
+| `CLOUD_SYNC` | Wipe + re-source from the cloud. |
+| `BARE_METAL` | Factory reset: stop everything, wipe the storage dir's contents, `System.exit` for an external supervisor to restart (no in-process re-source). |
 
-A forced source that is unavailable (e.g. `SNAPSHOT` with no snapshot, or a parent path that dies) escalates to the cloud via the [mid-stream escalation](#flow).
+A forced provider source that is unavailable (e.g. file-download with no snapshot, or a parent that dies) escalates to `CLOUD_SYNC` via the [mid-stream escalation](#flow).
 
 ## API
 
-- `POST /admin/download-refresh?type=DOWNLOAD` — start (async, single-flight); `type` also accepted in the JSON body.
+- `POST /admin/download-refresh?type=PIPE_AND_PROVIDER_REFRESH` — start (async, single-flight); `type` also accepted in the JSON body.
 - `GET /admin/download-refresh/status` — running / type / progress / last result.
 - `GET /pipe/snapshot`, `GET /pipe/snapshot/info` — serve snapshot ZIP / availability + watermark.
 - `GET /pipe/poll` (+ `X-Pipe-Cursors` header) — k-way-merge multi-topic pull.

@@ -15,16 +15,16 @@ import java.nio.file.Paths;
  *
  * <p>Source selection (reactive, no cross-node coordination):
  * <ol>
- *   <li>No parent (root) → CLOUD.</li>
- *   <li>Parent {@code /health} DOWN (mid-refresh or unreachable) → escalate to CLOUD.</li>
- *   <li>Parent has a snapshot → SNAPSHOT (download + restore).</li>
- *   <li>Otherwise → INCREMENTAL_PARENT (k-way-merge pull from the parent).</li>
+ *   <li>No parent (root) → CLOUD_SYNC.</li>
+ *   <li>Parent {@code /health} DOWN (mid-refresh or unreachable) → escalate to CLOUD_SYNC.</li>
+ *   <li>Parent has a snapshot → PIPE_AND_PROVIDER_FILE_DOWNLOAD (download + restore).</li>
+ *   <li>Otherwise → PIPE_AND_PROVIDER_STREAM (k-way-merge pull from the parent).</li>
  * </ol>
  *
- * <p>Crash-safety: the SNAPSHOT path downloads + atomically swaps topic folders BEFORE clearing
- * ack/offset state, so a failed download leaves live data intact. The INCREMENTAL/CLOUD paths wipe
- * then re-fetch from 0; ingestion is offset-idempotent, so a retry after a partial fetch simply
- * resumes without duplicates.
+ * <p>Crash-safety: the file-download path downloads + atomically swaps topic folders BEFORE clearing
+ * ack/offset state, so a failed download leaves live data intact. The stream/cloud paths wipe then
+ * re-fetch from 0; ingestion is offset-idempotent, so a retry after a partial fetch simply resumes
+ * without duplicates.
  */
 @Singleton
 public class DownloadRefreshOrchestrator {
@@ -57,16 +57,16 @@ public class DownloadRefreshOrchestrator {
     /** Decide where to bootstrap from, given the current parent (null when this node is root). */
     BootstrapSource chooseSource(String parentUrl) {
         if (parentUrl == null) {
-            return BootstrapSource.CLOUD; // root node — only the cloud is upstream
+            return BootstrapSource.CLOUD_SYNC; // root node — only the cloud is upstream
         }
         if (!client.isParentHealthy(parentUrl)) {
             log.info("event=bootstrap.escalate_to_cloud reason=parent_unhealthy parentUrl={}", parentUrl);
-            return BootstrapSource.CLOUD; // parent mid-refresh / unreachable
+            return BootstrapSource.CLOUD_SYNC; // parent mid-refresh / unreachable
         }
         if (client.snapshotAvailable(parentUrl)) {
-            return BootstrapSource.SNAPSHOT;
+            return BootstrapSource.PIPE_AND_PROVIDER_FILE_DOWNLOAD;
         }
-        return BootstrapSource.INCREMENTAL_PARENT;
+        return BootstrapSource.PIPE_AND_PROVIDER_STREAM;
     }
 
     /** Run the bootstrap with auto source selection. Never throws — failures returned as a result. */
@@ -84,25 +84,25 @@ public class DownloadRefreshOrchestrator {
         log.info("event=bootstrap.started source={} parentUrl={}", source, parentUrl);
         try {
             switch (source) {
-                case SNAPSHOT:
+                case PIPE_AND_PROVIDER_FILE_DOWNLOAD:
                     // Mid-stream parent failure (parent enters refresh / dies during download) —
                     // escalate to the cloud rather than fail. The parent is unusable now.
                     try {
                         return bootstrapFromSnapshot(parentUrl);
                     } catch (Exception e) {
-                        log.warn("event=bootstrap.parent_failed_midstream source=SNAPSHOT err={} — escalating to cloud",
+                        log.warn("event=bootstrap.parent_failed_midstream source=PIPE_AND_PROVIDER_FILE_DOWNLOAD err={} — escalating to cloud",
                                 e.toString());
                         return escalateToCloud();
                     }
-                case INCREMENTAL_PARENT:
+                case PIPE_AND_PROVIDER_STREAM:
                     try {
                         return bootstrapIncremental(parentUrl);
                     } catch (Exception e) {
-                        log.warn("event=bootstrap.parent_failed_midstream source=INCREMENTAL_PARENT err={} — escalating to cloud",
+                        log.warn("event=bootstrap.parent_failed_midstream source=PIPE_AND_PROVIDER_STREAM err={} — escalating to cloud",
                                 e.toString());
                         return escalateToCloud();
                     }
-                case CLOUD:
+                case CLOUD_SYNC:
                 default:
                     // Escalation at selection (parent unhealthy) — jitter to avoid a cloud stampede.
                     // A root node (no parent) has no herd, so no jitter.
@@ -124,7 +124,7 @@ public class DownloadRefreshOrchestrator {
             return bootstrapFromCloud();
         } catch (Exception e) {
             log.error("event=bootstrap.cloud_escalation_failed err={}", e.toString(), e);
-            return DownloadRefreshResult.failure(BootstrapSource.CLOUD, e.toString());
+            return DownloadRefreshResult.failure(BootstrapSource.CLOUD_SYNC, e.toString());
         }
     }
 
@@ -134,24 +134,24 @@ public class DownloadRefreshOrchestrator {
         Path zip = client.downloadSnapshot(parentUrl, dir);
         SnapshotManifest manifest = restorer.restore(zip, dir);
         cleaner.clearState(dataDir);
-        log.info("event=bootstrap.completed source=SNAPSHOT topics={}", manifest.getTopicHeads().size());
-        return DownloadRefreshResult.ok(BootstrapSource.SNAPSHOT, manifest);
+        log.info("event=bootstrap.completed source=PIPE_AND_PROVIDER_FILE_DOWNLOAD topics={}", manifest.getTopicHeads().size());
+        return DownloadRefreshResult.ok(BootstrapSource.PIPE_AND_PROVIDER_FILE_DOWNLOAD, manifest);
     }
 
     private DownloadRefreshResult bootstrapIncremental(String parentUrl) {
         cleaner.clearState(dataDir);
         cleaner.clearTopicData(dataDir);
         client.bulkFetchFromParent(parentUrl, dataDir);
-        log.info("event=bootstrap.completed source=INCREMENTAL_PARENT parentUrl={}", parentUrl);
-        return DownloadRefreshResult.ok(BootstrapSource.INCREMENTAL_PARENT, null);
+        log.info("event=bootstrap.completed source=PIPE_AND_PROVIDER_STREAM parentUrl={}", parentUrl);
+        return DownloadRefreshResult.ok(BootstrapSource.PIPE_AND_PROVIDER_STREAM, null);
     }
 
     private DownloadRefreshResult bootstrapFromCloud() {
         cleaner.clearState(dataDir);
         cleaner.clearTopicData(dataDir);
         client.bulkFetchFromCloud(dataDir);
-        log.info("event=bootstrap.completed source=CLOUD");
-        return DownloadRefreshResult.ok(BootstrapSource.CLOUD, null);
+        log.info("event=bootstrap.completed source=CLOUD_SYNC");
+        return DownloadRefreshResult.ok(BootstrapSource.CLOUD_SYNC, null);
     }
 
     /** Sleep a random 0..escalationJitterMs to de-synchronize a fan-out of children onto the cloud. */

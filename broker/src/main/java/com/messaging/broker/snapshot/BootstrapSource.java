@@ -1,13 +1,13 @@
 package com.messaging.broker.snapshot;
 
 /**
- * The chosen source for a download-refresh bootstrap.
+ * The resolved source used to re-source data during a download-refresh (reported back in status).
  */
 public enum BootstrapSource {
-    /** Parent POS has a ready-made snapshot ZIP — download + restore (fast path). */
-    SNAPSHOT,
-    /** Parent POS is healthy but has no snapshot — incremental k-way-merge pull from it. */
-    INCREMENTAL_PARENT,
-    /** No usable parent (this node is root, or the parent is mid-refresh) — pull from the cloud. */
-    CLOUD
+    /** Parent POS had a ready-made snapshot ZIP — downloaded + restored (fast path). */
+    PIPE_AND_PROVIDER_FILE_DOWNLOAD,
+    /** Parent POS healthy but no snapshot — record-by-record k-way-merge stream from it. */
+    PIPE_AND_PROVIDER_STREAM,
+    /** No usable parent (root, or parent mid-refresh) — pulled from the cloud. */
+    CLOUD_SYNC
 }

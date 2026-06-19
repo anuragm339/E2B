@@ -19,7 +19,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
 
     def "root node (no parent) bootstraps from the cloud"() {
         expect:
-        orchestrator.chooseSource(null) == BootstrapSource.CLOUD
+        orchestrator.chooseSource(null) == BootstrapSource.CLOUD_SYNC
     }
 
     def "unhealthy parent (mid-refresh) escalates to the cloud"() {
@@ -27,7 +27,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         client.isParentHealthy("http://parent") >> false
 
         expect:
-        orchestrator.chooseSource("http://parent") == BootstrapSource.CLOUD
+        orchestrator.chooseSource("http://parent") == BootstrapSource.CLOUD_SYNC
     }
 
     def "healthy parent with a snapshot uses the SNAPSHOT path"() {
@@ -36,7 +36,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         client.snapshotAvailable("http://parent") >> true
 
         expect:
-        orchestrator.chooseSource("http://parent") == BootstrapSource.SNAPSHOT
+        orchestrator.chooseSource("http://parent") == BootstrapSource.PIPE_AND_PROVIDER_FILE_DOWNLOAD
     }
 
     def "healthy parent without a snapshot uses the INCREMENTAL_PARENT path"() {
@@ -45,7 +45,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         client.snapshotAvailable("http://parent") >> false
 
         expect:
-        orchestrator.chooseSource("http://parent") == BootstrapSource.INCREMENTAL_PARENT
+        orchestrator.chooseSource("http://parent") == BootstrapSource.PIPE_AND_PROVIDER_STREAM
     }
 
     // ── sequencing per path ──────────────────────────────────────────────────
@@ -73,7 +73,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
 
         and:
         result.success
-        result.source == BootstrapSource.SNAPSHOT
+        result.source == BootstrapSource.PIPE_AND_PROVIDER_FILE_DOWNLOAD
         result.manifest.is(manifest)
     }
 
@@ -94,7 +94,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
 
         and:
         result.success
-        result.source == BootstrapSource.INCREMENTAL_PARENT
+        result.source == BootstrapSource.PIPE_AND_PROVIDER_STREAM
     }
 
     def "CLOUD path: clear state + topic data, then pull from cloud"() {
@@ -111,7 +111,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
 
         and:
         result.success
-        result.source == BootstrapSource.CLOUD
+        result.source == BootstrapSource.CLOUD_SYNC
     }
 
     def "SNAPSHOT path escalates to the cloud when the parent fails mid-download"() {
@@ -127,7 +127,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         then: "falls back to a full cloud bootstrap"
         1 * client.bulkFetchFromCloud("/tmp/data")
         result.success
-        result.source == BootstrapSource.CLOUD
+        result.source == BootstrapSource.CLOUD_SYNC
     }
 
     def "INCREMENTAL path escalates to the cloud when the parent pull fails mid-stream"() {
@@ -143,7 +143,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         then:
         1 * client.bulkFetchFromCloud("/tmp/data")
         result.success
-        result.source == BootstrapSource.CLOUD
+        result.source == BootstrapSource.CLOUD_SYNC
     }
 
     def "if cloud escalation ALSO fails, a failure result is returned (never thrown)"() {
@@ -160,7 +160,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         then:
         noExceptionThrown()
         !result.success
-        result.source == BootstrapSource.CLOUD
+        result.source == BootstrapSource.CLOUD_SYNC
         result.error.contains("cloud down too")
     }
 
@@ -175,7 +175,7 @@ class DownloadRefreshOrchestratorSpec extends Specification {
         then:
         noExceptionThrown()
         !result.success
-        result.source == BootstrapSource.CLOUD
+        result.source == BootstrapSource.CLOUD_SYNC
         result.error.contains("cloud unreachable")
     }
 }

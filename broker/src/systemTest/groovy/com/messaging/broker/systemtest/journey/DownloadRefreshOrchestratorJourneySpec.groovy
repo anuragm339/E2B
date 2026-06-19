@@ -25,7 +25,7 @@ class DownloadRefreshOrchestratorJourneySpec extends TwoBrokerJourneySupport {
 
         then: "it chose the incremental path and succeeded"
         result.success
-        result.source == BootstrapSource.INCREMENTAL_PARENT
+        result.source == BootstrapSource.PIPE_AND_PROVIDER_STREAM
 
         and: "the parent's data was re-sourced into the child's storage"
         def childStorage = childBean(StorageEngine)
@@ -45,6 +45,6 @@ class DownloadRefreshOrchestratorJourneySpec extends TwoBrokerJourneySupport {
 
         then: "it chose the snapshot fast path and succeeded"
         result.success
-        result.source == BootstrapSource.SNAPSHOT
+        result.source == BootstrapSource.PIPE_AND_PROVIDER_FILE_DOWNLOAD
     }
 }
