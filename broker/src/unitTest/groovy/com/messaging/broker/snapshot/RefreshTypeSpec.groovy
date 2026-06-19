@@ -31,6 +31,15 @@ class RefreshTypeSpec extends Specification {
         RefreshType.LOCAL.forcedSource() == null
     }
 
+    def "tryParse defaults blank but REJECTS unknown (so a typo is a 400, not a destructive refresh)"() {
+        expect:
+        RefreshType.tryParse("LOCAL").get() == RefreshType.LOCAL
+        RefreshType.tryParse("").get() == RefreshType.PIPE_AND_PROVIDER_REFRESH
+        RefreshType.tryParse(null).get() == RefreshType.PIPE_AND_PROVIDER_REFRESH
+        RefreshType.tryParse("nonsense").isEmpty()
+        RefreshType.tryParse("BARE_METALL").isEmpty()
+    }
+
     def "isLocal is true only for LOCAL"() {
         expect:
         RefreshType.LOCAL.isLocal()

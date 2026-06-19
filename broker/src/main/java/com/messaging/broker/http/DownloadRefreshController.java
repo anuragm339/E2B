@@ -53,15 +53,22 @@ public class DownloadRefreshController {
     @Post
     @Consumes(MediaType.APPLICATION_JSON)
     @Produces(MediaType.APPLICATION_JSON)
-    public Map<String, Object> trigger(@QueryValue @Nullable String type, @Body @Nullable Map<String, Object> body) {
-        // Type comes from ?type= or {"type":..}; defaults to DOWNLOAD (auto-select source).
+    public io.micronaut.http.HttpResponse<Map<String, Object>> trigger(
+            @QueryValue @Nullable String type, @Body @Nullable Map<String, Object> body) {
+        // Type comes from ?type= or {"type":..}; blank defaults to PIPE_AND_PROVIDER_REFRESH.
         String raw = (type != null && !type.isBlank())
                 ? type
                 : (body != null && body.get("type") != null ? body.get("type").toString() : null);
-        RefreshType refreshType = RefreshType.from(raw);
+
+        // Reject a typo with 400 — never silently run a destructive refresh on an unknown type.
+        var parsed = RefreshType.tryParse(raw);
+        if (parsed.isEmpty()) {
+            return io.micronaut.http.HttpResponse.badRequest(Map.of("status", "INVALID_TYPE", "type", raw));
+        }
+        RefreshType refreshType = parsed.get();
 
         if (!running.compareAndSet(false, true)) {
-            return Map.of("status", "ALREADY_RUNNING");
+            return io.micronaut.http.HttpResponse.ok(Map.of("status", "ALREADY_RUNNING"));
         }
         lastType = refreshType;
         log.info("event=refresh.requested type={}", refreshType);
@@ -75,7 +82,7 @@ public class DownloadRefreshController {
                 running.set(false);
             }
         });
-        return Map.of("status", "INITIATED", "type", refreshType.toString());
+        return io.micronaut.http.HttpResponse.ok(Map.of("status", "INITIATED", "type", refreshType.toString()));
     }
 
     @Get("/status")

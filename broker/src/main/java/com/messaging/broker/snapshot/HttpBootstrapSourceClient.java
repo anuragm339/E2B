@@ -38,6 +38,7 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
     static final String HEADS_HEADER = "X-Pipe-Heads";
 
     private final StorageEngine storage;
+    private final com.messaging.broker.compaction.CompactionIndex compactionIndex;
     private final BootstrapProgressTracker progress;
     private final String cloudUrl;
     private final int maxBatches;
@@ -48,12 +49,14 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
 
     public HttpBootstrapSourceClient(
             StorageEngine storage,
+            com.messaging.broker.compaction.CompactionIndex compactionIndex,
             BootstrapProgressTracker progress,
             // Explicit cloud data URL for escalation (any node, incl. non-root). The chained default
             // (-> registry URL) is defined in application.yml since the cloud-server serves both.
             @Value("${broker.cloud.data-url:http://localhost:8080}") String cloudUrl,
             @Value("${broker.bootstrap.max-batches:100000}") int maxBatches) {
         this.storage = storage;
+        this.compactionIndex = compactionIndex;
         this.progress = progress;
         this.cloudUrl = cloudUrl;
         this.maxBatches = maxBatches;
@@ -207,14 +210,20 @@ public class HttpBootstrapSourceClient implements BootstrapSourceClient {
         }
     }
 
-    /** Append a record unless it is already stored (offset-idempotent dedup). Package-private for tests. */
+    /**
+     * Append a record unless already stored (offset-idempotent dedup), maintaining the compaction
+     * index on every store — mirroring the steady-state pipe ingest in {@code BrokerService}, so
+     * compaction/delivery filtering stay correct after a download refresh. Package-private for tests.
+     */
     void ingestRecords(List<MessageRecord> records) {
         for (MessageRecord r : records) {
             long head = storage.getCurrentOffset(r.getTopic(), 0);
             if (r.getOffset() > 0 && r.getOffset() <= head) {
                 continue; // already stored
             }
-            storage.append(r.getTopic(), 0, r);
+            long offset = storage.append(r.getTopic(), 0, r);
+            long ts = r.getCreatedAt() != null ? r.getCreatedAt().toEpochMilli() : System.currentTimeMillis();
+            compactionIndex.updateKey(r.getTopic(), r.getMsgKey(), offset, ts);
         }
     }
 

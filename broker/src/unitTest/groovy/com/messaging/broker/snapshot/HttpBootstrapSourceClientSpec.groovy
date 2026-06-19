@@ -14,7 +14,8 @@ import java.time.Instant
 class HttpBootstrapSourceClientSpec extends Specification {
 
     StorageEngine storage = Mock()
-    HttpBootstrapSourceClient client = new HttpBootstrapSourceClient(storage, new BootstrapProgressTracker(), "http://cloud", 1000)
+    com.messaging.broker.compaction.CompactionIndex compactionIndex = Mock()
+    HttpBootstrapSourceClient client = new HttpBootstrapSourceClient(storage, compactionIndex, new BootstrapProgressTracker(), "http://cloud", 1000)
     ObjectMapper mapper = new ObjectMapper().findAndRegisterModules()
 
     def rec(long offset, String topic) {
@@ -28,9 +29,11 @@ class HttpBootstrapSourceClientSpec extends Specification {
         when:
         client.ingestRecords([rec(5L, "t"), rec(15L, "t")])
 
-        then: "offset 5 (<= head) skipped; offset 15 (> head) appended"
+        then: "offset 5 (<= head) skipped; offset 15 (> head) appended + indexed"
         0 * storage.append("t", 0, { it.offset == 5L })
         1 * storage.append("t", 0, { it.offset == 15L })
+        1 * compactionIndex.updateKey("t", "k15", _, _)
+        0 * compactionIndex.updateKey("t", "k5", _, _)
     }
 
     def "ingestRecords always appends offset-0 records (the dedup guard is offset > 0)"() {

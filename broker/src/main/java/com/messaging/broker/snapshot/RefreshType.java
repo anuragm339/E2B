@@ -44,13 +44,22 @@ public enum RefreshType {
 
     /** Parse a request value, defaulting to PIPE_AND_PROVIDER_REFRESH (auto) when blank/unknown. */
     public static RefreshType from(String raw) {
+        return tryParse(raw).orElse(PIPE_AND_PROVIDER_REFRESH);
+    }
+
+    /**
+     * Strict parse: blank → the default ({@code PIPE_AND_PROVIDER_REFRESH}); a recognized value →
+     * that value; an UNKNOWN non-blank value → empty (so the caller can reject it with a 400 rather
+     * than silently running a destructive refresh on a typo).
+     */
+    public static java.util.Optional<RefreshType> tryParse(String raw) {
         if (raw == null || raw.isBlank()) {
-            return PIPE_AND_PROVIDER_REFRESH;
+            return java.util.Optional.of(PIPE_AND_PROVIDER_REFRESH);
         }
         try {
-            return valueOf(raw.trim().toUpperCase());
+            return java.util.Optional.of(valueOf(raw.trim().toUpperCase()));
         } catch (IllegalArgumentException e) {
-            return PIPE_AND_PROVIDER_REFRESH;
+            return java.util.Optional.empty();
         }
     }
 }
