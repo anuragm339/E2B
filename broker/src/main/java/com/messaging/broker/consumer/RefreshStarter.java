@@ -16,6 +16,18 @@ public interface RefreshStarter {
     CompletableFuture<RefreshResult> startRefresh(String topic);
 
     /**
+     * Start a refresh for a topic, labeling it with the requested refresh type (for the
+     * RefreshContext + metrics). Default delegates to {@link #startRefresh(String)} (LOCAL).
+     *
+     * @param topic Topic to refresh
+     * @param refreshType refresh type label (e.g. "LOCAL", "CLOUD_SYNC", "PIPE_AND_PROVIDER_STREAM")
+     * @return Future containing refresh result
+     */
+    default CompletableFuture<RefreshResult> startRefresh(String topic, String refreshType) {
+        return startRefresh(topic);
+    }
+
+    /**
      * Get expected consumers for a topic.
      *
      * @param topic Topic name

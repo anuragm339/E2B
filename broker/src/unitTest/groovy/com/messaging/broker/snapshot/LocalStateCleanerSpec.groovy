@@ -52,6 +52,23 @@ class LocalStateCleanerSpec extends Specification {
         noExceptionThrown()
     }
 
+    def "retainTopics removes topics not in the keep set, preserving kept topics + infra dirs"() {
+        given:
+        write("prices-v1/segment_metadata.db", "x")
+        write("stale-topic/segment_metadata.db", "y")
+        write("ack-store/CURRENT", "rocks")
+        write("snapshots/latest.zip", "zip")
+
+        when: "keep only prices-v1 (e.g. the snapshot manifest's topics)"
+        cleaner.retainTopics(tempDir.toString(), ["prices-v1"] as Set)
+
+        then:
+        Files.exists(tempDir.resolve("prices-v1"))
+        !Files.exists(tempDir.resolve("stale-topic"))
+        Files.exists(tempDir.resolve("ack-store"))
+        Files.exists(tempDir.resolve("snapshots"))
+    }
+
     def "clearTopicData wipes topic folders but preserves ack-store and snapshots"() {
         given:
         write("prices-v1/segment_metadata.db", "d1")

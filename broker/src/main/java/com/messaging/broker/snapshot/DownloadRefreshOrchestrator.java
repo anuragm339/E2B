@@ -171,6 +171,8 @@ public class DownloadRefreshOrchestrator {
         SnapshotManifest[] holder = new SnapshotManifest[1];
         quiesceWipeRecover(() -> {
             holder[0] = restorer.restore(zip, dir);
+            // Reconcile deletions: drop child topics that are no longer in the parent snapshot.
+            cleaner.retainTopics(dataDir, holder[0].getTopicHeads().keySet());
             cleaner.clearState(dataDir);
         });
         log.info("event=bootstrap.completed source=PIPE_AND_PROVIDER_FILE_DOWNLOAD topics={}", holder[0].getTopicHeads().size());

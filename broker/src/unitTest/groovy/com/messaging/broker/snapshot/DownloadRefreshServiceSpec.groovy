@@ -24,8 +24,8 @@ class DownloadRefreshServiceSpec extends Specification {
         def result = service.runBootstrapAndRefresh()
 
         then:
-        1 * refreshCoordinator.startRefresh("prices-v1") >> CompletableFuture.completedFuture(null)
-        1 * refreshCoordinator.startRefresh("reference-data-v5") >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("prices-v1", _) >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("reference-data-v5", _) >> CompletableFuture.completedFuture(null)
         0 * storage.getTopicNames()
         result.source == BootstrapSource.PIPE_AND_PROVIDER_FILE_DOWNLOAD
     }
@@ -39,8 +39,8 @@ class DownloadRefreshServiceSpec extends Specification {
         service.runBootstrapAndRefresh()
 
         then:
-        1 * refreshCoordinator.startRefresh("t-a") >> CompletableFuture.completedFuture(null)
-        1 * refreshCoordinator.startRefresh("t-b") >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-a", _) >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-b", _) >> CompletableFuture.completedFuture(null)
     }
 
     def "a failed bootstrap does NOT trigger any consumer refresh"() {
@@ -51,7 +51,7 @@ class DownloadRefreshServiceSpec extends Specification {
         def result = service.runBootstrapAndRefresh()
 
         then:
-        0 * refreshCoordinator.startRefresh(_)
+        0 * refreshCoordinator.startRefresh(_, _)
         !result.success
     }
 
@@ -64,8 +64,8 @@ class DownloadRefreshServiceSpec extends Specification {
 
         then: "no orchestrator bootstrap at all; just the local replay per topic"
         0 * orchestrator.bootstrap(_)
-        1 * refreshCoordinator.startRefresh("t-a") >> CompletableFuture.completedFuture(null)
-        1 * refreshCoordinator.startRefresh("t-b") >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-a", _) >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-b", _) >> CompletableFuture.completedFuture(null)
         result.success
         result.source == null
     }
@@ -77,7 +77,7 @@ class DownloadRefreshServiceSpec extends Specification {
         then:
         1 * bareMetalReset.reset()
         0 * orchestrator.bootstrap(_)
-        0 * refreshCoordinator.startRefresh(_)
+        0 * refreshCoordinator.startRefresh(_, _)
         result.success
     }
 
@@ -90,7 +90,7 @@ class DownloadRefreshServiceSpec extends Specification {
 
         then: "orchestrator is asked to force CLOUD"
         1 * orchestrator.bootstrap(BootstrapSource.CLOUD_SYNC) >> DownloadRefreshResult.ok(BootstrapSource.CLOUD_SYNC, null)
-        1 * refreshCoordinator.startRefresh("t-a") >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-a", _) >> CompletableFuture.completedFuture(null)
     }
 
     def "DOWNLOAD (auto) passes a null forced source to the orchestrator"() {
@@ -102,20 +102,20 @@ class DownloadRefreshServiceSpec extends Specification {
 
         then:
         1 * orchestrator.bootstrap(null) >> DownloadRefreshResult.ok(BootstrapSource.PIPE_AND_PROVIDER_STREAM, null)
-        1 * refreshCoordinator.startRefresh("t-a") >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-a", _) >> CompletableFuture.completedFuture(null)
     }
 
     def "a failing startRefresh for one topic does not abort the others"() {
         given:
         orchestrator.bootstrap(_) >> DownloadRefreshResult.ok(BootstrapSource.CLOUD_SYNC, null)
         storage.getTopicNames() >> (["t-a", "t-b"] as Set)
-        refreshCoordinator.startRefresh("t-a") >> { throw new RuntimeException("boom") }
+        refreshCoordinator.startRefresh("t-a", _) >> { throw new RuntimeException("boom") }
 
         when:
         service.runBootstrapAndRefresh()
 
         then:
         noExceptionThrown()
-        1 * refreshCoordinator.startRefresh("t-b") >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-b", _) >> CompletableFuture.completedFuture(null)
     }
 }

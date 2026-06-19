@@ -79,6 +79,11 @@ public class RefreshInitiator implements RefreshStarter {
 
     @Override
     public CompletableFuture<RefreshResult> startRefresh(String topic) {
+        return startRefresh(topic, "LOCAL");
+    }
+
+    @Override
+    public CompletableFuture<RefreshResult> startRefresh(String topic, String refreshType) {
         // Check for existing refresh and force cancel if needed
         RefreshContext existingRefresh = activeRefreshes.get(topic);
         if (existingRefresh != null) {
@@ -96,7 +101,7 @@ public class RefreshInitiator implements RefreshStarter {
         }
 
         // Build the context object before acquiring the lock — construction is safe without it.
-        RefreshContext context = new RefreshContext(topic, expectedConsumers);
+        RefreshContext context = new RefreshContext(topic, expectedConsumers, "TOPIC", refreshType);
         context.setState(RefreshState.RESET_SENT);
         context.setResetSentTime(Instant.now());
 
@@ -130,7 +135,7 @@ public class RefreshInitiator implements RefreshStarter {
         refreshLogger.logRefreshStarted(startContext);
 
         // Record metrics and pause pipe calls outside the lock (I/O-free, order doesn't matter)
-        metrics.recordRefreshStarted(topic, "LOCAL", currentRefreshId);
+        metrics.recordRefreshStarted(topic, refreshType, currentRefreshId);
         metrics.updateRefreshState(topic, RefreshState.RESET_SENT);
 
         // Pause pipe calls before starting refresh

@@ -159,7 +159,11 @@ public class RefreshCoordinator {
      * Start a refresh for a topic.
      */
     public CompletableFuture<RefreshResult> startRefresh(String topic) {
-        CompletableFuture<RefreshResult> result = initiationService.startRefresh(topic);
+        return startRefresh(topic, "LOCAL");
+    }
+
+    public CompletableFuture<RefreshResult> startRefresh(String topic, String refreshType) {
+        CompletableFuture<RefreshResult> result = initiationService.startRefresh(topic, refreshType);
 
         // Send RESET after initiation
         RefreshContext context = activeRefreshes.get(topic);

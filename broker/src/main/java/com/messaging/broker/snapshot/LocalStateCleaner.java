@@ -84,6 +84,35 @@ public class LocalStateCleaner {
         }
     }
 
+    /**
+     * Delete topic folders NOT in {@code keep} (preserving infra dirs) — used by the snapshot path
+     * to reconcile deletions: a topic removed upstream and absent from the snapshot manifest is
+     * removed from the child instead of lingering as stale live data.
+     */
+    public void retainTopics(String dataDirStr, java.util.Set<String> keep) {
+        Path dataDir = Paths.get(dataDirStr);
+        if (!Files.isDirectory(dataDir)) {
+            return;
+        }
+        try (var entries = Files.list(dataDir)) {
+            List<Path> stale = entries
+                    .filter(Files::isDirectory)
+                    .filter(p -> !NON_TOPIC_DIRS.contains(p.getFileName().toString()))
+                    .filter(p -> !keep.contains(p.getFileName().toString()))
+                    .toList();
+            for (Path topic : stale) {
+                deleteRecursively(topic);
+            }
+            if (!stale.isEmpty()) {
+                log.info("event=bootstrap.stale_topics_removed dataDir={} removed={}", dataDir, stale.size());
+            }
+        } catch (IOException e) {
+            throw new DataRefreshException(ErrorCode.DATA_REFRESH_SNAPSHOT_RESTORE_FAILED,
+                    "Failed to remove stale topics for bootstrap", e)
+                    .withContext("dataDir", dataDirStr);
+        }
+    }
+
     private static void deleteRecursively(Path path) throws IOException {
         if (!Files.exists(path)) {
             return;

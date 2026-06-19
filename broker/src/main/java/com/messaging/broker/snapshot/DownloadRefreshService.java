@@ -64,7 +64,7 @@ public class DownloadRefreshService {
         progress.start("local-refresh", BootstrapProgressTracker.Phase.REFRESHING);
         Collection<String> topics = storage.getTopicNames();
         log.info("event=local_refresh.triggering_consumer_refresh topics={}", topics.size());
-        refreshTopics(topics);
+        refreshTopics(topics, "LOCAL");
         progress.done();
         return DownloadRefreshResult.ok(null, null); // no bootstrap source for a local refresh
     }
@@ -84,15 +84,46 @@ public class DownloadRefreshService {
                 : storage.getTopicNames();
         log.info("event=download_refresh.triggering_consumer_refresh source={} topics={}",
                 result.getSource(), topics.size());
-        refreshTopics(topics);
+        refreshTopics(topics, result.getSource().name());
+        // Stay "running" until the consumer RESET→replay→READY actually finishes, so a second
+        // download refresh can't start mid-replay. (isRefreshActive stays true through the ~60s
+        // post-COMPLETED cleanup window, so this slightly over-waits — safe.)
+        awaitRefreshesComplete(topics);
         progress.done();
         return result;
     }
 
-    private void refreshTopics(Collection<String> topics) {
+    private static final long REFRESH_POLL_MS = 500;
+    /** Bounded wait — comfortably past the refresh abort watchdog (10 min) + cleanup window. */
+    private static final long REFRESH_MAX_WAIT_MS = 15L * 60L * 1000L;
+
+    private void awaitRefreshesComplete(Collection<String> topics) {
+        long deadline = System.currentTimeMillis() + REFRESH_MAX_WAIT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            boolean anyActive = false;
+            for (String topic : topics) {
+                if (refreshCoordinator.isRefreshActive(topic)) {
+                    anyActive = true;
+                    break;
+                }
+            }
+            if (!anyActive) {
+                return;
+            }
+            try {
+                Thread.sleep(REFRESH_POLL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        log.warn("event=download_refresh.await_refresh_timeout topics={}", topics.size());
+    }
+
+    private void refreshTopics(Collection<String> topics, String refreshType) {
         for (String topic : topics) {
             try {
-                refreshCoordinator.startRefresh(topic);
+                refreshCoordinator.startRefresh(topic, refreshType);
             } catch (Exception e) {
                 log.error("event=refresh.trigger_failed topic={} err={}", topic, e.toString());
             }
