@@ -85,10 +85,22 @@ A refresh may reach READY (and the broker report healthy/green) only once a real
 | `broker.bootstrap.escalation-jitter-ms` | `30000` | Cloud-escalation jitter (anti-stampede) |
 | `broker.cloud.data-url` | → registry url | Cloud target for escalation (any node) |
 
+## Refresh type (caller-chosen)
+
+The refresh is type-driven: `POST /admin/download-refresh` takes `?type=` or a JSON body `{"type":..}` (`RefreshType.from`, default `DOWNLOAD`). `DownloadRefreshService.runRefresh(type)` dispatches:
+
+| `type` | Behavior |
+|---|---|
+| `LOCAL` | Replay the node's own segments to consumers — no download (the original refresh). |
+| `DOWNLOAD` | Wipe + re-source, **auto-selecting** the source (default). |
+| `SNAPSHOT` / `INCREMENTAL` / `CLOUD` | Wipe + re-source, **forcing** that source (`RefreshType.forcedSource` → `DownloadRefreshOrchestrator.bootstrap(forced)`). |
+
+A forced source that is unavailable (e.g. `SNAPSHOT` with no snapshot, or a parent path that dies) escalates to the cloud via the [mid-stream escalation](#flow).
+
 ## API
 
-- `POST /admin/download-refresh` — start (async, single-flight).
-- `GET /admin/download-refresh/status` — running / progress / last result.
+- `POST /admin/download-refresh?type=DOWNLOAD` — start (async, single-flight); `type` also accepted in the JSON body.
+- `GET /admin/download-refresh/status` — running / type / progress / last result.
 - `GET /pipe/snapshot`, `GET /pipe/snapshot/info` — serve snapshot ZIP / availability + watermark.
 - `GET /pipe/poll` (+ `X-Pipe-Cursors` header) — k-way-merge multi-topic pull.
 

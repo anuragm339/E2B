@@ -36,10 +36,34 @@ public class DownloadRefreshService {
         this.progress = progress;
     }
 
-    /** Source fresh data, then refresh consumers for every affected topic. Never throws. */
+    /** Backward-compatible entry point — auto-selected download refresh. */
     public DownloadRefreshResult runBootstrapAndRefresh() {
+        return runRefresh(RefreshType.DOWNLOAD);
+    }
+
+    /**
+     * Dispatch a refresh by type. {@code LOCAL} replays the node's own segments (no download);
+     * the rest wipe + re-source (auto or forced source) and then refresh consumers. Never throws.
+     */
+    public DownloadRefreshResult runRefresh(RefreshType type) {
+        if (type.isLocal()) {
+            return runLocalRefresh();
+        }
+        return runDownloadRefresh(type);
+    }
+
+    private DownloadRefreshResult runLocalRefresh() {
+        progress.start("local-refresh", BootstrapProgressTracker.Phase.REFRESHING);
+        Collection<String> topics = storage.getTopicNames();
+        log.info("event=local_refresh.triggering_consumer_refresh topics={}", topics.size());
+        refreshTopics(topics);
+        progress.done();
+        return DownloadRefreshResult.ok(null, null); // no bootstrap source for a local refresh
+    }
+
+    private DownloadRefreshResult runDownloadRefresh(RefreshType type) {
         progress.start("download-refresh", BootstrapProgressTracker.Phase.DOWNLOADING);
-        DownloadRefreshResult result = orchestrator.bootstrap();
+        DownloadRefreshResult result = orchestrator.bootstrap(type.forcedSource());
         if (!result.isSuccess()) {
             progress.failed();
             log.warn("event=download_refresh.bootstrap_failed source={} err={} — skipping consumer refresh",
@@ -52,14 +76,18 @@ public class DownloadRefreshService {
                 : storage.getTopicNames();
         log.info("event=download_refresh.triggering_consumer_refresh source={} topics={}",
                 result.getSource(), topics.size());
+        refreshTopics(topics);
+        progress.done();
+        return result;
+    }
+
+    private void refreshTopics(Collection<String> topics) {
         for (String topic : topics) {
             try {
                 refreshCoordinator.startRefresh(topic);
             } catch (Exception e) {
-                log.error("event=download_refresh.refresh_trigger_failed topic={} err={}", topic, e.toString());
+                log.error("event=refresh.trigger_failed topic={} err={}", topic, e.toString());
             }
         }
-        progress.done();
-        return result;
     }
 }

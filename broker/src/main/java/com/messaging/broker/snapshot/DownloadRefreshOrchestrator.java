@@ -69,10 +69,18 @@ public class DownloadRefreshOrchestrator {
         return BootstrapSource.INCREMENTAL_PARENT;
     }
 
-    /** Run the bootstrap end to end. Never throws — failures are returned as a result. */
+    /** Run the bootstrap with auto source selection. Never throws — failures returned as a result. */
     public DownloadRefreshResult bootstrap() {
+        return bootstrap(null);
+    }
+
+    /**
+     * Run the bootstrap end to end. When {@code forced} is non-null that source is used; otherwise
+     * the source is auto-selected. Never throws — failures are returned as a result.
+     */
+    public DownloadRefreshResult bootstrap(BootstrapSource forced) {
         String parentUrl = topology.getCurrentParentUrl();
-        BootstrapSource source = chooseSource(parentUrl);
+        BootstrapSource source = (forced != null) ? forced : chooseSource(parentUrl);
         log.info("event=bootstrap.started source={} parentUrl={}", source, parentUrl);
         try {
             switch (source) {

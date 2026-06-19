@@ -17,7 +17,7 @@ class DownloadRefreshServiceSpec extends Specification {
     def "SNAPSHOT success refreshes every topic from the manifest"() {
         given:
         def manifest = new SnapshotManifest(1L, ["prices-v1": 5L, "reference-data-v5": 9L])
-        orchestrator.bootstrap() >> DownloadRefreshResult.ok(BootstrapSource.SNAPSHOT, manifest)
+        orchestrator.bootstrap(_) >> DownloadRefreshResult.ok(BootstrapSource.SNAPSHOT, manifest)
 
         when:
         def result = service.runBootstrapAndRefresh()
@@ -31,7 +31,7 @@ class DownloadRefreshServiceSpec extends Specification {
 
     def "CLOUD/incremental success (no manifest) refreshes topics discovered in storage"() {
         given:
-        orchestrator.bootstrap() >> DownloadRefreshResult.ok(BootstrapSource.CLOUD, null)
+        orchestrator.bootstrap(_) >> DownloadRefreshResult.ok(BootstrapSource.CLOUD, null)
         storage.getTopicNames() >> (["t-a", "t-b"] as Set)
 
         when:
@@ -44,7 +44,7 @@ class DownloadRefreshServiceSpec extends Specification {
 
     def "a failed bootstrap does NOT trigger any consumer refresh"() {
         given:
-        orchestrator.bootstrap() >> DownloadRefreshResult.failure(BootstrapSource.CLOUD, "cloud unreachable")
+        orchestrator.bootstrap(_) >> DownloadRefreshResult.failure(BootstrapSource.CLOUD, "cloud unreachable")
 
         when:
         def result = service.runBootstrapAndRefresh()
@@ -54,9 +54,48 @@ class DownloadRefreshServiceSpec extends Specification {
         !result.success
     }
 
+    def "LOCAL refresh replays all topics WITHOUT any bootstrap/download"() {
+        given:
+        storage.getTopicNames() >> (["t-a", "t-b"] as Set)
+
+        when:
+        def result = service.runRefresh(RefreshType.LOCAL)
+
+        then: "no orchestrator bootstrap at all; just the local replay per topic"
+        0 * orchestrator.bootstrap(_)
+        1 * refreshCoordinator.startRefresh("t-a") >> CompletableFuture.completedFuture(null)
+        1 * refreshCoordinator.startRefresh("t-b") >> CompletableFuture.completedFuture(null)
+        result.success
+        result.source == null
+    }
+
+    def "a forced source type is passed through to the orchestrator"() {
+        given:
+        storage.getTopicNames() >> (["t-a"] as Set)
+
+        when:
+        service.runRefresh(RefreshType.CLOUD)
+
+        then: "orchestrator is asked to force CLOUD"
+        1 * orchestrator.bootstrap(BootstrapSource.CLOUD) >> DownloadRefreshResult.ok(BootstrapSource.CLOUD, null)
+        1 * refreshCoordinator.startRefresh("t-a") >> CompletableFuture.completedFuture(null)
+    }
+
+    def "DOWNLOAD (auto) passes a null forced source to the orchestrator"() {
+        given:
+        storage.getTopicNames() >> (["t-a"] as Set)
+
+        when:
+        service.runRefresh(RefreshType.DOWNLOAD)
+
+        then:
+        1 * orchestrator.bootstrap(null) >> DownloadRefreshResult.ok(BootstrapSource.INCREMENTAL_PARENT, null)
+        1 * refreshCoordinator.startRefresh("t-a") >> CompletableFuture.completedFuture(null)
+    }
+
     def "a failing startRefresh for one topic does not abort the others"() {
         given:
-        orchestrator.bootstrap() >> DownloadRefreshResult.ok(BootstrapSource.CLOUD, null)
+        orchestrator.bootstrap(_) >> DownloadRefreshResult.ok(BootstrapSource.CLOUD, null)
         storage.getTopicNames() >> (["t-a", "t-b"] as Set)
         refreshCoordinator.startRefresh("t-a") >> { throw new RuntimeException("boom") }
 
