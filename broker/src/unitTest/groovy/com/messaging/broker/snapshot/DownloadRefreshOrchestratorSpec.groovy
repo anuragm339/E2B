@@ -1,6 +1,8 @@
 package com.messaging.broker.snapshot
 
 import com.messaging.broker.core.TopologyManager
+import com.messaging.common.api.PipeConnector
+import com.messaging.common.api.StorageEngine
 import spock.lang.Specification
 
 import java.nio.file.Path
@@ -11,9 +13,11 @@ class DownloadRefreshOrchestratorSpec extends Specification {
     BootstrapSourceClient client = Mock()
     LocalStateCleaner cleaner = Mock()
     SnapshotRestorer restorer = Mock()
+    PipeConnector pipeConnector = Mock()
+    StorageEngine storage = Mock()
 
     DownloadRefreshOrchestrator orchestrator = new DownloadRefreshOrchestrator(
-            "/tmp/data", topology, client, cleaner, restorer, 0L) // jitter 0 in tests
+            "/tmp/data", topology, client, cleaner, restorer, pipeConnector, storage, 0L) // jitter 0 in tests
 
     // ── source selection ─────────────────────────────────────────────────────
 
@@ -46,6 +50,31 @@ class DownloadRefreshOrchestratorSpec extends Specification {
 
         expect:
         orchestrator.chooseSource("http://parent") == BootstrapSource.PIPE_AND_PROVIDER_STREAM
+    }
+
+    // ── quiesce ───────────────────────────────────────────────────────────────
+
+    def "download bootstrap pauses the pipe and closes/recovers storage around the wipe"() {
+        given:
+        topology.getCurrentParentUrl() >> null // CLOUD_SYNC path
+
+        when:
+        orchestrator.bootstrap()
+
+        then: "pipe paused, storage closed BEFORE the wipe, recovered AFTER, pipe resumed"
+        1 * pipeConnector.pausePipeCalls()
+
+        then:
+        1 * storage.close()
+
+        then:
+        1 * cleaner.clearTopicData("/tmp/data")
+
+        then:
+        1 * storage.recover()
+
+        then:
+        1 * pipeConnector.resumePipeCalls()
     }
 
     // ── sequencing per path ──────────────────────────────────────────────────
