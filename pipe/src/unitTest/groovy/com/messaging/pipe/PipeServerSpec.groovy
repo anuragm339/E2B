@@ -133,6 +133,17 @@ class PipeServerSpec extends Specification {
         resp.headers.get(PipeServer.HEADS_HEADER) != null
     }
 
+    def "merge sets each record's topic (real storage.read returns null-topic records)"() {
+        given: "a record stored under topic-a but with a null topic field, as the segment reader returns"
+        backing['topic-a'] = [new MessageRecord(5L, null, 0, 'k5', null, '{}', Instant.now())]
+
+        when:
+        def resp = server.pollMessages("{}", 0L, 100, "")
+
+        then: "the served record carries its topic so the child can route it"
+        records(resp)[0].topic == 'topic-a'
+    }
+
     // ── Legacy mode (no header) ──────────────────────────────────────────────
 
     def "legacy mode (no cursor header) serves a single topic from the offset"() {

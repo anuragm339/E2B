@@ -184,6 +184,9 @@ public class PipeServer {
         long last = from;
         for (MessageRecord r : records) {
             if (r.getOffset() >= from) {
+                // storage.read does NOT populate topic (it is implicit in the segment path); the
+                // merged response mixes topics, so the child needs each record's topic to route it.
+                r.setTopic(topic);
                 buf.add(r);
                 last = r.getOffset();
             }
