@@ -58,6 +58,12 @@ broker:
 
   # Download-refresh bootstrap: safety cap on pull batches (terminates a synthetic looping cloud;
   # a finite production source terminates earlier on 204).
+  # BARE_METAL factory reset: stop everything, wipe the storage dir's contents, exit (non-zero) for
+  # an external supervisor to restart. settle-ms lets the admin HTTP response flush before teardown.
+  bare-metal:
+    exit-code: ${BARE_METAL_EXIT_CODE:70}
+    settle-ms: ${BARE_METAL_SETTLE_MS:500}
+
   bootstrap:
     max-batches: ${BOOTSTRAP_MAX_BATCHES:100000}
     # Upper bound (ms) on a random delay before escalating to the cloud when the parent is mid-

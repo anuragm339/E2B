@@ -15,19 +15,25 @@ public enum RefreshType {
     /** Force incremental k-way-merge pull from the parent. */
     INCREMENTAL,
     /** Force pull from the cloud. */
-    CLOUD;
+    CLOUD,
+    /** Factory reset: stop everything, wipe the storage dir's contents, exit (operator restarts). */
+    BARE_METAL;
 
     public boolean isLocal() {
         return this == LOCAL;
     }
 
-    /** The forced bootstrap source, or {@code null} to auto-select (DOWNLOAD). LOCAL has none. */
+    public boolean isBareMetal() {
+        return this == BARE_METAL;
+    }
+
+    /** The forced bootstrap source, or {@code null} to auto-select / N-A (DOWNLOAD/LOCAL/BARE_METAL). */
     public BootstrapSource forcedSource() {
         return switch (this) {
             case SNAPSHOT -> BootstrapSource.SNAPSHOT;
             case INCREMENTAL -> BootstrapSource.INCREMENTAL_PARENT;
             case CLOUD -> BootstrapSource.CLOUD;
-            case DOWNLOAD, LOCAL -> null;
+            case DOWNLOAD, LOCAL, BARE_METAL -> null;
         };
     }
 

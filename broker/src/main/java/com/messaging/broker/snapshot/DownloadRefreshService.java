@@ -24,16 +24,19 @@ public class DownloadRefreshService {
     private final RefreshCoordinator refreshCoordinator;
     private final StorageEngine storage;
     private final BootstrapProgressTracker progress;
+    private final BareMetalResetService bareMetalReset;
 
     public DownloadRefreshService(
             DownloadRefreshOrchestrator orchestrator,
             RefreshCoordinator refreshCoordinator,
             StorageEngine storage,
-            BootstrapProgressTracker progress) {
+            BootstrapProgressTracker progress,
+            BareMetalResetService bareMetalReset) {
         this.orchestrator = orchestrator;
         this.refreshCoordinator = refreshCoordinator;
         this.storage = storage;
         this.progress = progress;
+        this.bareMetalReset = bareMetalReset;
     }
 
     /** Backward-compatible entry point — auto-selected download refresh. */
@@ -46,6 +49,11 @@ public class DownloadRefreshService {
      * the rest wipe + re-source (auto or forced source) and then refresh consumers. Never throws.
      */
     public DownloadRefreshResult runRefresh(RefreshType type) {
+        if (type.isBareMetal()) {
+            log.warn("event=refresh.bare_metal_initiated — node will stop, wipe storage, and exit for restart");
+            bareMetalReset.reset(); // async: stop everything → wipe → System.exit
+            return DownloadRefreshResult.ok(null, null);
+        }
         if (type.isLocal()) {
             return runLocalRefresh();
         }

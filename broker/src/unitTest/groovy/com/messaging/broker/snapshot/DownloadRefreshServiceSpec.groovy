@@ -11,8 +11,9 @@ class DownloadRefreshServiceSpec extends Specification {
     DownloadRefreshOrchestrator orchestrator = Mock()
     RefreshCoordinator refreshCoordinator = Mock()
     StorageEngine storage = Mock()
+    BareMetalResetService bareMetalReset = Mock()
 
-    DownloadRefreshService service = new DownloadRefreshService(orchestrator, refreshCoordinator, storage, new BootstrapProgressTracker())
+    DownloadRefreshService service = new DownloadRefreshService(orchestrator, refreshCoordinator, storage, new BootstrapProgressTracker(), bareMetalReset)
 
     def "SNAPSHOT success refreshes every topic from the manifest"() {
         given:
@@ -67,6 +68,17 @@ class DownloadRefreshServiceSpec extends Specification {
         1 * refreshCoordinator.startRefresh("t-b") >> CompletableFuture.completedFuture(null)
         result.success
         result.source == null
+    }
+
+    def "BARE_METAL triggers the reset and does NO bootstrap or consumer refresh"() {
+        when:
+        def result = service.runRefresh(RefreshType.BARE_METAL)
+
+        then:
+        1 * bareMetalReset.reset()
+        0 * orchestrator.bootstrap(_)
+        0 * refreshCoordinator.startRefresh(_)
+        result.success
     }
 
     def "a forced source type is passed through to the orchestrator"() {
