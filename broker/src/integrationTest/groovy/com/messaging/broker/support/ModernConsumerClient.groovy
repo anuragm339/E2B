@@ -59,6 +59,14 @@ class ModernConsumerClient implements AutoCloseable {
         ))
     }
 
+    void sendBatchAck(String topic, String group) {
+        send(new BrokerMessage(
+            BrokerMessage.MessageType.BATCH_ACK,
+            System.nanoTime(),
+            BrokerTestApp.buildGroupTopicPayload(topic, group)
+        ))
+    }
+
     boolean isConnected() {
         connection.isAlive()
     }

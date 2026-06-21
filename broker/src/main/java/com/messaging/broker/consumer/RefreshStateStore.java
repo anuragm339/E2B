@@ -55,6 +55,14 @@ public class RefreshStateStore {
             props.setProperty(topicPrefix + ".ready.sent.time", context.getReadySentTime().toString());
         }
 
+        props.setProperty(topicPrefix + ".replay.start.offset", String.valueOf(context.getReplayStartOffset()));
+        props.setProperty(topicPrefix + ".replay.target.offset", String.valueOf(context.getReplayTargetOffset()));
+        if (context.getReplayCutoffTime() != null) {
+            props.setProperty(topicPrefix + ".replay.cutoff.time", context.getReplayCutoffTime().toString());
+        } else {
+            props.remove(topicPrefix + ".replay.cutoff.time");
+        }
+
         // Save refresh ID (for per-batch metrics tracking)
         if (context.getRefreshId() != null) {
             props.setProperty(topicPrefix + ".refresh.id", context.getRefreshId());
@@ -242,6 +250,21 @@ public class RefreshStateStore {
         String readySentTimeStr = props.getProperty(topicPrefix + ".ready.sent.time");
         if (readySentTimeStr != null) {
             context.setReadySentTime(Instant.parse(readySentTimeStr));
+        }
+
+        String replayStartOffset = props.getProperty(topicPrefix + ".replay.start.offset");
+        if (replayStartOffset != null) {
+            context.setReplayStartOffset(Long.parseLong(replayStartOffset));
+        }
+
+        String replayTargetOffset = props.getProperty(topicPrefix + ".replay.target.offset");
+        if (replayTargetOffset != null) {
+            context.setReplayTargetOffset(Long.parseLong(replayTargetOffset));
+        }
+
+        String replayCutoffTime = props.getProperty(topicPrefix + ".replay.cutoff.time");
+        if (replayCutoffTime != null) {
+            context.setReplayCutoffTime(Instant.parse(replayCutoffTime));
         }
 
         // Load refresh ID (for per-batch metrics tracking)

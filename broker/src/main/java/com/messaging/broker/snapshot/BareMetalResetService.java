@@ -14,7 +14,13 @@ import java.util.Comparator;
 import java.util.List;
 
 /**
- * BARE_METAL factory reset: stop the whole node, wipe the storage directory's contents, and exit.
+ * Bare-metal hard reset: stop the whole node, wipe the storage directory's contents, and exit.
+ *
+ * <p>The admin {@code BARE_METAL} refresh type drives this path (via {@code DownloadRefreshService}):
+ * the connected consumers are RESET best-effort first, then {@link #reset()} tears the node down and
+ * {@code System.exit}s. It is the destructive variant — distinct from the in-process
+ * stop-network-server / wipe / re-source lifecycle that the other (SNAPSHOT/STREAM/CLOUD) refresh
+ * types follow without exiting.
  *
  * <p>Order (per design): stop pipe + broker + everything FIRST so nothing holds the storage files,
  * THEN delete all contents, THEN exit. {@link ApplicationContext#stop()} runs every {@code @PreDestroy}

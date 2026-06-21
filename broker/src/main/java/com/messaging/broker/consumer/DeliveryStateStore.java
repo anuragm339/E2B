@@ -73,6 +73,9 @@ public class DeliveryStateStore {
      * @param inFlightUntil Timestamp when in-flight status expires
      */
     public void saveState(String deliveryKey, long lastAckedOffset, long inFlightUntil) {
+        if (repository.isPaused()) {
+            return; // dropped during a refresh wipe so stale state cannot be re-persisted
+        }
         DeliveryState state = new DeliveryState(lastAckedOffset, inFlightUntil);
         cache.compute(deliveryKey, (key, ignored) -> {
             persistState(key, state);
@@ -89,6 +92,9 @@ public class DeliveryStateStore {
      * @param lastAckedOffset New acknowledged offset
      */
     public void updateAckedOffset(String deliveryKey, long lastAckedOffset) {
+        if (repository.isPaused()) {
+            return;
+        }
         cache.compute(deliveryKey, (key, current) -> {
             DeliveryState existing = current != null ? current : new DeliveryState(0, 0);
             DeliveryState updated = new DeliveryState(lastAckedOffset, existing.inFlightUntil);
@@ -104,6 +110,9 @@ public class DeliveryStateStore {
      * @param inFlightUntil Timestamp when in-flight expires
      */
     public void updateInFlightUntil(String deliveryKey, long inFlightUntil) {
+        if (repository.isPaused()) {
+            return;
+        }
         cache.compute(deliveryKey, (key, current) -> {
             DeliveryState existing = current != null ? current : new DeliveryState(0, 0);
             DeliveryState updated = new DeliveryState(existing.lastAckedOffset, inFlightUntil);
@@ -201,6 +210,23 @@ public class DeliveryStateStore {
             // Trigger immediate flush to persist cleanup
             repository.flush();
         }
+    }
+
+    /**
+     * Quiesce delivery-state tracking for a destructive download-refresh wipe: cancel the periodic
+     * flush, drop the in-memory cache + repository state, and reject further writes so a stray ACK
+     * cannot re-create {@code delivery-state.properties} after {@code clearState} deletes it.
+     */
+    public void quiesceForWipe() {
+        repository.pauseForWipe();
+        cache.clear();
+    }
+
+    /** Resume after the wipe, reloading the cache from the (now wiped/restored) file on disk. */
+    public void resumeAfterWipe() {
+        repository.resumeAfterWipe();
+        cache.clear();
+        loadFromRepository();
     }
 
     /**

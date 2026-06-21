@@ -1,5 +1,6 @@
 package com.messaging.broker.snapshot;
 
+import com.messaging.common.api.PipeConnector;
 import com.messaging.common.api.StorageEngine;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.scheduling.annotation.Scheduled;
@@ -30,6 +31,7 @@ public class SnapshotScheduler {
     private final StorageEngine storage;
     private final SnapshotBuilder builder;
     private final SnapshotStore store;
+    private final PipeConnector pipeConnector;
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     public SnapshotScheduler(
@@ -37,12 +39,14 @@ public class SnapshotScheduler {
             @Value("${broker.storage.dataDir:./data}") String dataDir,
             StorageEngine storage,
             SnapshotBuilder builder,
-            SnapshotStore store) {
+            SnapshotStore store,
+            PipeConnector pipeConnector) {
         this.enabled = enabled;
         this.dataDir = dataDir;
         this.storage = storage;
         this.builder = builder;
         this.store = store;
+        this.pipeConnector = pipeConnector;
     }
 
     @Scheduled(
@@ -64,20 +68,26 @@ public class SnapshotScheduler {
             log.info("event=snapshot.build_skipped reason=already_running");
             return null;
         }
+        // P4b: pause the pipe so the per-topic heads and the global pipe cursor N* are a consistent
+        // cut — otherwise the pipe could append between capturing heads and reading the cursor, and a
+        // restoring child seeded with N* would miss those records.
+        pipeConnector.pausePipeCalls();
         try {
             Map<String, Long> heads = new LinkedHashMap<>();
             for (String topic : storage.getTopicNames()) {
                 heads.put(topic, storage.getCurrentOffset(topic, 0));
             }
-            SnapshotManifest manifest = builder.build(Paths.get(dataDir), store.tempZip(), heads);
+            long pipeOffset = pipeConnector.getCurrentOffset(); // N*
+            SnapshotManifest manifest = builder.build(Paths.get(dataDir), store.tempZip(), heads, pipeOffset);
             store.publish(store.tempZip(), manifest);
-            log.info("event=snapshot.published topics={}", heads.size());
+            log.info("event=snapshot.published topics={} pipeOffset={}", heads.size(), pipeOffset);
             return manifest;
         } catch (Exception e) {
             // Never propagate to the Micronaut scheduled pool — log and try again next tick.
             log.error("event=snapshot.build_failed err={}", e.toString(), e);
             return null;
         } finally {
+            pipeConnector.resumePipeCalls();
             running.set(false);
         }
     }

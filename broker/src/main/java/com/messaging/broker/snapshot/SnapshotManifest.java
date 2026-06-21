@@ -27,15 +27,30 @@ public class SnapshotManifest {
     @JsonProperty("topicHeads")
     private Map<String, Long> topicHeads = new LinkedHashMap<>();
 
+    /**
+     * N* — the global pipe cursor ({@code HttpPipeConnector.getCurrentOffset()}) captured atomically
+     * with the topic data when the snapshot was built. The restoring child seeds its pipe-offset to
+     * this so the pipe resumes from N* (fetching only the tail the parent appended after the snapshot)
+     * instead of re-streaming the whole history from 0. {@code -1} = absent (legacy snapshot) →
+     * restore falls back to streaming from 0.
+     */
+    @JsonProperty("pipeOffset")
+    private long pipeOffset = -1;
+
     public SnapshotManifest() {
     }
 
     public SnapshotManifest(long createdAtMs, Map<String, Long> topicHeads) {
+        this(createdAtMs, topicHeads, -1);
+    }
+
+    public SnapshotManifest(long createdAtMs, Map<String, Long> topicHeads, long pipeOffset) {
         this.schemaVersion = SCHEMA_VERSION;
         this.createdAtMs = createdAtMs;
         if (topicHeads != null) {
             this.topicHeads = new LinkedHashMap<>(topicHeads);
         }
+        this.pipeOffset = pipeOffset;
     }
 
     public int getSchemaVersion() {
@@ -60,5 +75,14 @@ public class SnapshotManifest {
 
     public void setTopicHeads(Map<String, Long> topicHeads) {
         this.topicHeads = topicHeads;
+    }
+
+    /** N* — the global pipe cursor at snapshot-build time; -1 when absent (legacy snapshot). */
+    public long getPipeOffset() {
+        return pipeOffset;
+    }
+
+    public void setPipeOffset(long pipeOffset) {
+        this.pipeOffset = pipeOffset;
     }
 }

@@ -42,11 +42,20 @@ endpoints:
 broker:
   nodeId: ${NODE_ID:local-001}
 
-  # Refresh READY delivery-freshness gate. A refresh is only allowed to reach READY (and the
-  # broker reported healthy/green) once a real delivery reached a consumer within this window,
-  # unless the topic is legitimately empty (healthy-idle). 0 disables the gate. Default 6h.
+  # Refresh READY settle window, measured against each record's immutable created_time. A refresh
+  # reaches READY for a topic once the consumer has been delivered every record whose created_time
+  # is OLDER than this window — the "settled" history. Records created within the window are still
+  # settling and flow via normal delivery after READY (they do not gate it). 0 = require full
+  # catch-up to the latest record. Default 6h.
   refresh:
-    delivery-freshness-window-ms: ${REFRESH_DELIVERY_FRESHNESS_WINDOW_MS:21600000}
+    ready-settle-window-ms: ${REFRESH_READY_SETTLE_WINDOW_MS:21600000}
+    # Replay only records created within the last N hours before refresh start. 0 means full
+    # available history. READY is sent only after consumers catch up to the captured replay target.
+    replay:
+      window-hours: ${REFRESH_REPLAY_WINDOW_HOURS:0}
+    # When set, refresh health is DOWN only for active refreshes on these topics. Non-critical
+    # topic refreshes may continue in the background while /health reports green.
+    health-critical-topics: []
 
   # Data snapshot for POS->POS bootstrap. A parent-capable POS periodically builds a ZIP of pure
   # topic data (served at /pipe/snapshot) so a child can bootstrap fast instead of streaming every
@@ -58,8 +67,8 @@ broker:
 
   # Download-refresh bootstrap: safety cap on pull batches (terminates a synthetic looping cloud;
   # a finite production source terminates earlier on 204).
-  # BARE_METAL factory reset: stop everything, wipe the storage dir's contents, exit (non-zero) for
-  # an external supervisor to restart. settle-ms lets the admin HTTP response flush before teardown.
+  # Legacy factory-reset settings retained for the BareMetalResetService bean. The admin
+  # BARE_METAL refresh type now follows the normal destructive refresh lifecycle instead of exiting.
   bare-metal:
     exit-code: ${BARE_METAL_EXIT_CODE:70}
     settle-ms: ${BARE_METAL_SETTLE_MS:500}
@@ -69,6 +78,12 @@ broker:
     # Upper bound (ms) on a random delay before escalating to the cloud when the parent is mid-
     # refresh, so a parent refresh doesn't fan its children into a synchronized cloud stampede.
     escalation-jitter-ms: ${BOOTSTRAP_ESCALATION_JITTER_MS:30000}
+    # Fresh install / post-bare-metal empty boot: when the data dir has no topics, no in-flight
+    # refresh and no pipe offset, run a bootstrap-and-refresh (health DOWN → re-source →
+    # RESET→replay→READY) so the empty node converges to the bare-metal end state instead of
+    # silently streaming in while /health reads green. Disabled in tests.
+    fresh-install:
+      enabled: ${BOOTSTRAP_FRESH_INSTALL_ENABLED:true}
 
   # Self-status error API (/admin/status/errors*). The ring captures WARN+ERROR; this sets the
   # DEFAULT minimum level the endpoints SHOW (ERROR keeps the views error-focused). Override per

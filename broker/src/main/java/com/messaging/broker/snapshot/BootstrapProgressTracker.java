@@ -66,6 +66,19 @@ public class BootstrapProgressTracker {
         return phase;
     }
 
+    /**
+     * True while the node is actively wiping + re-sourcing its data (the DOWNLOADING/INGESTING
+     * phases) — the destructive window where there is no per-topic {@code RefreshContext} yet and the
+     * node has no serveable data. {@code /health} reports DOWN unconditionally during this window
+     * (node-wide), independent of {@code health-critical-topics}. The subsequent REFRESHING phase is
+     * deliberately excluded: by then data is restored and per-topic {@code RefreshContext}s drive
+     * health with the normal {@code health-critical-topics} scoping.
+     */
+    public boolean isReSourcing() {
+        Phase p = phase;
+        return p == Phase.DOWNLOADING || p == Phase.INGESTING;
+    }
+
     /** Percent complete in [0,100], or -1 when the denominator is unknown. */
     public double percent() {
         long d = denominator;

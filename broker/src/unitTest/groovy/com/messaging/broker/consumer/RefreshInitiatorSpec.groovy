@@ -18,6 +18,8 @@ class RefreshInitiatorSpec extends Specification {
     RefreshStateStore   stateStore      = Mock()
     RefreshEventLogger  refreshLogger   = Mock()
     RefreshWorkflow     stateMachine    = new RefreshStateMachine()
+    RefreshReplayWindowResolver replayWindowResolver = Mock()
+    com.messaging.broker.legacy.LegacyClientConfig legacyClientConfig = Mock()  // getServiceTopics() defaults to null
 
     RefreshInitiator initiator
 
@@ -30,25 +32,58 @@ class RefreshInitiatorSpec extends Specification {
 
     def setup() {
         initiator = new RefreshInitiator(
-                remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger)
+                remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger,
+                replayWindowResolver, legacyClientConfig)
         initiator.setSharedState(activeRefreshes, resetRetryTasks, replayCheckTasks, abortWatchdogTasks, readyTimeoutTasks)
 
         // Default stubs
         remoteConsumers.getGroupTopicIdentifiers("prices-v1")  >> (["group-a:prices-v1"] as Set)
         remoteConsumers.getGroupTopicIdentifiers("ref-data-v5") >> (["group-b:ref-data-v5"] as Set)
+        replayWindowResolver.resolve(_ as String, _) >> new RefreshReplayWindowResolver.RefreshReplayWindow(0L, Long.MIN_VALUE, null)
         stateStore.saveState(_) >> {}
+    }
+
+    def "getExpectedConsumers includes CONFIGURED groups so a cold-boot refresh waits instead of skipping"() {
+        given: "no consumer registered at runtime yet, but config maps the service to this topic"
+        remoteConsumers.getGroupTopicIdentifiers("minimum-price") >> ([] as Set)
+        legacyClientConfig.getServiceTopics() >> ["price-quote": ["minimum-price", "prices-v1"]]
+
+        expect: "the configured group:topic is expected, so the refresh is not skipped"
+        initiator.getExpectedConsumers("minimum-price") == (["price-quote:minimum-price"] as Set)
+    }
+
+    def "getExpectedConsumers prefers runtime consumers and ignores config when any are connected"() {
+        given: "a consumer is connected with a different group than the configured one"
+        remoteConsumers.getGroupTopicIdentifiers("minimum-price") >> (["dynamic-grp:minimum-price"] as Set)
+        legacyClientConfig.getServiceTopics() >> ["price-quote": ["minimum-price"]]
+
+        expect: "only the connected consumer is expected — we don't wait on a configured-but-absent group"
+        initiator.getExpectedConsumers("minimum-price") == (["dynamic-grp:minimum-price"] as Set)
     }
 
     // ── Happy-path ────────────────────────────────────────────────────────────
 
-    def "startRefresh creates context in RESET_SENT state for known topic"() {
+    def "startRefresh creates context in RESET_SENT state without pausing pipe"() {
         when:
         initiator.startRefresh("prices-v1").get()
 
         then:
         activeRefreshes.containsKey("prices-v1")
         activeRefreshes["prices-v1"].state == RefreshState.RESET_SENT
-        1 * pipeConnector.pausePipeCalls()
+        0 * pipeConnector.pausePipeCalls()
+    }
+
+    def "startRefresh captures replay window offsets on context"() {
+        given:
+        def cutoff = java.time.Instant.parse("2026-06-19T00:00:00Z")
+        when:
+        initiator.startRefresh("prices-v1").get()
+
+        then:
+        1 * replayWindowResolver.resolve("prices-v1", _) >> new RefreshReplayWindowResolver.RefreshReplayWindow(200L, 350L, cutoff)
+        activeRefreshes["prices-v1"].replayStartOffset == 200L
+        activeRefreshes["prices-v1"].replayTargetOffset == 350L
+        activeRefreshes["prices-v1"].replayCutoffTime == cutoff
     }
 
     def "startRefresh skips when no consumers are registered"() {

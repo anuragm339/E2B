@@ -1,7 +1,8 @@
 # Multi-stage Dockerfile for Messaging Provider Broker
 
 # Stage 1: Build
-FROM gradle:8.5-jdk17 AS builder
+# JDK 21: the build targets Java 21 (build.gradle sourceCompatibility/targetCompatibility = 21).
+FROM gradle:8.5-jdk21 AS builder
 
 WORKDIR /build
 
@@ -21,7 +22,7 @@ COPY broker/ broker/
 RUN ./gradlew :broker:build -x test --no-daemon
 
 # Stage 2: Runtime
-FROM eclipse-temurin:17-jre-jammy
+FROM eclipse-temurin:21-jre-jammy
 
 # Create non-root user
 RUN groupadd -r broker && useradd -r -g broker broker

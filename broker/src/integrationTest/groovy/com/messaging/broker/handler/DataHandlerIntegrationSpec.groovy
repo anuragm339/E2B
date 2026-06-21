@@ -6,6 +6,8 @@ import com.messaging.common.model.EventType
 import io.micronaut.test.extensions.spock.annotation.MicronautTest
 import spock.util.concurrent.PollingConditions
 
+import java.time.Instant
+
 @MicronautTest
 class DataHandlerIntegrationSpec extends BrokerHandlerSpecSupport {
 
@@ -36,6 +38,40 @@ class DataHandlerIntegrationSpec extends BrokerHandlerSpecSupport {
             assert records.size() == 1
             assert records[0].eventType == EventType.DELETE
             assert records[0].data == null
+        }
+    }
+
+    def "DataHandler stores the source created_time verbatim (immutable, used by the READY gate)"() {
+        given:
+        def sourceCreated = Instant.parse('2011-02-20T10:15:30Z')
+
+        when:
+        consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 1004L,
+            toJson([msg_key: 'dh-key-created', event_type: 'MESSAGE', data: [v: 1],
+                    topic: 'dh-created-topic', created: sourceCreated.toString()]).bytes))
+
+        then:
+        new PollingConditions(timeout: 3).eventually {
+            def records = storage.read('dh-created-topic', 0, 0, 10)
+            assert records.size() == 1
+            assert records[0].createdAt == sourceCreated
+        }
+    }
+
+    def "DataHandler stamps ingest time when the producer omits created_time"() {
+        given:
+        def before = Instant.now()
+
+        when:
+        consumer.send(new BrokerMessage(BrokerMessage.MessageType.DATA, 1005L,
+            toJson([msg_key: 'dh-key-nocreated', event_type: 'MESSAGE', data: [v: 1],
+                    topic: 'dh-nocreated-topic']).bytes))
+
+        then:
+        new PollingConditions(timeout: 3).eventually {
+            def records = storage.read('dh-nocreated-topic', 0, 0, 10)
+            assert records.size() == 1
+            assert !records[0].createdAt.isBefore(before)
         }
     }
 

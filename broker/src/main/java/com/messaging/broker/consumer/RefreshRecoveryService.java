@@ -92,15 +92,7 @@ public class RefreshRecoveryService implements RefreshRecovery {
         }
 
         log.info("Resuming {} refresh(es) from saved state", savedRefreshes.size());
-
-        // Pause pipes BEFORE resuming any refresh
-        pipeConnector.pausePipeCalls();
-
-        LogContext pipeContext = LogContext.builder()
-                .custom("reason", "recovery")
-                .custom("refreshCount", savedRefreshes.size())
-                .build();
-        refreshLogger.logPipePaused(pipeContext);
+        log.info("Pipe polling remains active during refresh recovery; recovery does not mutate pipe-offset.properties");
 
         // Record startup time for all resumed refreshes
         Instant startupTime = Instant.now();
@@ -306,7 +298,7 @@ public class RefreshRecoveryService implements RefreshRecovery {
 
         // H2-NEW-1: Arm the abort watchdog for recovered READY_SENT refreshes. Without this,
         // a restart during the READY_SENT phase has no upper-bound safety net — the READY ACK
-        // retry loop runs indefinitely if consumers never reconnect, leaving the pipe paused.
+        // retry loop runs indefinitely if consumers never reconnect.
         if (scheduleAbortWatchdogCallback != null) {
             scheduleAbortWatchdogCallback.schedule(topic);
         }

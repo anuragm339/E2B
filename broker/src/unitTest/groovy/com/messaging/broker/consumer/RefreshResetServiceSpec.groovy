@@ -98,6 +98,36 @@ class RefreshResetServiceSpec extends Specification {
         context.getReceivedResetAcks().contains("groupA:topic")
     }
 
+    def "handleResetAck resets consumer to configured replay start offset"() {
+        given:
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.RESET_SENT)
+        context.setReplayStartOffset(200L)
+        remoteConsumers.isLegacyConsumer("client-1:topic:groupA") >> false
+
+        when:
+        service.handleResetAck("groupA:topic", "client-1", "topic", context, "trace-1")
+
+        then:
+        1 * remoteConsumers.resetConsumerOffset("client-1", "topic", "groupA", 200L)
+        context.consumerOffsets["groupA:topic"] == 200L
+    }
+
+    def "handleResetAck adjusts replay start offset for legacy consumers"() {
+        given:
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setState(RefreshState.RESET_SENT)
+        context.setReplayStartOffset(200L)
+        remoteConsumers.isLegacyConsumer("client-1:topic:groupA") >> true
+
+        when:
+        service.handleResetAck("groupA:topic", "client-1", "topic", context, "trace-1")
+
+        then:
+        1 * remoteConsumers.resetConsumerOffset("client-1", "topic", "groupA", 199L)
+        context.consumerOffsets["groupA:topic"] == 199L
+    }
+
     // ── Concurrency: Fix 5 ───────────────────────────────────────────────────
 
     def "simultaneous RESET_ACKs from two different consumers — exactly one drives REPLAYING transition"() {

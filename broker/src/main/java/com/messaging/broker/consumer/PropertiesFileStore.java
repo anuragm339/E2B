@@ -109,6 +109,18 @@ public class PropertiesFileStore implements PropertiesStore {
     }
 
     /**
+     * Drop the in-memory cache and reload it from the file currently on disk.
+     *
+     * <p>Used after a destructive download-refresh wipe: the on-disk file has just been deleted (or
+     * replaced), so the in-memory state must be re-synced to it instead of re-persisting the stale
+     * pre-wipe entries. If the file is now absent, the store comes back empty.
+     */
+    public synchronized void reload() {
+        cache.clear();
+        loadFromDisk();
+    }
+
+    /**
      * Load properties from disk.
      */
     private void loadFromDisk() {

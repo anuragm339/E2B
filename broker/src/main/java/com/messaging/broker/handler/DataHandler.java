@@ -75,12 +75,15 @@ public class DataHandler implements MessageHandler {
 
             EventType eventType = eventTypeStr.equals("DELETE") ? EventType.DELETE : EventType.MESSAGE;
 
-            // Create message record
+            // Create message record. created_time is authoritative and immutable: take it from the
+            // payload ("created", legacy alias "createdAt") and store it verbatim so it survives
+            // unchanged down the pipe (it gates refresh READY). Only stamp ingest time if the
+            // producer omitted it.
             MessageRecord record = new MessageRecord(
                 msgKey,
                 eventType,
                 eventType == EventType.DELETE ? null : data,
-                Instant.now()
+                extractCreatedAt(json)
             );
 
             // Store
@@ -142,5 +145,27 @@ public class DataHandler implements MessageHandler {
             );
         }
         return field.asText();
+    }
+
+    /**
+     * Extract the authoritative {@code created_time} from the producer payload so it is stored
+     * verbatim (the refresh READY gate compares it against the settle window). Accepts {@code created}
+     * or the legacy alias {@code createdAt}, as either an ISO-8601 string or epoch-millis number.
+     * Falls back to {@code Instant.now()} only when the producer omits it (or it is unparseable),
+     * preserving the previous behaviour for callers that never sent a timestamp.
+     */
+    private static Instant extractCreatedAt(JsonNode json) {
+        JsonNode node = json.hasNonNull("created") ? json.get("created")
+                : json.hasNonNull("createdAt") ? json.get("createdAt")
+                : null;
+        if (node == null) {
+            return Instant.now();
+        }
+        try {
+            return node.isNumber() ? Instant.ofEpochMilli(node.asLong()) : Instant.parse(node.asText());
+        } catch (Exception e) {
+            log.warn("event=data.created_time_unparseable value={} — stamping ingest time", node.asText());
+            return Instant.now();
+        }
     }
 }

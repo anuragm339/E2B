@@ -71,13 +71,13 @@ class SnapshotBuilderSpec extends Specification {
         !entries.contains(".DS_Store")
     }
 
-    def "manifest.json round-trips and carries the schema version"() {
+    def "manifest.json round-trips and carries the schema version + N* pipe offset"() {
         given:
         write("prices-v1/segment_metadata.db", "sqlite")
         Path outZip = tempDir.resolve("snap.zip")
 
         when:
-        builder.build(tempDir, outZip, ["prices-v1": 7L])
+        builder.build(tempDir, outZip, ["prices-v1": 7L], 4242L)
         def json = readEntry(outZip, "manifest.json")
         def parsed = mapper.readValue(json, SnapshotManifest)
 
@@ -85,6 +85,16 @@ class SnapshotBuilderSpec extends Specification {
         parsed.schemaVersion == SnapshotManifest.SCHEMA_VERSION
         parsed.createdAtMs > 0
         parsed.topicHeads["prices-v1"] == 7L
+        parsed.pipeOffset == 4242L
+    }
+
+    def "a legacy manifest without pipeOffset parses with N* = -1"() {
+        when:
+        def parsed = mapper.readValue('{"schemaVersion":1,"createdAtMs":5,"topicHeads":{"t":3}}', SnapshotManifest)
+
+        then:
+        parsed.pipeOffset == -1L
+        parsed.topicHeads["t"] == 3L
     }
 
     private List<String> zipEntryNames(Path zip) {

@@ -7,14 +7,17 @@ import com.messaging.broker.consumer.ConsumerDeliveryManager
 import com.messaging.broker.handler.DisconnectHandler
 import com.messaging.broker.handler.MessageHandlerRegistry
 import com.messaging.broker.monitoring.BrokerMetrics
+import com.messaging.broker.snapshot.BootstrapProgressTracker
 import com.messaging.common.api.NetworkServer
 import com.messaging.common.api.StorageEngine
+import io.micronaut.context.BeanProvider
 import com.messaging.common.model.EventType
 import com.messaging.common.model.MessageRecord
 import spock.lang.Specification
 
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.time.Instant
 
 /**
@@ -37,10 +40,15 @@ class BrokerServiceSpec extends Specification {
     CompactionIndex compactionIndex = Mock()
 
     private BrokerService brokerService() {
+        brokerService("/tmp/broker-service-spec", false)
+    }
+
+    private BrokerService brokerService(String dataDir, boolean freshInstallEnabled) {
         new BrokerService(storage, Mock(NetworkServer), Mock(ConsumerDeliveryManager),
                 Mock(AdaptiveBatchDeliveryManager), Mock(TopologyManager), Mock(BrokerMetrics),
                 Mock(MessageHandlerRegistry), Mock(DisconnectHandler), Mock(ShutdownCoordinator),
-                Mock(AckStoreSeeder), compactionIndex, 9092, false)
+                Mock(AckStoreSeeder), compactionIndex, Mock(BeanProvider), new BootstrapProgressTracker(),
+                dataDir, freshInstallEnabled, 9092, false)
     }
 
     private static MessageRecord pipeRecord(long offset) {
@@ -378,6 +386,60 @@ class BrokerServiceSpec extends Specification {
         then: "timeout is detected correctly"
         (beforeTimeout - batchSentTime) < timeoutMs  // Not timed out
         (afterTimeout - batchSentTime) > timeoutMs   // Timed out
+    }
+
+    // ===== Fresh-install (empty-boot) bootstrap detection =====
+
+    def "isFreshInstall is false when the feature is disabled, even on an empty dir"() {
+        given:
+        storage.getTopicNames() >> ([] as Set)
+        def dir = Files.createTempDirectory('fresh-off-')
+
+        expect:
+        !brokerService(dir.toString(), false).isFreshInstall()
+
+        cleanup:
+        dir.toFile().deleteDir()
+    }
+
+    def "isFreshInstall is false when storage already has topic data"() {
+        given:
+        storage.getTopicNames() >> (['prices-v1'] as Set)
+        def dir = Files.createTempDirectory('fresh-hasdata-')
+
+        expect:
+        !brokerService(dir.toString(), true).isFreshInstall()
+
+        cleanup:
+        dir.toFile().deleteDir()
+    }
+
+    def "isFreshInstall is false when a state file shows the node streamed/refreshed before"() {
+        given:
+        storage.getTopicNames() >> ([] as Set)
+        def dir = Files.createTempDirectory('fresh-state-')
+        Files.writeString(dir.resolve(stateFile), 'x')
+
+        expect:
+        !brokerService(dir.toString(), true).isFreshInstall()
+
+        cleanup:
+        dir.toFile().deleteDir()
+
+        where:
+        stateFile << ['pipe-offset.properties', 'data-refresh-state.properties']
+    }
+
+    def "isFreshInstall is true on a truly empty enabled node"() {
+        given:
+        storage.getTopicNames() >> ([] as Set)
+        def dir = Files.createTempDirectory('fresh-empty-')
+
+        expect:
+        brokerService(dir.toString(), true).isFreshInstall()
+
+        cleanup:
+        dir.toFile().deleteDir()
     }
 
     def "BROKER-3: timeout value must be positive"() {

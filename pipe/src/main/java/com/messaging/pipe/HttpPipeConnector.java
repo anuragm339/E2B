@@ -65,6 +65,10 @@ public class HttpPipeConnector implements PipeConnector {
     private volatile long currentOffset = 0;
     private volatile long lastPersistedOffset = -1;
     private volatile long adaptiveDelay;
+    // True once a poll returns 0 records — the upstream has nothing beyond the cursor (backlog drained).
+    // Reset to false on resetOffset() (a bootstrap re-stream is starting). Used as the "load finished"
+    // signal that gates refresh readiness / health on a pipe-fed bootstrap.
+    private volatile boolean upstreamDrained = false;
 
     public HttpPipeConnector(
             @Client("/") StreamingHttpClient streamingHttpClient,
@@ -156,8 +160,10 @@ public class HttpPipeConnector implements PipeConnector {
 
                 if (received > 0) {
                     adaptiveDelay = Math.max(minPollIntervalMs, duration / 2);
+                    upstreamDrained = false; // still pulling the backlog
                 } else {
                     adaptiveDelay = Math.min(adaptiveDelay * 2, maxPollIntervalMs);
+                    upstreamDrained = true;  // nothing left upstream beyond the cursor — load finished
                 }
             } catch (Exception e) {
                 log.error("Polling error", e);
@@ -198,6 +204,25 @@ public class HttpPipeConnector implements PipeConnector {
     /** Current pipe ingest cursor — a single GLOBAL upstream offset (the poll carries no topic). */
     public long getCurrentOffset() {
         return currentOffset;
+    }
+
+    /**
+     * Force the cursor to {@code offset} and persist it (call while paused). After a snapshot restore
+     * this seeds N* so the pipe resumes forward; after a STREAM/CLOUD wipe it seeds 0 to re-stream.
+     */
+    @Override
+    public synchronized void resetOffset(long offset) {
+        this.currentOffset = offset;
+        this.lastPersistedOffset = Long.MIN_VALUE; // force persistOffset() to write even if value matches
+        this.upstreamDrained = false; // a re-stream is starting — not drained until a poll says so
+        persistOffset();
+        log.info("event=pipe_connector.offset_reset offset={}", offset);
+    }
+
+    /** True once a poll returns 0 records (upstream drained beyond the cursor) — the "load finished" signal. */
+    @Override
+    public boolean isUpstreamDrained() {
+        return upstreamDrained;
     }
 
     /** True while pipe polling is paused for a data refresh. */

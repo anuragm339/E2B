@@ -19,7 +19,7 @@ class LocalStateCleanerSpec extends Specification {
         Files.writeString(p, content)
     }
 
-    def "clearState removes ack-store and parent state files, keeps topology and topic data"() {
+    def "clearState removes parent state files, keeps topology, topic data, and the ack-store dir"() {
         given:
         write("ack-store/CURRENT", "rocks")
         write("consumer-offsets.properties", "c")
@@ -32,12 +32,14 @@ class LocalStateCleanerSpec extends Specification {
         when:
         cleaner.clearState(tempDir.toString())
 
-        then: "parent-specific state gone"
-        !Files.exists(tempDir.resolve("ack-store"))
+        then: "parent-specific state files gone"
         !Files.exists(tempDir.resolve("consumer-offsets.properties"))
         !Files.exists(tempDir.resolve("pipe-offset.properties"))
         !Files.exists(tempDir.resolve("data-refresh-state.properties"))
         !Files.exists(tempDir.resolve("delivery-state.properties"))
+
+        and: "the ack-store directory is NOT deleted — its open RocksDB handle is cleared in place by SharedRocksDb"
+        Files.exists(tempDir.resolve("ack-store/CURRENT"))
 
         and: "this node's own identity and topic data preserved"
         Files.exists(tempDir.resolve("topology.properties"))

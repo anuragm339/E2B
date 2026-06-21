@@ -11,6 +11,10 @@ broker:
   storage:
     data-dir: ${java.io.tmpdir}/broker-integration-test
     segment-size: 10485760
+  bootstrap:
+    # Don't auto-bootstrap on empty-data-dir integration boots (would bounce the network server).
+    fresh-install:
+      enabled: false
   registry:
     url: ""
   pipe:

@@ -20,7 +20,9 @@ import java.util.Set;
  * <p>The download-refresh re-sources authoritative data from upstream, so the PARENT-specific
  * state this node holds must be cleared first (it is the parent's, not this node's):
  * <ul>
- *   <li>{@code ack-store/} — RocksDB ACK + compaction CF; rebuilt from segments (backfill path).</li>
+ *   <li>RocksDB ACK + compaction CFs — cleared IN PLACE by {@code SharedRocksDb.clearCompactionAndAck()}
+ *       (not by deleting {@code ack-store/}, which would corrupt the open singleton handle); rebuilt
+ *       from segments / re-sourced data.</li>
  *   <li>{@code consumer-offsets.properties} — this node's consumers re-sync from 0.</li>
  *   <li>{@code pipe-offset.properties} — reset; the pipe re-syncs from 0 (idempotent ingestion).</li>
  *   <li>{@code data-refresh-state.properties}, {@code delivery-state.properties} — stale in-flight state.</li>
@@ -46,11 +48,17 @@ public class LocalStateCleaner {
     /** Directories that are never topic folders and must be preserved by {@link #clearTopicData}. */
     static final Set<String> NON_TOPIC_DIRS = Set.of(ACK_STORE_DIR, "snapshots");
 
-    /** Reset RocksDB + the parent-specific state files. Leaves topic data and topology in place. */
+    /**
+     * Reset the parent-specific state files. Leaves topic data and topology in place.
+     *
+     * <p>The RocksDB {@code ack-store/} is NOT deleted here. It is a long-lived singleton handle
+     * (shared by the ACK store and compaction index); deleting its files out from under the open
+     * handle corrupts it and breaks every subsequent write. The caller clears those column families
+     * in place via {@code SharedRocksDb.clearCompactionAndAck()} as part of the same wipe bracket.
+     */
     public void clearState(String dataDirStr) {
         Path dataDir = Paths.get(dataDirStr);
         try {
-            deleteRecursively(dataDir.resolve(ACK_STORE_DIR));
             for (String f : STATE_FILES) {
                 Files.deleteIfExists(dataDir.resolve(f));
             }

@@ -45,8 +45,17 @@ public class SnapshotBuilder {
      *                   embedded in the manifest as the bootstrap watermark.
      * @return the manifest written into the ZIP.
      */
+    /** Backward-compatible overload — no captured pipe cursor (N* = -1). */
     public SnapshotManifest build(Path dataDir, Path outputZip, Map<String, Long> topicHeads) {
-        SnapshotManifest manifest = new SnapshotManifest(System.currentTimeMillis(), topicHeads);
+        return build(dataDir, outputZip, topicHeads, -1);
+    }
+
+    /**
+     * @param pipeOffset N* — the global pipe cursor captured atomically with {@code topicHeads}, so a
+     *                   restoring child can resume the pipe from it instead of re-streaming from 0.
+     */
+    public SnapshotManifest build(Path dataDir, Path outputZip, Map<String, Long> topicHeads, long pipeOffset) {
+        SnapshotManifest manifest = new SnapshotManifest(System.currentTimeMillis(), topicHeads, pipeOffset);
         try {
             if (outputZip.getParent() != null) {
                 Files.createDirectories(outputZip.getParent());

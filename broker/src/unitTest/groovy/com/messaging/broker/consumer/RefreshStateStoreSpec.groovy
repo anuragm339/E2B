@@ -21,6 +21,9 @@ class RefreshStateStoreSpec extends Specification {
         context.setResetSentTime(Instant.parse("2025-01-01T00:00:00Z"))
         context.setReadySentTime(Instant.parse("2025-01-01T00:10:00Z"))
         context.setRefreshId("refresh-1")
+        context.setReplayStartOffset(200L)
+        context.setReplayTargetOffset(300L)
+        context.setReplayCutoffTime(Instant.parse("2024-12-31T00:00:00Z"))
         context.recordResetAck("groupA:topic")
         context.recordReadyAck("groupA:topic")
         context.updateConsumerOffset("groupA:topic", 123L)
@@ -40,6 +43,9 @@ class RefreshStateStoreSpec extends Specification {
         loaded.getReceivedReadyAcks().contains("groupA:topic")
         loaded.getConsumerOffsets().get("groupA:topic") == 123L
         loaded.getRefreshId() == "refresh-1"
+        loaded.getReplayStartOffset() == 200L
+        loaded.getReplayTargetOffset() == 300L
+        loaded.getReplayCutoffTime() == Instant.parse("2024-12-31T00:00:00Z")
         loaded.getResetSentTime() != null
         loaded.getReadySentTime() != null
     }

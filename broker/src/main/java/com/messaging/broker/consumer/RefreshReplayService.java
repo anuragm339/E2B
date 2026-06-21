@@ -31,10 +31,8 @@ public class RefreshReplayService implements ReplayPhase {
     private final StorageEngine storage;
     private final DataRefreshMetrics metrics;
     private final RefreshEventLogger refreshLogger;
-    private final DeliveryFreshnessTracker deliveryFreshness;
-    // READY is held until a real delivery happened within this window (or the topic is empty).
-    // 0 disables the gate (legacy/test constructor). Default 6h.
-    private final long freshnessWindowMs;
+    private final RefreshReplayWindowResolver replayWindowResolver;
+    private final com.messaging.common.api.PipeConnector pipeConnector;
 
     @Inject
     public RefreshReplayService(
@@ -42,27 +40,27 @@ public class RefreshReplayService implements ReplayPhase {
             StorageEngine storage,
             DataRefreshMetrics metrics,
             RefreshEventLogger refreshLogger,
-            DeliveryFreshnessTracker deliveryFreshness,
-            @Value("${broker.refresh.delivery-freshness-window-ms:21600000}") long freshnessWindowMs) {
+            RefreshReplayWindowResolver replayWindowResolver,
+            com.messaging.common.api.PipeConnector pipeConnector) {
         this.remoteConsumers = remoteConsumers;
         this.storage = storage;
         this.metrics = metrics;
         this.refreshLogger = refreshLogger;
-        this.deliveryFreshness = deliveryFreshness;
-        this.freshnessWindowMs = freshnessWindowMs;
+        this.replayWindowResolver = replayWindowResolver;
+        this.pipeConnector = pipeConnector;
     }
 
     /**
      * Backward-compatible constructor for tests that only verify replay gating
-     * and metric calls, not storage-head-based gap updates. Passes a null freshness
-     * tracker and window 0, which disables the delivery-freshness gate.
+     * and metric calls, not storage-head-based gap updates. Passes a null storage engine, an
+     * unbounded resolver, and a null pipe (so the dynamic "load finished" gate is skipped).
      */
     @Deprecated
     public RefreshReplayService(
             ConsumerRegistry remoteConsumers,
             DataRefreshMetrics metrics,
             RefreshEventLogger refreshLogger) {
-        this(remoteConsumers, null, metrics, refreshLogger, null, 0L);
+        this(remoteConsumers, null, metrics, refreshLogger, RefreshReplayWindowResolver.unbounded(), null);
     }
 
     @Override
@@ -90,8 +88,10 @@ public class RefreshReplayService implements ReplayPhase {
                 progressedConsumers++;
             }
             try {
-                long storageHead = storage.getCurrentOffset(topic, 0);
-                long gap = Math.max(0, storageHead - committedOffset);
+                long replayTarget = context.hasReplayTargetOffset()
+                        ? context.getReplayTargetOffset()
+                        : storage.getCurrentOffset(topic, 0);
+                long gap = Math.max(0, replayTarget - committedOffset);
                 metrics.updateReplayGapOffset(topic, consumerGroupTopic, gap);
             } catch (Exception e) {
                 log.debug("Could not update replay gap metric for topic {} consumer {}: {}",
@@ -104,21 +104,14 @@ public class RefreshReplayService implements ReplayPhase {
                     topic, progressedConsumers, Instant.now());
         }
 
-        boolean allCaughtUp = allConsumersCaughtUp(topic, ackedConsumers);
+        boolean allCaughtUp = allConsumersCaughtUp(topic, context, ackedConsumers);
         boolean allResetAcksReceived = context.allResetAcksReceived();
 
         if (allCaughtUp && allResetAcksReceived) {
-            // Delivery-freshness gate: caught-up alone is not enough to go READY/green. Require that
-            // fresh data actually reached a consumer recently, UNLESS the topic legitimately has
-            // nothing to deliver (empty head) — the healthy-idle exception. Guards against a refresh
-            // that "completes" without any real delivery (e.g. silently broken delivery path).
-            if (!deliveryFreshGateSatisfied(topic)) {
-                log.info("event=refresh.ready_gated topic={} refreshId={} reason=no_recent_delivery "
-                                + "windowMs={} lastDeliveryMs={} — holding READY",
-                        topic, context.getRefreshId(), freshnessWindowMs,
-                        deliveryFreshness != null ? deliveryFreshness.getLastSuccessfulDeliveryMs() : -1);
-                return false;
-            }
+            // READY fires once consumers have caught up to the replay target. The target is the
+            // "settled" history horizon (last record with created_time older than the configured
+            // settle window — see RefreshReplayWindowResolver); records inside the window are still
+            // settling and continue to arrive via the normal delivery flow after READY.
             LogContext progressContext = LogContext.builder()
                     .topic(topic)
                     .custom("refreshId", context.getRefreshId())
@@ -174,7 +167,8 @@ public class RefreshReplayService implements ReplayPhase {
             // Note: Adaptive delivery manager will automatically discover and deliver messages
             // No explicit trigger needed - watermark-based polling handles replay
 
-            log.debug("Replay ready for consumer starting from offset 0 (adaptive delivery will poll)");
+            log.debug("Replay ready for consumer starting from offset {} (adaptive delivery will poll)",
+                    context.getReplayStartOffset());
 
         } catch (Exception e) {
             DataRefreshException ex = new DataRefreshException(ErrorCode.DATA_REFRESH_REPLAY_FAILED,
@@ -192,33 +186,37 @@ public class RefreshReplayService implements ReplayPhase {
         return remoteConsumers.allConsumersCaughtUp(topic, ackedConsumers);
     }
 
-    /**
-     * The READY delivery-freshness gate. Returns true (READY allowed) when either a real delivery
-     * happened within the configured window, or the topic has nothing to deliver.
-     *
-     * <p>Disabled (always true) when the tracker is absent or the window is non-positive — the
-     * legacy/test constructor and an explicit opt-out. {@code getCurrentOffset} returns the last
-     * stored offset and {@code -1} for an empty topic, so {@code head < 0} is the healthy-idle case.
-     *
-     * <p>NOTE: this is the steady-state/LOCAL-refresh gate. Download-refresh will layer a per-topic
-     * bootstrap watermark on top so a mid-bootstrap empty topic cannot satisfy the head&lt;0 branch.
-     */
-    private boolean deliveryFreshGateSatisfied(String topic) {
-        if (deliveryFreshness == null || freshnessWindowMs <= 0) {
-            return true; // gate disabled (legacy/test ctor)
+    private boolean allConsumersCaughtUp(String topic, RefreshContext context, Set<String> ackedConsumers) {
+        if (!context.hasReplayTargetOffset()) {
+            return allConsumersCaughtUp(topic, ackedConsumers);
         }
-        long head = -1;
-        try {
-            if (storage != null) {
-                head = storage.getCurrentOffset(topic, 0);
+        long target = context.getReplayTargetOffset();
+        if (context.isDynamicReplayTarget()) {
+            // Async (pipe-fed) load: the "load finished" signal is the pipe being OUT OF DATA (its last
+            // poll returned nothing → the whole backlog is in storage). Until then we are still loading,
+            // so hold READY and keep /health DOWN — this is what stops a fresh boot from completing
+            // instantly against empty storage. Once drained, re-evaluate the settled target against the
+            // now-complete live head and check consumers against it.
+            if (pipeConnector != null && !pipeConnector.isUpstreamDrained()) {
+                return false; // pipe still streaming the backlog — load not finished
             }
-        } catch (Exception e) {
-            log.debug("deliveryFreshGate: could not read head for topic {}: {}", topic, e.getMessage());
-            head = -1;
+            target = replayWindowResolver.settledTarget(topic);
+            context.setReplayTargetOffset(target);
         }
-        if (head < 0) {
-            return true; // healthy-idle: nothing to deliver
+        if (target < 0) {
+            return true;
         }
-        return deliveryFreshness.deliveredWithin(freshnessWindowMs, System.currentTimeMillis());
+        for (String consumerGroupTopic : ackedConsumers) {
+            long committedOffset = remoteConsumers.getCommittedOffset(consumerGroupTopic);
+            long requiredOffset = remoteConsumers.isLegacyGroupTopic(topic, consumerGroupTopic)
+                    ? target
+                    : target + 1;
+            if (committedOffset < requiredOffset) {
+                log.debug("Consumer {} not caught up for refresh window: offset={}, required={}, target={}",
+                        consumerGroupTopic, committedOffset, requiredOffset, target);
+                return false;
+            }
+        }
+        return true;
     }
 }

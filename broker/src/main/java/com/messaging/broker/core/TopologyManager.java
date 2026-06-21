@@ -54,6 +54,9 @@ public class TopologyManager {
     private volatile Function<MessageRecord, Boolean> messageHandler;
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean queryInFlight = new AtomicBoolean();
+    // Counted down after the first registry query completes, so a boot-time caller can block briefly
+    // for the parent URL to be known before acting (see resolveTopologyNow).
+    private final java.util.concurrent.CountDownLatch firstResolveLatch = new java.util.concurrent.CountDownLatch(1);
 
     public TopologyManager(
             CloudRegistryClient registryClient,
@@ -103,6 +106,24 @@ public class TopologyManager {
     }
 
     /**
+     * Block up to {@code timeoutMs} for the first registry topology resolution to complete, so a
+     * boot-time caller that needs the parent URL (e.g. the empty-boot bootstrap) does not act before
+     * topology is known and wrongly escalate a child node to the cloud. Relies on {@link #start()}
+     * having scheduled the initial query (delay 0). Returns early once the first query completes
+     * (success or failure), or after the timeout — the caller then proceeds with whatever
+     * {@link #getCurrentParentUrl()} holds (null ⇒ root/cloud).
+     */
+    public void resolveTopologyNow(long timeoutMs) {
+        try {
+            if (!firstResolveLatch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                log.warn("event=topology.resolve_timeout timeoutMs={} parentUrl={}", timeoutMs, currentParentUrl);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
      * Register handler for messages received from parent
      * @param handler Function that returns true on successful processing, false on failure
      */
@@ -134,6 +155,7 @@ public class TopologyManager {
                     handleTopologyUpdate(topology);
                 } finally {
                     queryInFlight.set(false);
+                    firstResolveLatch.countDown(); // first resolution complete — unblock resolveTopologyNow
                 }
             });
 

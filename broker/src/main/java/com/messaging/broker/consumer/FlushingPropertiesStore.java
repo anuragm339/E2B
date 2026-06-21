@@ -26,6 +26,10 @@ public class FlushingPropertiesStore implements PropertiesStore {
     private final AtomicBoolean started = new AtomicBoolean();
     private final AtomicBoolean stopped = new AtomicBoolean();
     private volatile ScheduledFuture<?> flushTask;
+    // True while a destructive download-refresh wipe is in progress. The periodic flush is cancelled
+    // and all mutating/flush calls become no-ops so a stray write (in-flight ACK or timer) cannot
+    // re-create the on-disk file after clearState has deleted it.
+    private volatile boolean paused = false;
 
     /**
      * Create periodic flush repository.
@@ -116,6 +120,52 @@ public class FlushingPropertiesStore implements PropertiesStore {
         log.info("Stopped periodic flush for {}", description);
     }
 
+    /**
+     * Quiesce the store for a destructive download-refresh wipe: cancel the periodic flush, drop the
+     * in-memory cache, and reject further writes/flushes until {@link #resumeAfterWipe()}. Closing the
+     * write path here is what guarantees a deleted {@code *.properties} file cannot reappear with stale
+     * pre-wipe state while {@code clearState} is removing it.
+     */
+    public synchronized void pauseForWipe() {
+        if (paused) {
+            return;
+        }
+        paused = true;
+        ScheduledFuture<?> task = flushTask;
+        if (task != null) {
+            task.cancel(false);
+            flushTask = null;
+        }
+        delegate.clear();
+        log.info("Paused {} for refresh wipe (flush cancelled, in-memory state dropped)", description);
+    }
+
+    /**
+     * Resume after a wipe: reload the in-memory cache from whatever is now on disk (the file may have
+     * been deleted or replaced) and re-arm the periodic flush. Safe to call when not paused.
+     */
+    public synchronized void resumeAfterWipe() {
+        if (!paused) {
+            return;
+        }
+        delegate.reload();
+        paused = false;
+        if (started.get() && !stopped.get()) {
+            flushTask = flusher.scheduleWithFixedDelay(
+                    this::flushSafely,
+                    flushIntervalMs,
+                    flushIntervalMs,
+                    TimeUnit.MILLISECONDS
+            );
+        }
+        log.info("Resumed {} after refresh wipe (reloaded {} entries from disk)", description, delegate.size());
+    }
+
+    /** Whether the store is currently quiesced for a refresh wipe. */
+    public boolean isPaused() {
+        return paused;
+    }
+
     private void flushSafely() {
         try {
             delegate.persistToDisk();
@@ -138,16 +188,25 @@ public class FlushingPropertiesStore implements PropertiesStore {
 
     @Override
     public void put(String key, String value) {
+        if (paused) {
+            return; // dropped during a refresh wipe so stale state cannot be re-persisted
+        }
         delegate.put(key, value);
     }
 
     @Override
     public void putAll(Map<String, String> properties) {
+        if (paused) {
+            return;
+        }
         delegate.putAll(properties);
     }
 
     @Override
     public void remove(String key) {
+        if (paused) {
+            return;
+        }
         delegate.remove(key);
     }
 
@@ -168,6 +227,9 @@ public class FlushingPropertiesStore implements PropertiesStore {
 
     @Override
     public void flush() {
+        if (paused) {
+            return; // do not write the wiped-out state back to disk mid-refresh
+        }
         delegate.flush();
     }
 

@@ -10,7 +10,9 @@ package com.messaging.broker.snapshot;
  *   <li>{@code PIPE_AND_PROVIDER_FILE_DOWNLOAD} / {@code PIPE_AND_PROVIDER_STREAM} — advanced: force
  *       the file-download or record-stream source respectively.</li>
  *   <li>{@code CLOUD_SYNC} — re-source from the cloud.</li>
- *   <li>{@code BARE_METAL} — factory reset: stop everything, wipe the storage dir, exit for restart.</li>
+ *   <li>{@code BARE_METAL} — hard reset: RESET consumers best-effort, then stop the node, wipe the
+ *       data dir, and {@code System.exit}; an external supervisor restarts the empty node, which
+ *       re-sources via the normal startup path. Distinct from the in-process refresh lifecycle.</li>
  * </ul>
  */
 public enum RefreshType {
@@ -32,6 +34,8 @@ public enum RefreshType {
     /**
      * The forced bootstrap source, or {@code null} to auto-select / N-A
      * ({@code PIPE_AND_PROVIDER_REFRESH} / {@code LOCAL} / {@code BARE_METAL}).
+     * BARE_METAL never reaches the orchestrator (it exits the process); the empty node re-sources
+     * on the next boot by auto-selecting the best available upstream source.
      */
     public BootstrapSource forcedSource() {
         return switch (this) {

@@ -52,7 +52,7 @@ class RefreshRecoveryServiceSpec extends Specification {
         0 * refreshLogger._
     }
 
-    def "recoverAndResumeRefreshes pauses pipe assigns missing refresh id and resumes saved topics"() {
+    def "recoverAndResumeRefreshes keeps pipe active assigns missing refresh id and resumes saved topics"() {
         given:
         def resetContext = refreshContext("prices-v1", RefreshState.RESET_SENT, ["group-a:prices-v1"] as Set)
         resetContext.recordShutdown(Instant.now().minusSeconds(5))
@@ -80,12 +80,12 @@ class RefreshRecoveryServiceSpec extends Specification {
         !activeRefreshes.containsKey("orders-v1")
         resetRetryTopics == ["prices-v1"]
         replayTopics.isEmpty()
-        1 * pipeConnector.pausePipeCalls()
+        0 * pipeConnector.pausePipeCalls()
         1 * remoteConsumers.broadcastResetToTopic("prices-v1")
         2 * stateStore.saveState(_ as RefreshContext)
         1 * stateStore.clearState("orders-v1")
         2 * refreshLogger.logStateTransition(_)
-        1 * refreshLogger.logPipePaused(_)
+        0 * refreshLogger.logPipePaused(_)
         1 * refreshLogger.logResetSent(_)
     }
 

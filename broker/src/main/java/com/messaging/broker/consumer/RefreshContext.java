@@ -72,6 +72,13 @@ public class RefreshContext {
 
     // Refresh batch tracking
     private volatile String refreshId;  // Unique identifier for the refresh batch (survives broker restarts)
+    private volatile long replayStartOffset;
+    private volatile long replayTargetOffset;
+    private volatile Instant replayCutoffTime;
+    // True when the data is loaded asynchronously (pipe-fed bootstrap/non-LOCAL refresh): the settled
+    // READY target must be re-evaluated against the live storage head as data streams in, rather than
+    // using replayTargetOffset captured once at refresh start (which may have seen empty storage).
+    private volatile boolean dynamicReplayTarget;
 
     // For extensibility (future service/global refresh)
     private final String refreshScope;  // "TOPIC", "SERVICE", "GLOBAL"
@@ -98,6 +105,9 @@ public class RefreshContext {
         this.lastShutdownTime = null;
         this.refreshScope = refreshScope;
         this.refreshType = refreshType;
+        this.replayStartOffset = 0L;
+        this.replayTargetOffset = Long.MIN_VALUE;
+        this.replayCutoffTime = null;
     }
 
     public boolean allResetAcksReceived() {
@@ -130,7 +140,7 @@ public class RefreshContext {
         receivedResetAcks.add(consumerId);
         resetAckTimes.put(consumerId, Instant.now());  // Record timestamp
         consumerReplaying.put(consumerId, true);  // Mark as replaying
-        consumerOffsets.put(consumerId, 0L);      // Start from offset 0
+        consumerOffsets.put(consumerId, replayStartOffset);
         lastReplayProgressTime = Instant.now();
     }
 
@@ -227,4 +237,16 @@ public class RefreshContext {
     public void setRefreshId(String refreshId) { this.refreshId = refreshId; }
     public String getRefreshScope() { return refreshScope; }
     public String getRefreshType() { return refreshType; }
+    public long getReplayStartOffset() { return replayStartOffset; }
+    public void setReplayStartOffset(long replayStartOffset) { this.replayStartOffset = replayStartOffset; }
+    public long getReplayTargetOffset() { return replayTargetOffset; }
+    public void setReplayTargetOffset(long replayTargetOffset) { this.replayTargetOffset = replayTargetOffset; }
+    public boolean hasReplayTargetOffset() { return replayTargetOffset != Long.MIN_VALUE; }
+    public boolean hasRecordsInReplayWindow() {
+        return !hasReplayTargetOffset() || replayTargetOffset < 0 || replayStartOffset <= replayTargetOffset;
+    }
+    public Instant getReplayCutoffTime() { return replayCutoffTime; }
+    public void setReplayCutoffTime(Instant replayCutoffTime) { this.replayCutoffTime = replayCutoffTime; }
+    public boolean isDynamicReplayTarget() { return dynamicReplayTarget; }
+    public void setDynamicReplayTarget(boolean dynamicReplayTarget) { this.dynamicReplayTarget = dynamicReplayTarget; }
 }

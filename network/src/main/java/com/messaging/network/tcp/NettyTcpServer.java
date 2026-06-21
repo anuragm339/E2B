@@ -53,6 +53,9 @@ public class NettyTcpServer implements NetworkServer {
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
+    // Last port we bound to, remembered so resumeAccepting() can rebind after a mid-process
+    // stopAccepting() (the download-refresh wipe window) without the caller re-supplying it.
+    private volatile int boundPort = -1;
 
     public NettyTcpServer(
             @Value("${broker.network.threads.boss:2}") int bossThreads,
@@ -121,12 +124,16 @@ public class NettyTcpServer implements NetworkServer {
                         }
                     })
                     .option(ChannelOption.SO_BACKLOG, 128)
+                    // Allow immediate rebind of the listen port on resumeAccepting() after a
+                    // mid-process stopAccepting() — the old listen socket may briefly linger.
+                    .option(ChannelOption.SO_REUSEADDR, true)
                     .childOption(ChannelOption.SO_KEEPALIVE, true)
                     .childOption(ChannelOption.TCP_NODELAY, true);
 
             // Bind and start accepting connections (bind to all interfaces)
             ChannelFuture future = bootstrap.bind("0.0.0.0", port).sync();
             serverChannel = future.channel();
+            boundPort = port;
 
             log.info("NettyTcpServer started on port {} (all interfaces)", port);
 
@@ -339,21 +346,61 @@ public class NettyTcpServer implements NetworkServer {
     @PreDestroy
     public void shutdown() {
         log.info("Shutting down NettyTcpServer...");
+        closeServer();
+        log.info("NettyTcpServer shutdown complete");
+    }
 
+    /**
+     * Stop accepting and serving consumer connections without tearing down the bean.
+     *
+     * <p>Closes the listening socket and the worker/boss event-loop groups (which disconnects every
+     * connected client), but leaves the registered {@code handlers}/{@code disconnectHandlers} and
+     * {@link #boundPort} intact so {@link #resumeAccepting()} can rebind. Used by the download-refresh
+     * lifecycle to take the consumer transport down for the wipe + re-source window.
+     */
+    @Override
+    public void stopAccepting() {
+        log.info("event=network_server.stop_accepting port={} clients={}", boundPort, clientChannels.size());
+        closeServer();
+    }
+
+    /**
+     * Rebind the same port and resume accepting connections after {@link #stopAccepting()}.
+     * Reuses the surviving handler registrations.
+     */
+    @Override
+    public void resumeAccepting() throws NetworkException {
+        if (boundPort < 0) {
+            throw new NetworkException(ErrorCode.NETWORK_BIND_FAILED,
+                    "resumeAccepting() called before the server was ever started");
+        }
+        log.info("event=network_server.resume_accepting port={}", boundPort);
+        start(boundPort);
+    }
+
+    /**
+     * Close the listening socket and event-loop groups, releasing the port and dropping all client
+     * channels. Idempotent — safe to call from both {@link #stopAccepting()} and the {@code @PreDestroy}
+     * {@link #shutdown()} (e.g. a refresh-time stop followed by context teardown). Handler
+     * registrations are deliberately preserved so a subsequent {@link #start(int)} reuses them.
+     */
+    private synchronized void closeServer() {
         if (serverChannel != null) {
             serverChannel.close().syncUninterruptibly();
+            serverChannel = null;
         }
 
         if (workerGroup != null) {
             workerGroup.shutdownGracefully().syncUninterruptibly();
+            workerGroup = null;
         }
 
         if (bossGroup != null) {
             bossGroup.shutdownGracefully().syncUninterruptibly();
+            bossGroup = null;
         }
 
         clientChannels.clear();
-        log.info("NettyTcpServer shutdown complete");
     }
 
     /**

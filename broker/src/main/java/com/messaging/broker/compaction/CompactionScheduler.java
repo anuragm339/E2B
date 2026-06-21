@@ -211,9 +211,9 @@ public class CompactionScheduler {
                 break;
             }
             // Pause compaction for any topic under active refresh: a download-refresh swaps/wipes
-            // that topic's segments, and even a LOCAL refresh replays from offset 0, so concurrent
-            // segment rewrites would race the rebuild. Per-topic skip (not the whole run) — and the
-            // pipe is the only ingest, which a refresh also gates, so nothing accumulates meanwhile.
+            // that topic's segments, and LOCAL refresh is replaying a captured offset range to
+            // consumers. Per-topic skip (not the whole run) avoids rewriting segments underneath
+            // the refresh while allowing unrelated topics to compact.
             if (refreshCoordinator.get().isRefreshActive(topic)) {
                 log.debug("event=compaction_skipped_topic topic={} reason=refresh_active", topic);
                 metrics.recordCompactionSkipped("refresh_active");

@@ -105,12 +105,25 @@ public class RefreshResetService implements ResetPhase {
         // Record metrics: RESET ACK received
         metrics.recordResetAckReceived(topic, consumerGroupTopic, context.getRefreshId());
 
-        // Reset offset to 0 for THIS consumer
+        // Reset offset for THIS consumer to the configured replay-window start.
         // Extract the group from the subscription identifier ("group:topic").
-        String group = consumerGroupTopic.split(":")[0];
-        remoteConsumers.resetConsumerOffset(clientId, topic, group, 0);
-        log.debug("Reset offset to 0 for consumer: {} (group:topic={}) on topic: {}, traceId={}",
-                 clientId, consumerGroupTopic, topic, traceId);
+        String suffix = ":" + topic;
+        String group = consumerGroupTopic.endsWith(suffix)
+                ? consumerGroupTopic.substring(0, consumerGroupTopic.length() - suffix.length())
+                : consumerGroupTopic.split(":", 2)[0];
+        long resetOffset = context.getReplayStartOffset();
+        try {
+            if (remoteConsumers.isLegacyConsumer(clientId + ":" + topic + ":" + group)) {
+                resetOffset = resetOffset - 1;
+            }
+        } catch (Exception e) {
+            log.debug("Could not resolve legacy status for consumer {}, using replayStartOffset={}: {}",
+                    consumerGroupTopic, resetOffset, e.getMessage());
+        }
+        remoteConsumers.resetConsumerOffset(clientId, topic, group, resetOffset);
+        context.updateConsumerOffset(consumerGroupTopic, resetOffset);
+        log.debug("Reset offset to {} for consumer: {} (group:topic={}) on topic: {}, traceId={}",
+                 resetOffset, clientId, consumerGroupTopic, topic, traceId);
 
         // Initialize transfer metrics to 0 now that replay will begin for this consumer.
         // This ensures the gauge exists in Prometheus immediately — even when the topic

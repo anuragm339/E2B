@@ -607,6 +607,26 @@ public class ConsumerRegistry {
     }
 
     /**
+     * Resolve whether the currently connected consumer for a group/topic uses the legacy protocol.
+     *
+     * <p>If the consumer is not currently registered, default to legacy semantics. That preserves
+     * the deployed fleet's last-delivered offset convention while still allowing live modern
+     * consumers to use the stricter next-to-deliver replay-target boundary.
+     */
+    public boolean isLegacyGroupTopic(String topic, String groupTopic) {
+        String suffix = ":" + topic;
+        String group = groupTopic != null && groupTopic.endsWith(suffix)
+                ? groupTopic.substring(0, groupTopic.length() - suffix.length())
+                : groupTopic;
+        for (RemoteConsumer consumer : registrationService.getConsumersByTopic(topic)) {
+            if (consumer.getGroup().equals(group)) {
+                return consumer.isLegacy();
+            }
+        }
+        return true;
+    }
+
+    /**
      * Reset consumer offset (for manual intervention or data refresh).
      */
     public void resetConsumerOffset(String clientId, String topic, String group, long offset) {
@@ -640,7 +660,7 @@ public class ConsumerRegistry {
             // which "caught up" is offset == head + 1; under that convention the boundary offset ==
             // head is premature by one record. Do NOT tighten this to "<= storageHead" — that would
             // make a legacy consumer (whose offset caps at head) never satisfy caught-up, stalling
-            // refresh completion and leaving ingestion paused forever. See codebase-book
+            // refresh completion forever. See codebase-book
             // 05-data-model "Offset conventions".
             for (String groupTopic : consumerGroupTopics) {
                 long consumerOffset = offsetTracker.getOffset(groupTopic);

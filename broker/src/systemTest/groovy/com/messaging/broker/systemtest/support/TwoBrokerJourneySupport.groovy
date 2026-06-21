@@ -68,6 +68,7 @@ abstract class TwoBrokerJourneySupport extends Specification {
                 'broker.network.port'              : "${findFreePort()}".toString(),
                 'broker.network.type'              : 'tcp',
                 'broker.registry.url'              : '',
+                'broker.bootstrap.fresh-install.enabled' : 'false',
                 'broker.storage.type'              : 'filechannel',
                 'broker.storage.dataDir'           : dir.toString(),
                 'broker.storage.data-dir'          : dir.toString(),

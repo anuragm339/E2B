@@ -10,16 +10,17 @@ import java.util.concurrent.TimeUnit
 
 class RefreshContextSpec extends Specification {
 
-    def "recordResetAck marks consumer replaying and offset 0"() {
+    def "recordResetAck marks consumer replaying at replay start offset"() {
         given:
         def context = new RefreshContext("topic", ["groupA:topic"] as Set)
+        context.setReplayStartOffset(5L)
 
         when:
         context.recordResetAck("groupA:topic")
 
         then:
         context.getReceivedResetAcks().contains("groupA:topic")
-        context.getConsumerOffsets().get("groupA:topic") == 0L
+        context.getConsumerOffsets().get("groupA:topic") == 5L
         context.isConsumerReplaying("groupA:topic")
         context.getResetAckTimes().get("groupA:topic") != null
     }

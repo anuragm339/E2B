@@ -1,8 +1,14 @@
 package com.messaging.broker.snapshot;
 
+import com.messaging.broker.compaction.SharedRocksDb;
+import com.messaging.broker.consumer.ConsumerOffsetTracker;
+import com.messaging.broker.consumer.DeliveryStateStore;
 import com.messaging.broker.core.TopologyManager;
 import com.messaging.common.api.PipeConnector;
 import com.messaging.common.api.StorageEngine;
+import com.messaging.common.exception.DataRefreshException;
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
 import io.micronaut.context.annotation.Value;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
@@ -39,6 +45,9 @@ public class DownloadRefreshOrchestrator {
     private final SnapshotRestorer restorer;
     private final PipeConnector pipeConnector;
     private final StorageEngine storage;
+    private final ConsumerOffsetTracker consumerOffsets;
+    private final DeliveryStateStore deliveryState;
+    private final SharedRocksDb sharedRocksDb;
     // Upper bound on a random delay before escalating to the cloud, so that a parent entering
     // refresh doesn't fan its children into a synchronized cloud stampede. 0 disables.
     private final long escalationJitterMs;
@@ -51,6 +60,9 @@ public class DownloadRefreshOrchestrator {
             SnapshotRestorer restorer,
             PipeConnector pipeConnector,
             StorageEngine storage,
+            ConsumerOffsetTracker consumerOffsets,
+            DeliveryStateStore deliveryState,
+            SharedRocksDb sharedRocksDb,
             @Value("${broker.bootstrap.escalation-jitter-ms:30000}") long escalationJitterMs) {
         this.dataDir = dataDir;
         this.topology = topology;
@@ -59,6 +71,9 @@ public class DownloadRefreshOrchestrator {
         this.restorer = restorer;
         this.pipeConnector = pipeConnector;
         this.storage = storage;
+        this.consumerOffsets = consumerOffsets;
+        this.deliveryState = deliveryState;
+        this.sharedRocksDb = sharedRocksDb;
         this.escalationJitterMs = escalationJitterMs;
     }
 
@@ -90,9 +105,6 @@ public class DownloadRefreshOrchestrator {
         String parentUrl = topology.getCurrentParentUrl();
         BootstrapSource source = (forced != null) ? forced : chooseSource(parentUrl);
         log.info("event=bootstrap.started source={} parentUrl={}", source, parentUrl);
-        // Quiesce the steady-state pipe for the whole bootstrap: it writes into the same storage we
-        // are about to wipe/restore, and it owns pipe-offset.properties which clearState deletes.
-        pipeConnector.pausePipeCalls();
         try {
             switch (source) {
                 case PIPE_AND_PROVIDER_FILE_DOWNLOAD:
@@ -125,8 +137,6 @@ public class DownloadRefreshOrchestrator {
         } catch (Exception e) {
             log.error("event=bootstrap.failed source={} err={}", source, e.toString(), e);
             return DownloadRefreshResult.failure(source, e.toString());
-        } finally {
-            pipeConnector.resumePipeCalls();
         }
     }
 
@@ -136,19 +146,38 @@ public class DownloadRefreshOrchestrator {
      * rebuild managers). {@code recover} runs even if the op fails, so we never leave storage closed.
      */
     private void quiesceWipeRecover(Runnable fileOp) {
+        pipeConnector.pausePipeCalls();
+        // Quiesce the offset/delivery stores BEFORE the wipe so their periodic flush (or a stray
+        // in-flight ACK) cannot re-create consumer-offsets/delivery-state on disk right after
+        // clearState deletes them. Resumed (reloaded from the wiped/restored file) in the finally.
+        consumerOffsets.quiesceForWipe();
+        deliveryState.quiesceForWipe();
         try {
-            storage.close();
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to close storage for refresh", e);
-        }
-        try {
-            fileOp.run();
-        } finally {
             try {
-                storage.recover();
+                storage.close();
             } catch (Exception e) {
-                log.error("event=bootstrap.storage_recover_failed err={}", e.toString(), e);
+                throw ExceptionLogger.logAndThrow(log, new DataRefreshException(
+                        ErrorCode.DATA_REFRESH_SNAPSHOT_RESTORE_FAILED,
+                        "Failed to close storage for refresh", e).withContext("dataDir", dataDir));
             }
+            // Reset the RocksDB ACK + compaction column families IN PLACE. Doing this by deleting the
+            // ack-store/ directory (the old clearState behaviour) corrupted the long-lived singleton
+            // handle and stalled the pipe on the first post-wipe record; clearing in place keeps the
+            // open handle (and the cached handles in the ack/compaction stores) valid.
+            sharedRocksDb.clearCompactionAndAck();
+            try {
+                fileOp.run();
+            } finally {
+                try {
+                    storage.recover();
+                } catch (Exception e) {
+                    log.error("event=bootstrap.storage_recover_failed err={}", e.toString(), e);
+                }
+            }
+        } finally {
+            deliveryState.resumeAfterWipe();
+            consumerOffsets.resumeAfterWipe();
+            pipeConnector.resumePipeCalls();
         }
     }
 
@@ -174,19 +203,28 @@ public class DownloadRefreshOrchestrator {
             // Reconcile deletions: drop child topics that are no longer in the parent snapshot.
             cleaner.retainTopics(dataDir, holder[0].getTopicHeads().keySet());
             cleaner.clearState(dataDir);
+            // Resume the pipe from N* (the snapshot's captured cursor) instead of re-streaming the
+            // whole history from 0 — fetch only the tail the parent appended after the snapshot.
+            // clearState wiped pipe-offset; reset it here while the pipe is paused. Legacy snapshot
+            // (N* = -1) → seed 0 (full re-stream), preserving the old behaviour.
+            long nStar = holder[0].getPipeOffset();
+            pipeConnector.resetOffset(nStar >= 0 ? nStar : 0);
         });
-        log.info("event=bootstrap.completed source=PIPE_AND_PROVIDER_FILE_DOWNLOAD topics={}", holder[0].getTopicHeads().size());
+        log.info("event=bootstrap.completed source=PIPE_AND_PROVIDER_FILE_DOWNLOAD topics={} pipeOffset={}",
+                holder[0].getTopicHeads().size(), holder[0].getPipeOffset());
         return DownloadRefreshResult.ok(BootstrapSource.PIPE_AND_PROVIDER_FILE_DOWNLOAD, holder[0]);
     }
 
     private DownloadRefreshResult bootstrapIncremental(String parentUrl) {
-        // Wipe with storage closed, recover (empty), THEN ingest into the fresh engine.
+        // Pipe-only: wipe local data + state with storage closed, recover empty, and reset the pipe
+        // cursor to 0 — the normal pipe poller (resumed by quiesceWipeRecover) re-streams from the
+        // start. No separate bulk pull (that double-pulled with the live pipe).
         quiesceWipeRecover(() -> {
             cleaner.clearState(dataDir);
             cleaner.clearTopicData(dataDir);
+            pipeConnector.resetOffset(0);
         });
-        client.bulkFetchFromParent(parentUrl, dataDir);
-        log.info("event=bootstrap.completed source=PIPE_AND_PROVIDER_STREAM parentUrl={}", parentUrl);
+        log.info("event=bootstrap.completed source=PIPE_AND_PROVIDER_STREAM parentUrl={} mode=pipe_stream", parentUrl);
         return DownloadRefreshResult.ok(BootstrapSource.PIPE_AND_PROVIDER_STREAM, null);
     }
 
@@ -194,9 +232,9 @@ public class DownloadRefreshOrchestrator {
         quiesceWipeRecover(() -> {
             cleaner.clearState(dataDir);
             cleaner.clearTopicData(dataDir);
+            pipeConnector.resetOffset(0);
         });
-        client.bulkFetchFromCloud(dataDir);
-        log.info("event=bootstrap.completed source=CLOUD_SYNC");
+        log.info("event=bootstrap.completed source=CLOUD_SYNC mode=pipe_stream");
         return DownloadRefreshResult.ok(BootstrapSource.CLOUD_SYNC, null);
     }
 
