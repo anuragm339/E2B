@@ -29,7 +29,7 @@ See [TCP API](04-api-catalog.md#tcp-data-plane) and [Storage](05-data-model.md#s
 - **Data:** `TopologyResponse`, `MessageRecord`, `topology.properties`, `pipe-offset.properties`.
 - **Events/topics:** HTTP JSON records with topic and parent offsets; no Kafka client.
 - **External systems:** Cloud registry and parent HTTP broker.
-- **POS dependency:** Pipe pauses during refresh so the POS snapshot is replayed against stable local data.
+- **POS dependency:** Pipe pauses only for destructive download-refresh sections that mutate `pipe-offset.properties` or topic folders; local POS refresh leaves pipe polling active.
 - **Compaction:** Pipe records update the same compaction index as producer records.
 - **Failures:** Registry/probe/poll failures retain or retry the previous state with adaptive delay; failed storage handling prevents offset advancement.
 - **Tests:** `CloudRegistryClientIntegrationSpec`, `TopologyManagerProbeIntegrationSpec`, `HttpPipeConnectorIntegrationSpec`, `PipeOutageJourneySpec`.
@@ -130,10 +130,10 @@ See [Data model](05-data-model.md#rocksdb) and [Recovery](09-error-retry-recover
 
 ## POS Data Refresh
 
-- **Business purpose:** Reset consumers, replay a stable local snapshot, and resume upstream updates only after all consumers are ready.
+- **Business purpose:** Reset consumers and replay local data while upstream pipe polling remains active unless a destructive download-refresh bootstrap is mutating local pipe/storage state.
 - **Entry point:** `POST /admin/refresh-topic` in `broker/src/main/java/com/messaging/broker/http/RefreshController.java`.
-- **Main files:** `RefreshCoordinator.java`, `RefreshInitiator.java`, `RefreshResetService.java`, `RefreshReplayService.java`, `RefreshReadyService.java`, `RefreshRecoveryService.java`.
-- **Flow:** Pause pipe, persist `RESET_SENT`, clear ACK records, broadcast RESET, reset each ACKing group to offset `0`, replay, broadcast READY, wait for READY ACKs, resume pipe and reconciliation.
+- **Main files:** `RefreshCoordinator.java`, `RefreshInitiator.java`, `RefreshReplayWindowResolver.java`, `RefreshResetService.java`, `RefreshReplayService.java`, `RefreshReadyService.java`, `RefreshRecoveryService.java`.
+- **Flow:** Persist `RESET_SENT`, resolve the replay window, clear ACK records, broadcast RESET, reset each ACKing group to the replay start offset, replay until the captured target is reached, broadcast READY, wait for READY ACKs, clear refresh state, and resume ACK reconciliation.
 - **Data:** `RefreshContext`, `data-refresh-state.properties`, consumer offsets, ACK store.
 - **Events:** `RESET`, `RESET_ACK`, batches, `READY`, `READY_ACK`.
 - **External systems:** POS consumers and parent pipe.

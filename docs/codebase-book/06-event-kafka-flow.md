@@ -197,12 +197,12 @@ Sources: `SubscribeHandler.java`, `LegacyClientConfig.java`, `LegacyConsumerDeli
 ## Refresh Event Flow
 
 ```text
-pause pipe
+pause ACK reconciliation for the topic
 RESET(topic) -> RESET_ACK(topic, group)
-reset group offset to 0
-replay BATCH_HEADER/raw/BATCH_ACK until caught up
+reset group offset to configured replay start
+replay BATCH_HEADER/raw/BATCH_ACK until captured replay target is caught up
 READY(topic) -> READY_ACK(topic, group)
-resume pipe and ACK reconciliation
+resume ACK reconciliation
 ```
 
 Full state and race handling: [POS machine state](07-pos-machine-state.md).

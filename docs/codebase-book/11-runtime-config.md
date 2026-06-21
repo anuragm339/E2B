@@ -63,6 +63,16 @@ Factory also creates compaction, registry, refresh, and flush executors with cod
 
 Persistent files: `topology.properties`, `pipe-offset.properties`.
 
+## Refresh
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `broker.refresh.ready-settle-window-ms` | `21600000` | READY settle window by `created_time`: READY waits only for records older than this (settled history); records within the window arrive via normal delivery after READY. `0` = full catch-up to head |
+| `broker.refresh.replay.window-hours` | `0` | Replay start horizon (how far back to re-deliver). `0` = full available history; positive values start replay from records in the last N hours |
+| `broker.refresh.health-critical-topics` | `[]` | If non-empty, only active refreshes for listed topics make `/health` DOWN |
+
+LOCAL refresh never pauses the upstream pipe. PIPE_AND_PROVIDER, CLOUD_SYNC, and BARE_METAL pause pipe polling only while local wipe/restore/state-clear work mutates topic folders or `pipe-offset.properties`; the pipe is resumed before bulk parent/cloud ingest.
+
 ## ACK Store
 
 - Backend: RocksDB

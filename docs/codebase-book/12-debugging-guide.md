@@ -68,9 +68,9 @@ Use:
 By state:
 
 - `RESET_SENT`: compare expected consumers and RESET ACK set; check client `onReset`, connection, and service mapping.
-- `REPLAYING`: inspect `consumer-offsets.properties`, storage head, pending ACKs, and replay gap metric.
+- `REPLAYING`: inspect `consumer-offsets.properties`, storage head, `replay.start.offset`/`replay.target.offset` in `data-refresh-state.properties`, pending ACKs, and replay gap metric.
 - `READY_SENT`: inspect READY ACK set and client `onReady`; retry occurs every 10 seconds.
-- `ABORTED`: automatic operational recovery policy is not confirmed; inspect pipe/reconciliation state.
+- `ABORTED`: automatic operational recovery policy is not confirmed; inspect reconciliation state and any destructive download-refresh bootstrap logs.
 
 **F1 (scheduled-task guards):** if a refresh hangs in a non-terminal state with no progress AND no
 abort after the 10-minute window, look for a logged throw from a refresh timer:
@@ -78,8 +78,30 @@ abort after the 10-minute window, look for a logged throw from a refresh timer:
 `Abort watchdog failed for topic ... — re-arming for another window`. Each refresh timer
 (`retryResetBroadcast`, `checkReadyAckTimeout`, `runAbortWatchdog`) now guards its body so an
 unchecked throw can no longer silently cancel its `ScheduledExecutorService` schedule/re-arm and
-strand the refresh (which would keep the pipe paused until a broker restart). A repeating
+strand the refresh. A repeating
 `re-arming for another window` log means a deterministic throw in the abort path needs fixing.
+
+### Admin refresh stuck at health 503, `consumerCount=0`, `await_refresh_timeout`
+
+Symptom: an **admin** download-refresh (`POST /admin/download-refresh?type=…` with a non-LOCAL,
+non-fresh-install type) runs the wipe + re-source fine, but `/health` then stays **503** and
+`data_refresh_messages_transferred=0`. Logs show every topic's `event=refresh.reset_broadcast …
+consumerCount=0` and eventually `event=download_refresh.await_refresh_timeout topics=N` (~15 min).
+
+Cause: the admin path (`stopServer=true`) calls `network_server.stop_accepting`, which EOFs every
+consumer. **The legacy consumer client does not reconnect after EOF** — it logs
+`📪 EOF received - shutting down` and stops. With no consumers connected, the refresh has no one to
+drive to READY, so it hangs until the await cap and health never releases.
+
+Confirm: `docker logs <consumer> | grep EOF` shows the shutdown with no following reconnect;
+`broker` logs show `network_server.stop_accepting … clients=N` followed by no re-registration.
+
+Recovery: **restart the consumer containers** — they reconnect, the late-join path drives the
+pending refreshes to READY, and `/health` returns 200. Not a broker bug: the wipe / pipe re-stream /
+RocksDB in-place clear all succeeded. See ch20 "Why stop the network server during the wipe" →
+known-limitation note. The fresh-install bootstrap (`stopServer=false`) is unaffected.
+
+Files: `DownloadRefreshService.java`, `NettyTcpServer.java`, legacy consumer client.
 
 Files: `RefreshCoordinator.java`, phase services, `RefreshStateStore.java`.
 
@@ -94,6 +116,32 @@ Files: `RefreshCoordinator.java`, phase services, `RefreshStateStore.java`.
 7. Check storage exception from `BrokerService.handlePipeMessage`.
 
 Files: `TopologyManager.java`, `CloudRegistryClient.java`, `HttpPipeConnector.java`, `BrokerService.java`.
+
+### Pipe frozen on one record after a bootstrap/refresh — `CompactionIndex write failed`
+
+Symptom: after a download-refresh / fresh-install bootstrap, the pipe stalls at a single offset and
+`broker.messages.stored` stops growing. Logs show, every ~30s:
+
+```
+CRITICAL: Failed to store pipe message at offset N: CompactionIndex write failed
+... Next poll will retry from offset N-1 ...
+Caused by: org.rocksdb.RocksDBException: While open a file for appending:
+           /data/ack-store/000008.log: No such file or directory
+```
+
+Cause: the bootstrap wipe used to **delete the `ack-store/` directory** (`LocalStateCleaner.clearState`)
+while `SharedRocksDb` — the long-lived singleton handle shared by the ACK store and the compaction
+index — was still open. RocksDB's files were yanked out from under it, so every subsequent
+`compactionIndex.updateKey` threw, which fails `handlePipeMessage`, which makes the pipe retry the
+same record forever (it never advances → looks like a "premature drain"/incomplete load, but the
+pipe is *blocked*, not drained). Disk is NOT full in this case.
+
+Fix (in place): the wipe now clears the RocksDB ACK + compaction column families **in place** via
+`SharedRocksDb.clearCompactionAndAck()` (range tombstones) instead of deleting the directory, so the
+open handle — and the cached handles in `RocksDbAckStore`/`RocksDbCompactionIndex` — stay valid.
+`DownloadRefreshOrchestrator.quiesceWipeRecover` calls it right after `storage.close()`.
+
+Files: `SharedRocksDb.java`, `LocalStateCleaner.java`, `DownloadRefreshOrchestrator.java`.
 
 ## Compaction Problems
 

@@ -84,8 +84,8 @@ generated interceptor**, giving a single chokepoint for the retry block AND the 
 Producing must be **OFF during a data refresh, ON only after `READY`**. It is the write-side
 twin of the read-side pause already in the tree:
 `HttpPipeConnector.pausePipeCalls()` / `resumePipeCalls()`
-(`provider/pipe/.../HttpPipeConnector.java`) pause cloud ingestion while the refresh runs
-`RESET → REPLAY → READY` ([ch.7](07-pos-machine-state.md)).
+(`provider/pipe/.../HttpPipeConnector.java`) pause cloud ingestion during destructive
+download-refresh storage mutations ([ch.7](07-pos-machine-state.md)).
 
 **Rationale:** a refresh replays a clean snapshot of a topic to consumers; a concurrent
 `publish()` would interleave new records and tear the snapshot.
