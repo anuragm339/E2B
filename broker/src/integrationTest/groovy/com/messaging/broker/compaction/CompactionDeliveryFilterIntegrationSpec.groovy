@@ -208,6 +208,7 @@ class CompactionDeliveryFilterIntegrationSpec extends BrokerHandlerSpecSupport {
         conditions.eventually {
             assert subscriber.received.any { it.type == BrokerMessage.MessageType.DATA }
         }
+        subscriber.sendBatchAck('offset-topic', 'offset-group')
 
         and: "after delivery settles, the persisted offset has advanced past all 3 records"
         // The delivery offset must reach at least 3, indicating the consumer advanced

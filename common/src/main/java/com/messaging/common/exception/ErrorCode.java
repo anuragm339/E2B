@@ -58,6 +58,9 @@ public enum ErrorCode {
     DATA_REFRESH_REPLAY_FAILED(4005, "DATA_REFRESH", "Message replay failed during data refresh", true),
     DATA_REFRESH_METRICS_ERROR(4006, "DATA_REFRESH", "Data refresh metrics recording failed", true),
     DATA_REFRESH_COMPLETION_FAILED(4007, "DATA_REFRESH", "Data refresh completion failed", true),
+    DATA_REFRESH_SNAPSHOT_BUILD_FAILED(4008, "DATA_REFRESH", "Failed to build data snapshot", true),
+    DATA_REFRESH_SNAPSHOT_NOT_FOUND(4009, "DATA_REFRESH", "No data snapshot available", false),
+    DATA_REFRESH_SNAPSHOT_RESTORE_FAILED(4010, "DATA_REFRESH", "Failed to restore data snapshot", true),
 
     // ==================== BROKER ERRORS (5xxx) ====================
     BROKER_NOT_INITIALIZED(5001, "BROKER", "Broker not initialized", false),

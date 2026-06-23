@@ -3,8 +3,10 @@ package com.messaging.broker.consumer;
 import com.messaging.broker.monitoring.LogContext;
 import com.messaging.broker.monitoring.RefreshEventLogger;
 import com.messaging.broker.consumer.ConsumerRegistry;
+import com.messaging.broker.legacy.LegacyClientConfig;
 import com.messaging.broker.monitoring.DataRefreshMetrics;
 import com.messaging.common.api.PipeConnector;
+import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,6 +32,8 @@ public class RefreshInitiator implements RefreshStarter {
     private final RefreshWorkflow stateMachine;
     private final RefreshStateStore stateStore;
     private final RefreshEventLogger refreshLogger;
+    private final RefreshReplayWindowResolver replayWindowResolver;
+    private final LegacyClientConfig legacyClientConfig;
 
     // Shared state - injected by coordinator
     private Map<String, RefreshContext> activeRefreshes;
@@ -46,12 +50,28 @@ public class RefreshInitiator implements RefreshStarter {
             RefreshWorkflow stateMachine,
             RefreshStateStore stateStore,
             RefreshEventLogger refreshLogger) {
+        this(remoteConsumers, pipeConnector, metrics, stateMachine, stateStore, refreshLogger,
+                RefreshReplayWindowResolver.unbounded(), null);
+    }
+
+    @Inject
+    public RefreshInitiator(
+            ConsumerRegistry remoteConsumers,
+            PipeConnector pipeConnector,
+            DataRefreshMetrics metrics,
+            RefreshWorkflow stateMachine,
+            RefreshStateStore stateStore,
+            RefreshEventLogger refreshLogger,
+            RefreshReplayWindowResolver replayWindowResolver,
+            LegacyClientConfig legacyClientConfig) {
         this.remoteConsumers = remoteConsumers;
         this.pipeConnector = pipeConnector;
         this.metrics = metrics;
         this.stateMachine = stateMachine;
         this.stateStore = stateStore;
         this.refreshLogger = refreshLogger;
+        this.replayWindowResolver = replayWindowResolver;
+        this.legacyClientConfig = legacyClientConfig;
     }
 
     /**
@@ -79,6 +99,11 @@ public class RefreshInitiator implements RefreshStarter {
 
     @Override
     public CompletableFuture<RefreshResult> startRefresh(String topic) {
+        return startRefresh(topic, "LOCAL");
+    }
+
+    @Override
+    public CompletableFuture<RefreshResult> startRefresh(String topic, String refreshType) {
         // Check for existing refresh and force cancel if needed
         RefreshContext existingRefresh = activeRefreshes.get(topic);
         if (existingRefresh != null) {
@@ -96,9 +121,17 @@ public class RefreshInitiator implements RefreshStarter {
         }
 
         // Build the context object before acquiring the lock — construction is safe without it.
-        RefreshContext context = new RefreshContext(topic, expectedConsumers);
+        RefreshContext context = new RefreshContext(topic, expectedConsumers, "TOPIC", refreshType);
         context.setState(RefreshState.RESET_SENT);
         context.setResetSentTime(Instant.now());
+        RefreshReplayWindowResolver.RefreshReplayWindow replayWindow = replayWindowResolver.resolve(topic, refreshType);
+        context.setReplayStartOffset(replayWindow.startOffset());
+        context.setReplayTargetOffset(replayWindow.targetOffset());
+        context.setReplayCutoffTime(replayWindow.cutoff());
+        // Non-LOCAL refreshes load data asynchronously over the pipe (no bulkFetch), so the settled
+        // READY target must track the live head as storage fills — not the snapshot taken now (which
+        // may see empty/partial storage). LOCAL replays already-present local segments → static target.
+        context.setDynamicReplayTarget(!"LOCAL".equals(refreshType));
 
         // Synchronized block covers both refreshId assignment AND activeRefreshes.put().
         // Previously put() was outside the block, leaving a window where two concurrent
@@ -129,18 +162,10 @@ public class RefreshInitiator implements RefreshStarter {
                 .build();
         refreshLogger.logRefreshStarted(startContext);
 
-        // Record metrics and pause pipe calls outside the lock (I/O-free, order doesn't matter)
-        metrics.recordRefreshStarted(topic, "LOCAL", currentRefreshId);
+        // Record metrics outside the lock. Consumer refresh does not mutate pipe-offset.properties
+        // or topic folders, so it must not own pipe pause/resume.
+        metrics.recordRefreshStarted(topic, refreshType, currentRefreshId);
         metrics.updateRefreshState(topic, RefreshState.RESET_SENT);
-
-        // Pause pipe calls before starting refresh
-        pipeConnector.pausePipeCalls();
-
-        LogContext pipeContext = LogContext.builder()
-                .topic(topic)
-                .custom("refreshId", currentRefreshId)
-                .build();
-        refreshLogger.logPipePaused(pipeContext);
 
         // Persist state immediately
         stateStore.saveState(context);
@@ -152,7 +177,25 @@ public class RefreshInitiator implements RefreshStarter {
 
     @Override
     public Set<String> getExpectedConsumers(String topic) {
-        return new HashSet<>(remoteConsumers.getGroupTopicIdentifiers(topic));
+        // Prefer the consumers REGISTERED right now. Only when none are registered — the fresh/cold-boot
+        // case, where the refresh fires before consumers reconnect — fall back to the CONFIGURED groups
+        // (legacy service-topics) so the refresh WAITS for them via RESET-retry + late-join instead of
+        // skipping the topic; the abort watchdog bounds genuinely-absent consumers. Format is
+        // "group:topic", and a legacy consumer's group is its serviceName (the service-topics key), so
+        // the configured identifier matches what a consumer reports on its RESET/READY ack.
+        Set<String> runtime = new HashSet<>(remoteConsumers.getGroupTopicIdentifiers(topic));
+        if (!runtime.isEmpty()) {
+            return runtime; // consumers are connected — use them (don't wait on configured-but-absent ones)
+        }
+        Set<String> configured = new HashSet<>();
+        if (legacyClientConfig != null && legacyClientConfig.getServiceTopics() != null) {
+            for (Map.Entry<String, java.util.List<String>> e : legacyClientConfig.getServiceTopics().entrySet()) {
+                if (e.getValue() != null && e.getValue().contains(topic)) {
+                    configured.add(e.getKey() + ":" + topic); // serviceName == group
+                }
+            }
+        }
+        return configured;
     }
 
     @Override

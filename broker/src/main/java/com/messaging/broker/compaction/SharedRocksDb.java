@@ -1,5 +1,8 @@
 package com.messaging.broker.compaction;
 
+import com.messaging.common.exception.ErrorCode;
+import com.messaging.common.exception.ExceptionLogger;
+import com.messaging.common.exception.StorageException;
 import io.micronaut.context.annotation.Value;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -93,6 +96,50 @@ public class SharedRocksDb {
 
         log.info("SharedRocksDb opened at {} with column families: default, compaction " +
                  "(shared block cache: {} MB)", dbPath, blockCacheBytes / (1024 * 1024));
+    }
+
+    /**
+     * Empty both column families IN PLACE, keeping the open DB handle valid.
+     *
+     * <p>The bootstrap wipe used to delete the {@code ack-store/} directory on disk
+     * ({@code LocalStateCleaner.clearState}). But this DB is a long-lived {@code @Singleton} opened
+     * once at startup and held (with cached column-family handles) by
+     * {@link com.messaging.broker.ack.RocksDbAckStore} and {@link RocksDbCompactionIndex}. Deleting
+     * its files out from under the open handle corrupted it — every subsequent write threw
+     * {@code "While open a file for appending: NNN.log: No such file or directory"} — so the first
+     * pipe record ingested after a wipe failed its compaction-index write and the pipe stalled on
+     * that record forever. Clearing via range tombstones produces the same empty end-state while the
+     * handle (and every cached handle) stays valid; the index then repopulates as data is re-sourced.
+     */
+    public void clearCompactionAndAck() {
+        try {
+            clearColumnFamily(defaultHandle);
+            clearColumnFamily(compactionHandle);
+            log.info("event=ack_store.cleared_in_place path={}", dbPath);
+        } catch (RocksDBException e) {
+            throw ExceptionLogger.logAndThrow(log, new StorageException(
+                    ErrorCode.STORAGE_METADATA_ERROR,
+                    "Failed to clear ack-store/compaction RocksDB for bootstrap", e)
+                    .withContext("dbPath", dbPath));
+        }
+    }
+
+    /** Delete every key in {@code handle} without dropping the column family (handle stays valid). */
+    private void clearColumnFamily(ColumnFamilyHandle handle) throws RocksDBException {
+        byte[] first;
+        byte[] last;
+        try (RocksIterator it = db.newIterator(handle)) {
+            it.seekToFirst();
+            if (!it.isValid()) {
+                return; // already empty
+            }
+            first = it.key();
+            it.seekToLast();
+            last = it.key();
+        }
+        // deleteRange covers [first, last) — exclusive of the last key, so remove that one explicitly.
+        db.deleteRange(handle, first, last);
+        db.delete(handle, writeOptions, last);
     }
 
     @PreDestroy

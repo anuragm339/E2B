@@ -10,6 +10,8 @@ import com.messaging.broker.consumer.ConsumerDeliveryManager;
 import com.messaging.broker.monitoring.BrokerMetrics;
 import com.messaging.broker.monitoring.TraceIds;
 import com.messaging.broker.core.TopologyManager;
+import com.messaging.broker.snapshot.BootstrapProgressTracker;
+import com.messaging.broker.snapshot.DownloadRefreshService;
 import com.messaging.common.api.NetworkServer;
 import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.ErrorCode;
@@ -19,6 +21,7 @@ import com.messaging.common.exception.StorageException;
 import com.messaging.common.model.BrokerMessage;
 import com.messaging.common.model.MessageRecord;
 import io.micrometer.core.instrument.Timer;
+import io.micronaut.context.BeanProvider;
 import io.micronaut.context.annotation.Value;
 import io.micronaut.context.event.ApplicationEventListener;
 import io.micronaut.runtime.server.event.ServerStartupEvent;
@@ -27,6 +30,10 @@ import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 /**
  * Main broker service that wires storage and network together
@@ -46,8 +53,18 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
     private final ShutdownCoordinator shutdownCoordinator;
     private final AckStoreSeeder ackStoreSeeder;
     private final CompactionIndex compactionIndex;
+    // Lazy provider avoids any startup-time DI cycle (DownloadRefreshService pulls in the refresh +
+    // network beans). Only resolved on a fresh-install boot.
+    private final BeanProvider<DownloadRefreshService> downloadRefreshProvider;
+    private final BootstrapProgressTracker bootstrapProgress;
+    private final String dataDir;
+    private final boolean freshInstallBootstrapEnabled;
     private final int serverPort;
     private final boolean ackStoreSeedOnStartupEnabled;
+
+    // Bounded wait for the first topology resolution before the fresh-install bootstrap chooses a
+    // source — without it a child node would escalate to the cloud on every fresh boot.
+    private static final long TOPOLOGY_RESOLVE_TIMEOUT_MS = 5000;
 
     @Inject
     public BrokerService(
@@ -62,6 +79,10 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
             ShutdownCoordinator shutdownCoordinator,
             AckStoreSeeder ackStoreSeeder,
             CompactionIndex compactionIndex,
+            BeanProvider<DownloadRefreshService> downloadRefreshProvider,
+            BootstrapProgressTracker bootstrapProgress,
+            @Value("${broker.storage.data-dir:./data}") String dataDir,
+            @Value("${broker.bootstrap.fresh-install.enabled:true}") boolean freshInstallBootstrapEnabled,
             @Value("${broker.network.port:9092}") int serverPort,
             @Value("${ack-store.seed-on-startup.enabled:true}") boolean ackStoreSeedOnStartupEnabled) {
 
@@ -76,6 +97,10 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         this.shutdownCoordinator = shutdownCoordinator;
         this.ackStoreSeeder = ackStoreSeeder;
         this.compactionIndex = compactionIndex;
+        this.downloadRefreshProvider = downloadRefreshProvider;
+        this.bootstrapProgress = bootstrapProgress;
+        this.dataDir = dataDir;
+        this.freshInstallBootstrapEnabled = freshInstallBootstrapEnabled;
         this.serverPort = serverPort;
         this.ackStoreSeedOnStartupEnabled = ackStoreSeedOnStartupEnabled;
 
@@ -143,6 +168,63 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
         topologyManager.onMessageReceived(this::handlePipeMessage);
         topologyManager.start();
         log.info("Topology manager started");
+
+        // Fresh install / post-bare-metal empty boot: converge to the bare-metal end state
+        // (health DOWN → re-source → RESET→replay→READY) instead of silently streaming in while
+        // /health reports green.
+        maybeBootstrapFreshInstall();
+    }
+
+    /**
+     * On a fresh install (or the empty node a bare-metal {@code System.exit} restarts into), run the
+     * same re-source + consumer-refresh a bare-metal converges to: gate {@code /health} DOWN, pull the
+     * authoritative data from the parent/cloud, and RESET→replay→READY the consumers. Without this the
+     * empty node would stream data in over the normal pipe while {@code /health} already reads green.
+     *
+     * <p>Runs asynchronously so startup completes; {@code /health} is gated DOWN synchronously first so
+     * there is no green window. Note we call {@code runBootstrapAndRefresh()} (the auto re-source), NOT
+     * the {@code BARE_METAL} refresh type — the latter {@code System.exit}s and would loop on an empty
+     * node.
+     */
+    private void maybeBootstrapFreshInstall() {
+        if (!isFreshInstall()) {
+            return;
+        }
+        log.warn("event=fresh_boot.detected dataDir={} — bootstrapping as a bare-metal re-source", dataDir);
+        // Gate /health DOWN immediately (synchronously) so there is no green window before the async run.
+        bootstrapProgress.start("fresh-boot", BootstrapProgressTracker.Phase.DOWNLOADING);
+        Thread.ofVirtual().name("fresh-boot-bootstrap").start(() -> {
+            try {
+                topologyManager.resolveTopologyNow(TOPOLOGY_RESOLVE_TIMEOUT_MS);
+                downloadRefreshProvider.get().runBootstrapAndRefresh();
+            } catch (Exception e) {
+                log.error("event=fresh_boot.failed err={}", e.toString(), e);
+                bootstrapProgress.failed();
+            }
+        });
+    }
+
+    /**
+     * A fresh install has no topic data, no in-flight refresh to resume (so refresh-recovery owns that
+     * case), and has never streamed from a parent (no persisted pipe offset).
+     */
+    // Package-private for unit testing of the detection logic.
+    boolean isFreshInstall() {
+        if (!freshInstallBootstrapEnabled) {
+            return false;
+        }
+        try {
+            if (!storage.getTopicNames().isEmpty()) {
+                return false; // already has data
+            }
+            Path dir = Paths.get(dataDir);
+            boolean inFlightRefresh = Files.exists(dir.resolve("data-refresh-state.properties"));
+            boolean streamedBefore = Files.exists(dir.resolve("pipe-offset.properties"));
+            return !inFlightRefresh && !streamedBefore;
+        } catch (Exception e) {
+            log.warn("event=fresh_boot.detect_failed err={} — skipping fresh-install bootstrap", e.toString());
+            return false;
+        }
     }
 
     /**
@@ -199,7 +281,7 @@ public class BrokerService implements ApplicationEventListener<ServerStartupEven
                 // for genuine duplicates this is a no-op.
                 compactionIndex.updateKey(topic, record.getMsgKey(), record.getOffset(),
                         record.getCreatedAt().toEpochMilli());
-                log.info("event=pipe_message.duplicate_skipped topic={} offset={} storageHead={}",
+                log.debug("event=pipe_message.duplicate_skipped topic={} offset={} storageHead={}",
                         topic, record.getOffset(), topicHead);
                 metrics.stopE2ETimer(e2eSample);
                 return true;

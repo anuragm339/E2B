@@ -18,3 +18,10 @@ data/
 oldClient
 broker/data
 broker/logs
+
+# macOS
+.DS_Store
+
+# graphify artifacts
+graphify-out/
+graphify-source/

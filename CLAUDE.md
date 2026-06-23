@@ -99,6 +99,24 @@ Whenever code changes:
 
 Documentation must remain synchronized with code.
 
+### Regenerate the rendered site after editing chapters
+
+The book is viewed through a generated single-page app: `docs/codebase-book/index.html`
+redirects to `site/index.html`, which loads the chapter content from
+`docs/codebase-book/site/assets/content.js`. Editing a `NN-*.md` chapter does **not**
+update the viewer on its own — the generated bundle is stale until rebuilt.
+
+After adding or editing any chapter (including a brand-new `NN-*.md`, which is
+auto-discovered), you MUST run:
+
+```
+node docs/codebase-book/build-site.mjs
+```
+
+and commit the regenerated `docs/codebase-book/site/assets/content.js` (and any other
+changed files under `site/`) together with the chapter markdown. A documentation change is
+not complete until the site reflects it.
+
 ---
 
 ## REQUIRED DESIGN REVIEW

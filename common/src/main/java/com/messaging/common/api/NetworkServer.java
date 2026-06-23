@@ -69,6 +69,32 @@ public interface NetworkServer {
     void shutdown();
 
     /**
+     * Stop accepting and serving consumer connections WITHOUT tearing down the bean.
+     *
+     * <p>Closes the listening socket and disconnects every connected client, but preserves the
+     * registered message/disconnect handlers and the configured bind port so the server can be
+     * brought back with {@link #resumeAccepting()}. Used by the destructive download-refresh
+     * lifecycle to take the consumer transport down for the wipe + re-source window so no ACK can
+     * advance consumer offsets while local state is deleted.
+     *
+     * <p>Default no-op for transports that do not support a mid-process bounce.
+     */
+    default void stopAccepting() {
+        shutdown();
+    }
+
+    /**
+     * Resume accepting consumer connections after {@link #stopAccepting()}, rebinding the same port.
+     *
+     * <p>Default is a no-op; transports supporting a mid-process bounce re-bind here.
+     *
+     * @throws NetworkException if the server fails to rebind
+     */
+    default void resumeAccepting() throws NetworkException {
+        // no-op for transports without mid-process bounce support
+    }
+
+    /**
      * Get list of connected client IDs
      * @return List of client IDs
      */

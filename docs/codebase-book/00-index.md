@@ -26,6 +26,7 @@ This book is a source-backed map of the repository. Start with the chapter that 
 17. [Performance tuning (throughput profile)](17-performance-tuning.md)
 18. [Roadmap — Local message bus (`@Producer`)](18-roadmap-local-message-bus.md) — **PLANNED, not implemented**
 19. [Roadmap — Broker self-status API (`/admin/status/*`)](19-self-status-api.md) — **PLANNED, not implemented**
+20. [Download refresh (`/admin/download-refresh`)](20-download-refresh.md) — wipe + re-source from parent/cloud; implemented on `feature/download-refresh`
 
 ## Features
 

@@ -127,6 +127,10 @@ public class BatchAckService implements ConsumerAckService {
             long oldOffset = consumer.getCurrentOffset();
             offsetTracker.updateOffset(group + ":" + topic, committedOffset);
 
+            // Real delivery confirmed: stamp the per-consumer field that StatusController state
+            // derivation depends on.
+            consumer.lastDeliveryAttempt = System.currentTimeMillis();
+
             // Update metrics
             metrics.updateConsumerOffset(clientId, topic, group, committedOffset);
             metrics.updateConsumerLastAckTime(clientId, topic, group);

@@ -57,7 +57,8 @@ Transition validation: `RefreshStateMachine.java`.
 - snapshots currently registered `group:topic` consumers;
 - returns `COMPLETED` immediately if none exist;
 - creates a UUID refresh ID shared by concurrent topics in the same batch;
-- pauses pipe calls;
+- leaves pipe polling active because local consumer refresh does not mutate `pipe-offset.properties` or topic folders;
+- resolves `broker.refresh.replay.window-hours` into a concrete replay start offset and captured target head;
 - persists `RESET_SENT`.
 
 Sources: `RefreshInitiator.java`, `RefreshController.java`.
@@ -74,7 +75,8 @@ Sources: `RefreshInitiator.java`, `RefreshController.java`.
 On RESET_ACK:
 
 - validate expected consumer and duplicate;
-- reset that consumer's offset to `0`;
+- reset that consumer's offset to the captured replay start offset;
+- for legacy consumers, reset to `replayStartOffset - 1` because legacy offsets mean last-delivered;
 - initialize replay metrics;
 - persist context;
 - the first accepted ACK atomically claims transition to `REPLAYING`.
@@ -90,7 +92,7 @@ Normal adaptive delivery resumes because `RefreshGatePolicy` blocks only `RESET_
 Replay completion requires:
 
 - every expected RESET ACK received; and
-- every ACKed consumer considered caught up.
+- every ACKed consumer considered caught up to the captured replay target. The target is the **settled-history** offset: the last record whose `created_time` is older than `broker.refresh.ready-settle-window-ms` (default 6h). Records created within that window are still settling and are not required for READY (they arrive via normal delivery after). If no record is within the window the target is the head (deliver everything); if every record is within the window the target is `-1` (READY immediately). `broker.refresh.replay.window-hours` separately bounds how far back replay *starts*.
 
 Source: `RefreshReplayService.java`.
 
@@ -109,10 +111,11 @@ READY ACK timeout checks run every 10 seconds and re-send to the live ACK set. A
 On completion:
 
 - persist `COMPLETED`;
-- resume pipe only when no sibling topic in the same refresh batch remains active;
 - clear the topic's refresh state;
 - resume ACK reconciliation;
 - retain in-memory context for 60 seconds before guarded cleanup.
+
+`/health` normally reports DOWN while any topic refresh is active. If `broker.refresh.health-critical-topics` is configured, only active refreshes for those topics block health; non-critical topics can continue replaying while the broker reports green.
 
 Sources: `RefreshReadyService.java`, `RefreshCoordinator.java`.
 
@@ -149,12 +152,12 @@ File: `<dataDir>/data-refresh-state.properties`.
 
 Owner: `broker/src/main/java/com/messaging/broker/consumer/RefreshStateStore.java`.
 
-Persisted content includes active topics, refresh ID/type/state, expected consumers, ACK sets, timestamps, replay progress, and downtime. The store includes backward-compatible loading for an older single-active-refresh format.
+Persisted content includes active topics, refresh ID/type/state, expected consumers, ACK sets, timestamps, replay progress, replay-window offsets/cutoff, and downtime. The store includes backward-compatible loading for an older single-active-refresh format.
 
 At broker startup, `RefreshRecoveryService`:
 
 - loads all contexts;
-- pauses pipe before resuming;
+- leaves pipe polling active while resuming consumer-refresh state;
 - fills missing old refresh IDs with UUIDs;
 - groups topics by refresh ID;
 - records startup/downtime;
@@ -176,7 +179,7 @@ REPLAYING watchdog re-arms if replay recently progressed. READY_SENT gets one ad
 
 1. Delivery must not occur before startup READY_ACK.
 2. Delivery is blocked while refresh is waiting for RESET ACK.
-3. Pipe must remain paused until every active topic in a refresh batch is terminal.
+3. Local consumer refresh must not own pipe pause/resume; only destructive download-refresh bootstrap sections may pause pipe polling.
 4. A decoded partial batch must not be ACKed.
 5. ACK and timeout may complete only the matching delivery generation.
 6. Reconnect must preserve durable group/topic offset and remove stale socket state.

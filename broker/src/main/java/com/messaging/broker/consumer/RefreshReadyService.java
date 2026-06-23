@@ -175,8 +175,13 @@ public class RefreshReadyService implements ReadyPhase {
         stateStore.saveState(context);
 
         // Use context.getRefreshId() instead of currentRefreshId field
-        // (currentRefreshId may be null if another topic completed first)
-        metrics.recordRefreshCompleted(topic, "LOCAL", "SUCCESS", context.getRefreshId(), context);
+        // (currentRefreshId may be null if another topic completed first).
+        // Record the COMPLETED metric under the SAME refresh type the refresh was STARTED with
+        // (context.getRefreshType(), e.g. CLOUD_SYNC / PIPE_AND_PROVIDER_STREAM / LOCAL) — hardcoding
+        // "LOCAL" here split every non-LOCAL refresh into two dashboard rows: a started-only row under
+        // its real type and a completed-only row under LOCAL (a fresh-install bootstrap showed as
+        // CLOUD_SYNC + LOCAL with no single row carrying both start and end time).
+        metrics.recordRefreshCompleted(topic, context.getRefreshType(), "SUCCESS", context.getRefreshId(), context);
 
         long durationMs = context.getResetSentTime() != null ?
                 java.time.Duration.between(context.getResetSentTime(), Instant.now()).toMillis() : 0;
@@ -188,34 +193,6 @@ public class RefreshReadyService implements ReadyPhase {
                 .custom("consumerCount", context.getExpectedConsumers().size())
                 .build();
         refreshLogger.logRefreshCompleted(completeContext);
-
-        // Resume pipe calls only if NO other refreshes IN THE SAME BATCH are in progress.
-        // Exclude both COMPLETED and ABORTED: an aborted sibling topic is terminal and should
-        // not prevent the pipe from resuming when the remaining topics have completed.
-        String batchId = context.getRefreshId();
-        boolean otherRefreshesInBatchActive = activeRefreshes.values().stream()
-                .anyMatch(ctx -> !ctx.getTopic().equals(topic) &&
-                                 ctx.getRefreshId().equals(batchId) &&
-                                 ctx.getState() != RefreshState.COMPLETED &&
-                                 ctx.getState() != RefreshState.ABORTED);
-
-        if (!otherRefreshesInBatchActive) {
-            pipeConnector.resumePipeCalls();
-
-            LogContext pipeContext = LogContext.builder()
-                    .topic(topic)
-                    .custom("refreshId", batchId)
-                    .build();
-            refreshLogger.logPipeResumed(pipeContext);
-        } else {
-            long activeTopicsInBatch = activeRefreshes.values().stream()
-                    .filter(ctx -> ctx.getRefreshId().equals(batchId) &&
-                                   ctx.getState() != RefreshState.COMPLETED &&
-                                   ctx.getState() != RefreshState.ABORTED)
-                    .count();
-            log.info("Pipe calls remain PAUSED ({} other topic(s) in batch {} still in progress)",
-                    activeTopicsInBatch, batchId);
-        }
 
         // Clear state for this topic only
         stateStore.clearState(topic);

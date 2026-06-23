@@ -160,6 +160,29 @@ public class DataRefreshMetrics {
     }
 
     /**
+     * Re-emit the {@code data_refresh_start_time_seconds} gauge for a refresh recovered after a broker
+     * restart, from the persisted start time. Unlike {@link #recordRefreshStarted} this does NOT
+     * increment {@code refreshStartedTotal} or change the refresh state — the refresh did not start
+     * anew, it is resuming, so only the gauge value is restored under the original refresh_id/type.
+     */
+    public void restoreRefreshStartTime(String topic, String refreshType, String refreshId, long startTimeMs) {
+        String key = topic + ":" + refreshType + ":" + refreshId;
+        AtomicDouble startTimeValue = refreshStartTimeValues.computeIfAbsent(key, k -> {
+            AtomicDouble atomicTime = new AtomicDouble(0.0);
+            refreshStartTimeGauges.computeIfAbsent(key, gk ->
+                    Gauge.builder("data_refresh_start_time_seconds", atomicTime, AtomicDouble::get)
+                            .description("Timestamp when refresh started (seconds since epoch)")
+                            .tag("topic", topic)
+                            .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
+                            .register(registry)
+            );
+            return atomicTime;
+        });
+        startTimeValue.set(startTimeMs / 1000.0);
+    }
+
+    /**
      * Record refresh workflow completed
      */
     public void recordRefreshCompleted(String topic, String refreshType, String status, String refreshId, RefreshContext context) {
@@ -571,6 +594,30 @@ public class DataRefreshMetrics {
             return atomicMessages;
         });
         messagesValue.addAndGet(messages);
+    }
+
+    /**
+     * Restore the {@code data_refresh_messages_transferred_total} gauge for a refresh recovered after
+     * a broker restart, to the count already delivered before the restart (derived from the consumer's
+     * persisted replay progress). Unlike {@link #recordDataTransferred} this SETS the value rather than
+     * adding, so the resumed replay continues from the restored baseline instead of from zero.
+     */
+    public void restoreMessagesTransferred(String topic, String consumer, String refreshType, String refreshId, long messages) {
+        String key = topic + ":" + consumer + ":" + refreshType;
+        AtomicLong messagesValue = messagesTransferredValues.computeIfAbsent(key, k -> {
+            AtomicLong atomicMessages = new AtomicLong(0);
+            messagesTransferredGauges.computeIfAbsent(key, gk ->
+                    Gauge.builder("data_refresh_messages_transferred_total", atomicMessages, AtomicLong::get)
+                            .description("Total messages transferred during current data refresh")
+                            .tag("topic", topic)
+                            .tag("consumer", consumer)
+                            .tag("refresh_type", refreshType)
+                            .tag("refresh_id", refreshId)
+                            .register(registry)
+            );
+            return atomicMessages;
+        });
+        messagesValue.set(messages);
     }
 
     /**

@@ -169,7 +169,7 @@ All files live under `broker.storage.data-dir`. Atomic write behavior is impleme
 |---|---|---|
 | `consumer-offsets.properties` | `ConsumerOffsetTracker.java` | `group:topic -> offset`; local annotation consumers use their consumer ID |
 | `delivery-state.properties` | `DeliveryStateStore.java` | `<group:topic>.offset` and `.until` |
-| `data-refresh-state.properties` | `RefreshStateStore.java` | Active topic contexts, ACK sets, timestamps, replay state |
+| `data-refresh-state.properties` | `RefreshStateStore.java` | Active topic contexts, ACK sets, timestamps, replay state, captured replay-window offsets/cutoff |
 | `pipe-offset.properties` | `HttpPipeConnector.java` | `pipe.current.offset` |
 | `topology.properties` | `TopologyPropertiesStore.java` | Last role and parent |
 
@@ -209,7 +209,8 @@ The single per-`group:topic` persisted consumer offset (`ConsumerOffsetTracker`)
 
 Because both conventions share the same offset store, the broker's caught-up / lag / clamp helpers are written for the **legacy** convention (correct for the fleet) and are off-by-one for a modern consumer at the single boundary `offset == head`:
 
-- `ConsumerRegistry.allConsumersCaughtUp` (`:635`) — `offset < head` ⇒ not caught up. Correct for legacy; one record early for modern. **Do not tighten to `<= head`**: a legacy offset caps at `head`, so that would make caught-up unreachable and **stall refresh completion, leaving ingestion paused forever**. This gates `REPLAYING → READY` via `RefreshReplayService:95`.
+- `ConsumerRegistry.allConsumersCaughtUp` (`:635`) — `offset < head` ⇒ not caught up. Correct for legacy; one record early for modern. **Do not tighten to `<= head`**: a legacy offset caps at `head`, so that would make caught-up unreachable and **stall refresh completion forever**. This remains the fallback gate for contexts without a captured replay target.
+- `RefreshReplayService` captured-target checks are consumer-type aware: legacy consumers require `offset >= target`; modern consumers require `offset >= target + 1`.
 - Consumer-lag / replay-gap metrics `head - committedOffset` (`BatchAckService.java:151,331`, `BatchDeliveryService.java:371`, `RefreshReplayService.java:82`) — exact for legacy; undercount modern by 1. Metric-only.
 - Corrupt-offset clamp `ConsumerRegistrationManager.validateAndCorrectOffset` (`:103,113`) — only `offset > head + 1` is corrupt; it clamps **down to `head`**, the at-least-once-safe floor (exactly caught-up for legacy; at most one duplicate for modern, never a skip). Clamping to `head + 1` would risk silently skipping the last record on a corrupt file.
 

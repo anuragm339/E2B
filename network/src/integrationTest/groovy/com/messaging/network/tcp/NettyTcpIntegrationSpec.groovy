@@ -190,6 +190,52 @@ class NettyTcpIntegrationSpec extends Specification {
         newConnection?.disconnect()
     }
 
+    // =========================================================================
+    // stopAccepting / resumeAccepting — mid-process bounce (download-refresh wipe window)
+    // =========================================================================
+
+    def "stopAccepting disconnects clients and resumeAccepting rebinds the same port reusing handlers"() {
+        given: "a server with a registered handler and a connected client"
+        serverMessageLatch = new CountDownLatch(1)
+        server = new NettyTcpServer(2, 8)
+        server.registerHandler({ clientId, m ->
+            serverReceivedMessages.add(m)
+            serverMessageLatch.countDown()
+        } as NetworkServer.MessageHandler)
+        server.start(testPort)
+        def conn1 = new NettyTcpClient().connect("localhost", testPort).get(5, TimeUnit.SECONDS)
+        conn1.send(brokerMsg(BrokerMessage.MessageType.SUBSCRIBE, 1L, "reg".getBytes())).get(5, TimeUnit.SECONDS)
+        serverMessageLatch.await(5, TimeUnit.SECONDS)
+
+        when: "the server stops accepting (refresh wipe window)"
+        server.stopAccepting()
+        Thread.sleep(300)
+
+        then: "the existing client is disconnected and no client is tracked"
+        !conn1.isAlive()
+        server.getConnectedClients().isEmpty()
+
+        when: "the server resumes on the same port and a fresh client connects"
+        def secondMessageLatch = new CountDownLatch(1)
+        // reuse the SAME registered handler — it must survive the bounce
+        serverMessageLatch = secondMessageLatch
+        // re-point the existing handler's latch via a second handler that counts down the new latch
+        server.registerHandler({ clientId, m -> secondMessageLatch.countDown() } as NetworkServer.MessageHandler)
+        server.resumeAccepting()
+        def conn2 = new NettyTcpClient().connect("localhost", testPort).get(5, TimeUnit.SECONDS)
+        conn2.send(brokerMsg(BrokerMessage.MessageType.SUBSCRIBE, 2L, "reg2".getBytes())).get(5, TimeUnit.SECONDS)
+        def deliveredAfterResume = secondMessageLatch.await(5, TimeUnit.SECONDS)
+
+        then: "the rebound server accepts the connection and the surviving handler still fires"
+        conn2.isAlive()
+        deliveredAfterResume
+        // the original handler also survived: it recorded the post-resume SUBSCRIBE
+        serverReceivedMessages.any { it.getMessageId() == 2L }
+
+        cleanup:
+        conn2?.disconnect()
+    }
+
     def "multiple clients can connect simultaneously"() {
         given:
         def connectedClients = new CopyOnWriteArrayList<String>()

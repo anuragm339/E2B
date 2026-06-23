@@ -21,6 +21,9 @@ class RefreshStateStoreSpec extends Specification {
         context.setResetSentTime(Instant.parse("2025-01-01T00:00:00Z"))
         context.setReadySentTime(Instant.parse("2025-01-01T00:10:00Z"))
         context.setRefreshId("refresh-1")
+        context.setReplayStartOffset(200L)
+        context.setReplayTargetOffset(300L)
+        context.setReplayCutoffTime(Instant.parse("2024-12-31T00:00:00Z"))
         context.recordResetAck("groupA:topic")
         context.recordReadyAck("groupA:topic")
         context.updateConsumerOffset("groupA:topic", 123L)
@@ -40,8 +43,45 @@ class RefreshStateStoreSpec extends Specification {
         loaded.getReceivedReadyAcks().contains("groupA:topic")
         loaded.getConsumerOffsets().get("groupA:topic") == 123L
         loaded.getRefreshId() == "refresh-1"
+        loaded.getReplayStartOffset() == 200L
+        loaded.getReplayTargetOffset() == 300L
+        loaded.getReplayCutoffTime() == Instant.parse("2024-12-31T00:00:00Z")
         loaded.getResetSentTime() != null
         loaded.getReadySentTime() != null
+    }
+
+    def "refresh type round-trips so a recovered refresh keeps its real type (not LOCAL)"() {
+        given: "a non-LOCAL refresh context (e.g. an admin stream refresh)"
+        def store = new RefreshStateStore(tempDir.toString())
+        def context = new RefreshContext("topic", ["groupA:topic"] as Set, "TOPIC", "PIPE_AND_PROVIDER_STREAM")
+        context.setState(RefreshState.REPLAYING)
+        context.setRefreshId("refresh-2")
+
+        when:
+        store.saveState(context)
+        def reloaded = new RefreshStateStore(tempDir.toString()).loadAllRefreshes().get("topic")
+
+        then: "the restored context carries the persisted type, not the default LOCAL"
+        reloaded.getRefreshType() == "PIPE_AND_PROVIDER_STREAM"
+    }
+
+    def "a state file without a persisted type loads as LOCAL (backward-compatible)"() {
+        given: "a state file written before the refresh.type field existed"
+        def file = tempDir.resolve("data-refresh-state.properties")
+        Files.writeString(file, [
+                "active.refresh.topics=topic",
+                "topic.topic.state=REPLAYING",
+                "topic.topic.start.time=2025-01-01T00:00:00Z",
+                "topic.topic.expected.consumers=groupA:topic",
+                "topic.topic.refresh.id=refresh-old"
+        ].join("\n") + "\n")
+
+        when:
+        def loaded = new RefreshStateStore(tempDir.toString()).loadAllRefreshes().get("topic")
+
+        then: "missing type defaults to LOCAL"
+        loaded != null
+        loaded.getRefreshType() == "LOCAL"
     }
 
     def "clearState removes topic entry"() {

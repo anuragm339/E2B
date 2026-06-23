@@ -27,7 +27,7 @@ Items below could not be confirmed from code or need an owner decision.
 1. Should all persisted consumer offsets be standardized as next-to-deliver, including legacy?
 2. Should `CommitOffsetHandler` accept `storageHead + 1` for a caught-up modern consumer?
 3. Does `DeliveryStateStore` participate in active remote delivery recovery, or is it retained legacy infrastructure? Its direct integration into `BatchDeliveryService` was not confirmed.
-4. Should refresh reset to storage earliest offset rather than literal `0` after retention/compaction?
+4. Should replay-window reset semantics remain consumer-type aware, or should legacy/modern offset conventions be unified first?
 5. Should reconciliation include disconnected historical groups?
 
 ## Refresh/POS

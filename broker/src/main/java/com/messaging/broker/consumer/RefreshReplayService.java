@@ -9,6 +9,8 @@ import com.messaging.common.api.StorageEngine;
 import com.messaging.common.exception.DataRefreshException;
 import com.messaging.common.exception.ErrorCode;
 import com.messaging.common.exception.ExceptionLogger;
+import io.micronaut.context.annotation.Value;
+import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,28 +31,36 @@ public class RefreshReplayService implements ReplayPhase {
     private final StorageEngine storage;
     private final DataRefreshMetrics metrics;
     private final RefreshEventLogger refreshLogger;
+    private final RefreshReplayWindowResolver replayWindowResolver;
+    private final com.messaging.common.api.PipeConnector pipeConnector;
 
+    @Inject
     public RefreshReplayService(
             ConsumerRegistry remoteConsumers,
             StorageEngine storage,
             DataRefreshMetrics metrics,
-            RefreshEventLogger refreshLogger) {
+            RefreshEventLogger refreshLogger,
+            RefreshReplayWindowResolver replayWindowResolver,
+            com.messaging.common.api.PipeConnector pipeConnector) {
         this.remoteConsumers = remoteConsumers;
         this.storage = storage;
         this.metrics = metrics;
         this.refreshLogger = refreshLogger;
+        this.replayWindowResolver = replayWindowResolver;
+        this.pipeConnector = pipeConnector;
     }
 
     /**
      * Backward-compatible constructor for tests that only verify replay gating
-     * and metric calls, not storage-head-based gap updates.
+     * and metric calls, not storage-head-based gap updates. Passes a null storage engine, an
+     * unbounded resolver, and a null pipe (so the dynamic "load finished" gate is skipped).
      */
     @Deprecated
     public RefreshReplayService(
             ConsumerRegistry remoteConsumers,
             DataRefreshMetrics metrics,
             RefreshEventLogger refreshLogger) {
-        this(remoteConsumers, null, metrics, refreshLogger);
+        this(remoteConsumers, null, metrics, refreshLogger, RefreshReplayWindowResolver.unbounded(), null);
     }
 
     @Override
@@ -78,8 +88,10 @@ public class RefreshReplayService implements ReplayPhase {
                 progressedConsumers++;
             }
             try {
-                long storageHead = storage.getCurrentOffset(topic, 0);
-                long gap = Math.max(0, storageHead - committedOffset);
+                long replayTarget = context.hasReplayTargetOffset()
+                        ? context.getReplayTargetOffset()
+                        : storage.getCurrentOffset(topic, 0);
+                long gap = Math.max(0, replayTarget - committedOffset);
                 metrics.updateReplayGapOffset(topic, consumerGroupTopic, gap);
             } catch (Exception e) {
                 log.debug("Could not update replay gap metric for topic {} consumer {}: {}",
@@ -92,10 +104,14 @@ public class RefreshReplayService implements ReplayPhase {
                     topic, progressedConsumers, Instant.now());
         }
 
-        boolean allCaughtUp = allConsumersCaughtUp(topic, ackedConsumers);
+        boolean allCaughtUp = allConsumersCaughtUp(topic, context, ackedConsumers);
         boolean allResetAcksReceived = context.allResetAcksReceived();
 
         if (allCaughtUp && allResetAcksReceived) {
+            // READY fires once consumers have caught up to the replay target. The target is the
+            // "settled" history horizon (last record with created_time older than the configured
+            // settle window — see RefreshReplayWindowResolver); records inside the window are still
+            // settling and continue to arrive via the normal delivery flow after READY.
             LogContext progressContext = LogContext.builder()
                     .topic(topic)
                     .custom("refreshId", context.getRefreshId())
@@ -151,7 +167,8 @@ public class RefreshReplayService implements ReplayPhase {
             // Note: Adaptive delivery manager will automatically discover and deliver messages
             // No explicit trigger needed - watermark-based polling handles replay
 
-            log.debug("Replay ready for consumer starting from offset 0 (adaptive delivery will poll)");
+            log.debug("Replay ready for consumer starting from offset {} (adaptive delivery will poll)",
+                    context.getReplayStartOffset());
 
         } catch (Exception e) {
             DataRefreshException ex = new DataRefreshException(ErrorCode.DATA_REFRESH_REPLAY_FAILED,
@@ -167,5 +184,39 @@ public class RefreshReplayService implements ReplayPhase {
     @Override
     public boolean allConsumersCaughtUp(String topic, Set<String> ackedConsumers) {
         return remoteConsumers.allConsumersCaughtUp(topic, ackedConsumers);
+    }
+
+    private boolean allConsumersCaughtUp(String topic, RefreshContext context, Set<String> ackedConsumers) {
+        if (!context.hasReplayTargetOffset()) {
+            return allConsumersCaughtUp(topic, ackedConsumers);
+        }
+        long target = context.getReplayTargetOffset();
+        if (context.isDynamicReplayTarget()) {
+            // Async (pipe-fed) load: the "load finished" signal is the pipe being OUT OF DATA (its last
+            // poll returned nothing → the whole backlog is in storage). Until then we are still loading,
+            // so hold READY and keep /health DOWN — this is what stops a fresh boot from completing
+            // instantly against empty storage. Once drained, re-evaluate the settled target against the
+            // now-complete live head and check consumers against it.
+            if (pipeConnector != null && !pipeConnector.isUpstreamDrained()) {
+                return false; // pipe still streaming the backlog — load not finished
+            }
+            target = replayWindowResolver.settledTarget(topic);
+            context.setReplayTargetOffset(target);
+        }
+        if (target < 0) {
+            return true;
+        }
+        for (String consumerGroupTopic : ackedConsumers) {
+            long committedOffset = remoteConsumers.getCommittedOffset(consumerGroupTopic);
+            long requiredOffset = remoteConsumers.isLegacyGroupTopic(topic, consumerGroupTopic)
+                    ? target
+                    : target + 1;
+            if (committedOffset < requiredOffset) {
+                log.debug("Consumer {} not caught up for refresh window: offset={}, required={}, target={}",
+                        consumerGroupTopic, committedOffset, requiredOffset, target);
+                return false;
+            }
+        }
+        return true;
     }
 }

@@ -65,8 +65,7 @@ Only `scheduleReplayCheck` guarded its body; the other three did not:
 - `abortRefreshIfStuck` (abort watchdog, one-shot + re-arm) — a throw lost the **last-resort abort
   itself** → a stuck refresh never reached a terminal state.
 
-Because the pipe by design never resumes until the refresh completes, losing any of these could
-leave ingestion **paused until a broker restart**. Fixed by guarding each: `retryResetBroadcast`
+Losing any of these could leave refresh state active until a broker restart. Fixed by guarding each: `retryResetBroadcast`
 and `checkReadyAckTimeout` swallow `Exception` around their risky call (the periodic re-run /
 self-reschedule then survives), and a new `runAbortWatchdog` wrapper catches a throwing
 `abortRefreshIfStuck` and **re-arms** the watchdog for another window (re-arm is refreshId-guarded,
@@ -82,7 +81,7 @@ decoded — i.e. before `ClientMessageHandler` forwarded the records and before 
 handler that threw (or a consumer that crashed) between decode and processing **silently lost** data
 the broker would never resend. The same hazard applied to the refresh control acks: `RESET_ACK`
 and `READY_ACK` were sent regardless of whether `onReset`/`onReady` actually succeeded, so a
-half-reset or half-activated consumer could let a refresh complete (and the pipe resume) against
+half-reset or half-activated consumer could let a refresh complete against
 state it never applied.
 
 Fixed by moving every client ack to *after* successful processing:
@@ -93,8 +92,8 @@ Fixed by moving every client ack to *after* successful processing:
   handler's `handleBatch` succeeded; on any failure, or when no handler is registered, it withholds
   the ack and the broker's ack-timeout reverts the offset and redelivers.
 - `handleResetMessage`/`handleReadyMessage` withhold `RESET_ACK`/`READY_ACK` when any
-  `onReset`/`onReady` throws, so a failed refresh times out and aborts (ingestion stays paused, by
-  design) instead of proceeding against un-reset consumers.
+  `onReset`/`onReady` throws, so a failed refresh times out and aborts instead of proceeding
+  against un-reset consumers.
 
 Regression specs: `ClientConsumerManagerRoutingSpec` (ack sent on success, withheld on handler
 failure), `network/.../codec/BatchAckHandlerIntegrationSpec` (unwrap, no outbound ack),
@@ -191,7 +190,7 @@ One full journey run retained a reconnected group's pending ACK beyond timeout a
 
 Sources: `ConsumerCrashDuringReplayJourneySpec.groovy`, delivery state classes.
 
-Impact: pipe remains paused and all refresh participants wait.
+Impact: the refreshed topic remains active/non-green and all refresh participants wait; upstream pipe polling is not paused by the local consumer refresh itself.
 
 ### Compaction
 
@@ -218,7 +217,8 @@ Sources: `HttpPipeConnector.java`, `PipeServer.java`, `TopologyManager.java`, `P
 ### Offset Semantics
 
 - Modern offsets are next-to-deliver; legacy offsets are last-acknowledged. Full table and per-site analysis: [Data model — Offset conventions](05-data-model.md#offset-conventions-legacy-vs-modern--dual-convention).
-- `allConsumersCaughtUp` reads one property representation for both. It is written for the **legacy** convention (`offset == head` ⇒ caught up), which is correct for the deployed fleet. **Verdict (reviewed 2026-06-16): do NOT "consistency-fix" it toward next-to-deliver (`<= head`).** A legacy offset caps at `head`, so that would make caught-up unreachable and **stall refresh completion → ingestion paused forever**. Same reasoning blocks clamping registration to `head + 1`.
+- `allConsumersCaughtUp` reads one property representation for both. It is written for the **legacy** convention (`offset == head` ⇒ caught up), which is correct for the deployed fleet. **Verdict (reviewed 2026-06-16): do NOT "consistency-fix" it toward next-to-deliver (`<= head`).** A legacy offset caps at `head`, so that would make caught-up unreachable and **stall refresh completion forever**. Same reasoning blocks clamping registration to `head + 1`.
+- Captured refresh-window checks are consumer-type aware: legacy waits for `target`, modern waits for `target + 1`. If a consumer is disconnected and cannot be typed, the code defaults to legacy semantics to avoid wedging the deployed fleet.
 - `CommitOffsetHandler` clamps to storage head, not head plus one.
 - Registration clamps a corrupt value above head+1 back to head, intentionally allowing replay — the at-least-once-safe floor (legacy: exactly caught-up; modern: at most one duplicate, never a skip).
 

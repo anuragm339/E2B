@@ -118,7 +118,7 @@ class RefreshCoordinatorSpec extends Specification {
         1 * metrics.resetMetricsForNewRefresh()
         1 * metrics.recordRefreshStarted("topic", "LOCAL", _ as String)
         2 * metrics.recordResetSent("topic", _ as String, _ as String)
-        1 * pipeConnector.pausePipeCalls()
+        0 * pipeConnector.pausePipeCalls()
         1 * stateStore.saveState(_ as RefreshContext)
 
         cleanup:
@@ -198,7 +198,7 @@ class RefreshCoordinatorSpec extends Specification {
         coordinator.shutdown()
     }
 
-    def "handleReadyAck completes refresh and resumes pipe"() {
+    def "handleReadyAck completes refresh without owning pipe resume"() {
         given:
         def remoteConsumers = Mock(ConsumerRegistry) {
             getGroupTopicIdentifiers(_ as String) >> (["groupA:topic"] as Set)

@@ -92,15 +92,7 @@ public class RefreshRecoveryService implements RefreshRecovery {
         }
 
         log.info("Resuming {} refresh(es) from saved state", savedRefreshes.size());
-
-        // Pause pipes BEFORE resuming any refresh
-        pipeConnector.pausePipeCalls();
-
-        LogContext pipeContext = LogContext.builder()
-                .custom("reason", "recovery")
-                .custom("refreshCount", savedRefreshes.size())
-                .build();
-        refreshLogger.logPipePaused(pipeContext);
+        log.info("Pipe polling remains active during refresh recovery; recovery does not mutate pipe-offset.properties");
 
         // Record startup time for all resumed refreshes
         Instant startupTime = Instant.now();
@@ -200,10 +192,30 @@ public class RefreshRecoveryService implements RefreshRecovery {
     @Override
     public void repopulateMetricTimings(String topic, RefreshContext context) {
         String refreshId = context.getRefreshId();
+        String refreshType = context.getRefreshType();
         Instant resetSentTime = context.getResetSentTime();
         Instant readySentTime = context.getReadySentTime();
 
+        // The metric gauges are in-memory and wiped on restart. Re-emit the start_time gauge under the
+        // original refresh_id/type so a recovered refresh keeps a continuous (not absent/0) live value.
+        // reset-sent time is the start proxy — the original start.time is not restored into the context
+        // (it is final/constructor-set), and RESET is broadcast within ms of the refresh starting.
+        Instant startProxy = resetSentTime != null ? resetSentTime : context.getStartTime();
+        if (startProxy != null) {
+            metrics.restoreRefreshStartTime(topic, refreshType, refreshId, startProxy.toEpochMilli());
+        }
+
         for (String consumer : context.getExpectedConsumers()) {
+            // Re-seed messages_transferred from the consumer's persisted replay progress
+            // (current.offset - replay.start.offset) so the resumed replay continues from the
+            // pre-restart baseline instead of counting from zero. Approximate where offsets are sparse
+            // (compaction gaps), but keeps the live count from collapsing after a restart.
+            Long currentOffset = context.getConsumerOffsets().get(consumer);
+            if (currentOffset != null) {
+                long delivered = Math.max(0L, currentOffset - context.getReplayStartOffset());
+                metrics.restoreMessagesTransferred(topic, consumer, refreshType, refreshId, delivered);
+            }
+
             // RESET timing
             if (context.getReceivedResetAcks().contains(consumer)) {
                 Instant resetAckTime = context.getResetAckTimes().get(consumer);
@@ -306,7 +318,7 @@ public class RefreshRecoveryService implements RefreshRecovery {
 
         // H2-NEW-1: Arm the abort watchdog for recovered READY_SENT refreshes. Without this,
         // a restart during the READY_SENT phase has no upper-bound safety net — the READY ACK
-        // retry loop runs indefinitely if consumers never reconnect, leaving the pipe paused.
+        // retry loop runs indefinitely if consumers never reconnect.
         if (scheduleAbortWatchdogCallback != null) {
             scheduleAbortWatchdogCallback.schedule(topic);
         }

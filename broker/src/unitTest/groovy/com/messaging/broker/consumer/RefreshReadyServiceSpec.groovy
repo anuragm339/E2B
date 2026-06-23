@@ -94,7 +94,7 @@ class RefreshReadyServiceSpec extends Specification {
         0 * refreshLogger.logReadySent(_)
     }
 
-    def "completeRefresh resumes pipe only when the batch is fully complete"() {
+    def "completeRefresh resumes reconciliation without owning pipe resume"() {
         given:
         def first = context("prices-v1", ["group-a:prices-v1"] as Set, "batch-1")
         first.setResetSentTime(first.startTime)
@@ -123,8 +123,8 @@ class RefreshReadyServiceSpec extends Specification {
         then:
         sibling.state == RefreshState.COMPLETED
         1 * reconciliationScheduler.resumeForTopic("orders-v1")
-        1 * pipeConnector.resumePipeCalls()
-        1 * refreshLogger.logPipeResumed(_)
+        0 * pipeConnector.resumePipeCalls()
+        0 * refreshLogger.logPipeResumed(_)
     }
 
     def "completeRefresh resumes reconciliation for the completed topic regardless of sibling state"() {
@@ -139,8 +139,22 @@ class RefreshReadyServiceSpec extends Specification {
         then: "reconciliation resumed for prices-v1 (RocksDB fully re-populated by replay)"
         1 * reconciliationScheduler.resumeForTopic("prices-v1")
 
-        and: "pipe is also resumed since this was the only topic in the batch"
-        1 * pipeConnector.resumePipeCalls()
+        and: "consumer refresh completion does not own pipe resume"
+        0 * pipeConnector.resumePipeCalls()
+    }
+
+    def "completeRefresh records the COMPLETED metric under the context's real refresh type (not a hardcoded LOCAL)"() {
+        given: "a non-LOCAL refresh — e.g. a fresh-install bootstrap that re-sourced from the cloud"
+        def ctx = new RefreshContext("prices-v1", ["group-a:prices-v1"] as Set, "TOPIC", "CLOUD_SYNC")
+        ctx.setRefreshId("batch-cloud")
+        ctx.setResetSentTime(ctx.startTime)
+        activeRefreshes.put("prices-v1", ctx)
+
+        when:
+        service.completeRefresh("prices-v1", ctx)
+
+        then: "the completed metric carries CLOUD_SYNC, so it lines up with the started metric on one dashboard row"
+        1 * metrics.recordRefreshCompleted("prices-v1", "CLOUD_SYNC", "SUCCESS", "batch-cloud", ctx)
     }
 
     private static RefreshContext context(String topic, Set<String> consumers, String refreshId) {

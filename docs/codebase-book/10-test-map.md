@@ -110,6 +110,7 @@ Consumer/delivery/refresh:
 - `RefreshInitiatorSpec`
 - `RefreshReadyServiceSpec`
 - `RefreshRecoveryServiceSpec`
+- `RefreshReplayWindowResolverSpec`
 - `RefreshReplayServiceSpec`
 - `RefreshResetServiceSpec`
 - `RefreshResultSpec`
@@ -125,7 +126,7 @@ Core/handler/legacy/model/monitoring:
 - JSON/legacy parser and validation specs under `broker/src/unitTest/groovy/com/messaging/broker/handler/`
 - `LegacyConsumerDeliveryManagerSpec`, `MergedBatchSpec`, `TopicCursorSpec`
 - DTO specs under `broker/src/unitTest/groovy/com/messaging/broker/model/`
-- `BrokerMetricsSpec`, `DataRefreshMetricsSpec`, `LogContextSpec`, `TraceIdsSpec`
+- `BrokerMetricsSpec`, `DataRefreshMetricsSpec`, `LogContextSpec`, `RefreshHealthIndicatorSpec`, `TraceIdsSpec`
 
 ## Broker Integration Suites
 

@@ -112,6 +112,20 @@ public class ConsumerOffsetTracker {
     }
 
     /**
+     * Quiesce offset tracking for a destructive download-refresh wipe: cancel the periodic flush,
+     * drop in-memory offsets, and reject further updates so a stray ACK cannot re-create
+     * {@code consumer-offsets.properties} after {@code clearState} deletes it.
+     */
+    public void quiesceForWipe() {
+        repository.pauseForWipe();
+    }
+
+    /** Resume after the wipe, reloading offsets from the (now wiped/restored) file on disk. */
+    public void resumeAfterWipe() {
+        repository.resumeAfterWipe();
+    }
+
+    /**
      * Shutdown - flush final offsets.
      */
     @PreDestroy

@@ -55,9 +55,24 @@ public class RefreshStateStore {
             props.setProperty(topicPrefix + ".ready.sent.time", context.getReadySentTime().toString());
         }
 
+        props.setProperty(topicPrefix + ".replay.start.offset", String.valueOf(context.getReplayStartOffset()));
+        props.setProperty(topicPrefix + ".replay.target.offset", String.valueOf(context.getReplayTargetOffset()));
+        if (context.getReplayCutoffTime() != null) {
+            props.setProperty(topicPrefix + ".replay.cutoff.time", context.getReplayCutoffTime().toString());
+        } else {
+            props.remove(topicPrefix + ".replay.cutoff.time");
+        }
+
         // Save refresh ID (for per-batch metrics tracking)
         if (context.getRefreshId() != null) {
             props.setProperty(topicPrefix + ".refresh.id", context.getRefreshId());
+        }
+
+        // Save refresh TYPE. The metric gauges are tagged by refresh_type, and the replay gate keys
+        // off it (settled vs static target). Without this, a recovered refresh defaults to LOCAL on
+        // restart — mislabeling its metrics into a separate series and losing type-driven behavior.
+        if (context.getRefreshType() != null) {
+            props.setProperty(topicPrefix + ".refresh.type", context.getRefreshType());
         }
 
         // Save downtime periods
@@ -224,7 +239,11 @@ public class RefreshStateStore {
 
         Set<String> expectedConsumers = new HashSet<>(Arrays.asList(consumersStr.split(",")));
 
-        RefreshContext context = new RefreshContext(topic, expectedConsumers);
+        // Restore the refresh TYPE so recovered metrics keep their real refresh_type tag and the
+        // replay gate keeps its settled/static behavior. Default LOCAL for state files written before
+        // this field existed (backward-compatible).
+        String refreshType = props.getProperty(topicPrefix + ".refresh.type", "LOCAL");
+        RefreshContext context = new RefreshContext(topic, expectedConsumers, "TOPIC", refreshType);
         context.setState(state);
 
         // Parse timestamps
@@ -242,6 +261,21 @@ public class RefreshStateStore {
         String readySentTimeStr = props.getProperty(topicPrefix + ".ready.sent.time");
         if (readySentTimeStr != null) {
             context.setReadySentTime(Instant.parse(readySentTimeStr));
+        }
+
+        String replayStartOffset = props.getProperty(topicPrefix + ".replay.start.offset");
+        if (replayStartOffset != null) {
+            context.setReplayStartOffset(Long.parseLong(replayStartOffset));
+        }
+
+        String replayTargetOffset = props.getProperty(topicPrefix + ".replay.target.offset");
+        if (replayTargetOffset != null) {
+            context.setReplayTargetOffset(Long.parseLong(replayTargetOffset));
+        }
+
+        String replayCutoffTime = props.getProperty(topicPrefix + ".replay.cutoff.time");
+        if (replayCutoffTime != null) {
+            context.setReplayCutoffTime(Instant.parse(replayCutoffTime));
         }
 
         // Load refresh ID (for per-batch metrics tracking)

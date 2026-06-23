@@ -52,6 +52,7 @@ public class CompactionScheduler {
     private final double maxProcessCpuUsage;
     private final double maxHeapUsage;
     private final com.sun.management.OperatingSystemMXBean osBean;
+    private final io.micronaut.context.BeanProvider<com.messaging.broker.consumer.RefreshCoordinator> refreshCoordinator;
     private final Executor compactionExecutor;
     private final AtomicBoolean compactionRunning = new AtomicBoolean();
 
@@ -65,6 +66,8 @@ public class CompactionScheduler {
             CompactionIndex compactionIndex,
             BrokerMetrics metrics,
             com.messaging.broker.monitoring.MemoryMonitor memoryMonitor,
+            // Lazy (BeanProvider) to avoid an eager DI cycle through the refresh/consumer graph.
+            io.micronaut.context.BeanProvider<com.messaging.broker.consumer.RefreshCoordinator> refreshCoordinator,
             @Named("compactionExecutor") Executor compactionExecutor,
             @Value("${compaction.enabled:true}") boolean enabled,
             @Value("${compaction.tombstone-retention-days:7}") int tombstoneRetentionDays,
@@ -81,6 +84,7 @@ public class CompactionScheduler {
         this.compactionIndex       = compactionIndex;
         this.metrics               = metrics;
         this.memoryMonitor         = memoryMonitor;
+        this.refreshCoordinator    = refreshCoordinator;
         this.compactionExecutor    = compactionExecutor;
         this.enabled               = enabled;
         this.tombstoneRetentionDays = tombstoneRetentionDays;
@@ -205,6 +209,15 @@ public class CompactionScheduler {
                 log.info("event=compaction_run_budget_exhausted compactedTopics={} maxTopicsPerRun={}",
                         compactedTopics, maxTopicsPerRun);
                 break;
+            }
+            // Pause compaction for any topic under active refresh: a download-refresh swaps/wipes
+            // that topic's segments, and LOCAL refresh is replaying a captured offset range to
+            // consumers. Per-topic skip (not the whole run) avoids rewriting segments underneath
+            // the refresh while allowing unrelated topics to compact.
+            if (refreshCoordinator.get().isRefreshActive(topic)) {
+                log.debug("event=compaction_skipped_topic topic={} reason=refresh_active", topic);
+                metrics.recordCompactionSkipped("refresh_active");
+                continue;
             }
             if (!canRunCompaction("before_topic", topic)) {
                 break;

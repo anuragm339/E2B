@@ -117,6 +117,9 @@ abstract class BrokerSystemTestSupport extends Specification {
             'compaction.max-heap-usage'                            : '100.0',
             'micronaut.server.port'                  : "${findFreePort()}",
             'data-refresh.enabled'                   : 'false',
+            // Don't auto-bootstrap on every empty-data-dir test boot (would bounce the network
+            // server + wait on topology mid-test); the dedicated fresh-boot spec opts back in.
+            'broker.bootstrap.fresh-install.enabled' : 'false',
             // Suppress test-consumer beans (GenericConsumerHandler/@Consumer) in broker context
             'consumer.legacy.enabled'                : 'true',
             // Explicitly configure legacy-clients so the broker context has the right mapping

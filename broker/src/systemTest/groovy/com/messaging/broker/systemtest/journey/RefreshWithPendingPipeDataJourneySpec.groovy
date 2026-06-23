@@ -7,33 +7,31 @@ import com.messaging.broker.systemtest.support.BrokerSystemTestSupport
 import spock.util.concurrent.PollingConditions
 
 /**
- * Journey: pipe data queued during a refresh is delivered in the correct order after
- * the refresh completes, with no premature delivery and no duplicates.
+ * Journey: pipe data arriving around a local refresh is delivered without loss or duplicates.
  *
  * POS scenario: a data refresh is triggered at the same time as a stream of new price
  * updates arriving at the cloud pipe. The broker must:
- *  1. Pause the pipe when refresh starts (startRefresh → pipeConnector.pausePipeCalls()).
+ *  1. Keep the pipe active because local refresh does not mutate pipe-offset.properties.
  *  2. Complete the RESET → REPLAYING → READY → COMPLETED lifecycle.
- *  3. Resume the pipe on completeRefresh() → deliver queued records AFTER the refresh.
+ *  3. Continue delivering records that arrive before, during, or after refresh.
  *
- * Crucially, records enqueued during the refresh window must NOT arrive before the
- * consumer receives READY — that would mean post-refresh data mixes with replay data,
- * potentially corrupting consumer state.
+ * Records enqueued during the refresh window may arrive before READY or through replay;
+ * the contract is that they are not lost and the pipe is not left paused.
  *
  * Two sub-scenarios tested:
  * A. Records enqueued BEFORE refresh — must be re-delivered via replay (no loss).
- * B. Records enqueued DURING the refresh (while pipe is paused) — must arrive only
- *    AFTER the consumer has received READY and pipe is resumed.
+ * B. Records enqueued around refresh — must arrive even though local refresh no longer
+ *    pauses or resumes the pipe.
  *
  * Verified behaviours:
  * 1. Pre-refresh records are replayed and received by the consumer after RESET.
- * 2. Records enqueued while pipe is paused are NOT delivered before READY.
- * 3. After READY, all queued records are delivered in order.
+ * 2. Records enqueued around refresh are delivered.
+ * 3. After READY, additional records continue to flow normally.
  * 4. Committed offset and RocksDB reflect all records in their correct sequence.
  */
 class RefreshWithPendingPipeDataJourneySpec extends BrokerSystemTestSupport {
 
-    def "pipe data queued during refresh is withheld until after READY — no premature delivery"() {
+    def "pipe data around local refresh is delivered while pipe remains active"() {
         given: "consumer receives 3 pre-refresh records"
         collector().reset()
         cloudServer.enqueueMessages((1..3).collect { i ->
@@ -48,15 +46,15 @@ class RefreshWithPendingPipeDataJourneySpec extends BrokerSystemTestSupport {
         }
         collector().reset()
 
-        and: "3 new records are queued in the pipe BEFORE the refresh starts"
-        // These will be withheld by the broker's pipe pause once the refresh triggers.
-        // They represent events that arrived at the cloud side just as refresh was called.
+        and: "3 new records are queued in the pipe before the refresh starts"
+        // Local refresh no longer pauses the pipe. These records may be delivered before READY
+        // or as part of replay, but they must not be lost.
         cloudServer.enqueueMessages((4..6).collect { i ->
             [offset: (long) i, topic: 'prices-v1', partition: 0,
              msgKey: "during-${i}", eventType: 'MESSAGE', data: """{"v":${i}}"""]
         })
 
-        when: "refresh is triggered — pipe is paused immediately by startRefresh()"
+        when: "local refresh is triggered"
         def coordinator = brokerCtx.getBean(RefreshCoordinator)
         coordinator.startRefresh('prices-v1')
 
@@ -65,23 +63,14 @@ class RefreshWithPendingPipeDataJourneySpec extends BrokerSystemTestSupport {
             assert collector().resetCount >= 1
         }
 
-        and: "no during-refresh records have arrived yet — pipe is paused"
-        // Poll briefly to tolerate any async gap between RESET delivery and pipe-pause taking effect.
-        new PollingConditions(timeout: 5, delay: 0.2).eventually {
-            assert collector().getAll().size() == 0
-        }
-
         and: "consumer receives READY — full refresh lifecycle completed"
         new PollingConditions(timeout: 30, delay: 0.5).eventually {
             assert collector().readyCount >= 1
         }
 
-        // ── RECORDS QUEUED DURING REFRESH ARE DELIVERED AFTER READY ──────────
+        // ── RECORDS QUEUED AROUND REFRESH ARE DELIVERED ─────────────────────
 
-        and: "records queued while pipe was paused (during-4..6) are delivered after READY"
-        // These must NOT have arrived before READY. We verify by checking they are
-        // present now (post-READY), but we cannot verify they were absent before without
-        // intrusive timing — instead we verify delivery ordering via offset advancement.
+        and: "records queued around refresh (during-4..6) are delivered"
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
             assert collector().getAll().any { it.msgKey == 'during-4' }
             assert collector().getAll().any { it.msgKey == 'during-5' }
@@ -98,7 +87,7 @@ class RefreshWithPendingPipeDataJourneySpec extends BrokerSystemTestSupport {
              msgKey: 'post-8', eventType: 'MESSAGE', data: '{"post":8}'],
         ])
 
-        then: "post-refresh records arrive normally — pipe is not stuck paused"
+        then: "post-refresh records arrive normally"
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
             assert collector().getAll().any { it.msgKey == 'post-7' }
             assert collector().getAll().any { it.msgKey == 'post-8' }
@@ -112,7 +101,7 @@ class RefreshWithPendingPipeDataJourneySpec extends BrokerSystemTestSupport {
         and: "RocksDB ack-store has entries for queued and post-refresh records"
         def ackStore = brokerCtx.getBean(RocksDbAckStore)
         new PollingConditions(timeout: 10, delay: 0.3).eventually {
-            // Records that were queued while pipe was paused
+            // Records that were queued around local refresh
             assert ackStore.get('prices-v1', 'system-test-group', 4L) != null
             assert ackStore.get('prices-v1', 'system-test-group', 5L) != null
             assert ackStore.get('prices-v1', 'system-test-group', 6L) != null

@@ -13,6 +13,13 @@ import java.util.concurrent.atomic.AtomicReference
 
 class CompactionSchedulerSpec extends Specification {
 
+    /** A BeanProvider yielding a RefreshCoordinator that reports no active refresh (default). */
+    private io.micronaut.context.BeanProvider<com.messaging.broker.consumer.RefreshCoordinator> noRefresh() {
+        def coord = Mock(com.messaging.broker.consumer.RefreshCoordinator)
+        coord.isRefreshActive(_) >> false
+        return Mock(io.micronaut.context.BeanProvider) { get() >> coord }
+    }
+
     def "process CPU load normalization accepts fractional and percentage JVM formats"() {
         expect:
         CompactionScheduler.normalizeProcessCpuLoad(raw) == normalized
@@ -41,7 +48,7 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                memoryMonitor, noRefresh(), { Runnable task -> task.run() } as java.util.concurrent.Executor,
                 false, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
@@ -78,7 +85,7 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                memoryMonitor, noRefresh(), { Runnable task -> task.run() } as java.util.concurrent.Executor,
                 true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
@@ -121,7 +128,7 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                memoryMonitor, noRefresh(), { Runnable task -> task.run() } as java.util.concurrent.Executor,
                 true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
@@ -162,7 +169,7 @@ class CompactionSchedulerSpec extends Specification {
 
         def scheduler = new CompactionScheduler(
                 storage, segmentAccess, checkpointStore, planner, rewriter, compactionIndex, metrics,
-                memoryMonitor, { Runnable task -> task.run() } as java.util.concurrent.Executor,
+                memoryMonitor, noRefresh(), { Runnable task -> task.run() } as java.util.concurrent.Executor,
                 true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
         when:
@@ -192,6 +199,7 @@ class CompactionSchedulerSpec extends Specification {
                 Mock(RocksDbCompactionIndex),
                 metrics,
                 memoryMonitor,
+                noRefresh(),
                 executor,
                 true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
@@ -236,6 +244,7 @@ class CompactionSchedulerSpec extends Specification {
                     getHeapUsagePercent() >> 0.0d
                     isMemoryPressureHigh() >> false
                 },
+                noRefresh(),
                 executor,
                 true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 
@@ -268,6 +277,7 @@ class CompactionSchedulerSpec extends Specification {
                 Mock(CompactionPlanner), Mock(CompactionRewriter), Mock(RocksDbCompactionIndex),
                 metrics,
                 Stub(MemoryMonitor) { getHeapUsagePercent() >> 0.0d; isMemoryPressureHigh() >> false },
+                noRefresh(),
                 executor,
                 true, 7, 10, Integer.MAX_VALUE, 1, 1.0d, 1.0d)
 

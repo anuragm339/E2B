@@ -2,6 +2,7 @@ package com.messaging.broker.core
 
 import com.messaging.common.api.PipeConnector
 import com.messaging.common.model.MessageRecord
+import com.messaging.common.model.TopologyResponse
 import spock.lang.Specification
 import spock.lang.TempDir
 
@@ -27,6 +28,51 @@ class TopologyManagerSpec extends Specification {
         pipeConnector.connectCalls == 1
         pipeConnector.dataHandlerSet
         manager.getCurrentParentUrl() == "http://parent-1"
+    }
+
+    def "resolveTopologyNow returns promptly once the first registry query completes"() {
+        given:
+        def registryClient = Mock(CloudRegistryClient)
+        def pipeConnector = new FakePipeConnector()
+        def topology = new TopologyResponse()
+        topology.setRequestToFollow(["http://parent-1"])
+        registryClient.getTopology(_, _) >> CompletableFuture.completedFuture(topology)
+        def manager = new TopologyManager(registryClient, pipeConnector, "http://registry", "node-1", tempDir.toString())
+        manager.parentReachableProbe = { url -> true }  // skip real HTTP probe
+        manager.onMessageReceived({ MessageRecord record -> })
+
+        when: "start schedules the initial query; resolveTopologyNow blocks only until it lands"
+        manager.start()
+        def start = System.currentTimeMillis()
+        manager.resolveTopologyNow(5000)
+        def elapsed = System.currentTimeMillis() - start
+
+        then: "it unblocks on the first resolution well before the timeout"
+        elapsed < 4000
+
+        cleanup:
+        manager.shutdown()
+    }
+
+    def "resolveTopologyNow returns after the timeout when the registry never responds"() {
+        given:
+        def registryClient = Mock(CloudRegistryClient)
+        def pipeConnector = new FakePipeConnector()
+        registryClient.getTopology(_, _) >> new CompletableFuture<TopologyResponse>() // never completes
+        def manager = new TopologyManager(registryClient, pipeConnector, "http://registry", "node-1", tempDir.toString())
+
+        when:
+        manager.start()
+        def start = System.currentTimeMillis()
+        manager.resolveTopologyNow(300)
+        def elapsed = System.currentTimeMillis() - start
+
+        then: "it does not hang; returns around the timeout with no parent resolved"
+        elapsed >= 250
+        manager.getCurrentParentUrl() == null
+
+        cleanup:
+        manager.shutdown()
     }
 
     def "disconnects from parent"() {

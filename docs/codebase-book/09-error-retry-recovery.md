@@ -59,7 +59,7 @@ Tests: `SegmentCrashRecoverySpec.groovy`, `DefaultStorageRecoveryServiceSpec.gro
 - retries network/HTTP/parser failures;
 - persists only the last successfully handled offset;
 - resumes from `pipe-offset.properties`;
-- supports pause/resume during refresh;
+- supports pause/resume during destructive download-refresh sections;
 - copies/releases streaming Netty buffers before parsing.
 
 The connector treats partial successful processing transactionally: successfully handled records can advance in `finally`, while the failed record and later data are retried.
@@ -140,7 +140,7 @@ Only active registered pairs are reconciled. Historical disconnected groups are 
 
 Detailed state behavior is in [POS state](07-pos-machine-state.md).
 
-Recovery source: `RefreshRecoveryService.java`. It loads persisted contexts, pauses pipe first, records downtime, restores task scheduling, and resumes by state.
+Recovery source: `RefreshRecoveryService.java`. It loads persisted contexts, leaves pipe polling active, records downtime, restores task scheduling, and resumes by state.
 
 Abort watchdog behavior:
 

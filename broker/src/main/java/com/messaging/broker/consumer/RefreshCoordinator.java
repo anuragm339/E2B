@@ -40,6 +40,7 @@ public class RefreshCoordinator {
     private final BatchDeliveryService batchDeliveryService;
     private final ConsumerRegistry remoteConsumers;
     private final DataRefreshMetrics dataRefreshMetrics;
+    private final RefreshReadinessPolicy readinessPolicy;
 
     // Shared state
     private final Map<String, RefreshContext> activeRefreshes;
@@ -59,7 +60,8 @@ public class RefreshCoordinator {
             RefreshGatePolicy dataRefreshGatePolicy,
             BatchDeliveryService batchDeliveryService,
             ConsumerRegistry remoteConsumers,
-            DataRefreshMetrics dataRefreshMetrics) {
+            DataRefreshMetrics dataRefreshMetrics,
+            RefreshReadinessPolicy readinessPolicy) {
         this.initiationService = initiationService;
         this.resetService = resetService;
         this.replayService = replayService;
@@ -70,6 +72,7 @@ public class RefreshCoordinator {
         this.batchDeliveryService = batchDeliveryService;
         this.remoteConsumers = remoteConsumers;
         this.dataRefreshMetrics = dataRefreshMetrics;
+        this.readinessPolicy = readinessPolicy;
 
         this.scheduler = Executors.newScheduledThreadPool(2, r -> {
             Thread t = new Thread(r);
@@ -112,7 +115,8 @@ public class RefreshCoordinator {
                 dataRefreshGatePolicy,
                 batchDeliveryService,
                 remoteConsumers,
-                null
+                null,
+                new GlobalBarrierPolicy()
         );
     }
 
@@ -159,7 +163,11 @@ public class RefreshCoordinator {
      * Start a refresh for a topic.
      */
     public CompletableFuture<RefreshResult> startRefresh(String topic) {
-        CompletableFuture<RefreshResult> result = initiationService.startRefresh(topic);
+        return startRefresh(topic, "LOCAL");
+    }
+
+    public CompletableFuture<RefreshResult> startRefresh(String topic, String refreshType) {
+        CompletableFuture<RefreshResult> result = initiationService.startRefresh(topic, refreshType);
 
         // Send RESET after initiation
         RefreshContext context = activeRefreshes.get(topic);
@@ -194,10 +202,9 @@ public class RefreshCoordinator {
      * F1: run the abort watchdog so an unchecked throw in the abort logic can never silently lose
      * the safety net. The watchdog is a one-shot {@code scheduler.schedule}; if its task throws,
      * ScheduledThreadPoolExecutor stores the throwable in a Future nobody reads and the watchdog is
-     * simply gone — a stuck refresh would then never be aborted and, because the pipe does not
-     * resume until the refresh completes, ingestion stays paused until a broker restart. On any
-     * Exception we log and re-arm for another window instead (re-arm itself is refreshId-guarded,
-     * so a completed/replaced refresh does not loop). Errors (OOM etc.) stay fatal.
+     * simply gone — a stuck refresh would then never be aborted. On any Exception we log and re-arm
+     * for another window instead (re-arm itself is refreshId-guarded, so a completed/replaced
+     * refresh does not loop). Errors (OOM etc.) stay fatal.
      */
     private void runAbortWatchdog(String topic, String refreshId, boolean allowAbortFromReadySent) {
         try {
@@ -352,54 +359,70 @@ public class RefreshCoordinator {
         boolean allReceived = readyService.handleReadyAck(consumerGroupTopic, topic, context, traceId);
 
         if (allReceived) {
-            // NEW2-P2: Snapshot state BEFORE the CAS — the abort watchdog can race between
-            // markFirstReadyComplete() returning true and the stateMachine.transition() call:
-            // the watchdog sets context.setState(ABORTED) so the volatile re-read of
-            // context.getState() would return ABORTED, making transition(ABORTED, COMPLETED)
-            // fail and leaving the pipe permanently paused. Using the pre-CAS snapshot
-            // (always READY_SENT when allReadyAcksReceived() == true) guarantees a valid
-            // READY_SENT → COMPLETED path regardless of concurrent abort timing.
-            RefreshState stateAtCompletion = context.getState();
+            // This topic is settled (all READY acks in). Cancel its ready-timeout + abort watchdog now —
+            // it is not stuck, just possibly waiting on the cross-topic barrier, and we must not let its
+            // own watchdog abort it while it waits.
+            cancelTopicTimers(topic);
 
-            // NEW-P1: CAS guard prevents two concurrent final READY_ACKs from both driving
-            // completeRefresh — mirroring the markFirstResetAck() pattern for the REPLAYING
-            // transition. Without this, containsAll() is not atomic and two threads can both
-            // observe allReadyAcksReceived()==true and call resumePipeCalls/clearState twice.
-            if (!context.markFirstReadyComplete()) {
-                log.debug("Duplicate completion signal for topic {} — another thread already claimed transition",
+            // Readiness barrier: a settled topic does NOT go live until the policy allows it. For the
+            // global barrier that means EVERY in-flight refresh is settled — so no topic serves fresh
+            // data while another is still catching up. Held topics' new records wait in storage.
+            if (!readinessPolicy.canGoLive(topic, activeRefreshes)) {
+                log.info("event=refresh.settled_waiting topic={} — held by readiness barrier until all topics settle",
                         topic);
                 return;
             }
 
-            // Transition to COMPLETED state using the pre-CAS snapshot
+            // Barrier open → complete ALL settled topics together (not just this one).
+            completeAllSettledRefreshes();
+        }
+    }
+
+    /** Cancel the ready-timeout and abort watchdog for a topic (it has settled; nothing left to retry/abort). */
+    private void cancelTopicTimers(String topic) {
+        ScheduledFuture<?> readyTask = readyTimeoutTasks.remove(topic);
+        if (readyTask != null) readyTask.cancel(false);
+        ScheduledFuture<?> watchdogTask = abortWatchdogTasks.remove(topic);
+        if (watchdogTask != null) watchdogTask.cancel(false);
+    }
+
+    /**
+     * Complete every active refresh that has reached its settled point (all READY acks in) — invoked
+     * once the readiness barrier opens. Each is claimed via {@code markFirstReadyComplete()} so a
+     * concurrent caller cannot double-complete, and uses a pre-CAS state snapshot so a racing abort
+     * watchdog cannot wedge the READY_SENT → COMPLETED transition.
+     */
+    private void completeAllSettledRefreshes() {
+        for (Map.Entry<String, RefreshContext> entry : activeRefreshes.entrySet()) {
+            String topic = entry.getKey();
+            RefreshContext context = entry.getValue();
+            if (!context.allReadyAcksReceived()) {
+                continue; // not settled (shouldn't happen once the barrier is open) — leave it running
+            }
+            RefreshState stateAtCompletion = context.getState();
+            if (!context.markFirstReadyComplete()) {
+                continue; // already claimed/completed by another thread
+            }
             RefreshWorkflow.StateTransitionResult transition =
                     stateMachine.transition(stateAtCompletion, RefreshState.COMPLETED);
-
-            if (transition.isSuccess()) {
-                readyService.completeRefresh(topic, context);
-                RefreshHistoryRecorder doneHist = RefreshHistoryRecorder.instance();
-                if (doneHist != null) {
-                    doneHist.record(context, "COMPLETED");
-                }
-
-                // Cancel the READY timeout — no more retries needed now that all ACKs are in.
-                ScheduledFuture<?> readyTask = readyTimeoutTasks.remove(topic);
-                if (readyTask != null) readyTask.cancel(false);
-
-                // P1-1: Cancel the abort watchdog — refresh completed normally; no need to fire.
-                ScheduledFuture<?> watchdogTask = abortWatchdogTasks.remove(topic);
-                if (watchdogTask != null) watchdogTask.cancel(false);
-
-                // Cleanup after delay
-                final String completedRefreshId = context.getRefreshId();
-                scheduler.schedule(() -> {
-                    RefreshContext currentContext = activeRefreshes.get(topic);
-                    if (currentContext != null && completedRefreshId.equals(currentContext.getRefreshId())) {
-                        activeRefreshes.remove(topic);
-                        log.info("Refresh context removed for topic: {}", topic);
-                    }
-                }, 60, TimeUnit.SECONDS);
+            if (!transition.isSuccess()) {
+                continue;
             }
+            readyService.completeRefresh(topic, context);
+            RefreshHistoryRecorder doneHist = RefreshHistoryRecorder.instance();
+            if (doneHist != null) {
+                doneHist.record(context, "COMPLETED");
+            }
+            cancelTopicTimers(topic);
+
+            final String completedRefreshId = context.getRefreshId();
+            scheduler.schedule(() -> {
+                RefreshContext currentContext = activeRefreshes.get(topic);
+                if (currentContext != null && completedRefreshId.equals(currentContext.getRefreshId())) {
+                    activeRefreshes.remove(topic);
+                    log.info("Refresh context removed for topic: {}", topic);
+                }
+            }, 60, TimeUnit.SECONDS);
         }
     }
 
@@ -521,7 +544,7 @@ public class RefreshCoordinator {
 
         // F1: this runs on a scheduleWithFixedDelay task; an unchecked throw would cancel the whole
         // periodic schedule, so RESET would never be retried and the refresh could stall in
-        // RESET_SENT with the pipe paused. Swallow Exception so the periodic schedule is retained.
+        // RESET_SENT. Swallow Exception so the periodic schedule is retained.
         try {
             resetService.retryResetBroadcast(topic, context);
         } catch (Exception e) {
@@ -569,7 +592,7 @@ public class RefreshCoordinator {
 
         // F1: guard the timeout check so a throw cannot skip the self-reschedule below. This is a
         // one-shot task that re-arms itself; if readyService.checkReadyAckTimeout threw, the chain
-        // would die and a stuck READY_SENT refresh would keep the pipe paused until restart.
+        // would die and a stuck READY_SENT refresh could remain active until restart.
         try {
             readyService.checkReadyAckTimeout(topic, context);
         } catch (Exception e) {
@@ -587,6 +610,10 @@ public class RefreshCoordinator {
      */
     public RefreshContext getRefreshStatus(String topic) {
         return activeRefreshes.get(topic);
+    }
+
+    public Map<String, RefreshContext> getActiveRefreshesSnapshot() {
+        return new ConcurrentHashMap<>(activeRefreshes);
     }
 
     /**

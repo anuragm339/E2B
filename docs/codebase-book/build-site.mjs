@@ -538,14 +538,14 @@ const workflows = [
     shortTitle: "Refresh",
     category: "Reset, replay, ready",
     summary:
-      "Refresh freezes upstream pipe changes, resets selected POS groups, replays the local snapshot, and reopens normal operation only after every expected consumer is ready.",
+      "Refresh resets selected POS groups, replays the configured local window, and reopens normal operation only after every expected consumer is ready.",
     scenario:
       "An operator refreshes prices-v1 while two POS consumer groups are connected.",
     steps: [
       {
         title: "Admin starts refresh",
         detail:
-          "POST /admin/refresh-topic snapshots registered topic/group consumers, creates a refresh ID, pauses pipe calls, and persists RESET_SENT.",
+          "POST /admin/refresh-topic snapshots registered topic/group consumers, captures the replay window target, creates a refresh ID, and persists RESET_SENT.",
         signal: "RESET_SENT",
       },
       {
@@ -557,20 +557,20 @@ const workflows = [
       {
         title: "Offsets reset",
         detail:
-          "Each accepted RESET_ACK resets that consumer group's topic offset to 0. The first accepted ACK claims transition into REPLAYING.",
-        signal: "offset = 0",
+          "Each accepted RESET_ACK resets that consumer group's topic offset to the replay start. Legacy consumers use start minus one because their offset means last-delivered.",
+        signal: "offset = replay start",
       },
       {
         title: "Snapshot is replayed",
         detail:
-          "Normal adaptive batch delivery runs against stable local storage while the upstream pipe remains paused.",
+          "Normal adaptive batch delivery runs against stable local storage. Local refresh does not pause upstream pipe polling.",
         signal: "REPLAYING",
       },
       {
         title: "Catch-up is confirmed",
         detail:
-          "RefreshReplayService requires every expected RESET ACK and every acknowledged consumer offset to reach the storage head.",
-        signal: "consumer offset ≥ head",
+          "RefreshReplayService requires every expected RESET ACK and every acknowledged consumer offset to reach the captured target.",
+        signal: "consumer offset ≥ target",
       },
       {
         title: "Broker sends READY",
@@ -581,7 +581,7 @@ const workflows = [
       {
         title: "Normal operation resumes",
         detail:
-          "After all READY ACKs, the state becomes COMPLETED, reconciliation resumes, and the pipe resumes when no sibling topic refresh remains active.",
+          "After all READY ACKs, the state becomes COMPLETED and reconciliation resumes. Only destructive download-refresh file operations own pipe pause/resume.",
         signal: "COMPLETED",
       },
     ],
@@ -591,7 +591,7 @@ const workflows = [
       "State is persisted for broker restart recovery.",
       "Late joiners are added to RESET or READY handling based on active state.",
       "A 10-minute watchdog can abort stalled refreshes.",
-      "Pipe resumes only after all topics sharing the refresh ID are terminal.",
+      "Destructive download refresh pauses pipe polling only while local storage or pipe-offset state is mutated.",
     ],
     sources: [
       "broker/src/main/java/com/messaging/broker/http/RefreshController.java",
@@ -604,6 +604,7 @@ const workflows = [
       { label: "Refresh state machine", route: "#/chapter/07-pos-machine-state/refresh-state-machine" },
       { label: "Refresh event flow", route: "#/chapter/06-event-kafka-flow/refresh-event-flow" },
       { label: "Refresh API", route: "#/chapter/04-api-catalog/refresh-api" },
+      { label: "Planned redesign (P1–P6)", route: "#/chapter/20-download-refresh/planned-redesign-p1p6" },
     ],
   },
   {

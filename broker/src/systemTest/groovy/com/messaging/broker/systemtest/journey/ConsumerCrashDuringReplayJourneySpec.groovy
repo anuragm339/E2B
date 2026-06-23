@@ -97,7 +97,7 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
         consumerBCtx.close()
         // B's connection is dropped. The broker may remain in REPLAYING (B's offset stalled)
         // or advance to READY_SENT — either way the refresh cannot fully complete until B
-        // reconnects. The pipe is paused so this record is buffered until after READY.
+        // reconnects. Local refresh keeps the pipe active, so this record may arrive during replay.
         cloudServer.enqueueMessages([
             [offset: 50L, topic: 'prices-v1', partition: 0,
              msgKey: 'during-replay-A', eventType: 'MESSAGE', data: '{"mid":1}']
@@ -122,8 +122,7 @@ class ConsumerCrashDuringReplayJourneySpec extends BrokerSystemTestSupport {
         }
 
         and: "consumer A receives the record queued during the stalled replay window"
-        // during-replay-A (offset 50) was buffered while the pipe was paused. It must
-        // be delivered when the pipe resumes on refresh completion — before we reset.
+        // during-replay-A (offset 50) may arrive during replay or after READY, but must not be lost.
         new PollingConditions(timeout: 20, delay: 0.3).eventually {
             assert collector().getAll().any { it.msgKey == 'during-replay-A' }
         }
