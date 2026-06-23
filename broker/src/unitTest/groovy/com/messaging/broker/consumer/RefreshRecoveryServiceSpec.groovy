@@ -171,6 +171,28 @@ class RefreshRecoveryServiceSpec extends Specification {
         4 * refreshLogger.logStateTransition(_)
     }
 
+    def "recovery re-emits start_time and messages_transferred under the real (persisted) refresh type"() {
+        given: "a REPLAYING non-LOCAL refresh with persisted reset-sent time and consumer progress"
+        def ctx = new RefreshContext("prices-v1", ["group-a:prices-v1"] as Set, "TOPIC", "PIPE_AND_PROVIDER_STREAM")
+        ctx.setState(RefreshState.REPLAYING)
+        ctx.setRefreshId("refresh-7")
+        ctx.setResetSentTime(Instant.parse("2026-06-22T00:00:00Z"))
+        ctx.setReplayStartOffset(1000L)
+        ctx.updateConsumerOffset("group-a:prices-v1", 1500L) // delivered = 1500 - 1000 = 500
+
+        when:
+        service.resumeRefresh(ctx)
+
+        then: "start_time gauge restored from the reset-sent proxy, tagged with the real type (not LOCAL)"
+        1 * metrics.restoreRefreshStartTime(
+                "prices-v1", "PIPE_AND_PROVIDER_STREAM", "refresh-7",
+                Instant.parse("2026-06-22T00:00:00Z").toEpochMilli())
+
+        and: "messages_transferred re-seeded from current.offset - replay.start.offset"
+        1 * metrics.restoreMessagesTransferred(
+                "prices-v1", "group-a:prices-v1", "PIPE_AND_PROVIDER_STREAM", "refresh-7", 500L)
+    }
+
     private static RefreshContext refreshContext(String topic, RefreshState state, Set<String> consumers) {
         def context = new RefreshContext(topic, consumers)
         context.setState(state)

@@ -68,6 +68,13 @@ public class RefreshStateStore {
             props.setProperty(topicPrefix + ".refresh.id", context.getRefreshId());
         }
 
+        // Save refresh TYPE. The metric gauges are tagged by refresh_type, and the replay gate keys
+        // off it (settled vs static target). Without this, a recovered refresh defaults to LOCAL on
+        // restart — mislabeling its metrics into a separate series and losing type-driven behavior.
+        if (context.getRefreshType() != null) {
+            props.setProperty(topicPrefix + ".refresh.type", context.getRefreshType());
+        }
+
         // Save downtime periods
         List<RefreshContext.DowntimePeriod> downtimePeriods = context.getDowntimePeriods();
         props.setProperty(topicPrefix + ".downtime.count", String.valueOf(downtimePeriods.size()));
@@ -232,7 +239,11 @@ public class RefreshStateStore {
 
         Set<String> expectedConsumers = new HashSet<>(Arrays.asList(consumersStr.split(",")));
 
-        RefreshContext context = new RefreshContext(topic, expectedConsumers);
+        // Restore the refresh TYPE so recovered metrics keep their real refresh_type tag and the
+        // replay gate keeps its settled/static behavior. Default LOCAL for state files written before
+        // this field existed (backward-compatible).
+        String refreshType = props.getProperty(topicPrefix + ".refresh.type", "LOCAL");
+        RefreshContext context = new RefreshContext(topic, expectedConsumers, "TOPIC", refreshType);
         context.setState(state);
 
         // Parse timestamps
